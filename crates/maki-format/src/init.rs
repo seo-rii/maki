@@ -65,7 +65,9 @@ fn create_volume_with_metadata_version(
     }
     // Any file left in the layout directories belongs to an earlier volume:
     // slot headers carry no volume UUID, so the new volume would adopt its
-    // shards and serve their ciphertext instead of zeros (R5-018).
+    // shards and serve their ciphertext instead of zeros (R5-018). Every
+    // entry counts, so `list` refuses a name that is not UTF-8 here instead
+    // of skipping it.
     for dir in [
         layout::DATA_DIR,
         layout::JOURNAL_DIR,

@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 
 use maki_backing::remote_gc::OperationGuard;
 use maki_backing::remote_witness::{namespace, Action, Descriptor, Phase, Record, Request, Rpc};
@@ -9,12 +9,6 @@ use maki_backing::witness::Anchor;
 use maki_backing::{Backing, FileBacking};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-
-// fork temporarily inherits every open file description, including flock
-// locks, until exec closes CLOEXEC descriptors. Exclude process creation from
-// tests that expect dropping the final local lock to release it immediately;
-// ordinary GC tests still run concurrently.
-static PROCESS_SPAWN: RwLock<()> = RwLock::new(());
 
 #[derive(Serialize)]
 struct EmptyManifest {
@@ -138,9 +132,6 @@ fn enrollment_bytes(identity: [u8; 16], capacity: u64) -> Vec<u8> {
 
 #[test]
 fn foreign_or_corrupt_root_binding_blocks_gc_even_with_valid_current_manifest() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for mut binding in [
         enrollment_bytes([2; 16], 4096),
         enrollment_bytes([1; 16], 8192),
@@ -177,9 +168,6 @@ fn foreign_or_corrupt_root_binding_blocks_gc_even_with_valid_current_manifest() 
 
 #[test]
 fn matching_root_binding_allows_old_and_partially_removed_namespaces_to_be_collected() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     let retired_name = descriptor(2).namespace;
@@ -207,9 +195,6 @@ fn matching_root_binding_allows_old_and_partially_removed_namespaces_to_be_colle
 
 #[test]
 fn removes_only_quiescent_lower_fences_and_keeps_authority_root() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     let live = descriptor(2).namespace;
@@ -246,9 +231,6 @@ fn removes_only_quiescent_lower_fences_and_keeps_authority_root() {
 
 #[test]
 fn restore_and_pending_fork_sources_are_retained() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let mut state = record(5);
     state.current = Some(descriptor(3));
@@ -271,9 +253,6 @@ fn restore_and_pending_fork_sources_are_retained() {
 
 #[test]
 fn operation_guard_excludes_a_second_process_view_of_same_pinned_root() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (dir, disk) = root();
     let second = FileBacking::new(dir.path()).unwrap();
     let guard = OperationGuard::acquire(&disk).unwrap();
@@ -286,9 +265,6 @@ fn operation_guard_excludes_a_second_process_view_of_same_pinned_root() {
 
 #[test]
 fn unavailable_or_invalid_authority_cannot_delete_anything() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     populate(&disk, &old);
@@ -313,9 +289,6 @@ fn unavailable_or_invalid_authority_cannot_delete_anything() {
 
 #[test]
 fn unexpected_contents_and_missing_original_lock_are_preserved() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let extra = descriptor(1).namespace;
     let missing_lock = descriptor(2).namespace;
@@ -342,9 +315,6 @@ fn unexpected_contents_and_missing_original_lock_are_preserved() {
 
 #[test]
 fn resumes_each_durable_tombstone_unlink_prefix_without_recreating_lock() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let files = [
         "rollback.arena",
@@ -373,9 +343,6 @@ fn resumes_each_durable_tombstone_unlink_prefix_without_recreating_lock() {
 
 #[test]
 fn symlinks_hardlinks_and_foreign_names_never_escape_or_partially_delete() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::symlink;
     let (dir, disk) = root();
     let outside = tempfile::tempdir().unwrap();
@@ -412,9 +379,6 @@ fn symlinks_hardlinks_and_foreign_names_never_escape_or_partially_delete() {
 
 #[test]
 fn pinned_root_rename_cannot_redirect_gc_to_a_replacement_directory() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = tempfile::tempdir().unwrap();
     let original = parent.path().join("volume");
     let renamed = parent.path().join("original");
@@ -439,9 +403,6 @@ fn pinned_root_rename_cannot_redirect_gc_to_a_replacement_directory() {
 
 #[test]
 fn planted_current_tombstone_and_original_collision_are_preserved() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let current = descriptor(3).namespace;
     let current_tombstone = format!(".remote-gc-{current}");
@@ -523,9 +484,6 @@ impl Drop for WithoutCapability {
 
 #[test]
 fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let (dir, disk) = root();
     // The unlink failure is a directory without write permission, which
@@ -574,9 +532,6 @@ fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current
 
 #[test]
 fn operation_guard_is_exclusive_across_actual_processes() {
-    let _process = PROCESS_SPAWN
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     const CHILD_ROOT: &str = "MAKI_GC_CHILD_ROOT";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let disk = FileBacking::new(root).unwrap();
@@ -615,9 +570,6 @@ fn operation_guard_is_exclusive_across_actual_processes() {
 
 #[test]
 fn authority_change_aborts_before_deleting_a_newly_selected_source() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct ChangedAuthority {
         calls: AtomicUsize,
@@ -652,9 +604,6 @@ fn authority_change_aborts_before_deleting_a_newly_selected_source() {
 
 #[test]
 fn wrong_backing_format_fails_before_reclamation() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     populate(&disk, &old);
@@ -670,9 +619,6 @@ fn wrong_backing_format_fails_before_reclamation() {
 
 #[test]
 fn valid_authority_for_another_identity_cannot_reclaim_this_backing() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let old = descriptor(1).namespace;
     let newer = descriptor(5).namespace;
@@ -692,9 +638,6 @@ fn valid_authority_for_another_identity_cannot_reclaim_this_backing() {
 
 #[test]
 fn retired_namespace_with_a_live_lifetime_lock_is_never_unlinked() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let original = descriptor(1).namespace;
     let retired = format!(".remote-gc-{original}");
@@ -719,14 +662,15 @@ fn retired_namespace_with_a_live_lifetime_lock_is_never_unlinked() {
     );
 }
 
+/// A lifetime lock ends when its holder drops it. A child forked meanwhile
+/// shares the lock's open file description until its `exec`; when only the
+/// holder's descriptor was closed, the lock stayed held for that child and GC
+/// skipped a namespace no handle used any more.
 #[test]
-fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
+fn a_dropped_lifetime_lock_is_free_while_a_forked_child_holds_its_descriptor() {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let _process = PROCESS_SPAWN
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, disk) = root();
     let original = descriptor(1).namespace;
     let retired = format!(".remote-gc-{original}");
@@ -792,9 +736,12 @@ fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
         .unwrap()
         .collect(&rpc)
         .unwrap();
-    assert_eq!(report.skipped_live, std::slice::from_ref(&retired));
-    assert!(report.removed.is_empty());
-    assert!(disk.exists(&format!("{retired}/rollback.arena")).unwrap());
+    assert_eq!(
+        report.removed,
+        [original],
+        "GC report while the child still holds the dropped lock's descriptor: {report:?}"
+    );
+    assert!(!disk.exists(&retired).unwrap());
 
     release_write.write_all(&[1]).unwrap();
     let mut status = 0;
@@ -803,19 +750,10 @@ fn inherited_lifetime_lock_delays_gc_until_the_child_exits() {
     child.0 = 0;
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
-    let report = OperationGuard::acquire(&disk)
-        .unwrap()
-        .collect(&rpc)
-        .unwrap();
-    assert_eq!(report.removed, [original]);
-    assert!(!disk.exists(&retired).unwrap());
 }
 
 #[test]
 fn seeded_retention_oracle_covers_live_originals_and_every_retirement_prefix() {
-    let _process = PROCESS_SPAWN
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::collections::BTreeSet;
     let (_dir, disk) = root();
     let files = [

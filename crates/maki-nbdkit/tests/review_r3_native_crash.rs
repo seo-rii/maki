@@ -9,6 +9,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
@@ -16,11 +19,6 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-
-// A fork inherits other threads' creation locks until exec closes their
-// descriptors. Keep a fixture's creation lock out of all process starts.
-// Independent volume creation and external daemon lifetimes remain parallel.
-static PROCESS_SPAWN: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -158,13 +156,8 @@ root = {root:?}
 socket = {control:?}
 "#
         );
-        std::fs::write(&config, &raw).unwrap();
-        {
-            let _creation = PROCESS_SPAWN
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
-        }
+        volume_config::write(&config, &raw).unwrap();
+        maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         let mut client = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         client.write_all(CLIENT.as_bytes()).unwrap();
         let oracle = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
@@ -244,9 +237,6 @@ impl Process {
     fn start(mut command: Command, directory: &Path) -> Self {
         let stdout = tempfile::NamedTempFile::new_in(directory).unwrap();
         let stderr = tempfile::NamedTempFile::new_in(directory).unwrap();
-        let _spawn = PROCESS_SPAWN
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let child = command
             .process_group(0)
             .stdin(Stdio::null())

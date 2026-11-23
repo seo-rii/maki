@@ -65,6 +65,35 @@ them through filesystem permissions and ownership. Non-Linux development
 backends retain pathname validation and do not provide this single-link check;
 the supported data plane is Linux-only.
 
+A process running as root (an offline check, inspect, creation or remote
+administration command) creates each file and directory below the backing
+root for the owner of the directory it creates it in, when that owner is not
+root, so a lock file or manifest slot it recreates in the daemon user's tree
+stays openable by the daemon. A new file is created unnamed (`O_TMPFILE`),
+given away and synced with fsync before it is linked under its name; on a
+filesystem without unnamed files it is created under its name and given away
+before anything is written to it. A directory cannot be created unnamed: after
+`mkdirat`, the directory its name holds is given away only while it is empty
+and root's, whichever root process made it, so nothing that holds an entry or
+belongs to another user changes owner. An entry that already exists is opened
+as it is and never changes owner, and a refused owner change removes what was
+created. A crash between creating an entry and giving it away (a directory, or
+a file created under its name) leaves an empty root-owned entry that later
+runs open as it is, and the entries they create in such a directory are
+root's too. The backing root itself, when `FileBacking::new` creates it,
+belongs to the user that runs the process. The local witness directory
+follows the same rule, and its record is never published from a file another
+user may hold open: a leftover `anchor.next` is removed first, and a file
+that a user other than root or the record's owner puts back under that name
+meanwhile is refused.
+
+Volume, rollback, witness, attach and control-socket directory locks are
+`flock` locks on descriptors opened close-on-exec. Such a lock belongs to the
+open file description, which every child process forked by any thread shares
+until its `exec` closes its copy. Each lock guard therefore unlocks before
+closing its descriptor: a close alone would keep a released lock held for such
+a child, and a reattach in that window would fail as `VOLUME_ALREADY_ATTACHED`.
+
 ## Read and write semantics
 
 The engine divides the device into fixed crypto units. Reads take a consistent
@@ -305,14 +334,50 @@ growing memory. Each lane keeps several batches in flight (bounded by
 `limits.max_crypto_inflight_batches`), so one slow batch does not serialize the
 requests behind it. Local providers are called directly.
 
+The dispatcher and the random-prefix wrapper check every unit of a call before
+the first RPC and refuse the whole call for one they cannot carry. The
+scheduler applies the same per-unit checks at admission, request by request,
+so a request with such a unit (an empty ciphertext from a damaged slot, say)
+fails alone instead of failing every request coalesced with it. Only a
+retry-safe provider has a rejected coalesced call re-sent request by request;
+a provider that is not retry-safe is never sent a request twice, so its
+rejection reaches every request in the call.
+
 Queued groups own their payload and admission charge together. Cancellation
 removes the complete group even if it is behind another group waiting for an
 RPC slot. An active coalesced RPC remains necessary until its last caller
 leaves. For bounded-error calls, one caller budget covers admission, coalescing,
 the slot wait, and the provider response; dispatch does not restart it.
 
+Every deadline exit answers the same way: the last error an endpoint returned
+before the deadline for the RPC batch in progress (one batch of items with its
+retries and failovers), with that error's class, or the deadline error when no
+endpoint failed that batch, and one count in
+`maki_crypto_deadline_exceeded_total` whatever the error. A call larger than
+the endpoints' common batch limit is sent as several RPC batches, one after
+another, and reports only the current one, since an earlier batch that has
+since succeeded does not explain why the call is late. The dispatcher's own
+exits (before the first pass, at the top of a pass, right after a failed RPC,
+in admission, with an RPC in flight) share one path. A scheduler caller's
+budget starts before queueing, so it usually runs out before the dispatcher's,
+while the shared RPC is still running. Each scheduler caller therefore has an
+observer, which its queued group carries into the provider call that serves it
+(the coalesced batch or a per-request re-send) as a task-local. The dispatcher
+records there the latest endpoint error of its RPC batch in progress (without
+the not-sent mark), cleared when the next batch starts, and its own deadline
+exits. The observer records nothing at or after the caller's deadline, so a
+caller that leaves on its own timer returns what the dispatcher had seen before
+that deadline, whichever task runs first. A dispatcher hides the observer from
+its endpoints, so a nested set reports to the outer set only through its
+result: its expiry is a failure of that peer, counted by the nested set and not
+as the outer operation's deadline.
+
 The dispatcher validates quarantined endpoints in background tasks, never on
-the request path. Each admitted call owns a circuit-breaker permit for its
+the request path. Only proof that an endpoint serves another contract rejects
+it for the life of the set; an inconclusive validation (a failed exchange,
+such as a timeout or a truncated reply) is retried with the circuit breaker's
+doubling open interval, and the endpoint serves only after a validation
+succeeds in full. Each admitted call owns a circuit-breaker permit for its
 generation. Completion, operation deadline, cancellation, request/provider
 errors, and retry-budget refusal all release a HalfOpen probe slot; outcomes
 that are not endpoint failures do not advance the failure count. A stale
@@ -410,6 +475,11 @@ separate privileged `lvextend` and `xfs_growfs` operation.
   releasing ownership; `into_vec` transfers zeroization to the caller and
   releases only that buffer's lock ownership.
 - Configuration rejects literal values for sensitive headers.
+- Every loader reads a volume configuration through one checked reader
+  (`maki_nbdkit::config_file`): on Unix a final symlink, a second hard link, an
+  owner other than root or the loading process's user, or group or other write
+  access refuses the file before it is parsed
+  ([configuration file](configuration.md#configuration-file)).
 - Repeated credential names must declare the same source throughout a volume
   configuration; conflicting sources are rejected before credentials load.
 - A malformed provider response is treated as a contract failure, never trusted.

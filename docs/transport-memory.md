@@ -295,6 +295,17 @@ unlocked copy of the plaintext exists at any point. `local-aes-xts` follows
 the same pattern. The earlier implementation used the allocating AEAD API,
 which decrypted into an ordinary vector and wrapped it afterwards.
 
+Before an encrypt result is accepted, the caller searches it for its own
+plaintext (`CheckedProvider`, each `EndpointSet` endpoint and the self-test).
+The search is two-way string matching: it allocates nothing, and its only
+plaintext-dependent state is a few positions in registers or on the stack. The
+earlier search built a failure table of one machine word per plaintext byte in
+an ordinary vector, which was not page-locked, was freed without erasure and,
+for a unit whose bytes take two values (an allocation bitmap), reproduced the
+plaintext. `review_plaintext_scan_memory.rs` (maki-crypto) requires an accepted
+result to be checked without a heap allocation and no check, accepted or
+refused, to free an unerased block.
+
 Key files (`file`, systemd `credential`) are read directly into a guarded
 buffer and hex-decoded into another; `env` keys are copied out of the
 environment string, which is then erased (the environment block itself is
@@ -314,9 +325,9 @@ other `SecretBuffer` failure. `AesGcmSivProvider::key_schedule_locked()` and
 `key_schedules_are_page_locked_under_secure_buffers` requires it.
 
 **Residual.** Temporaries the cipher crates create on the stack while
-expanding the key, and stack or register state during encryption, are outside
-the page-lock claim; `memory_lock_mode = "all"` (`mlockall`) or the
-secure-swap policy covers them.
+expanding the key, and stack or register state during encryption and the
+plaintext search, are outside the page-lock claim; `memory_lock_mode = "all"`
+(`mlockall`) or the secure-swap policy covers them.
 
 ## Parser and TLS library-owned copies
 

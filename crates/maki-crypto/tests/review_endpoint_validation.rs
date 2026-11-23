@@ -1,4 +1,6 @@
 //! BUG-067 / BUG-068 / BUG-072: quarantine admission, attribution and ownership.
+//! Only proof of another contract rejects a candidate; a malformed reply
+//! defers it (see `review_endpoint_revalidation.rs`).
 use async_trait::async_trait;
 use maki_crypto::selftest::{cross_endpoint_self_test, provider_self_test};
 use maki_crypto::{
@@ -358,9 +360,13 @@ async fn malformed_reference_decrypt_defers_candidate_then_recovers() {
     assert!(set.endpoint_status()[1].validated);
 }
 
+/// A malformed candidate reply shows a failed exchange, not a different
+/// contract: the candidate never serves, but stays eligible and is
+/// revalidated after the validation interval.
 #[tokio::test(flavor = "current_thread")]
-async fn malformed_candidate_contract_is_still_rejected() {
+async fn malformed_candidate_is_never_admitted_but_is_revalidated() {
     use maki_test_support::fake_provider::Misbehavior;
+    let clock = Arc::new(ManualClock::new());
     let reference = Gated::new();
     let candidate = Gated::new();
     candidate
@@ -369,19 +375,36 @@ async fn malformed_candidate_contract_is_still_rejected() {
     let set = EndpointSet::with_quarantine(
         vec![
             ("reference".into(), reference, true),
-            ("candidate".into(), candidate, false),
+            ("candidate".into(), candidate.clone(), false),
         ],
         Some(validator()),
         cfg(),
-        Arc::new(ManualClock::new()),
+        clock.clone(),
     );
     set.encrypt_batch(&ctx(), &input()).await.unwrap();
     settle().await;
-    assert!(set.endpoint_status()[1].rejected);
+    let first = candidate.calls.load(Ordering::SeqCst);
+    let status = &set.endpoint_status()[1];
+    assert!(
+        first > 0 && !status.validated && !status.rejected,
+        "{status:?}"
+    );
+    clock.advance(Duration::from_secs(1));
+    set.encrypt_batch(&ctx(), &input()).await.unwrap();
+    settle().await;
+    let status = &set.endpoint_status()[1];
+    assert!(!status.validated && !status.rejected, "{status:?}");
+    assert!(
+        candidate.calls.load(Ordering::SeqCst) > first,
+        "a malformed reply must not end validation for the life of the set"
+    );
 }
 
+/// A different key is proof, not a failed exchange: the candidate is
+/// rejected and never validated again.
 #[tokio::test(flavor = "current_thread")]
-async fn different_key_candidate_is_still_rejected() {
+async fn different_key_candidate_is_rejected_for_the_life_of_the_set() {
+    let clock = Arc::new(ManualClock::new());
     let reference = Gated::new();
     let candidate = Gated::from_inner(
         FakeCryptoProvider::new(U as u32)
@@ -394,15 +417,24 @@ async fn different_key_candidate_is_still_rejected() {
     let set = EndpointSet::with_quarantine(
         vec![
             ("reference".into(), reference, true),
-            ("candidate".into(), candidate, false),
+            ("candidate".into(), candidate.clone(), false),
         ],
         Some(validator()),
         cfg(),
-        Arc::new(ManualClock::new()),
+        clock.clone(),
     );
     set.encrypt_batch(&ctx(), &input()).await.unwrap();
     settle().await;
     assert!(set.endpoint_status()[1].rejected);
+    let calls = candidate.calls.load(Ordering::SeqCst);
+    for _ in 0..10 {
+        clock.advance(Duration::from_secs(5));
+        set.encrypt_batch(&ctx(), &input()).await.unwrap();
+        settle().await;
+    }
+    let status = &set.endpoint_status()[1];
+    assert!(status.rejected && !status.validated, "{status:?}");
+    assert_eq!(candidate.calls.load(Ordering::SeqCst), calls, "revalidated");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -113,8 +113,7 @@ the reported values.
 all owner-only (`0700` directories, `0600` files). The command must target an
 empty, reviewed backing location, and the tree must end up owned by the daemon
 user: `/var/lib/maki` is `root:maki 0750`, so create the volume directory for
-the daemon and run the command as that user rather than as root (a root-owned
-`0700` tree is unreadable to the daemon, which then fails to attach):
+the daemon and run the command as that user:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/example
@@ -127,6 +126,18 @@ default copy-on-write data, ZFS) is unsupported. On btrfs, running
 `chattr +C /var/lib/maki/example` between the two commands makes every backing
 file created afterwards NOCOW; that configuration is not qualified
 ([copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
+
+A `maki` command run as root creates every file and directory below an
+existing backing root for the owner of the directory it creates it in, so a
+root `volume create` into a volume directory created as above leaves the same
+daemon-owned tree. A volume directory the command has to create itself is
+root's, and so is everything in it: a root-owned `0700` tree is unreadable to
+the daemon, which then fails to attach. `volume create` then warns with the
+`chown -R maki:maki` to run before the first start. The offline commands below
+follow the same rule. A root run that a crash interrupts can leave an empty
+root-owned directory behind (or, on a filesystem without `O_TMPFILE`, an empty
+root-owned file), which later runs open as it is; hand the tree back with
+`chown -R maki:maki` after such a crash.
 
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
@@ -166,6 +177,10 @@ attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
+It recreates a missing `volume.lock` (a restore or copy can drop the empty
+file); run as root, it creates the file for the owner of the backing root, so
+the daemon can still take the lock and nothing has to be handed back unless a
+crash interrupted the run (above).
 When checking a backing root directly, `maki-check` needs no segment size:
 like recovery, it bounds each journal segment file by the largest file a
 writer can produce under any valid `journal_segment_size` (at most 1 GiB), so
@@ -921,6 +936,25 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
+The November 2026 configuration-file check refuses a volume configuration that
+another user could change or substitute
+([configuration file](configuration.md#configuration-file)): a daemon started
+on one fails attach, and every `maki` command refuses it. Before upgrading,
+list the files it would refuse, then replace each listed file with a
+`root:maki 0640` copy of its contents (`install` replaces the name, so a
+symlink or second link is gone afterwards):
+
+```bash
+find /etc/maki/volumes -name '*.toml' \
+    \( -type l -o -links +1 -o -perm /022 -o ! -user root \) -print
+cp --dereference /etc/maki/volumes/<volume>.toml /root/<volume>.toml.copy
+install -m 0640 -o root -g maki /root/<volume>.toml.copy /etc/maki/volumes/<volume>.toml
+```
+
+Review the copied contents before installing them. A listed file owned by the
+daemon user is still accepted by the daemon, but not by `maki` commands run as
+root.
+
 Removing the package (`apt remove maki`) is refused by its `prerm` while any
 trusted attachment record exists or a `maki@`, `maki-attach@`,
 `maki-recover@` or `maki-workload@` unit is active: the helper being removed is what the
@@ -1020,14 +1054,21 @@ published checkpoint, in bytes including record headers. Repeated writes to
 one unit count once per journal record. A TRIM tombstone counts its header.
 Unsynced records enter this gauge when they become durable.
 
-With batching enabled, `maki_crypto_deadline_exceeded_total` counts completed
-scheduler encrypt/decrypt calls that return an operation-deadline error.
-Queue admission, coalescing, batch-slot waits and RPC time share that caller's
-budget. Two expired callers in one coalesced RPC contribute two; a caller
-contributes only once even if the dispatcher also observes the deadline.
-Success, other errors and caller cancellation do not increment it. Without a
-scheduler, the metric uses the dispatcher's deadline counter. These are crypto
-calls, not Engine or NBD requests, which may issue several crypto calls.
+`maki_crypto_deadline_exceeded_total` counts crypto encrypt/decrypt calls that
+ended because their `bounded-error` deadline expired, whatever error they
+returned. Such a call returns the last error an endpoint gave before the
+deadline for the RPC batch in progress (one batch of items with its retries and
+failovers; a call sent as several RPC batches reports only the current one),
+with that error's own class, or `operation deadline exceeded` when no endpoint
+failed that batch, so alert on this counter rather than on the error text.
+With batching enabled it counts scheduler callers: queue admission,
+coalescing, batch-slot waits and RPC time share each caller's budget. Two
+expired callers in one coalesced RPC contribute two; a caller contributes only
+once even if the dispatcher also observes the deadline. Success, errors that
+end a call before its deadline and caller cancellation do not increment it.
+Without a scheduler, the metric uses the dispatcher's deadline counter. These
+are crypto calls, not Engine or NBD requests, which may issue several crypto
+calls.
 
 ## Failure handling
 
@@ -1128,6 +1169,13 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
+- A volume configuration that is a symlink, has a second hard link, is owned
+  by a user other than root and the loading process's user, or is writable by
+  its group or others is refused before it is parsed, by the daemon (attach
+  fails), by every `maki` command that reads it and by `maki-benchmark`; the
+  error names the file and the problem. Install it `root:maki 0640`
+  ([configuration file](configuration.md#configuration-file)); a file owned
+  by the daemon user is accepted only by processes running as that user.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with no group or other permission bits
   (for example `0600` or `0400`), owned by root

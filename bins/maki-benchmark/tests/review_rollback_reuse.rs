@@ -1,6 +1,9 @@
 //! BUG-070: existing protected volumes need ordinary attach, not enrollment.
 #![cfg(target_os = "linux")]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -60,7 +63,7 @@ threads = 2
             witness.path().display().to_string()
         );
         let config = directory.path().join("volume.toml");
-        std::fs::write(&config, &raw).unwrap();
+        volume_config::write(&config, &raw).unwrap();
         Self {
             directory,
             witness,
@@ -187,7 +190,7 @@ fn authorized_reuse_still_rejects_changed_protected_capacity() {
     let fixture = Fixture::new();
     fixture.create();
     let before = snapshot(fixture.witness.path());
-    std::fs::write(
+    volume_config::write(
         &fixture.config,
         fixture
             .raw
@@ -209,7 +212,7 @@ fn authorized_reuse_still_rejects_changed_key_identity() {
     let other_key = fixture.directory.path().join("other-key");
     std::fs::copy(&key, &other_key).unwrap();
     let uuid_before = fixture.uuid();
-    std::fs::write(
+    volume_config::write(
         &fixture.config,
         fixture
             .raw
@@ -283,7 +286,7 @@ fn protected_root_without_configuration_still_refuses_plain_backing() {
         &fixture.raw[..rollback_start],
         &fixture.raw[nbd_start..]
     );
-    std::fs::write(&fixture.config, raw).unwrap();
+    volume_config::write(&fixture.config, raw).unwrap();
     let output = fixture.run(true);
     assert_failed_without_report(&output, 1);
     assert!(String::from_utf8_lossy(&output.stderr).contains("protected backing requires"));

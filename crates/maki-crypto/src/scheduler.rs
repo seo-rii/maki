@@ -19,11 +19,19 @@
 //! and decrypt run on separate lanes, each bounded (count + bytes) so pending
 //! crypto work can never grow without limit (SPEC §12).
 //!
+//! A request with a unit the provider stack refuses before sending anything
+//! (an empty or oversized ciphertext, or plaintext of a size the inner
+//! provider does not accept) is rejected at admission and fails alone: the
+//! dispatcher and the random-prefix wrapper refuse a whole call for one such
+//! unit, which would otherwise fail every request coalesced with it.
 //! A transport-class provider error reaches every request of the batch.
 //! An integrity or other request-specific rejection of a coalesced batch
-//! may concern one request only, so each request is then re-sent independently
-//! within the lane's inflight limit and gets its own verdict: a tampered unit read by one
-//! client never turns another client's healthy read into EIO.
+//! may concern one request only. For a retry-safe provider each request is
+//! then re-sent independently within the lane's inflight limit and gets its
+//! own verdict: a tampered unit read by one client never turns another
+//! client's healthy read into EIO. A provider that is not retry-safe is never
+//! sent a request twice, so its rejection reaches every request of the batch
+//! (R5-004).
 //!
 //! Costs: a request pays at most `max_wait` of extra latency when it is
 //! alone, and plaintext is copied once into the lane (the provider trait
@@ -39,9 +47,13 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 use crate::clock::Clock;
+use crate::endpoint::{deadline_error, observe_dispatch, DispatchObserver};
 use crate::error::CryptoError;
 use crate::flow::{DualPermit, DualSemaphore};
-use crate::provider::{private::ValidationCaller, CryptoProvider};
+use crate::provider::{
+    private::{SelfTestCaller, ValidationCaller},
+    CryptoProvider,
+};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 #[derive(Debug, Clone)]
@@ -121,9 +133,11 @@ impl SchedulerStats {
         self.coalesced_batches.load(Ordering::SeqCst)
     }
 
-    /// Completed encrypt/decrypt callers that received an operation deadline
-    /// error, including admission, coalescing and slot waits. Each caller is
-    /// counted once even when several callers share the same provider RPC.
+    /// Completed encrypt/decrypt callers whose operation deadline expired,
+    /// whatever error they returned: their own budget (admission,
+    /// coalescing, slot waits and the RPC) ran out, or the dispatcher
+    /// serving them ended the call at its deadline. Each caller is counted
+    /// once even when several callers share the same provider RPC.
     pub fn deadline_exceeded_total(&self) -> u64 {
         self.deadline_exceeded.load(Ordering::SeqCst)
     }
@@ -154,6 +168,8 @@ struct Group<I, O> {
     /// over because the group does not fit the current batch (BUG-153).
     enqueued_at: Duration,
     reply: Reply<O>,
+    /// What the dispatcher serving this group has seen.
+    observer: DispatchObserver,
     /// Queue capacity, released when the group is dispatched.
     _pending: PendingCharge,
 }
@@ -243,6 +259,7 @@ type ResendSafe = Arc<
 struct RetryGroup<I, O> {
     items: Vec<I>,
     reply: Reply<O>,
+    observer: DispatchObserver,
 }
 
 async fn retry_caller_closed<I, O>(pending: &mut VecDeque<RetryGroup<I, O>>) {
@@ -289,7 +306,7 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
                 _ = reply.closed() => None,
                 result = async {
                     let _call = InflightCall::enter(stats, len, false);
-                    call(context, group.items).await
+                    observe_dispatch(vec![group.observer], call(context, group.items)).await
                 } => Some(result),
             };
             if let Some((_, result)) = result {
@@ -473,6 +490,8 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
             logical_bytes,
             enqueued_at: self.clock.now(),
             reply: reply_tx,
+            // The submitting caller's, set by `BatchScheduler::with_deadline`.
+            observer: DispatchObserver::current(),
             _pending: PendingCharge {
                 stats: stats.clone(),
                 items: count,
@@ -623,10 +642,12 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let context = batch[0].context.clone();
         let mut lengths = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
+        let mut observers = Vec::with_capacity(batch.len());
         let mut all_items = Vec::with_capacity(items);
         for g in batch {
             lengths.push(g.items.len());
             replies.push(g.reply);
+            observers.push(g.observer);
             all_items.extend(g.items);
             // `_pending` drops here: the group left the queue.
         }
@@ -645,7 +666,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                 _ = all_replies_closed(replies.iter_mut()) => None,
                 result = async {
                     let _call = InflightCall::enter(stats.clone(), items, coalesced);
-                    call(context.clone(), all_items).await
+                    observe_dispatch(observers.clone(), call(context.clone(), all_items)).await
                 } => Some(result),
             };
             let Some((all_items, result)) = result else {
@@ -682,9 +703,11 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
             let pending = lengths
                 .into_iter()
                 .zip(replies)
-                .map(|(len, reply)| RetryGroup {
+                .zip(observers)
+                .map(|((len, reply), observer)| RetryGroup {
                     items: input.by_ref().take(len).collect(),
                     reply,
+                    observer,
                 })
                 .collect();
             run_retries(context, pending, call, stats, inflight, slot).await;
@@ -722,6 +745,53 @@ fn deliver<O>(
                 let _ = reply.send(Err(err.duplicate()));
             }
         }
+    }
+}
+
+/// Refuse, per request, every unit the provider stack below refuses before
+/// sending anything. `EndpointSet` and `RandomPrefixProvider` check each unit
+/// of a call before the first RPC and refuse the whole call for one they
+/// cannot carry. Once coalesced, that refusal reaches every request of the
+/// batch, and a provider that is not retry-safe never has a rejected batch
+/// re-sent request by request (R5-004), so one bad unit (say, a slot holding
+/// a CRC-valid empty ciphertext) would fail the healthy requests beside it
+/// although nothing was sent. Requests in one batch share their context, so
+/// a context the stack refuses fails them all alike and is not checked here.
+fn check_plaintext_units(
+    items: &[PlaintextUnit],
+    caps: &CryptoCapabilities,
+) -> Result<(), CryptoError> {
+    match items.iter().find(|item| {
+        !caps.accepts_plaintext_size(item.data.len())
+            || item.data.len() as u64 > caps.batch.max_bytes
+    }) {
+        Some(item) => Err(CryptoError::NonRetryableRequest(format!(
+            "unit {} has plaintext size {}, which the provider does not accept",
+            item.unit_index,
+            item.data.len()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The decrypt counterpart of [`check_plaintext_units`]. An empty unit is
+/// never ciphertext a provider made: `CheckedProvider` and the engine refuse
+/// an empty encrypt result.
+fn check_ciphertext_units(
+    items: &[CiphertextUnit],
+    caps: &CryptoCapabilities,
+) -> Result<(), CryptoError> {
+    match items
+        .iter()
+        .find(|item| item.data.is_empty() || item.data.len() > caps.max_ciphertext_size as usize)
+    {
+        Some(item) => Err(CryptoError::NonRetryableRequest(format!(
+            "unit {} has ciphertext size {}, outside the declared 1 to {} bytes",
+            item.unit_index,
+            item.data.len(),
+            caps.max_ciphertext_size
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -816,6 +886,13 @@ impl BatchScheduler {
         self.stats.clone()
     }
 
+    /// The inner provider's contract, learned on first use.
+    async fn inner_caps(&self) -> Result<&CryptoCapabilities, CryptoError> {
+        self.caps
+            .get_or_try_init(|| self.inner.capabilities())
+            .await
+    }
+
     fn decrypt_unit_size(&self, caps: &CryptoCapabilities) -> Result<u32, CryptoError> {
         self.unit_size
             .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
@@ -828,45 +905,49 @@ impl BatchScheduler {
     /// Start the caller's budget before its first queue-admission wait.
     /// Expiry drops the submit future; the lane then removes that group or
     /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
+    /// The operation runs with this caller's dispatch observer, which its
+    /// queued group carries to the dispatcher that serves it.
     async fn with_deadline<T>(
         &self,
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
-        let result = match self.max_operation_time() {
-            Some(limit) => {
-                let deadline = self.clock.now().saturating_add(limit);
+        let deadline = self
+            .max_operation_time()
+            .map(|limit| self.clock.now().saturating_add(limit));
+        // The observer records nothing at or after the deadline: a failure
+        // the dispatcher sees then arrived too late for this caller.
+        let observer = DispatchObserver::until(self.clock.clone(), deadline);
+        let operation = observe_dispatch(vec![observer.clone()], operation);
+        // `None`: the caller's own budget ran out first.
+        let result = match deadline {
+            Some(deadline) => {
                 let remaining = deadline.saturating_sub(self.clock.now());
                 if remaining.is_zero() {
-                    Err(crate::endpoint::deadline_error())
+                    None
                 } else {
                     tokio::select! {
                         biased;
-                        _ = self.clock.sleep(remaining) => Err(crate::endpoint::deadline_error()),
-                        result = operation => {
-                            // The timer may wake on a later tick. Check the clock
-                            // after the operation's final poll, as the dispatcher does.
-                            if self.clock.now() < deadline {
-                                result
-                            } else {
-                                Err(crate::endpoint::deadline_error())
-                            }
-                        }
+                        _ = self.clock.sleep(remaining) => None,
+                        // The timer may wake on a later tick. Check the clock
+                        // after the operation's final poll, as the dispatcher does.
+                        result = operation => (self.clock.now() < deadline).then_some(result),
                     }
                 }
             }
-            None => operation.await,
+            None => Some(operation.await),
         };
+        let report = observer.take();
         // The caller owns this outcome, whether its queue timer or the inner
-        // dispatcher's timer expired first. Ordinary cancellation never
-        // reaches this point and must not be counted as a timeout (BUG-154).
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(crate::endpoint::is_deadline_error)
-        {
+        // dispatcher's timer expired first, and whatever error it returns.
+        // Ordinary cancellation never reaches this point and must not be
+        // counted as a timeout (BUG-154).
+        if result.is_none() || report.deadline_expired {
             self.stats.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
         }
-        result
+        // Leave as the dispatcher serving this request would have at the
+        // deadline: with the last endpoint error of the request then in
+        // progress, or the deadline error if none failed it.
+        result.unwrap_or_else(|| Err(report.last_error.unwrap_or_else(deadline_error)))
     }
 }
 
@@ -924,6 +1005,7 @@ impl CryptoProvider for BatchScheduler {
             if items.is_empty() {
                 return Ok(Vec::new());
             }
+            check_plaintext_units(items, self.inner_caps().await?)?;
             // Reserve before copying: waiting callers retain only their own
             // input, never an uncharged duplicate owned by this scheduler.
             let permit = self
@@ -955,24 +1037,14 @@ impl CryptoProvider for BatchScheduler {
             if items.is_empty() {
                 return Ok(Vec::new());
             }
-            let caps = self
-                .caps
-                .get_or_try_init(|| self.inner.capabilities())
-                .await?;
+            let caps = self.inner_caps().await?;
             let unit_size = self.decrypt_unit_size(caps)?;
             let logical_bytes = (items.len() as u64)
                 .checked_mul(u64::from(unit_size))
                 .ok_or_else(|| {
                     CryptoError::NonRetryableRequest("logical batch size overflow".into())
                 })?;
-            if items
-                .iter()
-                .any(|item| item.data.len() > caps.max_ciphertext_size as usize)
-            {
-                return Err(CryptoError::NonRetryableRequest(
-                    "ciphertext exceeds the declared maximum unit size".into(),
-                ));
-            }
+            check_ciphertext_units(items, caps)?;
             // Check logical batching independently of resident ciphertext,
             // then reserve its full resident cost before cloning (R3-003).
             self.decrypt.check_admissible(items, logical_bytes, bytes)?;
@@ -992,6 +1064,23 @@ impl CryptoProvider for BatchScheduler {
                 )
                 .await
         })
+        .await
+    }
+
+    /// The self-test's compatibility-id probe bypasses the decrypt lane,
+    /// which calls the inner provider's ordinary decrypt: a translating
+    /// layer below (the random-prefix wrapper) must receive it as the probe.
+    /// It keeps the caller's deadline; it is one unit, sent once at attach.
+    async fn decrypt_compatibility_probe(
+        &self,
+        caller: SelfTestCaller,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.with_deadline(
+            self.inner
+                .decrypt_compatibility_probe(caller, context, items),
+        )
         .await
     }
 }

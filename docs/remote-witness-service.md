@@ -236,7 +236,10 @@ its owner can rewrite the administrator allow-list, the key path or the
 authority it names. A root-owned `0644` file suits both the service account
 and root; a command run as root refuses a configuration owned by the service
 account. Configurations hold no secrets, so group and other read access is
-allowed. Credential files are
+allowed. The writer and administrator configurations that the `maki volume`
+commands read are volume configurations and follow the same owner and mode
+rule, with exactly one hard link and at most 1 MiB
+([configuration file](configuration.md#configuration-file)). Credential files are
 regular files bounded to 1 MiB. Private-key files must not be symlinks or
 accessible to group/others (`0600` is appropriate), and must be owned by root
 or by the user the loading process runs as. A key owned by any other user is
@@ -248,7 +251,8 @@ their configuration's client key before they contact the authority, so run
 daemon user (`sudo -u maki`); a snapshot also needs a backup directory that
 user can create. `witness` may instead use the administrator configuration as
 root. `takeover`, `restore` and `resume-enrollment` need the administrator
-configuration: run them as root and then hand the new writer namespace back
+configuration: run them as root; they create the new writer namespace for the
+daemon user that owns the backing root
 ([below](#snapshot-takeover-and-restore)). Certificates and CA bundles may have
 any owner. The key loader accepts one
 unencrypted PKCS#8, PKCS#1 RSA or SEC1 EC PEM block. Encrypted keys, bag
@@ -412,19 +416,17 @@ state is the older snapshot. Quiesce first:
    ([planned shutdown](deployment/postgres.md#6-planned-stop-and-start)).
 2. Run takeover or restore below, then inspect the result with
    `maki volume witness`.
-3. Return the backing to the daemon user (next paragraph) and only then start
-   the target again.
+3. Only then start the target again.
 
 These commands, and `resume-enrollment`, create the new writer namespace
-owner-only (`0700` directories, `0600` files) as the user that runs them. Run
-as root, which an administrator key readable only by root requires, they leave
-a `remote-*` tree the `maki` daemon cannot open, and the next attach fails. Keep
-the administrator key unreadable to the daemon user and hand the tree back after
-the command instead:
-
-```sh
-chown -R maki:maki /var/lib/maki/<volume>
-```
+owner-only (`0700` directories, `0600` files). They run as root, which an
+administrator key readable only by root requires, and a process run as root
+creates every file and directory below the backing root for the owner of the
+directory it creates it in: in a backing root that belongs to the daemon user,
+the new `remote-*` tree is the daemon's, so nothing has to be handed back
+unless a crash interrupted the command
+([volume lifecycle](operations.md#volume-lifecycle)). Keep the administrator
+key unreadable to the daemon user.
 
 For a stale or failed writer, review the current fence/root and replace the
 placeholders:

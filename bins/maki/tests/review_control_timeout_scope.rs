@@ -5,6 +5,9 @@
 //! the command never uses. Commands without a control round trip refuse it
 //! as misuse (status 2, usage on stderr), before doing anything.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -25,7 +28,7 @@ max_ciphertext_size = 4384
 
 fn write_config(dir: &Path, name: &str, extra: &str) -> String {
     let path = dir.join(name);
-    std::fs::write(
+    volume_config::write(
         &path,
         format!(
             "{VOLUME}[backing]\nroot = {:?}\n{extra}",

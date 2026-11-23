@@ -37,11 +37,19 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Read a volume configuration through the checked reader: the file decides
+/// where plaintext and credentials go, so one another user could write or
+/// substitute is refused before it is parsed (SPEC §8).
+fn read_config_text(path: &std::path::Path) -> Result<String, String> {
+    maki_nbdkit::config_file::read_volume_config(path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn read_config(
     path: impl AsRef<std::path::Path>,
 ) -> Result<maki_format::config::VolumeConfig, String> {
     let path = path.as_ref();
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw = read_config_text(path)?;
     let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -127,13 +135,15 @@ enum ControlTarget<'a> {
 impl ControlTarget<'_> {
     /// Only the socket address is needed: the configuration is parsed, not
     /// validated, so one edited for the next start cannot block `drain` on
-    /// the running daemon.
+    /// the running daemon. It is still read through the checked reader: a
+    /// substituted file would send the command to another listener.
     fn socket(&self) -> Result<String, String> {
         match self {
             Self::Socket(path) => Ok(path.clone()),
             Self::Config(config) => {
-                let raw = std::fs::read_to_string(config).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                let path = std::path::Path::new(config);
+                let raw = maki_nbdkit::config_file::read_volume_config(path).map_err(|e| {
+                    if e.is_access_denied() {
                         format!(
                             "{config}: {e}; without access to the volume configuration pass \
                              --socket /run/maki-control/<volume>/control.sock"
@@ -221,9 +231,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["volume", "create", config] | ["volume", "create", config, "--discard"] => {
-            let raw = match std::fs::read_to_string(config) {
+            let raw = match read_config_text(std::path::Path::new(config)) {
                 Ok(raw) => raw,
-                Err(e) => return fail(format!("{config}: {e}")),
+                Err(e) => return fail(e),
             };
             let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
                 Ok(creation) => creation,
@@ -453,9 +463,13 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
     control(target, "reload", Some("cache"), payload, timeout)
 }
 
-/// The backing tree is created owner-only; a root-created volume is
-/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
-/// rollback witness is created the same way, so name both paths.
+/// The backing tree is created owner-only, and a root-owned entry in it is
+/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). Root
+/// creates each file and directory for the owner of the directory it creates
+/// it in, so what it leaves root-owned is a backing root or local rollback
+/// witness directory that root owns, such as one that did not exist and the
+/// command had to create, and everything below one. Name each path that
+/// holds such an entry.
 fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;
@@ -465,21 +479,56 @@ fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Opt
         .rollback_protection
         .as_ref()
         .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
-        .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()));
-    Some(match local_witness {
-        Some((root, witness)) => format!(
-            "the volume tree {root} and the rollback witness in {witness} were created \
-             owner-only by root; the daemon runs as the maki user and cannot open them. Run \
-             `maki volume create` as that user (sudo -u maki ...) or \
-             `chown -R maki:maki {root_arg} {witness_arg}` before starting the service",
-            root_arg = shell_word(root),
-            witness_arg = shell_word(witness)
-        ),
-        None => "the volume tree was created owner-only by root; the daemon runs as the maki \
-                 user and cannot open it. Run `maki volume create` as that user \
-                 (sudo -u maki ...) or chown the tree to maki:maki before starting the service"
-            .to_string(),
-    })
+        .map(|rollback| rollback.witness_root.as_str());
+    let held: Vec<(&str, &str)> = [("the volume tree", cfg.backing.root.as_str())]
+        .into_iter()
+        .chain(local_witness.map(|witness| ("the rollback witness in", witness)))
+        .filter(|(_, path)| holds_root_owned_entry(std::path::Path::new(path)))
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = held
+        .iter()
+        .map(|(what, path)| format!("{what} {path}"))
+        .collect();
+    let arguments: Vec<String> = held.iter().map(|(_, path)| shell_word(path)).collect();
+    Some(format!(
+        "{} {} entries created owner-only by root; the daemon runs as the maki user and \
+         cannot open them. Run `maki volume create` as that user (sudo -u maki ...) or \
+         `chown -R maki:maki {}` before starting the service",
+        named.join(" and "),
+        if held.len() == 1 { "holds" } else { "hold" },
+        arguments.join(" ")
+    ))
+}
+
+/// Whether `path` or anything below it is owned by root. An entry that
+/// cannot be described counts, so the warning errs towards a hand-back.
+#[cfg(unix)]
+fn holds_root_owned_entry(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    if metadata.uid() == 0 {
+        return true;
+    }
+    if !metadata.is_dir() {
+        return false;
+    }
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => holds_root_owned_entry(&entry.path()),
+            Err(_) => true,
+        }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn holds_root_owned_entry(_path: &std::path::Path) -> bool {
+    true
 }
 
 #[cfg(unix)]

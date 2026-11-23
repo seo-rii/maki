@@ -1,3 +1,6 @@
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::{Command, Output};
 
 use maki_backing::FileBacking;
@@ -57,7 +60,7 @@ fn created(discard: bool) -> (u32, String) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
     let config_path = directory.path().join("volume.toml");
-    std::fs::write(&config_path, config(&root)).unwrap();
+    volume_config::write(&config_path, config(&root)).unwrap();
     let mut args = vec!["volume", "create", config_path.to_str().unwrap()];
     if discard {
         args.push("--discard");
@@ -97,7 +100,7 @@ fn discard_flag_never_reinitializes_an_existing_volume() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("volume");
     let config_path = directory.path().join("volume.toml");
-    std::fs::write(&config_path, config(&root)).unwrap();
+    volume_config::write(&config_path, config(&root)).unwrap();
     let path = config_path.to_str().unwrap();
     assert!(run(&["volume", "create", path]).status.success());
     let output = run(&["volume", "create", path, "--discard"]);

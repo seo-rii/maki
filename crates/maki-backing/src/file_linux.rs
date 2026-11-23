@@ -38,6 +38,248 @@ fn open_at(parent: &File, child: &CStr, flags: i32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Open `child`, creating it owner-only (`0600`) when it is missing. A new
+/// file belongs to this process's user, except that a root process creates
+/// it for the owner of `parent` when another user owns that directory
+/// ([`new_entry_owner`]): a lock file or manifest slot that a root-run
+/// offline check recreates must not lock the daemon user out of its own
+/// volume. An existing entry is opened as it is; root gives away only a
+/// file it has just created.
+fn create_or_open(parent: &File, child: &CStr, access: i32) -> io::Result<File> {
+    match creation_owner(parent)? {
+        None => open_at(parent, child, access | libc::O_CREAT),
+        Some(owner) => create_or_open_for(parent, child, access, owner, true),
+    }
+}
+
+/// The owner [`new_entry_owner`] picks for an entry this process creates
+/// in `parent`, if not this process's user.
+fn creation_owner(parent: &File) -> io::Result<Option<crate::FileOwner>> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(None);
+    }
+    let metadata = parent.metadata()?;
+    Ok(new_entry_owner(
+        euid,
+        crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        },
+    ))
+}
+
+/// The owner an entry that a process with effective uid `euid` creates in
+/// a directory owned by `directory` must be given, if not its creator. Only
+/// root can give an entry away, and only a directory another user owns
+/// needs it. That user can already create and replace every entry there,
+/// so a new one root creates for them gives them nothing they lack, and
+/// root never gives an entry to anyone else. A root-owned directory gets
+/// root's entries, as the daemon could not create any there either.
+fn new_entry_owner(euid: u32, directory: crate::FileOwner) -> Option<crate::FileOwner> {
+    (euid == 0 && directory.uid != 0).then_some(directory)
+}
+
+/// [`child_dir`] creating a missing directory inside the backing root. Like
+/// a file ([`create_or_open`]), it is created for the owner of `parent`
+/// when a root process creates it in a directory another user owns. The
+/// root itself and missing ancestors of it (`Directory::new`) belong to the
+/// user that runs the process.
+fn create_or_open_dir(parent: &File, child: &CStr) -> io::Result<File> {
+    let Some(owner) = creation_owner(parent)? else {
+        return child_dir(parent, child, true);
+    };
+    match open_at(parent, child, libc::O_PATH | libc::O_DIRECTORY) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        existing => return existing,
+    }
+    // SAFETY: both arguments remain valid through mkdirat; no symlink is
+    // followed.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), child.as_ptr(), 0o700) } == 0 {
+        give_new_directory(parent, child, owner)?;
+    } else {
+        let error = io::Error::last_os_error();
+        // Another process created it meanwhile: open theirs as it is.
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    open_at(parent, child, libc::O_PATH | libc::O_DIRECTORY)
+}
+
+/// Give the directory this process has just created as `child` to `owner`,
+/// durably. A directory cannot be created unnamed, so the parent's owner
+/// could swap another one in under that name: whatever directory the name
+/// holds is given away only while it is empty and this process's user's
+/// (root's), which only a root process can have made, so nothing that holds
+/// an entry or belongs to anyone else changes owner. A refused change
+/// removes it again. A crash before the change leaves an empty root-owned
+/// directory, which a later run opens as it is.
+fn give_new_directory(parent: &File, child: &CStr, owner: crate::FileOwner) -> io::Result<()> {
+    let directory = open_at(parent, child, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let mut empty = true;
+    visit_names(&directory, |_| {
+        empty = false;
+        Ok(())
+    })?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if directory.metadata()?.uid() != unsafe { libc::geteuid() } || !empty {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a backing directory changed while it was being created",
+        ));
+    }
+    if let Err(error) = give(&directory, owner) {
+        // SAFETY: pinned parent and NUL-terminated name; AT_REMOVEDIR
+        // removes only an empty directory.
+        unsafe { libc::unlinkat(parent.as_raw_fd(), child.as_ptr(), libc::AT_REMOVEDIR) };
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// [`create_or_open`] for a file that must be created for `owner`.
+/// `unnamed` tries an `O_TMPFILE` creation first; tests clear it to cover
+/// filesystems without one.
+fn create_or_open_for(
+    parent: &File,
+    child: &CStr,
+    access: i32,
+    owner: crate::FileOwner,
+    unnamed: bool,
+) -> io::Result<File> {
+    match open_at(parent, child, access) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        existing => return existing,
+    }
+    match create_for(parent, child, access, owner, unnamed)? {
+        Some(file) => Ok(file),
+        // Another process created the entry meanwhile: open theirs as it is.
+        None => open_at(parent, child, access),
+    }
+}
+
+/// Create `child` for `owner`, or `None` when an entry of that name exists.
+/// The file is created unnamed (`O_TMPFILE`), given away and synced with
+/// fsync (fdatasync need not persist an owner change) before it is linked
+/// under its name, so the name never shows a root-owned file, even after a
+/// crash, and a refused owner change leaves nothing behind. Where the
+/// filesystem has no unnamed files, the file is created under its name and
+/// given away at once; when that fails it is removed again.
+fn create_for(
+    parent: &File,
+    child: &CStr,
+    access: i32,
+    owner: crate::FileOwner,
+    unnamed: bool,
+) -> io::Result<Option<File>> {
+    if unnamed {
+        // An unnamed file needs write access. A caller that asked for a
+        // read-only descriptor takes a lock with it and never writes.
+        match open_at(
+            parent,
+            c".",
+            libc::O_TMPFILE | libc::O_RDWR | (access & libc::O_NONBLOCK),
+        ) {
+            Ok(file) => {
+                give(&file, owner)?;
+                match link_unnamed(&file, parent, child) {
+                    Ok(()) => return Ok(Some(file)),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+                    // Linking failed otherwise (no CAP_DAC_READ_SEARCH and
+                    // no /proc, for one): the named form below either
+                    // works or reports what stops it.
+                    Err(_) => {}
+                }
+            }
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EISDIR)) => {
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let file = match open_at(parent, child, access | libc::O_CREAT | libc::O_EXCL) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = give(&file, owner) {
+        // Leave no file its directory's owner cannot open. SAFETY: pinned
+        // parent and NUL-terminated name; unlinkat never follows a link.
+        unsafe { libc::unlinkat(parent.as_raw_fd(), child.as_ptr(), 0) };
+        return Err(error);
+    }
+    Ok(Some(file))
+}
+
+/// Give an entry this process has just created, and nothing has written,
+/// to `owner`, and make the change durable.
+fn give(entry: &File, owner: crate::FileOwner) -> io::Result<()> {
+    std::os::unix::fs::fchown(entry, Some(owner.uid), Some(owner.gid)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot create the backing entry for the owner of its directory (uid {}, gid \
+                 {}): {error}",
+                owner.uid, owner.gid
+            ),
+        )
+    })?;
+    entry.sync_all()
+}
+
+/// Link an unnamed (`O_TMPFILE`) file as `child`; `AlreadyExists` when the
+/// name is taken.
+fn link_unnamed(file: &File, parent: &File, child: &CStr) -> io::Result<()> {
+    match link_descriptor(file, parent, child) {
+        // AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH before Linux 6.10, and a
+        // unit's bounding set can drop it; linking the descriptor's /proc
+        // entry does not.
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+            link_through_proc(file, parent, child)
+        }
+        linked => linked,
+    }
+}
+
+fn link_descriptor(file: &File, parent: &File, child: &CStr) -> io::Result<()> {
+    // SAFETY: open descriptors and NUL-terminated names; AT_EMPTY_PATH
+    // names the file descriptor itself.
+    if unsafe {
+        libc::linkat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            parent.as_raw_fd(),
+            child.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn link_through_proc(file: &File, parent: &File, child: &CStr) -> io::Result<()> {
+    let path = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "descriptor path"))?;
+    // SAFETY: open descriptor and NUL-terminated names; AT_SYMLINK_FOLLOW
+    // resolves the descriptor's link to the file itself.
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            parent.as_raw_fd(),
+            child.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn child_dir(parent: &File, child: &CStr, create: bool) -> io::Result<File> {
     // Searching a known pathname needs execute permission, not permission to
     // list each ancestor. Inspect an existing directory before trying mkdir.
@@ -207,7 +449,12 @@ impl Directory {
         // would share it and repeated/concurrent list calls could miss entries.
         let mut directory = child_dir(&self.0, c".", false)?;
         for component in path.split('/').filter(|part| !part.is_empty()) {
-            directory = child_dir(&directory, &name(OsStr::new(component))?, create)?;
+            let component = name(OsStr::new(component))?;
+            directory = if create {
+                create_or_open_dir(&directory, &component)?
+            } else {
+                child_dir(&directory, &component, false)?
+            };
         }
         Ok(directory)
     }
@@ -220,16 +467,16 @@ impl Directory {
 
     fn open_file(&self, path: &str, create: bool, read_only: bool) -> io::Result<File> {
         let (parent, child) = self.parent(path)?;
-        let file = open_at(
-            &parent,
-            &child,
-            if read_only {
-                libc::O_RDONLY
-            } else {
-                libc::O_RDWR
-            } | libc::O_NONBLOCK
-                | if create { libc::O_CREAT } else { 0 },
-        )?;
+        let access = if read_only {
+            libc::O_RDONLY
+        } else {
+            libc::O_RDWR
+        } | libc::O_NONBLOCK;
+        let file = if create {
+            create_or_open(&parent, &child, access)?
+        } else {
+            open_at(&parent, &child, access)?
+        };
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -263,6 +510,10 @@ impl Directory {
 #[cfg(test)]
 #[path = "root_directory_tests.rs"]
 mod root_directory_tests;
+
+#[cfg(test)]
+#[path = "creation_owner_tests.rs"]
+mod creation_owner_tests;
 
 fn entry_exists(parent: &File, child: &CStr) -> io::Result<bool> {
     // SAFETY: stat storage is initialized, parent is open and child is a valid
@@ -335,6 +586,29 @@ fn visit_names(
         visit(OsStr::from_bytes(name.to_bytes()))?;
     }
     Ok(())
+}
+
+/// A directory's sorted entry names for `Backing::list`, each exactly as
+/// stored. A name that is not UTF-8 fails the listing, unless
+/// `skip_non_utf8` leaves it out; it is never converted lossily, which
+/// could return a name that opens a different entry.
+fn utf8_names(directory: &File, skip_non_utf8: bool) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    visit_names(directory, |name| {
+        match name.to_str() {
+            Some(name) => names.push(name.to_owned()),
+            None if skip_non_utf8 => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not UTF-8",
+                ))
+            }
+        }
+        Ok(())
+    })?;
+    names.sort();
+    Ok(names)
 }
 
 /// A namespace's entries for retirement, which must account for each one:
@@ -543,7 +817,8 @@ impl Directory {
             }
             if entry == "rollback.lock" {
                 match file.try_lock() {
-                    Ok(()) => lock = Some(file),
+                    // `FileLock` unlocks on every return below.
+                    Ok(()) => lock = Some(FileLock { file }),
                     Err(std::fs::TryLockError::WouldBlock) => return Ok(GcRemoval::Live),
                     Err(std::fs::TryLockError::Error(error)) => return Err(error),
                 }
@@ -602,7 +877,7 @@ impl Directory {
             }
         }
         directory.sync_all()?;
-        if let Some(file) = &lock {
+        if let Some(FileLock { file }) = &lock {
             if file.metadata()?.nlink() != 1 || !same_entry(&directory, c"rollback.lock", file)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -694,43 +969,11 @@ impl Backing for FileBacking {
     }
 
     fn list(&self, path: &str) -> io::Result<Vec<String>> {
-        let directory = self.directory.directory(path, false)?;
-        let fd = open_at(&directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.into_raw_fd();
-        // SAFETY: fdopendir takes ownership on success; on failure we close fd.
-        let raw = unsafe { libc::fdopendir(fd) };
-        if raw.is_null() {
-            let error = io::Error::last_os_error();
-            drop(unsafe { File::from_raw_fd(fd) });
-            return Err(error);
-        }
-        let stream = DirectoryStream(raw);
-        let mut names = Vec::new();
-        loop {
-            // SAFETY: stream is private to this call. Clear this thread's errno
-            // to distinguish end-of-directory from an error; copy d_name before
-            // the next readdir, which may invalidate its storage.
-            unsafe { *libc::__errno_location() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    return Err(error);
-                }
-                break;
-            }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if name != c"." && name != c".." {
-                let name = name.to_str().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "directory entry name is not UTF-8",
-                    )
-                })?;
-                names.push(name.to_owned());
-            }
-        }
-        names.sort();
-        Ok(names)
+        utf8_names(&self.directory.directory(path, false)?, false)
+    }
+
+    fn list_skipping_non_utf8(&self, path: &str) -> io::Result<Vec<String>> {
+        utf8_names(&self.directory.directory(path, false)?, true)
     }
 
     fn sync_dir(&self, path: &str) -> io::Result<()> {
@@ -743,7 +986,7 @@ impl Backing for FileBacking {
         self.writable()?;
         let file = self.directory.open_file(path, true, false)?;
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",
@@ -762,5 +1005,13 @@ impl Backing for FileBacking {
         #[allow(clippy::unnecessary_cast)]
         let available = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
         Ok(Some(available))
+    }
+
+    fn directory_owner(&self, dir: &str) -> io::Result<Option<crate::FileOwner>> {
+        let metadata = self.directory.directory(dir, false)?.metadata()?;
+        Ok(Some(crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
     }
 }

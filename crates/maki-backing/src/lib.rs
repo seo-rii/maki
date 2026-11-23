@@ -174,7 +174,9 @@ pub struct FileOwner {
     pub gid: u32,
 }
 
-/// Held while a volume is attached; dropping releases the lock.
+/// Held while a volume is attached; dropping releases the lock at once, even
+/// while a child process forked meanwhile still holds a copy of the lock
+/// file's descriptor.
 pub trait VolumeLock: Send + Sync {}
 
 /// A confined storage namespace for one volume.
@@ -199,8 +201,23 @@ pub trait Backing: Send + Sync + 'static {
 
     fn create_dir_all(&self, path: &str) -> io::Result<()>;
 
-    /// Sorted file/dir names directly inside `dir` ("" = root).
+    /// Sorted file/dir names directly inside `dir` ("" = root). A name that
+    /// is not UTF-8 fails the listing with `InvalidData`, so a caller that
+    /// must account for every entry (one proving a directory empty) never
+    /// misses one, and no name is converted lossily into one that opens a
+    /// different entry.
     fn list(&self, dir: &str) -> io::Result<Vec<String>>;
+
+    /// [`list`](Backing::list) without the names that are not UTF-8, for
+    /// scans that look only for names the volume writes (all ASCII) and
+    /// ignore every other entry: such a name is none of those, so it is
+    /// skipped like any other unknown name instead of failing the scan.
+    /// Each name returned is exact. A backing whose names are all UTF-8
+    /// keeps this default; one that forwards `list` to a backing that can
+    /// hold other names forwards this too, or it refuses them.
+    fn list_skipping_non_utf8(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list(dir)
+    }
 
     /// Make namespace operations under `dir` durable (fsync of directory).
     fn sync_dir(&self, dir: &str) -> io::Result<()>;
@@ -213,6 +230,14 @@ pub trait Backing: Send + Sync + 'static {
     /// (`None` = unknown). Feeds the journal emergency reserve and the
     /// `maki_backing_free_bytes` metric.
     fn free_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// The owner of directory `dir` ("" = root) where the backing has Unix
+    /// ownership; `None` where it has none (in-memory and non-Unix
+    /// backings, and views that do not forward it).
+    fn directory_owner(&self, dir: &str) -> io::Result<Option<FileOwner>> {
+        let _ = dir;
         Ok(None)
     }
 }

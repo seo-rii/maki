@@ -3,6 +3,9 @@
 //! on double-create / corruption / bad configs, with a real filesystem
 //! backing and real AES-GCM-SIV keyed from the environment.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{Seek, SeekFrom, Write};
 use std::process::{Command, Output};
 
@@ -60,7 +63,7 @@ fn setup(name: &str, key_name: &str) -> Volume {
         .join("volume.toml")
         .to_string_lossy()
         .into_owned();
-    std::fs::write(&config_path, config(&root, name, key_name)).unwrap();
+    volume_config::write(&config_path, config(&root, name, key_name)).unwrap();
     Volume {
         _dir: dir,
         root,
@@ -204,7 +207,7 @@ fn usage_and_bad_inputs_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("bad.toml").to_string_lossy().into_owned();
     let root = dir.path().join("vol").to_string_lossy().replace('\\', "/");
-    std::fs::write(
+    volume_config::write(
         &bad,
         config(&root, "badvol", "k").replace("local-aes-gcm-siv\"", "no-such-provider\""),
     )
@@ -228,7 +231,7 @@ fn control_commands_time_out_against_a_silent_daemon() {
     let socket_str = socket.to_string_lossy().into_owned();
     let mut cfg = std::fs::read_to_string(&vol.config_path).unwrap();
     cfg.push_str(&format!("\n[control]\nsocket = \"{socket_str}\"\n"));
-    std::fs::write(&vol.config_path, cfg).unwrap();
+    volume_config::write(&vol.config_path, cfg).unwrap();
     // Bound but never served: connects land in the backlog and get no reply.
     let listener = UnixListener::bind(&socket).unwrap();
 
@@ -268,7 +271,7 @@ fn drain_command_propagates_the_control_result() {
             "\n[control]\nsocket = {:?}\n",
             socket.to_str().unwrap()
         ));
-        std::fs::write(&vol.config_path, cfg).unwrap();
+        volume_config::write(&vol.config_path, cfg).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let peer = std::thread::spawn(move || {

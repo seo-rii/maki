@@ -10,11 +10,12 @@ This page is that bootstrap. A dedicated `maki-attach provision` command does
 not exist yet. The [quick start](quickstart.md) uses this same procedure.
 
 Prerequisites: the package is [installed](installation-debian.md), the volume
-configuration exists at `/etc/maki/volumes/demo.toml`, its credential is in
-place, and `maki volume create` has already run. This example exports 8 GiB
-with 4096-byte blocks and creates a 6 GiB LV. Edit the variables together if
-your configuration differs. The socket must be the one in that volume's
-configuration.
+configuration exists at `/etc/maki/volumes/demo.toml` (`root:maki 0640`, as
+the [quick start](quickstart.md#2-write-the-volume-configuration) installs
+it), its credential is in place, and `maki volume create` has already run.
+This example exports 8 GiB with 4096-byte blocks and creates a 6 GiB LV. Edit
+the variables together if your configuration differs. The socket must be the
+one in that volume's configuration.
 
 Use a disposable host as root. The NBD device, VG name, attach configuration
 and mountpoint must be unused. Do not run other provisioning, LVM or NBD

@@ -26,6 +26,18 @@ mod linux;
 /// `Backing` over a real directory tree. Linux pins the root and resolves
 /// every component through directory descriptors without following symlinks.
 /// Other development platforms perform pathname validation only.
+///
+/// Entries are created owner-only (`0600` files, `0700` directories) for
+/// the user that runs the process, except that on Linux a process running
+/// as root creates a file or directory inside the root, in a directory
+/// another user owns, for that user (the directory's uid and gid): an
+/// offline check or inspect run as root may recreate a lock file or
+/// manifest slot in the daemon user's volume, and must not lock that user
+/// out. A file is given away before it holds a byte (and, where the
+/// filesystem has unnamed files, before it is linked under its name), an
+/// existing entry is never given away, and a refused change creates
+/// nothing. The root and missing ancestors of it, which [`FileBacking::new`]
+/// creates, belong to the user that runs the process.
 pub struct FileBacking {
     #[cfg(target_os = "linux")]
     directory: linux::Directory,
@@ -110,7 +122,7 @@ impl FileBacking {
             }
         };
         match file.try_lock_shared() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "lock held exclusively by another operation",
@@ -236,6 +248,29 @@ impl FileBacking {
             }
         }
         Ok(p)
+    }
+
+    /// A directory's sorted entry names for `Backing::list`, each exactly
+    /// as stored. A name that is not UTF-8 fails the listing, unless
+    /// `skip_non_utf8` leaves it out; it is never converted lossily, which
+    /// could return a name that opens a different entry.
+    #[cfg(not(target_os = "linux"))]
+    fn utf8_names(&self, dir: &str, skip_non_utf8: bool) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.resolve(dir, true)?)? {
+            match entry?.file_name().into_string() {
+                Ok(name) => names.push(name),
+                Err(_) if skip_non_utf8 => {}
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name is not UTF-8",
+                    ))
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -482,11 +517,23 @@ fn write_all_at(file: &File, mut offset: u64, mut data: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+/// An acquired `flock` lock. It belongs to the open file description, which
+/// a child forked by any thread shares until its `exec` closes its copy, so
+/// closing this descriptor alone would leave the lock held for that child.
+/// Dropping unlocks first: the lock ends with its holder.
 struct FileLock {
-    _file: File,
+    file: File,
 }
 
 impl VolumeLock for FileLock {}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Releasing a held lock does not fail on a valid descriptor; the
+        // close that follows still releases it where no child shares it.
+        let _ = self.file.unlock();
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl Backing for FileBacking {
@@ -529,19 +576,11 @@ impl Backing for FileBacking {
     }
 
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
-        let p = self.resolve(dir, true)?;
-        let mut names = Vec::new();
-        for entry in fs::read_dir(p)? {
-            let name = entry?.file_name().into_string().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory entry name is not UTF-8",
-                )
-            })?;
-            names.push(name);
-        }
-        names.sort();
-        Ok(names)
+        self.utf8_names(dir, false)
+    }
+
+    fn list_skipping_non_utf8(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.utf8_names(dir, true)
     }
 
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -560,7 +599,7 @@ impl Backing for FileBacking {
             .truncate(false)
             .open(&p)?;
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",
@@ -589,6 +628,16 @@ impl Backing for FileBacking {
     #[cfg(not(unix))]
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         Ok(None)
+    }
+
+    #[cfg(unix)]
+    fn directory_owner(&self, dir: &str) -> io::Result<Option<crate::FileOwner>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(self.resolve(dir, true)?)?;
+        Ok(Some(crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
     }
 }
 

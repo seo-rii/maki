@@ -180,15 +180,11 @@ fn check_mounts(
     nodes: &[BlockIdentity],
 ) -> io::Result<()> {
     for line in crate::probe::mountinfo_lines(mounts).filter(|line| !line.trim_ascii().is_empty()) {
-        let (left, _) =
-            crate::probe::split_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
-        if fields.len() < 6 {
-            return Err(invalid("incomplete mountinfo"));
-        }
-        let device = mount_device_number(fields[2])?;
+        let mount =
+            crate::probe::mount_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
+        let device = mount_device_number(mount.device)?;
         if nodes.iter().any(|node| node.device == device)
-            && crate::probe::unescape(fields[4]) != record.attachment.mountpoint.as_bytes()
+            && crate::probe::unescape(mount.mountpoint) != record.attachment.mountpoint.as_bytes()
         {
             return Err(invalid(
                 "recorded block device has another mount; stop all workload mounts before recovery",
@@ -499,14 +495,9 @@ pub(super) fn observe_complete(
     }
     let mut verified_mount = None;
     for line in crate::probe::mountinfo_lines(mounts) {
-        let (left, right) =
-            crate::probe::split_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
-        let fields: Vec<_> = crate::probe::mountinfo_fields(left).collect();
-        let filesystem: Vec<_> = crate::probe::mountinfo_fields(right).collect();
-        if fields.len() < 6 || filesystem.len() < 3 {
-            return Err(invalid("incomplete mountinfo"));
-        }
-        let mounted_path = crate::probe::unescape(fields[4]);
+        let mount =
+            crate::probe::mount_record(line).ok_or_else(|| invalid("incomplete mountinfo"))?;
+        let mounted_path = crate::probe::unescape(mount.mountpoint);
         if mounted_path != record.attachment.mountpoint.as_bytes() {
             // A foreign filesystem below the dedicated volume can hide data
             // paths even while its root and sentinel are correct. Compare
@@ -517,11 +508,11 @@ pub(super) fn observe_complete(
             }
             continue;
         }
-        let options = || crate::probe::mount_options(fields[5]);
+        let options = || crate::probe::mount_options(mount.options);
         // Kernel-only evidence of rw mounting, not a claim that writes or
         // database recovery would succeed; the gate performs no write probe.
         if !options().any(|option| option == b"rw")
-            || !crate::probe::mount_options(filesystem[2]).any(|option| option == b"rw")
+            || !crate::probe::mount_options(mount.super_options).any(|option| option == b"rw")
         {
             return Err(invalid("workload mount is read-only"));
         }
@@ -538,7 +529,7 @@ pub(super) fn observe_complete(
             ));
         }
         verified_mount = Some(VerifiedMount {
-            device: mount_device_number(fields[2])?,
+            device: mount_device_number(mount.device)?,
             mountinfo: line.to_vec(),
         });
     }

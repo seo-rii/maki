@@ -3,6 +3,9 @@
 //! engine), real I/O, and — on the second run — attach over the state the
 //! first process left behind (journal replay through the shipped binary).
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::{Command, Output};
 
 const KEY_HEX: &str = "8899aabbccddeeff00112233445566778899aabbccddeeff0011223344556677";
@@ -29,7 +32,7 @@ fn benchmark_creates_volume_runs_io_and_reattaches() {
         .join("volume.toml")
         .to_string_lossy()
         .into_owned();
-    std::fs::write(
+    volume_config::write(
         &config_path,
         format!(
             r#"
@@ -161,7 +164,7 @@ ca_file = "{ca}"
 [backing]
 root = "{path}"
 "#);
-        std::fs::write(&file, config).unwrap();
+        volume_config::write(&file, config).unwrap();
         for _ in 0..2 {
             let out = run(file.to_str().unwrap());
             let message = String::from_utf8_lossy(&out.stderr);
