@@ -139,7 +139,17 @@ impl DispatchMetrics {
 pub type ValidationFuture = Pin<Box<dyn Future<Output = Result<(), CryptoError>> + Send>>;
 
 /// Proves a quarantined endpoint interchangeable with a validated one,
-/// under the real volume context (SPEC §34).
+/// under the real volume context (SPEC §34). It is called with the
+/// validated reference and the candidate, each seen through the set's
+/// validation view of that endpoint, and its error decides the candidate's
+/// fate: `ProviderFatal` or `UnsupportedContext` excludes it for the life
+/// of the set, any other error defers it to a later attempt. The views
+/// relabel every failure an endpoint returns that is not evidence about
+/// the candidate (see `ValidationProvider::failure`), so the checks of
+/// [`crate::selftest`] reach a verdict only from the candidate's own
+/// replies. A layer that the validator stacks above a view (the daemon
+/// stacks the random-prefix wrapper) must not report a refusal of its own
+/// with either class, or the candidate is excluded for it.
 pub type EndpointValidator = Arc<
     dyn Fn(Arc<dyn CryptoProvider>, Arc<dyn CryptoProvider>, CryptoContext) -> ValidationFuture
         + Send
@@ -207,9 +217,11 @@ impl Revalidation {
 /// timeouts, admission limits, and replies that do not parse, are
 /// truncated or have the wrong shape (`Contract`: a proxy error page, a
 /// restart mid-response). A request refused without an integrity verdict
-/// (a generic HTTP 4xx, a `bad-request` reply) is such a failure too, but
-/// at attach the two checks read it as a verdict, so [`ValidationProvider`]
-/// relabels it as retryable before they see it, together with the
+/// (a generic HTTP 4xx, a `bad-request` reply) and a fatal error that the
+/// candidate's own provider reports (`ProviderFatal`: a backend or
+/// transport that says it cannot serve) are such failures too, but at
+/// attach the two checks read them as verdicts, so [`ValidationProvider`]
+/// relabels them as retryable before they see them, together with the
 /// reference's own failures, which say nothing about the candidate
 /// (BUG-068). Such an attempt is retried with backoff, and the endpoint
 /// serves only once a later validation succeeds in full.
@@ -366,9 +378,11 @@ impl ValidationProvider {
     ///
     /// - from either peer, a request refused without an integrity verdict
     ///   (`NonRetryableRequest`: a generic HTTP 4xx, a WebSocket
-    ///   `bad-request`, a gRPC `InvalidArgument`, a local admission limit).
-    ///   It says that this request was not served, not that the peer holds
-    ///   another key or lacks a capability it claims;
+    ///   `bad-request`, a gRPC `InvalidArgument`, a local admission limit)
+    ///   and a fatal error of the peer's own provider (`ProviderFatal`: a
+    ///   backend or transport that reports itself misconfigured or unable
+    ///   to serve). Either says that this request was not served, not that
+    ///   the peer holds another key or lacks a capability it claims;
     /// - from the validated reference, every other failure the checks
     ///   would read as a verdict on the candidate. Each endpoint already
     ///   wraps its peer in `CheckedProvider`, so a malformed reply of the
@@ -378,14 +392,12 @@ impl ValidationProvider {
     /// `Integrity` is kept from both peers: it is the definitive refusal a
     /// negative probe must get, and, for a decrypt of the other peer's
     /// ciphertext, the evidence of another key. The candidate's own
-    /// `Contract` is already inconclusive, and its `ProviderFatal` and
-    /// `UnsupportedContext` are verdicts.
+    /// `Contract` is already inconclusive, and its `UnsupportedContext`, an
+    /// explicit refusal of the context it was sent, is a verdict.
     fn failure(&self, operation: &str, error: CryptoError) -> CryptoError {
         let inconclusive = match &error {
-            CryptoError::NonRetryableRequest(_) => true,
-            CryptoError::Contract(_)
-            | CryptoError::ProviderFatal(_)
-            | CryptoError::UnsupportedContext(_) => self.reference,
+            CryptoError::NonRetryableRequest(_) | CryptoError::ProviderFatal(_) => true,
+            CryptoError::Contract(_) | CryptoError::UnsupportedContext(_) => self.reference,
             _ => false,
         };
         if !inconclusive {

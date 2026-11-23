@@ -2043,9 +2043,10 @@ conclusive (excluded for the life of the set):
 inconclusive (validated again later):
   a transport error, timeout or admission limit; a reply that does
   not parse, is truncated or has the wrong shape; a request refused
-  without an integrity failure (a generic bad request), by either
-  peer and whatever the request, a negative self-test probe
-  included; any other failure of the validated peer
+  without an integrity failure (a generic bad request) or a fatal
+  error that the endpoint's own provider reports, by either peer and
+  whatever the request, a negative self-test probe included; any
+  other failure of the validated peer
 ```
 
 A definitive integrity failure is `CryptoError::Integrity`, the evidence a
