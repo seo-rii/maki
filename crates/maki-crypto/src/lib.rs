@@ -16,6 +16,8 @@ pub mod retry;
 pub mod scheduler;
 pub mod secret;
 pub mod selftest;
+#[cfg(feature = "tls-trust")]
+pub mod tls_trust;
 pub mod types;
 
 pub use clock::{Clock, SystemClock};

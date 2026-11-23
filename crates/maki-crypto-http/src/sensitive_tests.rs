@@ -738,8 +738,8 @@ fn provider_drop_erases_owned_header_and_query_values() {
 fn provider_construction_error_erases_owned_credentials() {
     let spec = sensitive_credentials_spec(Some(super::TlsSpec {
         ca_pem: None,
-        // Keep this outside the watched allocation size. reqwest's parser may
-        // make transport-owned copies that this crate cannot erase.
+        // Keep this outside the watched allocation size. The PEM decoder may
+        // make copies that this crate cannot erase.
         identity_pem: Some(b"invalid client identity".to_vec()),
     }));
 

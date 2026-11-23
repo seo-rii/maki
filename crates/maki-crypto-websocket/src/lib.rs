@@ -336,6 +336,14 @@ fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError
     }
 }
 
+/// The roots this transport trusts: the host's trust store, the compiled-in
+/// public roots and the configured `ca_file`, the same for every remote
+/// transport (`maki_crypto::tls_trust`). Read when the connector is built:
+/// once with a TLS section, for every new connection without one.
+fn trusted_roots(tls: &WsTlsOptions) -> Result<rustls::RootCertStore, String> {
+    maki_crypto::tls_trust::trusted_roots(tls.ca_pem.as_deref()).map_err(|error| error.to_string())
+}
+
 impl WsCryptoProvider {
     pub fn new(mut spec: WsProviderSpec) -> Self {
         // The handshake library compares ws/wss literally. Preserve the path and query.
@@ -343,7 +351,8 @@ impl WsCryptoProvider {
             spec.url[..end].make_ascii_lowercase();
         }
         // Preserve deferred default-root loading: a WSS connection without
-        // explicit TLS options reloads native roots on every new connection.
+        // explicit TLS options reloads the host's trust store on every new
+        // connection.
         let tls_connector = if spec.tls.is_some() {
             Self::build_tls_connector(&spec)
         } else {
@@ -388,26 +397,7 @@ impl WsCryptoProvider {
             return Err("client certificate and private key must be configured together".into());
         }
 
-        let mut roots = rustls::RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        roots.add_parsable_certificates(native.certs);
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Some(ca_pem) = &tls.ca_pem {
-            let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("bad CA certificate: {error}"))?;
-            if certificates.is_empty() {
-                return Err("bad CA certificate: PEM contains no certificates".into());
-            }
-            // Configured trust material must be entirely valid. The
-            // best-effort parser used for native roots would otherwise let
-            // one valid root hide a malformed member of this bundle.
-            for certificate in certificates {
-                roots
-                    .add(certificate)
-                    .map_err(|_| "bad CA certificate: invalid certificate".to_string())?;
-            }
-        }
+        let roots = trusted_roots(tls)?;
 
         // Preserve an embedder's explicit choice; otherwise use the same ring
         // backend selected by this crate without installing process state.
@@ -988,6 +978,9 @@ mod connect_deadline_tests;
 
 #[cfg(test)]
 mod cancellation_tests;
+
+#[cfg(test)]
+mod trust_tests;
 
 #[cfg(test)]
 mod pending_reply_tests {

@@ -142,21 +142,27 @@ before the backing or a remote witness changes. Enable the `fake-provider`
 feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
-endpoint URL. The TLS section is optional when the transport's default trust
-is enough, and that default differs by transport:
+endpoint URL, and all three trust the same roots:
 
-| `crypto.provider` | Roots trusted without `ca_file` |
-|---|---|
-| `remote-http` | Only the public roots compiled into the binary (the `webpki-roots` set). The host's trust store is never read |
-| `remote-grpc` | Only the host's trust store. With no `ca_file`, an `https://` endpoint on a host whose store is empty is refused at attach |
-| `remote-websocket` | The host's trust store and the compiled-in public roots |
+- the host's trust store: the system CA bundle, or the files that
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. It is read best
+  effort: a missing store adds nothing and a certificate in it that does not
+  parse is skipped;
+- the public roots compiled into the binary (the `webpki-roots` set);
+- the certificates of a configured `ca_file`, which add to the other two and
+  replace neither. Every certificate in it must parse, and a file without one
+  is refused at attach.
 
-The host's trust store is the system CA bundle, or the files that
-`SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. A custom `ca_file`
-adds its certificates to the transport's roots; it does not replace them. A
-private CA installed only in the host's trust store is therefore trusted by
-`remote-grpc` and `remote-websocket` but not by `remote-http`, which needs it
-in `ca_file`. There is no certificate-verification bypass setting.
+The TLS section is therefore optional when the endpoint's chain leads to a
+public root or to a private CA installed in the host's trust store. Because the
+compiled-in roots are always there, a provider is built even on a host whose
+trust store is empty; an endpoint that none of the roots vouches for is refused
+at the TLS handshake. The roots are read when the provider is built at daemon
+start, so a CA added to the host's store later takes effect at the next
+restart (a WebSocket provider without a TLS section also reads the host's
+store again for each new connection). There is no certificate-verification
+bypass setting. The [remote witness](#remote-witness-endpoint-sets) is
+different: it trusts only its own `ca_file`.
 
 For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
 
