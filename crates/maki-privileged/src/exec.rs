@@ -739,6 +739,13 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
     }
 }
 
+/// The command ran to its own end and reported failure. A command that a
+/// signal terminated has no exit status: it never said whether it could do
+/// its work, and may have stopped halfway through it.
+fn exited_nonzero(error: &ExecError) -> bool {
+    matches!(error, ExecError::StepFailed { status: Some(code), .. } if *code != 0)
+}
+
 fn identity_error(message: impl Into<String>) -> ExecError {
     ExecError::Step {
         step: "nbd-identity".into(),
@@ -1406,8 +1413,10 @@ fn execute_with_options(
                     system.deactivate_lvm(current, intent.verified())
                 } else {
                     match system.run_step(step, None) {
-                        Err(error @ ExecError::StepFailed { .. })
-                            if allow_proof_deactivation && current.recovery.is_some() =>
+                        Err(error)
+                            if allow_proof_deactivation
+                                && current.recovery.is_some()
+                                && exited_nonzero(&error) =>
                         {
                             system.deactivate_lvm_from_proof(current).map_err(|fallback| {
                                 identity_error(format!(
