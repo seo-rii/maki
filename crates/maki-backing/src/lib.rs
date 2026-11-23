@@ -174,7 +174,9 @@ pub struct FileOwner {
     pub gid: u32,
 }
 
-/// Held while a volume is attached; dropping releases the lock.
+/// Held while a volume is attached; dropping releases the lock at once, even
+/// while a child process forked meanwhile still holds a copy of the lock
+/// file's descriptor.
 pub trait VolumeLock: Send + Sync {}
 
 /// A confined storage namespace for one volume.

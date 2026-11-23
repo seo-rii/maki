@@ -65,7 +65,10 @@ fn records_round_trip_atomically_with_private_regular_files() {
     let fixture = Fixture::new();
     let state = fixture.state().unwrap();
     let lock = state.lock().unwrap();
-    assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        lock.0.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(state.read("pg").unwrap().is_none());
     let mut entry = record();
     state.write(&entry).unwrap();
@@ -243,4 +246,80 @@ fn verify_config_loading_pins_trusted_descriptors_and_bounds_content() {
     symlink("missing", &config).unwrap();
     assert!(load().is_err());
     assert!(!fixture.0.join("missing").exists());
+}
+
+/// A child forked from this process that waits before its `exec` until it is
+/// dropped. Until then it holds a copy of every descriptor this process had
+/// when it forked, as each command the helper runs does between its fork and
+/// its `exec`.
+struct PausedChild {
+    resume: std::io::PipeWriter,
+    spawner: Option<std::thread::JoinHandle<io::Result<std::process::ExitStatus>>>,
+}
+
+impl PausedChild {
+    fn fork() -> Self {
+        use std::os::unix::process::CommandExt;
+        let (mut forked, forked_writer) = std::io::pipe().unwrap();
+        let (resume_reader, resume) = std::io::pipe().unwrap();
+        let parent_end = resume.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/true");
+        // SAFETY: the hook runs in the forked child before `exec` and only
+        // closes, writes and reads pipe descriptors; it allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                // Without the parent's write end, a parent that dies without
+                // resuming the child ends its wait instead of hanging it.
+                drop(std::os::fd::OwnedFd::from_raw_fd(parent_end));
+                (&forked_writer).write_all(&[1])?;
+                (&resume_reader).read_exact(&mut [0])?;
+                Ok(())
+            });
+        }
+        // `spawn` returns only once the child has exec'd.
+        let spawner = std::thread::spawn(move || command.spawn()?.wait());
+        forked.read_exact(&mut [0]).expect("the child forked");
+        Self {
+            resume,
+            spawner: Some(spawner),
+        }
+    }
+}
+
+impl Drop for PausedChild {
+    fn drop(&mut self) {
+        let _ = self.resume.write_all(&[1]);
+        let status = self.spawner.take().unwrap().join();
+        if !std::thread::panicking() {
+            assert!(status.unwrap().unwrap().success());
+        }
+    }
+}
+
+/// The attach lock is a `flock` on `attach.lock`, which belongs to the open
+/// file description. A command forked meanwhile shares that description until
+/// its `exec`; when releasing only closed the helper's descriptor, the next
+/// attach, detach, grow or verification waited for that child.
+#[test]
+fn a_released_attach_lock_is_free_while_a_forked_child_holds_its_descriptor() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    drop(state.lock().unwrap());
+    for existing in [false, true] {
+        let lock = if existing {
+            state.lock_existing()
+        } else {
+            state.lock()
+        }
+        .unwrap();
+        let child = PausedChild::fork();
+        drop(lock);
+        // `lock` blocks; probe without waiting for the child.
+        let probe = File::open(fixture.0.join("state/attach.lock")).unwrap();
+        assert!(
+            probe.try_lock().is_ok(),
+            "existing={existing}: a released attach lock stayed held for a forked child"
+        );
+        drop((probe, child));
+    }
 }

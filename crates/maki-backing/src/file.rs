@@ -110,7 +110,7 @@ impl FileBacking {
             }
         };
         match file.try_lock_shared() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "lock held exclusively by another operation",
@@ -505,11 +505,23 @@ fn write_all_at(file: &File, mut offset: u64, mut data: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+/// An acquired `flock` lock. It belongs to the open file description, which
+/// a child forked by any thread shares until its `exec` closes its copy, so
+/// closing this descriptor alone would leave the lock held for that child.
+/// Dropping unlocks first: the lock ends with its holder.
 struct FileLock {
-    _file: File,
+    file: File,
 }
 
 impl VolumeLock for FileLock {}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Releasing a held lock does not fail on a valid descriptor; the
+        // close that follows still releases it where no child shares it.
+        let _ = self.file.unlock();
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl Backing for FileBacking {
@@ -575,7 +587,7 @@ impl Backing for FileBacking {
             .truncate(false)
             .open(&p)?;
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Ok(()) => Ok(Box::new(FileLock { file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",

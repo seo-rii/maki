@@ -29,7 +29,7 @@ mod allocation;
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
 use crate::probe::{nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices};
-use crate::state::{BoundDeviceRecord, TrustedState};
+use crate::state::{BoundDeviceRecord, StateLock, TrustedState};
 use crate::verify::{
     verify_filesystem_identity, verify_mount_device, verify_mount_identity, MountExpectation,
     MountObservation,
@@ -163,14 +163,14 @@ pub fn load_trusted_config(path: impl AsRef<Path>) -> Result<crate::config::Atta
 /// Held for the whole attach so two helpers cannot pick the same device;
 /// the file lock is released when this is dropped.
 pub struct AttachLock {
-    _file: File,
+    _lock: StateLock,
     state: TrustedState,
 }
 
 pub fn lock_attach() -> io::Result<AttachLock> {
     let state = TrustedState::open()?;
-    let file = state.lock()?;
-    Ok(AttachLock { _file: file, state })
+    let lock = state.lock()?;
+    Ok(AttachLock { _lock: lock, state })
 }
 
 fn nbd_connected(device: &str) -> bool {
