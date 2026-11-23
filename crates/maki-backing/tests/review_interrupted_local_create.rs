@@ -348,6 +348,34 @@ fn create_refuses_a_committed_backing_whose_manifest_slots_are_damaged() {
     );
 }
 
+/// A creation never writes the second manifest slot; a volume's first
+/// commit does. Beside the initial manifest in slot 0, which is what a
+/// volume that committed once still holds there, a second slot holding
+/// anything but zeros is that commit in whatever state damage left it.
+#[test]
+fn create_refuses_a_second_manifest_slot_that_holds_anything() {
+    use std::os::unix::fs::FileExt;
+    for damage in [&[0xff; 8][..], b"#", &[1]] {
+        let (root, witness) = directories();
+        drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
+        let slot = root.path().join("rollback.manifest.1");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&slot)
+            .unwrap()
+            .write_all_at(damage, 4096)
+            .unwrap();
+        std::fs::remove_file(witness.path().join("anchor")).unwrap();
+        let before = std::fs::read(&slot).unwrap();
+        assert!(
+            RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err(),
+            "{damage:?}"
+        );
+        assert_eq!(std::fs::read(&slot).unwrap(), before);
+        assert!(entries(witness.path()).iter().all(|name| name != "anchor"));
+    }
+}
+
 /// An anchor that is empty is what an earlier release's creation left when
 /// it was cut after installing it, and also what a witness whose anchor
 /// was truncated looks like. `create` never writes over an anchor, and
