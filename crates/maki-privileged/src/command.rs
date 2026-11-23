@@ -34,6 +34,28 @@ impl Policy {
     };
 }
 
+thread_local! {
+    static FINISH_BY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous limit when dropped; see [`finish_by`].
+pub(super) struct Deadline(Option<Instant>);
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        FINISH_BY.set(self.0);
+    }
+}
+
+/// Until the returned guard is dropped, every command this thread starts
+/// must also finish by `deadline`, whatever its own policy allows, and none
+/// is started after it. A caller that itself runs inside a time limit (the
+/// failed-start hook, inside the unit's stop timeout) bounds all of its
+/// commands at once this way.
+pub(super) fn finish_by(deadline: Instant) -> Deadline {
+    Deadline(FINISH_BY.replace(Some(deadline)))
+}
+
 /// A command with a controlled environment: nothing inherited from the
 /// caller (no `LD_*`, no hostile `PATH`), a fixed system `PATH`, and
 /// `LC_ALL=C` so parsed output never depends on the caller's locale.
@@ -51,7 +73,17 @@ pub(crate) fn controlled(program: &str) -> Command {
     command
 }
 
-pub(super) fn capture(command: &mut Command, policy: Policy) -> io::Result<Output> {
+pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<Output> {
+    if let Some(deadline) = FINISH_BY.get() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no time left to start an external command",
+            ));
+        }
+        policy.timeout = policy.timeout.min(remaining);
+    }
     // Orphans must be reaped here even on hosts whose PID 1 does not promptly
     // reap. This process-wide setting remains enabled for the helper's short
     // lifetime. Reaping below is restricted to this command's process group;

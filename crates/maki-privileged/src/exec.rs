@@ -1410,7 +1410,28 @@ fn execute_with_options(
                     }
                     system.verify_rollback_lvm(current, intent.verified())?;
                     verify_connection(current, system)?;
-                    system.deactivate_lvm(current, intent.verified())
+                    // The intent has no other way down: the direct removal
+                    // below needs the completed mapping proof. LVM can also
+                    // end successfully without having found the volume
+                    // group, so look again instead of trusting its status.
+                    let outcome = match system.deactivate_lvm(current, intent.verified()) {
+                        Ok(()) => system
+                            .recovery_observation(current)?
+                            .vg_active
+                            .then(|| "left its mapping active".to_string()),
+                        Err(ExecError::Step { message, .. }) => Some(format!("failed ({message})")),
+                        Err(error) => Some(format!("failed ({error})")),
+                    };
+                    if let Some(outcome) = outcome {
+                        return Err(identity_error(format!(
+                            "scoped LVM deactivation of the interrupted activation on {} \
+                             {outcome}. LVM reads the volume group from that device and can \
+                             deactivate the mapping only while the volume's daemon serves it; \
+                             keeping the attach record",
+                            current.device
+                        )));
+                    }
+                    Ok(())
                 } else {
                     match system.run_step(step, None) {
                         Err(error)
@@ -1588,15 +1609,68 @@ fn cleanup_with(
     }
 }
 
-/// The storage work of the attach unit's failed-start hook. The hook only
-/// queues the recovery coordinator, so there is none.
-#[cfg(test)]
-fn finish_interrupted_activation_with(
-    _plan: &Plan,
-    _state: &TrustedState,
-    _system: &mut impl System,
+/// Finish the rollback of an attach that died between activating the volume
+/// group and recording the mapping proof. This is the storage work of the
+/// attach unit's failed-start hook, and `plan` is the detach plan.
+///
+/// Such a record holds only the activation intent, and its mapping can be
+/// deactivated only through LVM, which reads the volume group from the NBD
+/// device. The recovery coordinator stops the daemon before its cleanup, so
+/// that deactivation has to happen first, while the daemon still serves the
+/// device. Nothing else is done here: a record without an intent, or one
+/// whose device does not carry the recorded connection, is left to the
+/// coordinator, which stops the registered workloads first. An intent never
+/// authorized a mount, and this never unmounts.
+///
+/// The attach lock and every command must be done by `deadline`: the hook
+/// runs inside the unit's stop timeout, and the coordinator waits for it.
+/// Returns whether an interrupted activation was found and rolled back.
+pub fn finish_interrupted_activation(plan: &Plan, deadline: Instant) -> Result<bool, ExecError> {
+    finish_interrupted_activation_by(plan, &TrustedState::open()?, &mut LinuxSystem, deadline)
+}
+
+fn finish_interrupted_activation_by(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+    deadline: Instant,
 ) -> Result<bool, ExecError> {
-    Ok(false)
+    // Most failed starts leave no intent, and a start often fails because the
+    // global lock was busy for too long. Only the volume's own helper writes
+    // its record, atomically, and that helper is gone: look before queueing
+    // for the lock. The decision itself is made again under the lock.
+    if state
+        .read(&plan.volume)?
+        .is_none_or(|record| record.recovery_intent.is_none())
+    {
+        return Ok(false);
+    }
+    let _lock = state.lock_until(deadline)?;
+    let _bounded = command::finish_by(deadline);
+    finish_interrupted_activation_with(plan, state, system)
+}
+
+fn finish_interrupted_activation_with(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+) -> Result<bool, ExecError> {
+    let Some(record) = state.read(&plan.volume)? else {
+        return Ok(false);
+    };
+    if record.recovery_intent.is_none()
+        || system.backend(&record.device)?.as_deref() != Some(record.connection_id.as_str())
+    {
+        return Ok(false);
+    }
+    // The connected detach path verifies the intent against the live kernel
+    // state before and between its steps. Without an unmount step, a mount
+    // it did not expect can only stop it.
+    let mut plan = plan.clone();
+    plan.steps
+        .retain(|step| !matches!(step, PlannedStep::Umount { .. }));
+    execute_with_options(&plan, Some(state), system, false)?;
+    Ok(true)
 }
 
 #[cfg(test)]
