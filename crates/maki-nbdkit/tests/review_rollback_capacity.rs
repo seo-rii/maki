@@ -4,6 +4,9 @@
 #[path = "support/private_dir.rs"]
 mod private_dir;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use maki_backing::remote_witness::{Phase, StateStore};
 use maki_backing::{Backing, RollbackBacking};
 use maki_format::config::VolumeConfig;
@@ -73,9 +76,9 @@ struct Local {
 }
 
 impl Local {
-    fn new() -> Self {
+    fn new() -> Option<Self> {
         let directory = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let witness = other_filesystem::tempdir(directory.path())?;
         let key = write_key(directory.path());
         let rollback = format!(
             "[backing.rollback_protection]\nwitness_root = {:?}\ncapacity = \"8MiB\"",
@@ -83,12 +86,12 @@ impl Local {
         );
         let raw = config(&directory.path().join("volume"), &key, &rollback);
         create_volume_from_config_str(&raw).unwrap();
-        Self {
+        Some(Self {
             directory,
             witness,
             key,
             config: parse_and_validate(&raw).unwrap(),
-        }
+        })
     }
 }
 
@@ -122,7 +125,9 @@ async fn persist(config: &VolumeConfig, value: u8) {
 
 #[tokio::test]
 async fn local_larger_and_smaller_capacity_refuse_attach_and_preserve_fua_data() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     persist(&fixture.config, 0x5a).await;
     for capacity in [CAPACITY / 2, CAPACITY * 2] {
         let changed = changed_capacity(&fixture.config, capacity);
@@ -138,7 +143,9 @@ async fn local_larger_and_smaller_capacity_refuse_attach_and_preserve_fua_data()
 
 #[tokio::test]
 async fn local_capacity_is_checked_before_loading_provider_credentials() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     std::fs::remove_file(&fixture.key).unwrap();
     let changed = changed_capacity(&fixture.config, CAPACITY * 2);
     let error = attach_from_config(&changed)
@@ -149,7 +156,9 @@ async fn local_capacity_is_checked_before_loading_provider_credentials() {
 
 #[tokio::test]
 async fn inflated_capacity_cannot_validate_unusable_reserves_then_publish_ready() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     let mut changed = changed_capacity(&fixture.config, CAPACITY * 4);
     changed.backing.checkpoint_reserve_bytes.0 = 12 * 1024 * 1024;
     changed.backing.journal_emergency_reserve_bytes.0 = 12 * 1024 * 1024;
@@ -163,7 +172,9 @@ async fn inflated_capacity_cannot_validate_unusable_reserves_then_publish_ready(
 
 #[test]
 fn actual_capacity_still_rejects_an_impossible_reserve_policy() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     let mut changed = fixture.config.clone();
     changed.backing.checkpoint_reserve_bytes.0 = 12 * 1024 * 1024;
     changed.backing.journal_emergency_reserve_bytes.0 = 12 * 1024 * 1024;
@@ -173,7 +184,9 @@ fn actual_capacity_still_rejects_an_impossible_reserve_policy() {
 
 #[test]
 fn low_level_open_without_configuration_keeps_the_stored_capacity() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     let backing = RollbackBacking::open(
         &fixture.directory.path().join("volume"),
         fixture.witness.path(),
@@ -200,7 +213,9 @@ async fn ordinary_backing_without_rollback_configuration_still_attaches() {
 
 #[test]
 fn removing_rollback_configuration_still_refuses_raw_fallback() {
-    let fixture = Local::new();
+    let Some(fixture) = Local::new() else {
+        return;
+    };
     let mut changed = fixture.config.clone();
     changed.backing.rollback_protection = None;
     let message = build_backing(&changed).err().unwrap().to_string();

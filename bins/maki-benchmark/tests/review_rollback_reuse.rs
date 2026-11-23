@@ -4,6 +4,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -19,10 +22,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new() -> Option<Self> {
         let directory = tempfile::tempdir().unwrap();
         // The independent witness must be on another filesystem.
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let witness = other_filesystem::tempdir(directory.path())?;
         let key = directory.path().join("key");
         std::fs::write(&key, "17".repeat(32)).unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -64,12 +67,12 @@ threads = 2
         );
         let config = directory.path().join("volume.toml");
         volume_config::write(&config, &raw).unwrap();
-        Self {
+        Some(Self {
             directory,
             witness,
             config,
             raw,
-        }
+        })
     }
 
     fn root(&self) -> PathBuf {
@@ -136,7 +139,9 @@ fn assert_failed_without_report(output: &Output, code: i32) {
 
 #[test]
 fn fresh_protected_volume_still_initializes_and_verifies_reads() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     let output = fixture.run(false);
     assert!(
         output.status.success(),
@@ -152,7 +157,9 @@ fn fresh_protected_volume_still_initializes_and_verifies_reads() {
 
 #[test]
 fn existing_protected_volume_requires_explicit_destruction_authorization() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let witness_before = snapshot(fixture.witness.path());
     let uuid_before = fixture.uuid();
@@ -165,7 +172,9 @@ fn existing_protected_volume_requires_explicit_destruction_authorization() {
 
 #[test]
 fn authorized_protected_reuse_verifies_reads_and_preserves_volume_uuid() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let uuid_before = fixture.uuid();
     let marker_before = std::fs::read(fixture.root().join("rollback.format")).unwrap();
@@ -187,7 +196,9 @@ fn authorized_protected_reuse_verifies_reads_and_preserves_volume_uuid() {
 
 #[test]
 fn authorized_reuse_still_rejects_changed_protected_capacity() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let before = snapshot(fixture.witness.path());
     volume_config::write(
@@ -206,7 +217,9 @@ fn authorized_reuse_still_rejects_changed_protected_capacity() {
 
 #[test]
 fn authorized_reuse_still_rejects_changed_key_identity() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let key = fixture.directory.path().join("key");
     let other_key = fixture.directory.path().join("other-key");
@@ -228,7 +241,9 @@ fn authorized_reuse_still_rejects_changed_key_identity() {
 
 #[test]
 fn corrupted_protected_marker_is_never_treated_as_reusable() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let before = snapshot(fixture.witness.path());
     std::fs::write(fixture.root().join("rollback.format"), b"invalid").unwrap();
@@ -243,7 +258,9 @@ fn corrupted_protected_marker_is_never_treated_as_reusable() {
 
 #[test]
 fn partial_protected_layout_cannot_be_reinitialized_with_destroy_data() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     std::fs::create_dir(fixture.root()).unwrap();
     std::fs::write(fixture.root().join("unrelated"), b"leave this file").unwrap();
     let output = fixture.run(true);
@@ -258,7 +275,9 @@ fn partial_protected_layout_cannot_be_reinitialized_with_destroy_data() {
 
 #[test]
 fn protected_backing_without_volume_metadata_is_never_reinitialized() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let config = parse_and_validate(&fixture.raw).unwrap();
     let backing = build_backing(&config).unwrap();
@@ -276,7 +295,9 @@ fn protected_backing_without_volume_metadata_is_never_reinitialized() {
 
 #[test]
 fn protected_root_without_configuration_still_refuses_plain_backing() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.create();
     let before = snapshot(fixture.witness.path());
     let rollback_start = fixture.raw.find("[backing.rollback_protection]").unwrap();
@@ -295,7 +316,9 @@ fn protected_root_without_configuration_still_refuses_plain_backing() {
 
 #[test]
 fn refusal_checks_only_the_outer_marker_before_opening_any_writer() {
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     std::fs::create_dir(fixture.root()).unwrap();
     std::fs::write(fixture.root().join("rollback.format"), b"existing layout").unwrap();
     // No witness is enrolled. Opening the backing would fail before refusal.

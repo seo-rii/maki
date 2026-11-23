@@ -43,7 +43,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 OWN_OPTION = "--open-build-tree"
-# The fixtures hard-code /tmp (and /dev/shm for a second filesystem).
+# Other users can search /tmp; some fixtures hard-code it as well.
 SCRATCH_PARENT = "/tmp"
 
 # Source file of every test target with a case that skips without root.
@@ -248,7 +248,9 @@ def run(arguments):
         before = owned_by(0, trees)
         environment = [f"PATH={os.environ.get('PATH', os.defpath)}", f"TMPDIR={scratch}"]
         environment += [f"{name}={os.environ[name]}"
-                        for name in ("RUST_BACKTRACE", "RUST_TEST_THREADS") if name in os.environ]
+                        for name in ("RUST_BACKTRACE", "RUST_TEST_THREADS",
+                                     "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM")
+                        if name in os.environ]
         for target in ROOT_TARGETS:
             executable, package = tests[target]
             print(f"\nroot: {target}", flush=True)

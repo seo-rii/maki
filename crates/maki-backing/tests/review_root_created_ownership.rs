@@ -13,6 +13,9 @@
 #[path = "support/private_dir.rs"]
 mod private_dir;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -265,9 +268,10 @@ fn root_reopen_recreates_missing_rollback_files_for_the_daemon() {
     if skip_unless_root("root_reopen_recreates_missing_rollback_files_for_the_daemon") {
         return;
     }
-    // Explicit roots keep the witness on an independent filesystem.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     drop(RollbackBacking::create(root.path(), witness.path(), 8 * 4096).unwrap());
     give(root.path(), DAEMON);
     give(witness.path(), DAEMON);

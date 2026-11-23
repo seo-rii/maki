@@ -127,11 +127,10 @@ fn unreadable_parent_is_refused_before_creating_a_child() {
 
 #[test]
 fn a_different_filesystem_discards_ancestor_syncs() {
-    let temp = tempfile::tempdir_in("/dev/shm").unwrap();
-    let selected_device = temp.path().metadata().unwrap().dev();
-    if selected_device == fs::metadata("/").unwrap().dev() {
+    let Some(temp) = crate::other_filesystem::tempdir(Path::new("/")) else {
         return;
-    }
+    };
+    let selected_device = temp.path().metadata().unwrap().dev();
     Directory::new_with_sync(&temp.path().join("volume"), |file| {
         assert_eq!(file.metadata()?.dev(), selected_device);
         file.sync_all()

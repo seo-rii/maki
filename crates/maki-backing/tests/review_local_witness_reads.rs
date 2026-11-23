@@ -2,6 +2,9 @@
 //! process can observe the temporary soft limit or compete for descriptors.
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs::File;
 use std::io;
 
@@ -61,10 +64,10 @@ impl Drop for ExhaustedDescriptors {
 
 #[test]
 fn open_rollback_handles_resume_after_descriptor_exhaustion_but_not_anchor_changes() {
-    // Explicit roots keep the witness on an independent filesystem even if
-    // the build or test runner uses TMPDIR=/dev/shm.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 8 * 4096).unwrap();
     let file = backing.open("data", true).unwrap();
     file.write_at(0, b"old").unwrap();

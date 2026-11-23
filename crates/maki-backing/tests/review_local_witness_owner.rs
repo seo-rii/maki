@@ -7,6 +7,9 @@
 //! skipped when the suite runs unprivileged (as CI does).
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -95,9 +98,10 @@ fn root_reopen_of_a_daemon_owned_rollback_backing_creates_no_root_owned_file() {
     {
         return;
     }
-    // Explicit roots keep the witness on an independent filesystem.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 8 * 4096).unwrap();
     let file = backing.open("data", true).unwrap();
     file.write_at(0, b"daemon").unwrap();

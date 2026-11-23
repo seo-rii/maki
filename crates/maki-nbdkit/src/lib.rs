@@ -25,3 +25,8 @@ pub mod security;
 
 #[cfg(target_os = "linux")]
 pub mod plugin;
+
+// Socket fixtures of the unit tests bind below a short temporary directory.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/short_dir.rs"]
+mod short_dir;

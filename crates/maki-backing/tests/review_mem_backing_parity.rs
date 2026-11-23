@@ -8,6 +8,10 @@
 #[path = "common/namespace_parity.rs"]
 mod namespace_parity;
 
+#[cfg(target_os = "linux")]
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use maki_backing::{Backing, MemBacking};
 use namespace_parity::check;
 
@@ -75,7 +79,9 @@ fn linux_file_locks_follow_the_file_across_rename_and_unlink() {
 #[test]
 fn rollback_file_locks_follow_the_file_across_rename_and_unlink() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing =
         maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     check_lock_identity(&backing);
@@ -85,7 +91,9 @@ fn rollback_file_locks_follow_the_file_across_rename_and_unlink() {
 #[test]
 fn rollback_file_lock_keeps_unlinked_pages_until_release() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing =
         maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     let file = backing.open("lock", true).unwrap();
@@ -137,11 +145,13 @@ fn zero_length_allocation_is_a_no_op_on_every_backing() {
     #[cfg(target_os = "linux")]
     {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
-        assert_zero_length_allocation_is_a_no_op(
-            "RollbackBacking",
-            &maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap(),
-        );
+        if let Some(witness) = other_filesystem::tempdir(root.path()) {
+            assert_zero_length_allocation_is_a_no_op(
+                "RollbackBacking",
+                &maki_backing::RollbackBacking::create(root.path(), witness.path(), 64 * 4096)
+                    .unwrap(),
+            );
+        }
     }
 }
 

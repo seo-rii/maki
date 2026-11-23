@@ -7,6 +7,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -297,7 +300,7 @@ fn clean_detach_flushes_checkpoints_and_releases_lock() {
 
 #[test]
 fn adapter_opens_from_config_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let control_sock = dir
         .path()
         .join("control.sock")

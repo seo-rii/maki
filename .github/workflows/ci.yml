@@ -13,6 +13,13 @@ on:
   schedule:
     - cron: "0 3 * * *" # nightly gates
 
+# A rollback fixture that finds no second filesystem for its witness prints
+# that it is skipped and passes, and test runs do not show the output of
+# passing tests. The runners have /dev/shm on a filesystem of its own, so
+# here a missing one is a failure (tests/support/other_filesystem.rs).
+env:
+  MAKI_TEST_REQUIRE_OTHER_FILESYSTEM: "1"
+
 jobs:
   dependency-audit:
     # Keep the security gate independent so an advisory cannot hide test results.

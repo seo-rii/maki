@@ -4,6 +4,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_backing::Backing;
 use maki_control::protocol::{read_response, send_command, Request};
 use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
@@ -109,7 +112,7 @@ pub struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_dir::tempdir().unwrap();
         let root = dir.path().join("vol");
         let socket = dir.path().join("control.sock");
         let path = dir.path().join("volume.toml");

@@ -18,6 +18,8 @@
 //! that kills them at, or fails, one system call.
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
 #[path = "support/seccomp.rs"]
 mod seccomp;
 
@@ -28,12 +30,12 @@ use maki_backing::{Backing, RollbackBacking};
 
 const CAPACITY: u64 = 16 * 4096;
 
-/// The backing root and the witness directory, on two filesystems.
-fn directories() -> (tempfile::TempDir, tempfile::TempDir) {
-    (
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir_in("/dev/shm").unwrap(),
-    )
+/// The backing root and the witness directory, on two filesystems, or
+/// `None` where there is no second one (the test then says it is skipped).
+fn directories() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+    let root = tempfile::tempdir().unwrap();
+    let witness = other_filesystem::tempdir(root.path())?;
+    Some((root, witness))
 }
 
 fn entries(directory: &Path) -> Vec<String> {
@@ -169,7 +171,9 @@ fn create_completes_a_backing_whose_marker_was_never_written() {
         ("rollback.format", &torn[..]),
         ("rollback.format.next", &MARKER[..4]),
     ] {
-        let (root, witness) = directories();
+        let Some((root, witness)) = directories() else {
+            return;
+        };
         std::fs::write(root.path().join("rollback.lock"), b"").unwrap();
         std::fs::write(root.path().join(name), bytes).unwrap();
         let unchanged = std::process::Command::new("true").output().unwrap();
@@ -185,7 +189,9 @@ fn create_completes_a_backing_whose_marker_was_never_written() {
 fn create_killed_at_its_first_write_can_be_run_again() {
     use std::os::unix::process::ExitStatusExt;
     child();
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     let Some(killed) = interrupted(
         "create_killed_at_its_first_write_can_be_run_again",
         "killed at the first write",
@@ -202,7 +208,9 @@ fn create_killed_at_its_first_write_can_be_run_again() {
 #[test]
 fn create_that_ran_out_of_space_for_its_arena_can_be_run_again() {
     child();
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     let Some(failed) = interrupted(
         "create_that_ran_out_of_space_for_its_arena_can_be_run_again",
         "out of space for the arena",
@@ -224,7 +232,9 @@ fn create_that_ran_out_of_space_for_its_arena_can_be_run_again() {
 fn create_killed_while_writing_its_witness_anchor_can_be_run_again() {
     use std::os::unix::process::ExitStatusExt;
     child();
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     let Some(killed) = interrupted(
         "create_killed_while_writing_its_witness_anchor_can_be_run_again",
         "killed writing the anchor",
@@ -241,7 +251,9 @@ fn create_killed_while_writing_its_witness_anchor_can_be_run_again() {
 #[test]
 fn create_that_ran_out_of_space_for_its_witness_anchor_can_be_run_again() {
     child();
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     let Some(failed) = interrupted(
         "create_that_ran_out_of_space_for_its_witness_anchor_can_be_run_again",
         "out of space for the anchor",
@@ -263,12 +275,16 @@ fn create_that_ran_out_of_space_for_its_witness_anchor_can_be_run_again() {
 /// whatever the witness directory holds.
 #[test]
 fn control_create_refuses_a_used_backing_beside_an_empty_witness_directory() {
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
     commit(&backing, b"committed");
     drop(backing);
     let before = std::fs::read(root.path().join("rollback.manifest.1")).unwrap();
-    let unmounted = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(unmounted) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     for witness in [unmounted.path(), witness.path()] {
         assert!(RollbackBacking::create(root.path(), witness, CAPACITY).is_err());
     }
@@ -313,7 +329,9 @@ fn create_refuses_a_committed_backing_whose_manifest_slots_are_damaged() {
         ("the length of slot 0, slot 1 zeroed", header, zeroed),
         ("a byte of slot 0, slot 1 zeroed", body, zeroed),
     ] {
-        let (root, witness) = directories();
+        let Some((root, witness)) = directories() else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
         commit(&backing, b"committed");
         let file = backing.open("second", true).unwrap();
@@ -356,7 +374,9 @@ fn create_refuses_a_committed_backing_whose_manifest_slots_are_damaged() {
 fn create_refuses_a_second_manifest_slot_that_holds_anything() {
     use std::os::unix::fs::FileExt;
     for damage in [&[0xff; 8][..], b"#", &[1]] {
-        let (root, witness) = directories();
+        let Some((root, witness)) = directories() else {
+            return;
+        };
         drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
         let slot = root.path().join("rollback.manifest.1");
         std::fs::OpenOptions::new()
@@ -381,7 +401,9 @@ fn create_refuses_a_second_manifest_slot_that_holds_anything() {
 /// commit leaves.
 #[test]
 fn create_refuses_the_initial_manifest_in_the_second_slot() {
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
     let initial = std::fs::read(root.path().join("rollback.manifest.0")).unwrap();
     std::fs::write(root.path().join("rollback.manifest.1"), &initial).unwrap();
@@ -404,7 +426,9 @@ fn create_refuses_the_initial_manifest_in_the_second_slot() {
 #[test]
 fn control_create_and_open_refuse_a_witness_that_holds_an_empty_anchor() {
     for committed in [false, true] {
-        let (root, witness) = directories();
+        let Some((root, witness)) = directories() else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
         if committed {
             commit(&backing, b"committed");
@@ -445,7 +469,9 @@ fn control_create_and_open_refuse_a_witness_that_holds_an_empty_anchor() {
 /// no creation writes is refused and left as it is.
 #[test]
 fn control_create_refuses_a_backing_that_holds_anything_else() {
-    let (root, witness) = directories();
+    let Some((root, witness)) = directories() else {
+        return;
+    };
     std::fs::write(root.path().join("rollback.lock"), b"").unwrap();
     std::fs::write(root.path().join("rollback.format"), b"").unwrap();
     std::fs::write(root.path().join("notes"), b"operator").unwrap();

@@ -4,6 +4,7 @@ import contextlib
 import csv
 import importlib.util
 import io
+import os
 import pathlib
 import tempfile
 import unittest
@@ -44,6 +45,11 @@ class Client:
 
 class OracleTests(unittest.TestCase):
     def setUp(self):
+        # The entry points under test set the process umask to 0077 for the
+        # files they write; give later tests the caller's umask back.
+        umask = os.umask(0o077)
+        os.umask(umask)
+        self.addCleanup(os.umask, umask)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.ledger = pathlib.Path(self.directory.name) / "ack.jsonl"

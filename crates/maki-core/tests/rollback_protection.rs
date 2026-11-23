@@ -1,3 +1,7 @@
+#[cfg(target_os = "linux")]
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -113,11 +117,10 @@ struct RollbackFixture {
 
 #[cfg(target_os = "linux")]
 impl RollbackFixture {
-    fn new(capacity: u64, discard: bool) -> (Self, Volume, Arc<RollbackBacking>) {
-        let fixture = Self {
-            root: tempfile::tempdir().unwrap(),
-            witness: tempfile::tempdir_in("/dev/shm").unwrap(),
-        };
+    fn new(capacity: u64, discard: bool) -> Option<(Self, Volume, Arc<RollbackBacking>)> {
+        let root = tempfile::tempdir().unwrap();
+        let witness = other_filesystem::tempdir(root.path())?;
+        let fixture = Self { root, witness };
         let backing = Arc::new(
             RollbackBacking::create(fixture.root.path(), fixture.witness.path(), capacity).unwrap(),
         );
@@ -133,7 +136,7 @@ impl RollbackFixture {
             },
         )
         .unwrap();
-        (fixture, volume, backing)
+        Some((fixture, volume, backing))
     }
 
     fn reopen(&self) -> (Volume, Arc<RollbackBacking>) {
@@ -227,7 +230,9 @@ async fn revoked_freshness_rejects_a_plaintext_cache_hit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rollback_backing_fua_recovers_before_checkpoint() {
-    let (fixture, mut volume, backing) = RollbackFixture::new(256 * 1024, false);
+    let Some((fixture, mut volume, backing)) = RollbackFixture::new(256 * 1024, false) else {
+        return;
+    };
     let sequence = volume.write_ct(3, &ciphertext(0xa3), true).unwrap();
     assert!(volume.journal_durable_sequence() >= sequence);
     assert_eq!(volume.checkpoint_sequence(), 0);
@@ -240,7 +245,9 @@ fn rollback_backing_fua_recovers_before_checkpoint() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rollback_backing_checkpoint_discard_and_rewrite_roundtrip() {
-    let (fixture, mut volume, backing) = RollbackFixture::new(256 * 1024, true);
+    let Some((fixture, mut volume, backing)) = RollbackFixture::new(256 * 1024, true) else {
+        return;
+    };
     volume.write_ct(2, &ciphertext(0x21), true).unwrap();
     volume.checkpoint().unwrap();
     volume.discard_ct(2, true).unwrap();
@@ -257,7 +264,9 @@ fn rollback_backing_checkpoint_discard_and_rewrite_roundtrip() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rollback_backing_rejects_old_whole_image_with_current_witness() {
-    let (fixture, mut volume, backing) = RollbackFixture::new(256 * 1024, false);
+    let Some((fixture, mut volume, backing)) = RollbackFixture::new(256 * 1024, false) else {
+        return;
+    };
     let old_image = tempfile::tempdir().unwrap();
     volume.write_ct(1, &ciphertext(0x31), true).unwrap();
     copy_backing(fixture.root.path(), old_image.path());
@@ -274,7 +283,9 @@ fn rollback_backing_rejects_old_whole_image_with_current_witness() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rollback_backing_full_capacity_preserves_checkpoint_reservations() {
-    let (fixture, mut volume, backing) = RollbackFixture::new(72 * 1024, false);
+    let Some((fixture, mut volume, backing)) = RollbackFixture::new(72 * 1024, false) else {
+        return;
+    };
     let mut acknowledged = Vec::new();
     for unit in 0..16 {
         match volume.write_ct(unit, &ciphertext(unit as u8), true) {
@@ -307,7 +318,9 @@ fn rollback_backing_full_capacity_preserves_checkpoint_reservations() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollback_backing_concurrent_checkpoint_and_fua_journaling_roundtrip() {
-    let (fixture, volume, backing) = RollbackFixture::new(512 * 1024, false);
+    let Some((fixture, volume, backing)) = RollbackFixture::new(512 * 1024, false) else {
+        return;
+    };
     let engine = Engine::attach_recovered(
         volume,
         Arc::new(FakeCryptoProvider::new(UNIT)),

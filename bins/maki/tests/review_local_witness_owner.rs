@@ -9,6 +9,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -85,23 +88,25 @@ maximum_io = "64KiB"
 }
 
 struct Fixture {
-    // Explicit roots keep the witness on an independent filesystem.
     directory: tempfile::TempDir,
     witness_parent: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    /// `None` when there is no second filesystem for the witness.
+    fn new() -> Option<Self> {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let witness_parent = other_filesystem::reachable_tempdir(directory.path())?;
         let fixture = Self {
-            directory: tempfile::tempdir_in("/tmp").unwrap(),
-            witness_parent: tempfile::tempdir_in("/dev/shm").unwrap(),
+            directory,
+            witness_parent,
         };
         volume_config::write(
             fixture.config(),
             config(&fixture.root(), &fixture.witness()),
         )
         .unwrap();
-        fixture
+        Some(fixture)
     }
 
     fn root(&self) -> std::path::PathBuf {
@@ -141,7 +146,9 @@ fn root_offline_check_and_inspect_leave_the_daemon_able_to_open_its_witness() {
     {
         return;
     }
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     let config = fixture.config();
     let config = config.to_str().unwrap();
     // The documented creation: directories the daemon user owns, then
@@ -180,7 +187,9 @@ fn root_create_names_the_rollback_witness_among_the_paths_to_hand_back() {
     if skip_unless_root("root_create_names_the_rollback_witness_among_the_paths_to_hand_back") {
         return;
     }
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     let output = maki(
         &["volume", "create", fixture.config().to_str().unwrap()],
         None,

@@ -30,6 +30,10 @@ PROFILES = {
         "maki-core": ("rollback_protection", "rollback_process"),
     },
 }
+# Set for every suite of a profile. A rollback fixture that finds no second
+# filesystem prints that it is skipped and passes; the suites run without
+# --show-output, so nothing would show it. The variable makes it fail.
+PROFILE_ENVIRONMENT = {"rollback": {"MAKI_TEST_REQUIRE_OTHER_FILESYSTEM": "1"}}
 TERMINAL = {"passed", "failed", "cancelled", "incomplete"}
 
 
@@ -352,6 +356,7 @@ def worker(directory):
                 save_json(directory / "status.json", status)
                 log = directory / f"round-{round_number:04d}-{name}.log"
                 environment = os.environ.copy()
+                environment.update(PROFILE_ENVIRONMENT.get(status["profile"], {}))
                 if name in manifest:
                     environment["LD_LIBRARY_PATH"] = manifest[name]["library_path"]
                 result = run_child([str(binary), "--include-ignored", "--test-threads=1", "--color=never"],

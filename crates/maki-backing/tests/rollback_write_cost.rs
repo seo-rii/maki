@@ -7,6 +7,9 @@
 //! both views already reserve skips the recount.
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::time::{Duration, Instant};
 
 use maki_backing::{Backing, RollbackBacking};
@@ -15,7 +18,9 @@ use maki_backing::{Backing, RollbackBacking};
 #[ignore = "release gate: rollback-protected write cost at 128 MiB committed"]
 fn phase_r5_rollback_write_cost_gate_full() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 256 << 20).unwrap();
     let file = backing.open("journal", true).unwrap();
     let chunk = vec![7u8; 64 << 10];

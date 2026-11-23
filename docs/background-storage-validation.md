@@ -42,9 +42,13 @@ ignored tests, with one libtest thread per suite:
 | `review_discard_reclaim_retry` | V3 reclamation failure and retry |
 
 The `rollback` profile selects separate suites for the experimental Linux
-rollback backing. The host needs writable `/dev/shm` on a different filesystem
-from its temporary backing directory; this test witness is deliberately volatile
-and is not an example of production witness provisioning.
+rollback backing. The host needs a writable directory on a filesystem other
+than that of its temporary backing directory (the fixtures try `/dev/shm`,
+`/run/user/<uid>`, `/var/tmp`, `/tmp`, `TMPDIR` and `/run`). The runner sets
+`MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1` for these suites, so without one they
+fail; elsewhere such a test prints that it is skipped and passes. This test
+witness is deliberately volatile and is not an example of production witness
+provisioning.
 
 | Package / suite | Checked behavior |
 | --- | --- |

@@ -7,6 +7,9 @@
 //! 1 GiB capacity's bound (72 MiB) for a slot file of about 8 MiB.
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io;
@@ -122,9 +125,11 @@ fn read_payload(backing: &dyn Backing) -> Vec<u8> {
 
 #[test]
 fn local_manifest_length_beyond_its_slot_is_refused_before_allocating() {
+    let root = tempfile::tempdir().unwrap();
     // The witness must live on another filesystem than the backing.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 16 * PAGE).unwrap();
     write_payload(&backing, b"committed");
     drop(backing);
@@ -191,7 +196,9 @@ fn remote_manifest_length_beyond_its_slot_is_refused_before_allocating() {
 #[test]
 fn sparse_reads_do_not_allocate_zero_pages() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
     let file = backing.open("sparse", true).unwrap();
     let mut out = vec![0x55; 64 * PAGE as usize];
@@ -205,7 +212,9 @@ fn sparse_reads_do_not_allocate_zero_pages() {
 #[test]
 fn aligned_writes_to_fresh_pages_do_not_allocate_a_scratch_page_per_page() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 32 * PAGE).unwrap();
     let file = backing.open("fresh", true).unwrap();
     let data: Vec<u8> = (0..32 * PAGE).map(|offset| (offset % 251) as u8).collect();

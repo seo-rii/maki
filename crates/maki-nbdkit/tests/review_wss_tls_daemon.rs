@@ -3,6 +3,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -142,7 +145,7 @@ fn private_file(directory: &tempfile::TempDir, name: &str, contents: &str) -> St
 }
 
 fn config(server: &WssServer, client: Option<&Identity>) -> (tempfile::TempDir, String, String) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let ca_file = private_file(&directory, "ca.pem", &server.server_ca_pem);
     let client_tls = client
         .map(|client| {
