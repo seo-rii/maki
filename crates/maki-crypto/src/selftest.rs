@@ -123,9 +123,9 @@ fn patterns(unit_size: usize) -> Vec<PlaintextUnit> {
 ///   lacks the capability;
 /// - any other error is not integrity evidence and refuses attach. That
 ///   includes a request refused without an integrity verdict (a generic
-///   bad request); background validation of a quarantined endpoint, which
-///   must not take one such reply for proof, relabels it before it gets
-///   here (`ValidationProvider` in `endpoint.rs`).
+///   bad request) and a provider failure; background validation of a
+///   quarantined endpoint, which must not take either for proof, relabels
+///   them before they get here (`ValidationProvider` in `endpoint.rs`).
 fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
     if matches!(e, CryptoError::Integrity(_)) {
         return Ok(());
@@ -457,7 +457,8 @@ pub async fn cross_endpoint_self_test_attributed(
                 // malformed reply (`Contract`) only shows that this
                 // exchange failed. Background validation, where this
                 // verdict excludes the candidate for good, lets only an
-                // integrity failure reach it as a refusal (see
+                // integrity failure, or the candidate's explicit refusal of
+                // the volume's context, reach it as a refusal (see
                 // `ValidationProvider` in `endpoint.rs`).
                 let error = if error.is_retryable()
                     || matches!(error.class(), ErrorClass::EndpointFatal)

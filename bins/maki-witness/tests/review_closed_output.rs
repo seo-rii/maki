@@ -221,15 +221,19 @@ fn a_result_that_cannot_be_written_is_an_error() {
 fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.toml");
-    for args in [
-        vec![],
-        vec!["no-such-command"],
-        vec!["serve", missing.to_str().unwrap()],
-        vec![
-            "init",
-            dir.path().join("state").to_str().unwrap(),
-            "not-a-uuid",
-        ],
+    // Misuse exits 2, a failure 1.
+    for (args, status) in [
+        (vec![], 2),
+        (vec!["no-such-command"], 2),
+        (vec!["serve", missing.to_str().unwrap()], 1),
+        (
+            vec![
+                "init",
+                dir.path().join("state").to_str().unwrap(),
+                "not-a-uuid",
+            ],
+            2,
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_maki-witness"))
             .args(&args)
@@ -239,7 +243,7 @@ fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
             .stderr(closed_pipe())
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(output.status.code(), Some(status), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
     }
 }

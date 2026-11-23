@@ -206,7 +206,11 @@ impl fmt::Display for PlannedStep {
             }
             PlannedStep::LvmActivate { vg_name } => write!(f,
                 "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
-            PlannedStep::LvmDeactivate { vg_name } => write!(f, "vgchange -an {vg_name}"),
+            PlannedStep::LvmDeactivate { vg_name } => write!(
+                f,
+                "vgchange -an {vg_name}, on the recorded PVs only and by the recorded VG UUID \
+                 where the record names one"
+            ),
             PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => write!(
                 f,
                 "verify XFS identity on {device} before mount (fs uuid {})",
@@ -250,7 +254,10 @@ impl fmt::Display for PlannedStep {
                 lv_name,
                 target_bytes,
                 ..
-            } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
+            } => write!(
+                f,
+                "lvextend -L {target_bytes}b {vg_name}/{lv_name}, on the recorded PVs only"
+            ),
             PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {}", shell_word(mountpoint)),
         }
     }

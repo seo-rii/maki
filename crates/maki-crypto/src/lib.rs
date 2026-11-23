@@ -4,6 +4,10 @@
 //! Phase 2: provider self-test and batch-result validation.
 //! Phase 5: batching, retry, retry budget, circuit breaker, endpoint set.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod breaker;
 pub mod checked;
 pub mod clock;
@@ -16,6 +20,8 @@ pub mod retry;
 pub mod scheduler;
 pub mod secret;
 pub mod selftest;
+#[cfg(feature = "tls-trust")]
+pub mod tls_trust;
 pub mod types;
 
 pub use clock::{Clock, SystemClock};

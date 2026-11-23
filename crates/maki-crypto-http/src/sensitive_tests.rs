@@ -738,8 +738,8 @@ fn provider_drop_erases_owned_header_and_query_values() {
 fn provider_construction_error_erases_owned_credentials() {
     let spec = sensitive_credentials_spec(Some(super::TlsSpec {
         ca_pem: None,
-        // Keep this outside the watched allocation size. reqwest's parser may
-        // make transport-owned copies that this crate cannot erase.
+        // Keep this outside the watched allocation size. The PEM decoder may
+        // make copies that this crate cannot erase.
         identity_pem: Some(b"invalid client identity".to_vec()),
     }));
 
@@ -764,6 +764,113 @@ fn tls_spec_drop_erases_identity_pem() {
     let inspection = finish_inspection();
 
     assert_sensitive_allocations_wiped(inspection, 1);
+}
+
+/// A client certificate and two private keys, A (which the certificate
+/// names) and B, as PEM.
+struct IdentityParts {
+    certificate: String,
+    key_a: String,
+    key_a_der: Vec<u8>,
+    key_b: String,
+    /// The PEM decoder's output allocation for either key.
+    key_allocation: usize,
+}
+
+fn identity_parts() -> IdentityParts {
+    let key_a = rcgen::KeyPair::generate().unwrap();
+    let key_b = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["maki-client".into()])
+        .unwrap()
+        .self_signed(&key_a)
+        .unwrap();
+    let key_a_der = key_a.serialize_der();
+    // A length divisible by three has unpadded Base64, so the decoder's
+    // zero-filled output allocation is exactly the key's length.
+    assert_eq!(key_a_der.len() % 3, 0, "unexpected key encoding");
+    assert_eq!(key_b.serialize_der().len(), key_a_der.len());
+    IdentityParts {
+        certificate: certificate.pem(),
+        key_a: key_a.serialize_pem(),
+        key_allocation: key_a_der.len(),
+        key_a_der,
+        key_b: key_b.serialize_pem(),
+    }
+}
+
+/// Split `pem` with only allocations of the decoded key's size watched. A
+/// returned key is erased here, as rustls takes it; the result says whether
+/// it was `expected`.
+fn inspect_identity(pem: &str, size: usize, expected: &[u8]) -> (Option<bool>, Inspection) {
+    use zeroize::Zeroize as _;
+    begin_inspection_for_size(size);
+    let returned = match super::client_identity(pem.as_bytes()) {
+        Ok((certificates, mut key)) => {
+            let matches = key.secret_der() == expected;
+            key.zeroize();
+            drop(certificates);
+            Some(matches)
+        }
+        Err(error) => {
+            drop(error);
+            None
+        }
+    };
+    (returned, finish_inspection())
+}
+
+/// Why `inspection` does not show `keys` decoded keys, all erased.
+fn unerased_keys(inspection: Inspection, keys: usize) -> Option<String> {
+    if (inspection.allocations, inspection.deallocations) != (keys, keys) {
+        return Some(format!(
+            "decoded key allocations were not observed: {inspection:?}"
+        ));
+    }
+    (inspection.zeroized != inspection.deallocations)
+        .then(|| format!("a decoded private key was freed without erasure: {inspection:?}"))
+}
+
+#[test]
+fn identity_split_erases_a_replaced_private_key() {
+    let parts = identity_parts();
+    // The last key is the identity's, as for reqwest; key B is decoded
+    // first and replaced.
+    let pem = format!("{}{}{}", parts.certificate, parts.key_b, parts.key_a);
+    let (returned, inspection) = inspect_identity(&pem, parts.key_allocation, &parts.key_a_der);
+    assert_eq!(
+        returned,
+        Some(true),
+        "the last private key must be the identity's"
+    );
+    assert_eq!(unerased_keys(inspection, 2), None);
+}
+
+#[test]
+fn identity_split_errors_erase_the_decoded_private_key() {
+    let parts = identity_parts();
+    let malformed = "-----BEGIN CERTIFICATE-----\n!not-base64!\n-----END CERTIFICATE-----\n";
+    let public_key = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
+    let mut wrong = Vec::new();
+    for (case, pem) in [
+        ("no certificate", parts.key_a.clone()),
+        (
+            "a later section that is neither certificate nor key",
+            format!("{}{}{public_key}", parts.certificate, parts.key_a),
+        ),
+        (
+            "a later malformed section",
+            format!("{}{}{malformed}", parts.certificate, parts.key_a),
+        ),
+    ] {
+        let (returned, inspection) = inspect_identity(&pem, parts.key_allocation, &[]);
+        if returned.is_some() {
+            wrong.push(format!("{case}: the identity was accepted"));
+        }
+        if let Some(why) = unerased_keys(inspection, 1) {
+            wrong.push(format!("{case}: {why}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

@@ -53,7 +53,9 @@ ExecStop=-/usr/bin/systemctl --no-ask-password --no-block --job-mode=fail stop m
 # That coordinator stops maki@ before its cleanup, and its stop of maki@ is
 # ordered after this unit's stop job, so the daemon still serves the device
 # while the hook runs. The hook uses that for the one rollback LVM cannot do
-# later: an activation whose helper died before recording its mapping. It
-# waits at most 15s for leftover processes of the failed start and gives the
-# rollback 30s, inside TimeoutStopSec; the coordinator proceeds either way.
+# later: an activation whose helper died before recording its mapping, also
+# when the coordinator was refused (masked). Only for such a record does it
+# wait at most 15s for leftover processes of the failed start, 40s for its
+# turn on the attach lock and 30s for its commands, inside TimeoutStopSec and
+# the coordinator's JobTimeoutSec; the coordinator proceeds either way.
 ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i

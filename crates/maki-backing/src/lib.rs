@@ -12,6 +12,10 @@
 //! `FileBacking` talks to a real filesystem; `MemBacking` is an in-memory
 //! stand-in; `maki-test-support::CrashableBacking` simulates crashes.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod file;
 pub mod mem;
 pub mod path;

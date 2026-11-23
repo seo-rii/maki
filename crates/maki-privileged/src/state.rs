@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -247,25 +247,69 @@ impl TrustedState {
         Ok(StateLock(file))
     }
 
-    /// Take the lock, but give up at `deadline` rather than queue behind
-    /// another helper for as long as that one runs.
+    /// Take the lock in turn, but give up at `deadline` rather than wait for
+    /// as long as the helpers ahead of this one run.
+    ///
+    /// Requests that block in `flock` form a queue that the kernel serves in
+    /// order, and every other helper blocks. A caller that only retried a
+    /// non-blocking attempt would get the lock only when nobody is queued,
+    /// so every helper that queued meanwhile would overtake it. The blocking
+    /// request therefore runs on a thread of its own. At the deadline it is
+    /// abandoned: a lock granted to it later is dropped with the channel it
+    /// is sent into, which releases it, and the helper's exit ends a request
+    /// that is still queued.
     pub fn lock_until(&self, deadline: Instant) -> io::Result<StateLock> {
         let file = self.lock_file()?;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(StateLock(file)),
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the attach lock is held by another helper",
-                    ));
-                }
-            }
+        match file.try_lock() {
+            Ok(()) => return Ok(StateLock(file)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {}
         }
+        let held = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the attach lock is held by another helper",
+            )
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(held());
+        }
+        let (granted, answer) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("attach-lock".into())
+            .spawn(move || {
+                let _ = granted.send(file.lock().map(|()| StateLock(file)));
+            })?;
+        match answer.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(held()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "the attach lock request ended without an answer",
+            )),
+        }
+    }
+
+    /// How many lock requests of this process wait for `attach.lock`, from
+    /// `/proc/locks`. Only the inode number is compared, not the device, so
+    /// the process id keeps a blocked request on another filesystem's file
+    /// with the same inode number out of the count.
+    #[cfg(test)]
+    pub(crate) fn lock_waiters(&self) -> usize {
+        let inode = format!(":{}", self.lock_file().unwrap().metadata().unwrap().ino());
+        let pid = std::process::id().to_string();
+        std::fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(1) == Some(&"->")
+                    && fields.contains(&pid.as_str())
+                    && fields
+                        .iter()
+                        .any(|field| field.matches(':').count() == 2 && field.ends_with(&inode))
+            })
+            .count()
     }
 
     /// Verification joins the same exclusive lock without creating a file.
@@ -328,6 +372,17 @@ impl TrustedState {
     /// instead of leaving it out. Other names (the lock, a temporary record
     /// of a killed write) are not records.
     pub fn devices_of_other_volumes(&self, volume: &str) -> io::Result<BTreeMap<String, String>> {
+        let mut devices = BTreeMap::new();
+        for record in self.records_of_other_volumes(volume)? {
+            devices.entry(record.device).or_insert(record.volume);
+        }
+        Ok(devices)
+    }
+
+    /// Every other volume's trusted record, by volume name, read as
+    /// [`Self::devices_of_other_volumes`] reads them: an entry that cannot
+    /// be read fails the listing and is named.
+    pub fn records_of_other_volumes(&self, volume: &str) -> io::Result<Vec<BoundDeviceRecord>> {
         // List the directory this descriptor holds, wherever its path now
         // leads; each record is then opened relative to the descriptor.
         let listing = format!("/proc/self/fd/{}", self.directory.as_raw_fd());
@@ -342,7 +397,7 @@ impl TrustedState {
             }
         }
         names.sort();
-        let mut devices = BTreeMap::new();
+        let mut records = Vec::new();
         for name in names {
             let unreadable = |error: io::Error| {
                 io::Error::new(
@@ -364,11 +419,9 @@ impl TrustedState {
                 continue;
             }
             // An entry removed since the listing reserves nothing.
-            if let Some(record) = self.read(other).map_err(unreadable)? {
-                devices.entry(record.device).or_insert(record.volume);
-            }
+            records.extend(self.read(other).map_err(unreadable)?);
         }
-        Ok(devices)
+        Ok(records)
     }
 
     pub fn write(&self, record: &BoundDeviceRecord) -> io::Result<()> {

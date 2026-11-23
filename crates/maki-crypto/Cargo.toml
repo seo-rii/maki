@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# The TLS roots every remote crypto transport trusts (`tls_trust`). Only the
+# transport crates (maki-crypto-http, -websocket, -grpc) enable it.
+tls-trust = ["dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
+
 [dependencies]
 thiserror.workspace = true
 zeroize.workspace = true
@@ -14,6 +19,11 @@ uuid.workspace = true
 rand.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+# The one webpki-roots line in the workspace (tonic's own feature would add
+# the 0.26 line).
+webpki-roots = { version = "1.0.10", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

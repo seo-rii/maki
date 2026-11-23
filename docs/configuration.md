@@ -142,21 +142,27 @@ before the backing or a remote witness changes. Enable the `fake-provider`
 feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
-endpoint URL. The TLS section is optional when the transport's default trust
-is enough, and that default differs by transport:
+endpoint URL, and all three trust the same roots:
 
-| `crypto.provider` | Roots trusted without `ca_file` |
-|---|---|
-| `remote-http` | Only the public roots compiled into the binary (the `webpki-roots` set). The host's trust store is never read |
-| `remote-grpc` | Only the host's trust store. With no `ca_file`, an `https://` endpoint on a host whose store is empty is refused at attach |
-| `remote-websocket` | The host's trust store and the compiled-in public roots |
+- the host's trust store: the system CA bundle, or the files that
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. It is read best
+  effort: a missing store adds nothing and a certificate in it that does not
+  parse is skipped;
+- the public roots compiled into the binary (the `webpki-roots` set);
+- the certificates of a configured `ca_file`, which add to the other two and
+  replace neither. Every certificate in it must parse, and a file without one
+  is refused at attach.
 
-The host's trust store is the system CA bundle, or the files that
-`SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. A custom `ca_file`
-adds its certificates to the transport's roots; it does not replace them. A
-private CA installed only in the host's trust store is therefore trusted by
-`remote-grpc` and `remote-websocket` but not by `remote-http`, which needs it
-in `ca_file`. There is no certificate-verification bypass setting.
+The TLS section is therefore optional when the endpoint's chain leads to a
+public root or to a private CA installed in the host's trust store. Because the
+compiled-in roots are always there, a provider is built even on a host whose
+trust store is empty; an endpoint that none of the roots vouches for is refused
+at the TLS handshake. The roots are read when the provider is built at daemon
+start, so a CA added to the host's store later takes effect at the next
+restart (a WebSocket provider without a TLS section also reads the host's
+store again for each new connection). There is no certificate-verification
+bypass setting. The [remote witness](#remote-witness-endpoint-sets) is
+different: it trusts only its own `ca_file`.
 
 For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
 
@@ -515,8 +521,15 @@ when available, and establish throughput and tail latency with the
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
 stale response IDs are discarded; a binary frame, a text frame that is not JSON,
 or a response without a numeric ID breaks the contract and fails every request
-on that connection at once as a contract error. Ping and pong frames are
-ignored, and a close frame ends the connection. Pending requests are scoped to a connection
+on that connection at once as a contract error. An `integrity` or
+`unsupported-context` error frame whose envelope is not exact (see
+[provider error signals](#provider-error-signals)) fails only the request it
+answers, as a contract error, and that request is not sent again; the
+connection then takes no new request and is released once the requests already
+on it finish, as after a cancelled request (below). Any other malformed answer
+to one request, such as an unknown error class or reason or a missing item, is
+a contract error for that request and leaves the connection in use. Ping and
+pong frames are ignored, and a close frame ends the connection. Pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
@@ -665,10 +678,12 @@ Two failures carry an explicit token:
 
 A token is compared exactly. A missing, unknown, repeated or comma-joined
 value, or a token on any other HTTP or gRPC status, is not one of these
-signals: the response is classified by its status alone. A WebSocket
-`integrity` or `unsupported-context` error whose `reason` is absent or is not
-one of that class's two tokens, or whose frame repeats `id`, `error`, `class`
-or `reason`, is a contract error.
+signals: the response is classified by its status alone. A WebSocket frame
+that repeats a member is read from its last occurrence, so its class is the
+last `class` of its last `error`. An `integrity` or `unsupported-context`
+class selected this way is a contract error when its `reason` is absent, is
+not a string or is not one of that class's two tokens, or when the frame
+repeats `id`, `error`, `class` or `reason`.
 
 In each table below a row applies only when no row above it does.
 
@@ -708,10 +723,34 @@ A WebSocket error frame cannot report an endpoint failure. The upgrade that
 opens a connection can, as described [above](#websocket-and-grpc-contracts).
 
 A failure without such an answer is classified the same way on all three
-transports: a timeout or a lost connection is retryable, a TLS authentication
-or protocol failure is an endpoint failure, and a reply that breaks the
-transport's framing or its size limit (`max_response_bytes`,
-`max_message_bytes`, `max_frame_bytes`) is a contract error.
+transports: a timeout or a lost connection, also one that cuts a reply short,
+is retryable, and a TLS authentication or protocol failure is an endpoint
+failure. On an established connection, a reply that breaks the framing of the
+transport's messages or its size limit (`max_response_bytes`,
+`max_message_bytes`, `max_frame_bytes`) is a contract error: an HTTP/1.1
+response head or chunked body that does not parse, or a body that only the
+connection's close ends; a gRPC message whose length prefix, count or final
+status breaks the gRPC protocol, or a stream that ends inside a message; a
+WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
+with a numeric ID. Two protocol failures are classified otherwise:
+
+- A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
+  upgrade headers or with the wrong accept key, a status below 300 or above
+  599, a head that is not HTTP) is an endpoint failure, like a refused upgrade.
+  An upgrade reply cut short by a lost connection is retryable.
+- An HTTP/2 error under a gRPC call, a reset stream or a GOAWAY, becomes the
+  gRPC status that the gRPC library derives from it and is classified by the
+  gRPC table above. A reset, and a GOAWAY that refuses the call (its last
+  stream ID is below the call's stream, so the server did not process it), is
+  classified by its error code: `ENHANCE_YOUR_CALM` is throttled
+  (`ResourceExhausted`; a gRPC server's keepalive policy sends it to a client
+  that pings too often), `INADEQUATE_SECURITY` is an endpoint failure
+  (`PermissionDenied`), and every other code is retryable. A GOAWAY that
+  accepted the call and then closes the connection under it is retryable
+  whatever its code. Either way the request was handed to the connection and
+  counts as sent, so a call that a GOAWAY refused is sent to another endpoint
+  only when the provider is `retry_safe`. The next call opens a new
+  connection.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:
