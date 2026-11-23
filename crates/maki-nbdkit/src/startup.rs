@@ -35,7 +35,7 @@ impl Startup {
             match result {
                 Ok(()) => 0,
                 Err(error) => {
-                    eprintln!("maki-nbdkit: startup failed: {error}");
+                    diagnostic!("maki-nbdkit: startup failed: {error}");
                     -1
                 }
             }

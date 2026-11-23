@@ -25,6 +25,19 @@ use parking_lot::Mutex;
 
 use crate::adapter::{AdapterError, NbdAdapter};
 
+/// `eprintln!` that cannot panic, for the lines this shim writes to stderr,
+/// which nbdkit forwards to its log. `eprintln!` panics when the write fails
+/// (a log pipe whose reader has gone, a full log file). Every caller is
+/// inside a panic boundary, which would then fail the callback with EIO and
+/// log a caught panic in place of the reason, and in `unload` skip the
+/// `tracing` event that follows. A line stderr cannot take is dropped.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 #[path = "startup.rs"]
 mod startup;
 
@@ -165,13 +178,13 @@ unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
         if key == "config" {
             // A lossy conversion would store a different path (BUG-120).
             let Ok(path) = value.to_str() else {
-                eprintln!("maki-nbdkit: config=<path> must be valid UTF-8");
+                diagnostic!("maki-nbdkit: config=<path> must be valid UTF-8");
                 return -1;
             };
             *CONFIG_PATH.lock() = Some(path.to_owned());
             0
         } else {
-            eprintln!("maki-nbdkit: unknown parameter {key}");
+            diagnostic!("maki-nbdkit: unknown parameter {key}");
             -1
         }
     })
@@ -184,7 +197,7 @@ unsafe extern "C" fn config_complete() -> c_int {
         // (R4-001).
         maki_core::logging::install_default_logging();
         if CONFIG_PATH.lock().is_none() {
-            eprintln!("maki-nbdkit: missing config=<path> parameter");
+            diagnostic!("maki-nbdkit: missing config=<path> parameter");
             return -1;
         }
         0
@@ -385,7 +398,7 @@ fn unload_adapter() {
         // already uses for `open`-path failures (FUP-005) — as well as emitted
         // as a `tracing` event for hosts that do install one.
         if let Err(e) = a.shutdown() {
-            eprintln!("maki-nbdkit: shutdown during unload failed: {e}");
+            diagnostic!("maki-nbdkit: shutdown during unload failed: {e}");
             tracing::error!(error = %e, "maki-nbdkit: shutdown during unload failed");
         }
     }
