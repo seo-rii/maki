@@ -363,6 +363,45 @@ fn create_whose_binding_write_failed_is_resumed() {
     );
 }
 
+/// A creation stages the binding as `remote.enrollment.next` and renames it
+/// into place once it is synced. Whatever an interrupted creation left
+/// under that name, another identity's binding included, is never read:
+/// enrollment recovery writes the approved binding over it.
+#[test]
+fn enrollment_recovery_writes_over_a_staged_binding_left_behind() {
+    assert!(RollbackBacking::owns_host_entry(
+        "remote.enrollment.next",
+        true
+    ));
+    // Another identity's complete binding.
+    let other = tempfile::tempdir().unwrap();
+    let other_writer: Arc<dyn Rpc> = Arc::new(RoleRpc(
+        Arc::new(Authority(Mutex::new(
+            CanonicalState::initial([0x33; 16]).unwrap(),
+        ))),
+        Role::Writer,
+    ));
+    drop(
+        RollbackBacking::create_remote(&other.path().join("root"), other_writer, CAPACITY).unwrap(),
+    );
+    let foreign = std::fs::read(other.path().join("root/remote.enrollment")).unwrap();
+    for staged in [&[][..], &foreign[..20], &foreign[..]] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = locked_root(dir.path());
+        std::fs::write(root.join("rollback.format"), MARKER).unwrap();
+        std::fs::write(root.join("remote.enrollment.next"), staged).unwrap();
+        let (_, admin) = authority();
+        let record = inspect(admin.as_ref());
+        RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+            .unwrap_or_else(|error| panic!("staged {} bytes: {error}", staged.len()));
+        assert_eq!(inspect(admin.as_ref()).fence, 1);
+        assert!(!root.join("remote.enrollment.next").exists());
+        let binding = std::fs::read(root.join("remote.enrollment")).unwrap();
+        assert_eq!(binding.len(), 64);
+        assert_eq!(&binding[8..24], &IDENTITY);
+    }
+}
+
 /// A marker that is empty, or a torn copy (each byte the marker's or zero),
 /// is what a release that wrote the marker in place left when it was cut
 /// there. With nothing beside it but the root locks, no creation published
@@ -507,10 +546,10 @@ fn control_a_published_marker_is_continued_by_enrollment_recovery_only() {
     assert_eq!(inspect(admin.as_ref()).fence, 1);
 }
 
-/// One file later the creation writes the binding. Cut there, it leaves a
-/// published marker and an unwritten binding: enrollment recovery refuses
-/// the binding rather than write over it, and continues once the operator
-/// has moved it out of the root.
+/// A release that wrote the binding in place and was cut there left a
+/// published marker and an unwritten binding, which is also what a damaged
+/// binding looks like: enrollment recovery refuses it rather than write
+/// over it, and continues once the operator has moved it out of the root.
 #[test]
 fn control_an_unwritten_binding_is_quarantined_before_enrollment_recovery_continues() {
     let dir = tempfile::tempdir().unwrap();

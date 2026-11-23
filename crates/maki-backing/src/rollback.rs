@@ -276,7 +276,12 @@ impl RollbackBacking {
         if remote {
             matches!(
                 name,
-                MARKER | MARKER_NEXT | ENROLL_LOCK | gc::OPERATION_LOCK | enrollment::FILE
+                MARKER
+                    | MARKER_NEXT
+                    | ENROLL_LOCK
+                    | gc::OPERATION_LOCK
+                    | enrollment::FILE
+                    | enrollment::FILE_NEXT
             ) || gc::namespace_fence(name.strip_prefix(gc::TOMBSTONE).unwrap_or(name)).is_some()
         } else {
             matches!(name, MARKER | ARENA | LOCK) || MANIFESTS.contains(&name)
