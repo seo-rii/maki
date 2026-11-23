@@ -10,11 +10,6 @@ use maki_backing::{Backing, BackingFile, FileBacking, VolumeLock};
 use tempfile::tempdir;
 
 const ID: [u8; 16] = [1; 16];
-// Process spawning momentarily inherits every thread's open flock descriptor
-// until exec closes CLOEXEC fds. Serialize fixtures around that global fork
-// boundary so another test's immediate drop/reopen cannot see a child-held fd.
-// The dedicated CAS test still runs all 16 contender threads concurrently.
-static PROCESS_FIXTURES: Mutex<()> = Mutex::new(());
 fn op(n: u8, current: &Record, action: Action) -> Request {
     Request {
         authorization: test_authorization([n; 16], Some(current), &action),
@@ -91,7 +86,6 @@ fn test_authorization(
 
 #[test]
 fn explicit_enrollment_and_missing_state_fail_closed() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     assert!(StateStore::open(dir.path()).is_err());
     let mut store = StateStore::create(dir.path(), ID).unwrap();
@@ -107,7 +101,6 @@ fn explicit_enrollment_and_missing_state_fail_closed() {
 
 #[test]
 fn claim_activate_advance_release_reopen_preserves_freshness() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let current = active(&mut store);
@@ -145,7 +138,6 @@ fn claim_activate_advance_release_reopen_preserves_freshness() {
 
 #[test]
 fn active_writer_blocks_normal_claim_and_all_stale_mutations() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let old = active(&mut store);
@@ -177,7 +169,6 @@ fn active_writer_blocks_normal_claim_and_all_stale_mutations() {
 
 #[test]
 fn lost_response_exact_retry_survives_restart_but_operation_id_reuse_fails() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let prior = inspect(&mut store);
@@ -194,7 +185,6 @@ fn lost_response_exact_retry_survives_restart_but_operation_id_reuse_fails() {
 
 #[test]
 fn restore_requires_admin_and_advances_epoch_and_current_generation() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let first = active(&mut store);
@@ -250,7 +240,6 @@ fn restore_requires_admin_and_advances_epoch_and_current_generation() {
 
 #[test]
 fn restore_wrong_identity_future_source_and_unclaimed_activation_rejected() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let current = active(&mut store);
@@ -285,7 +274,6 @@ fn restore_wrong_identity_future_source_and_unclaimed_activation_rejected() {
 
 #[test]
 fn activation_cannot_reuse_namespace_or_change_anchor_on_normal_claim() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let initial = active(&mut store);
@@ -314,7 +302,6 @@ fn activation_cannot_reuse_namespace_or_change_anchor_on_normal_claim() {
 
 #[test]
 fn mutation_requires_nonzero_id_and_exact_full_expected_record() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let current = inspect(&mut store);
@@ -337,7 +324,6 @@ fn mutation_requires_nonzero_id_and_exact_full_expected_record() {
 
 #[test]
 fn corrupt_truncated_and_noncanonical_store_are_rejected() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for damage in 0..3 {
         let dir = tempdir().unwrap();
         drop(StateStore::create(dir.path(), ID).unwrap());
@@ -357,7 +343,6 @@ fn corrupt_truncated_and_noncanonical_store_are_rejected() {
 
 #[test]
 fn external_state_change_permanently_poisons_open_handle() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let path = dir.path().join("remote.state");
@@ -376,7 +361,6 @@ fn external_state_change_permanently_poisons_open_handle() {
 
 #[test]
 fn independent_service_processes_cannot_share_one_authority_lock() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let store = StateStore::create(dir.path(), ID).unwrap();
     assert_eq!(
@@ -517,7 +501,6 @@ fn faulty_store(dir: &Path) -> (Arc<FaultBacking>, StateStore, Vec<u8>, Record) 
 /// (`a_publication_failure_before_the_rename_refuses_only_that_request`).
 #[test]
 fn an_uncertain_publication_poisons_and_reopen_resolves_exact_old_or_new() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in [Fault::Rename, Fault::DirectorySync] {
         let dir = tempdir().unwrap();
         let (backing, mut store, _, before) = faulty_store(dir.path());
@@ -560,7 +543,6 @@ fn an_uncertain_publication_poisons_and_reopen_resolves_exact_old_or_new() {
 /// request fails; its exact retry applies once and is durable.
 #[test]
 fn a_publication_failure_before_the_rename_refuses_only_that_request() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in BEFORE_RENAME {
         let dir = tempdir().unwrap();
         let (backing, mut store, published, before) = faulty_store(dir.path());
@@ -588,7 +570,6 @@ fn a_publication_failure_before_the_rename_refuses_only_that_request() {
 /// published `remote.state`, and the request then applies afresh.
 #[test]
 fn a_reopen_after_a_failure_before_the_rename_serves_the_published_state() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in BEFORE_RENAME {
         let dir = tempdir().unwrap();
         let (backing, mut store, published, before) = faulty_store(dir.path());
@@ -613,7 +594,6 @@ fn a_reopen_after_a_failure_before_the_rename_serves_the_published_state() {
 
 #[test]
 fn reopen_must_republish_before_serving_any_response() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in [
         Fault::TempOpen,
         Fault::TempWrite,
@@ -633,7 +613,6 @@ fn reopen_must_republish_before_serving_any_response() {
 
 #[test]
 fn concurrent_full_record_claims_have_exactly_one_winner() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let current = inspect(&mut store);
@@ -660,7 +639,6 @@ fn concurrent_full_record_claims_have_exactly_one_winner() {
 
 #[test]
 fn child_process_lock_probe() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(path) = std::env::var_os("MAKI_REMOTE_WITNESS_TEST_LOCK_PATH") else {
         return;
     };
@@ -675,7 +653,6 @@ fn child_process_lock_probe() {
 
 #[test]
 fn stable_file_lock_excludes_a_separate_process() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let _store = StateStore::create(dir.path(), ID).unwrap();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -692,7 +669,6 @@ fn stable_file_lock_excludes_a_separate_process() {
 
 #[test]
 fn deterministic_sequence_preserves_monotone_fences_generations_and_stale_rejection() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let mut current = active(&mut store);
@@ -786,7 +762,6 @@ fn deterministic_sequence_preserves_monotone_fences_generations_and_stale_reject
 /// (different or undecodable bytes) still poisons permanently.
 #[test]
 fn a_transient_state_read_failure_refuses_only_that_request() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in [Fault::StateOpen, Fault::StateRead] {
         let dir = tempdir().unwrap();
         drop(StateStore::create(dir.path(), ID).unwrap());
@@ -813,7 +788,6 @@ fn a_transient_state_read_failure_refuses_only_that_request() {
 /// exact bytes come back.
 #[test]
 fn a_state_file_removed_while_locked_poisons_permanently() {
-    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), ID).unwrap();
     let before = inspect(&mut store);

@@ -92,9 +92,6 @@ fn init_with_stdout(stdout: std::process::Stdio) -> String {
         retry_stderr.contains("remote witness already enrolled"),
         "{retry_stderr}"
     );
-
-    // Open the store after the last CLI call. A child forked by another
-    // test can inherit the harness's lock and hold it until exec.
     maki_backing::remote_witness::StateStore::open(&state).expect("reopen initialized witness");
     stderr
 }
