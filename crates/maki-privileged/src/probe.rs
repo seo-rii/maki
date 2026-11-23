@@ -114,6 +114,7 @@ pub(crate) struct MountRecord<'a> {
     /// The mounted filesystem's `major:minor` (field 3).
     pub(crate) device: &'a [u8],
     /// The mount's root within its filesystem (field 4).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) root: &'a [u8],
     pub(crate) mountpoint: &'a [u8],
     /// The per-mount options (field 6).
@@ -122,6 +123,7 @@ pub(crate) struct MountRecord<'a> {
     /// Empty when the source string given to mount(2) was empty.
     pub(crate) source: &'a [u8],
     /// The superblock options, up to the end of the record.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) super_options: &'a [u8],
 }
 
