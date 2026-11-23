@@ -8,6 +8,7 @@
 //! request fails over to the other validated endpoints, failing only once
 //! every one of them has broken the contract for it (R5-005).
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -138,7 +139,9 @@ fn check_encrypt_result(
         // reproduces a whole unit of plaintext with negligible probability.
         // The error charges the endpoint that answered.
         let plain = item.data.expose();
-        if scan_plaintext && !plain.is_empty() && contains_plaintext(&ct.data, plain, |a, b| a == b)
+        if scan_plaintext
+            && !plain.is_empty()
+            && contains_plaintext(&ct.data, plain, |a, b| a.cmp(&b))
         {
             return Err(CryptoError::Contract(format!(
                 "encrypt result {i} carries its plaintext: the provider is not encrypting"
@@ -223,12 +226,23 @@ impl CryptoProvider for CheckedProvider {
     }
 }
 
-// Keep byte comparisons injectable so adversarial-work regressions measure
+// Search for the plaintext without deriving any table from it. A failure
+// table (KMP) or a shift table is a function of the unit's bytes that would
+// sit in ordinary heap memory, neither page-locked under `secure-buffers` nor
+// erased when freed; for a two-valued unit (an allocation bitmap) a KMP table
+// reproduces the plaintext exactly. Crochemore-Perrin two-way matching needs
+// only a critical factorization of the needle: its state is a few positions,
+// in registers or on the stack like a cipher's own temporaries. It stays
+// linear in the worst case (at most 2n + 5m comparisons for an n-byte
+// haystack and an m-byte needle), so a provider cannot make the check
+// quadratic with a periodic answer.
+//
+// Byte comparisons are injectable so adversarial-work regressions measure
 // the algorithm's actual work without depending on clocks or CPU speed.
 fn contains_plaintext(
     haystack: &[u8],
     needle: &[u8],
-    mut equal: impl FnMut(u8, u8) -> bool,
+    mut compare: impl FnMut(u8, u8) -> Ordering,
 ) -> bool {
     if needle.is_empty() {
         return true;
@@ -236,41 +250,83 @@ fn contains_plaintext(
     if needle.len() > haystack.len() {
         return false;
     }
-    // KMP retains the longest matched prefix instead of comparing it again
-    // at every candidate offset. Preprocessing and scanning are both linear,
-    // including long repeated prefixes and periodic near matches.
-    let mut prefix = vec![0; needle.len()];
-    let mut matched = 0;
-    for index in 1..needle.len() {
-        loop {
-            if equal(needle[index], needle[matched]) {
-                matched += 1;
-                break;
+    // The later of the maximal suffixes under the two byte orders splits
+    // needle = u v at a critical position (Crochemore and Rytter, "Text
+    // Algorithms", ch. 13), with `period` the period of v.
+    let (less, less_period) = maximal_suffix(needle, Ordering::Less, &mut compare);
+    let (greater, greater_period) = maximal_suffix(needle, Ordering::Greater, &mut compare);
+    let (critical, period) = if less > greater {
+        (less, less_period)
+    } else {
+        (greater, greater_period)
+    };
+    let mut equal = |a, b| compare(a, b) == Ordering::Equal;
+    // When u is a suffix of v's first period, `period` is the needle's exact
+    // period: after a mismatch in u the next attempt reuses the overlap
+    // (`memory`). Otherwise max(|u|, |v|) + 1 is a shift that cannot skip an
+    // occurrence, and nothing is remembered.
+    let periodic = (0..critical).all(|i| equal(needle[i], needle[period + i]));
+    let shift = if periodic {
+        period
+    } else {
+        critical.max(needle.len() - critical) + 1
+    };
+    let mut position = 0;
+    let mut memory = 0;
+    'search: while position + needle.len() <= haystack.len() {
+        // v from left to right, then u from right to left.
+        for i in critical.max(memory)..needle.len() {
+            if !equal(needle[i], haystack[position + i]) {
+                position += i - critical + 1;
+                memory = 0;
+                continue 'search;
             }
-            if matched == 0 {
-                break;
-            }
-            matched = prefix[matched - 1];
         }
-        prefix[index] = matched;
-    }
-    matched = 0;
-    for byte in haystack {
-        loop {
-            if equal(*byte, needle[matched]) {
-                matched += 1;
-                if matched == needle.len() {
-                    return true;
+        for i in (memory..critical).rev() {
+            if !equal(needle[i], haystack[position + i]) {
+                position += shift;
+                if periodic {
+                    memory = needle.len() - period;
                 }
-                break;
+                continue 'search;
             }
-            if matched == 0 {
-                break;
-            }
-            matched = prefix[matched - 1];
         }
+        return true;
     }
     false
+}
+
+/// The start and period of the maximal suffix of `needle`: for the natural
+/// byte order when `smaller` is `Less` (a byte comparing `Less` makes the
+/// later suffix the smaller one), for the reversed order when it is
+/// `Greater`. Fewer than 2m comparisons.
+fn maximal_suffix(
+    needle: &[u8],
+    smaller: Ordering,
+    compare: &mut impl FnMut(u8, u8) -> Ordering,
+) -> (usize, usize) {
+    let (mut left, mut right, mut offset, mut period) = (0, 1, 0, 1);
+    while let Some(&byte) = needle.get(right + offset) {
+        match compare(byte, needle[left + offset]) {
+            Ordering::Equal if offset + 1 == period => {
+                right += period;
+                offset = 0;
+            }
+            Ordering::Equal => offset += 1,
+            order if order == smaller => {
+                right += offset + 1;
+                offset = 0;
+                period = right - left;
+            }
+            _ => {
+                left = right;
+                right += 1;
+                offset = 0;
+                period = 1;
+            }
+        }
+    }
+    (left, period)
 }
 
 #[cfg(test)]
@@ -278,7 +334,7 @@ mod substring_tests {
     use super::contains_plaintext;
 
     fn search(haystack: &[u8], needle: &[u8]) -> bool {
-        contains_plaintext(haystack, needle, |a, b| a == b)
+        contains_plaintext(haystack, needle, |a, b| a.cmp(&b))
     }
 
     /// The search's answer and the number of byte comparisons it made.
@@ -286,7 +342,7 @@ mod substring_tests {
         let mut count = 0;
         let found = contains_plaintext(haystack, needle, |a, b| {
             count += 1;
-            a == b
+            a.cmp(&b)
         });
         (found, count)
     }
