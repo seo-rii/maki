@@ -392,8 +392,11 @@ takeover, restore or enrollment recovery) MUST create each file and
 directory it adds below the backing root or in a local witness directory for
 the owner of the directory it is created in, when that owner is not root, so
 that it never leaves an entry the daemon cannot open. It MUST NOT give away
-an entry it did not create, MUST give a new file its owner before writing to
-it, and MUST refuse rather than keep an entry it cannot give away. The
+an entry another user owns, MUST give a new file its owner before writing to
+it, and MUST refuse rather than keep an entry it cannot give away. A local
+witness publication MUST remove a temporary record left from before, and
+MUST NOT publish a file under that name that a user other than root or the
+record's owner owns, as that user may still hold it open for writing. The
 backing root itself, when such a command creates it, belongs to the user
 that runs the command.
 

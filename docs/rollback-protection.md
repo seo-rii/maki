@@ -257,9 +257,12 @@ file for the owner of its directory, so the daemon can still open both paths
 and nothing has to be handed back. The new witness record keeps the replaced
 record's owner, except that a root-owned record in a directory the daemon user
 owns goes back to that user, and a record of a third user is refused with an
-error naming both owners. Root never changes the owner of a file it did not
-create: a restored copy whose files lost their owners must still be returned
-with `chown -R maki:maki` (see the recovery procedure below). `maki-check`,
+error naming both owners. Root never changes the owner of a file that was
+there before it ran: a restored copy whose files lost their owners must still
+be returned with `chown -R maki:maki` (see the recovery procedure below). A
+leftover `anchor.next` is removed rather than reused, so the published record
+is never a file someone else may still hold open for writing; one that a third
+user puts under that name meanwhile is refused. `maki-check`,
 which takes only a backing root path and no configuration, cannot open this
 outer format. Removing the rollback configuration stanza does not enable raw
 fallback.

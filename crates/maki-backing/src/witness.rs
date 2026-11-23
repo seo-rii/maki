@@ -198,35 +198,69 @@ fn write_temporary(
     bytes: &[u8; ENCODED_LEN],
     owner: Option<FileOwner>,
 ) -> io::Result<()> {
+    // Whoever left a file under the temporary name (a failed earlier
+    // publication, or anyone who can write the directory) may still hold a
+    // writable descriptor of it, and would keep it on the published anchor.
+    // Remove it, so the record is a file created here: for the directory's
+    // owner when root creates it in a directory another user owns
+    // (`FileBacking`).
+    match backing.remove(TEMP_FILE) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     let file = backing.open(TEMP_FILE, true)?;
-    // A file a failed earlier publication left (or anyone put) here is
-    // emptied first, so handing it over gives nobody bytes they could not
-    // read before.
+    let handed_over = match owner {
+        Some(owner) if hand_over_temporary(file.owner()?, owner)? => Some(owner),
+        _ => None,
+    };
+    // A file put back under the name since the removal is opened as it is.
+    // It is emptied first, so handing it over gives nobody bytes they could
+    // not read before.
     file.set_len(0)?;
     // Hand the new record over before it holds a byte; `publish_anchor`
     // renames it over the anchor only after this change is synced with it.
-    let given = match owner {
-        Some(owner) if file.owner()? != Some(owner) => {
-            file.set_owner(owner).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot keep the witness anchor's owner (uid {}, gid {}): {error}",
-                        owner.uid, owner.gid
-                    ),
-                )
-            })?;
-            true
-        }
-        _ => false,
-    };
+    if let Some(owner) = handed_over {
+        file.set_owner(owner).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot keep the witness anchor's owner (uid {}, gid {}): {error}",
+                    owner.uid, owner.gid
+                ),
+            )
+        })?;
+    }
     file.write_at(0, bytes)?;
     file.set_len(ENCODED_LEN as u64)?;
     // fdatasync need not persist an owner change; fsync does.
-    if given {
+    if handed_over.is_some() {
         file.sync_all()
     } else {
         file.sync_data()
+    }
+}
+
+/// Whether root gives the temporary record, owned by `temporary`, to
+/// `owner` before writing it. The record is the file just created, for the
+/// directory's owner or, in a root-owned directory, for root. A file put
+/// back under its name after the stale one was removed is opened as it is
+/// instead: one of root's or of the record owner's uid gives nobody anything
+/// (that owner can rewrite the anchor already), and is handed over like a
+/// new one. One of any other user is refused, never given away: its owner
+/// may hold a writable descriptor of it, which would then rewrite the
+/// published anchor.
+fn hand_over_temporary(temporary: Option<FileOwner>, owner: FileOwner) -> io::Result<bool> {
+    match temporary {
+        Some(temporary) if temporary == owner => Ok(false),
+        Some(temporary) if temporary.uid != 0 && temporary.uid != owner.uid => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the witness directory holds an {TEMP_FILE} of uid {}, neither root's nor the \
+                 anchor owner's (uid {}); find out who put it there before opening the witness",
+                temporary.uid, owner.uid
+            ),
+        )),
+        _ => Ok(true),
     }
 }
 
@@ -242,7 +276,8 @@ fn publish_anchor(backing: &dyn Backing, anchor: &Anchor) -> io::Result<()> {
 /// root-owned one the daemon can no longer open. Only root can give a file
 /// to another user, and only root needs to: any other process creates the
 /// record as itself. The mode is not copied; every publication creates the
-/// record owner-only (`0600`).
+/// record owner-only (`0600`), unless root or the record's owner puts a file
+/// back under the temporary name meanwhile (`hand_over_temporary`).
 fn replaced_owner(backing: &dyn Backing) -> io::Result<Option<FileOwner>> {
     if !running_as_root() {
         return Ok(None);
@@ -833,6 +868,48 @@ mod tests {
         // A third user's anchor is given to nobody.
         let error = publication_owner(Some(daemon), Some(other)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn root_hands_over_only_a_temporary_record_of_root_or_the_record_owner() {
+        use super::hand_over_temporary;
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let daemon_group = FileOwner {
+            uid: 4242,
+            gid: 4646,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        let root_group = FileOwner { uid: 0, gid: 4343 };
+        // The record owner's own file needs no change.
+        assert!(!hand_over_temporary(Some(daemon), daemon).unwrap());
+        assert!(!hand_over_temporary(Some(root), root).unwrap());
+        // Root's file, whatever its group, is handed over.
+        assert!(hand_over_temporary(Some(root), daemon).unwrap());
+        assert!(hand_over_temporary(Some(root_group), daemon).unwrap());
+        // So is the record owner's file in another group: the directory's
+        // group when the anchor keeps its own.
+        assert!(hand_over_temporary(Some(daemon_group), daemon).unwrap());
+        // A file without an owner is asked to change, which such a backing
+        // refuses.
+        assert!(hand_over_temporary(None, daemon).unwrap());
+        // Anyone else's file is refused, for any record owner.
+        for owner in [daemon, root] {
+            let error = hand_over_temporary(Some(other), owner).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("uid 4444"), "{error}");
+            assert!(
+                error.to_string().contains(&format!("uid {}", owner.uid)),
+                "{error}"
+            );
+        }
+        assert!(hand_over_temporary(Some(daemon), other).is_err());
     }
 
     #[cfg(unix)]

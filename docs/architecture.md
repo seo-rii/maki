@@ -76,7 +76,10 @@ before anything is written to it. A new directory is given away only while it
 is still empty. An entry that already exists is opened as it is and never
 changes owner, and a refused owner change removes what was created. The
 backing root itself, when `FileBacking::new` creates it, belongs to the user
-that runs the process. The local witness directory follows the same rule.
+that runs the process. The local witness directory follows the same rule,
+and its record is never published from a file another user may hold open: a
+leftover `anchor.next` is removed first, and a file that a user other than
+root or the record's owner puts back under that name meanwhile is refused.
 
 ## Read and write semantics
 
