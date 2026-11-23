@@ -50,32 +50,44 @@ struct Fixture {
     backend: EngineControlBackend,
 }
 
+fn dispatch_config() -> DispatchConfig {
+    DispatchConfig {
+        retry: RetryPolicy {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        },
+        budget: RetryBudgetConfig {
+            retry_ratio: 1.0,
+            burst: 8,
+            min_probe_per_sec: 0.0,
+        },
+        breaker: BreakerConfig::default(),
+        global_max_inflight_batches: 8,
+        global_max_inflight_bytes: 1 << 20,
+        per_endpoint_max_inflight: 8,
+        per_endpoint_max_bytes: 1 << 20,
+        max_attempts: Some(1),
+        max_operation_time: Some(DEADLINE),
+        retry_safe: true,
+        validation_interval: Duration::from_secs(1),
+    }
+}
+
 impl Fixture {
     async fn new(config: SchedulerConfig, endpoint_clock: Option<Arc<ManualClock>>) -> Self {
+        Self::with_dispatch(config, endpoint_clock, dispatch_config()).await
+    }
+
+    async fn with_dispatch(
+        config: SchedulerConfig,
+        endpoint_clock: Option<Arc<ManualClock>>,
+        dispatch: DispatchConfig,
+    ) -> Self {
         let clock = Arc::new(ManualClock::new());
         let provider = Arc::new(FakeCryptoProvider::new(UNIT));
         let endpoints = Arc::new(EndpointSet::new(
             vec![("only".into(), provider.clone())],
-            DispatchConfig {
-                retry: RetryPolicy {
-                    initial_delay: Duration::ZERO,
-                    max_delay: Duration::ZERO,
-                },
-                budget: RetryBudgetConfig {
-                    retry_ratio: 1.0,
-                    burst: 8,
-                    min_probe_per_sec: 0.0,
-                },
-                breaker: BreakerConfig::default(),
-                global_max_inflight_batches: 8,
-                global_max_inflight_bytes: 1 << 20,
-                per_endpoint_max_inflight: 8,
-                per_endpoint_max_bytes: 1 << 20,
-                max_attempts: Some(1),
-                max_operation_time: Some(DEADLINE),
-                retry_safe: true,
-                validation_interval: Duration::from_secs(1),
-            },
+            dispatch,
             endpoint_clock.unwrap_or_else(|| clock.clone()),
         ));
         let scheduler = Arc::new(BatchScheduler::new(
@@ -339,6 +351,64 @@ async fn propagated_dispatcher_expiry_is_counted_once() {
         1,
         "inner and outer accounting must not add up"
     );
+}
+
+/// A bounded-error call that ends at its deadline returns the last endpoint
+/// error when an endpoint failed it. With batching the exported counter
+/// counted only callers that received the deadline error itself.
+async fn endpoint_error_at_the_deadline(shared_clock: bool) {
+    let endpoint_clock = (!shared_clock).then(|| Arc::new(ManualClock::new()));
+    let f = Fixture::with_dispatch(
+        SchedulerConfig {
+            target_items: 1,
+            ..config()
+        },
+        endpoint_clock.clone(),
+        DispatchConfig {
+            retry: RetryPolicy {
+                initial_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(1),
+            },
+            max_attempts: None,
+            ..dispatch_config()
+        },
+    )
+    .await;
+    f.provider
+        .fail_next((0..100).map(|_| CryptoError::Throttled("HTTP 429".into())));
+    let task = f.request(1, false);
+    settle().await;
+    assert_eq!(f.provider.encrypt_calls(), 1);
+    assert!(!task.is_finished(), "the call backs off until its deadline");
+    endpoint_clock
+        .as_ref()
+        .unwrap_or(&f.clock)
+        .advance(DEADLINE);
+    settle().await;
+    assert!(task.is_finished(), "request did not finish at its deadline");
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&error, CryptoError::Throttled(message) if message == "HTTP 429"),
+        "{error:?}"
+    );
+    assert_eq!(
+        f.count().await,
+        1,
+        "an expired call is a deadline whatever it returns"
+    );
+}
+
+/// One clock: the caller's timer and the dispatcher's expire together.
+#[tokio::test]
+async fn an_endpoint_error_at_the_callers_deadline_is_exported() {
+    endpoint_error_at_the_deadline(true).await;
+}
+
+/// Independent clocks: the dispatcher's retry loop ends the call at its
+/// deadline before the caller's own timer.
+#[tokio::test]
+async fn an_endpoint_error_at_the_dispatchers_deadline_is_exported() {
+    endpoint_error_at_the_deadline(false).await;
 }
 
 #[tokio::test]
