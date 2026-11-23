@@ -167,7 +167,7 @@ The scheduled `nightly-gates` job runs:
 | `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
 | `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
-| `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
+| `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on a second filesystem) |
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
 without a name filter, so every ignored test runs, including any new gate; the
@@ -711,13 +711,15 @@ cargo test -p maki-nbdkit --test rollback_config
 ```
 
 Linux storage fixtures place the backing on the normal temporary filesystem and
-the witness under `/dev/shm`, which must have a different device identity. This
-fixture is deliberately not a persistent witness deployment. Tests cover old
-whole-image rejection, page authentication, immutable predecessor retention,
-namespace sync boundaries and open handles, witness failures and reopen
-durability, full-capacity acknowledged-write recovery, cache/overlay freshness,
-concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256 encoding vectors
-cover the witness record, manifest and page domains.
+the witness in the first of `/dev/shm`, `/run/user/<uid>`, `/var/tmp`, `/tmp`,
+`TMPDIR` and `/run` that is on another filesystem (a different device
+identity); where there is none, each such test prints that it is skipped and
+why. This fixture is deliberately not a persistent witness deployment. Tests
+cover old whole-image rejection, page authentication, immutable predecessor
+retention, namespace sync boundaries and open handles, witness failures and
+reopen durability, full-capacity acknowledged-write recovery, cache/overlay
+freshness, concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256
+encoding vectors cover the witness record, manifest and page domains.
 
 The file model adds 1,600 deterministic operations against independent working
 and durable byte images, plus capacity reuse and unlink/handle-lifetime checks.

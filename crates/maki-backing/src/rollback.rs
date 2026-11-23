@@ -1229,7 +1229,9 @@ mod tests {
     #[test]
     fn punching_an_already_zero_part_of_a_mapped_page_is_idle() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
         let file = backing.open("file", true).unwrap();
         file.write_at(0, &[1, 0, 2]).unwrap();
@@ -1250,7 +1252,9 @@ mod tests {
     #[test]
     fn clean_file_and_directory_barriers_leave_the_witness_generation_unchanged() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
         backing.create_dir_all("data/sub").unwrap();
         let file = backing.open("data/file", true).unwrap();
@@ -1289,7 +1293,9 @@ mod tests {
     #[test]
     fn listing_only_returns_direct_children_of_the_exact_directory() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
         backing.create_dir_all("data/nested").unwrap();
         backing.create_dir_all("database").unwrap();
@@ -1304,7 +1310,9 @@ mod tests {
     #[test]
     fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
         let file = backing.open("pages", true).unwrap();
         file.write_at(0, b"x").unwrap();
@@ -1425,7 +1433,9 @@ mod tests {
     #[test]
     fn local_marker_and_manifest_slot_have_fixed_encodings() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
         let identity = backing.state.lock().committed.identity;
         assert_eq!(
@@ -1472,7 +1482,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let capacity = 64 * PAGE;
         let backing = RollbackBacking::create(root.path(), witness.path(), capacity).unwrap();
         let file = backing.open("evidence", true).unwrap();
@@ -1535,7 +1547,9 @@ mod tests {
 
         for damage in ["missing", "short", "long", "directory"] {
             let root = tempfile::tempdir().unwrap();
-            let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+            let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+                return;
+            };
             let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
             let slot = backing.state.lock().manifest_slot;
             let selected = root.path().join(MANIFESTS[slot]);
@@ -1586,7 +1600,9 @@ mod tests {
     fn reopen_authenticates_selected_evidence_before_repairing_storage() {
         for damage in ["short_manifest", "long_manifest", "page"] {
             let root = tempfile::tempdir().unwrap();
-            let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+            let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+                return;
+            };
             let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
             let file = backing.open("evidence", true).unwrap();
             file.write_at(0, b"evidence").unwrap();
@@ -1770,7 +1786,9 @@ mod tests {
     #[test]
     fn creation_reclaims_closed_identities_at_the_limit() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
         for _ in 0..MAX_ENTRIES {
             let file = backing.open("temporary", true).unwrap();
@@ -1790,7 +1808,9 @@ mod tests {
     #[test]
     fn creation_preserves_live_handles_and_pending_unlinks_at_the_limit() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
         let durable = backing.open("durable", true).unwrap();
         durable.write_at(0, b"old").unwrap();
@@ -1834,7 +1854,9 @@ mod tests {
     fn persistence_failures_preserve_previous_root_and_stop_all_handles() {
         for boundary in ["arena", "manifest", "witness"] {
             let root = tempfile::tempdir().unwrap();
-            let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+            let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+                return;
+            };
             let backing = RollbackBacking::create(root.path(), witness.path(), 64 * PAGE).unwrap();
             let file = backing.open("a", true).unwrap();
             file.write_at(0, b"old").unwrap();
@@ -1885,7 +1907,9 @@ mod tests {
         for trigger in ["free_bytes", "reservation", "creation"] {
             for boundary in ["arena", "manifest", "witness"] {
                 let root = tempfile::tempdir().unwrap();
-                let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+                let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+                    return;
+                };
                 let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
                 let old = backing.open("old", true).unwrap();
                 old.write_at(0, &[0x44; PAGE as usize]).unwrap();
@@ -2003,7 +2027,9 @@ mod tests {
     #[test]
     fn uncommitted_overwrites_and_truncation_cannot_destroy_previous_pages() {
         let root = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let Some(witness) = crate::other_filesystem::tempdir(root.path()) else {
+            return;
+        };
         let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
         let file = backing.open("a", true).unwrap();
         file.write_at(0, &[0x42; 8192]).unwrap();

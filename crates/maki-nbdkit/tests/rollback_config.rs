@@ -1,27 +1,18 @@
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::MetadataExt;
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::path::Path;
 
 use maki_nbdkit::daemon::{build_backing, create_volume_from_config_str, parse_and_validate};
 
-fn fixture() -> std::io::Result<(tempfile::TempDir, tempfile::TempDir)> {
+/// The backing root and a witness on another filesystem, or `None` when
+/// there is none and the test is skipped.
+fn fixture() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
     let backing = tempfile::tempdir().expect("backing fixture");
-    let witness_parent = Path::new("/dev/shm");
-    if !witness_parent.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "/dev/shm is required for the independent-filesystem witness fixture",
-        ));
-    }
-    let witness = tempfile::tempdir_in(witness_parent)?;
-    if backing.path().metadata().unwrap().dev() == witness.path().metadata().unwrap().dev() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "/dev/shm is not independent from the temporary backing filesystem",
-        ));
-    }
-    Ok((backing, witness))
+    let witness = other_filesystem::tempdir(backing.path())?;
+    Some((backing, witness))
 }
 
 fn config(root: &Path, witness: Option<&Path>) -> String {
@@ -61,7 +52,9 @@ maximum_io = "64KiB"
 
 #[test]
 fn protected_volume_is_created_then_opened_only_with_its_witness() {
-    let (backing, witness) = fixture().expect("independent witness fixture");
+    let Some((backing, witness)) = fixture() else {
+        return;
+    };
     let raw = config(backing.path(), Some(witness.path()));
     create_volume_from_config_str(&raw).unwrap();
     let parsed = parse_and_validate(&raw).unwrap();
@@ -81,7 +74,9 @@ fn protected_volume_is_created_then_opened_only_with_its_witness() {
 
 #[test]
 fn protected_create_refuses_in_place_migration_of_a_raw_volume() {
-    let (backing, witness) = fixture().expect("independent witness fixture");
+    let Some((backing, witness)) = fixture() else {
+        return;
+    };
     create_volume_from_config_str(&config(backing.path(), None)).unwrap();
 
     let error = create_volume_from_config_str(&config(backing.path(), Some(witness.path())))

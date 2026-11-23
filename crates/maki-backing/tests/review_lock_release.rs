@@ -12,6 +12,9 @@
 #[path = "support/private_dir.rs"]
 mod private_dir;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -91,7 +94,9 @@ fn a_dropped_lock_is_free_while_a_forked_child_still_holds_its_descriptor() {
 #[test]
 fn a_closed_rollback_backing_reopens_while_a_forked_child_holds_its_descriptors() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 16 * 4096).unwrap();
     let child = PausedChild::fork();
     drop(backing);

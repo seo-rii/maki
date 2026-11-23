@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use maki_backing::{Backing, BackingFile, RollbackBacking};
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,11 +14,12 @@ const PAGE: usize = 4096;
 const PAGES: usize = 8;
 const CAPACITY: usize = PAGE * PAGES;
 
-fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
-    (
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir_in("/dev/shm").unwrap(),
-    )
+/// The backing root and a witness on another filesystem, or `None` when
+/// there is none and the test is skipped.
+fn dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+    let root = tempfile::tempdir().unwrap();
+    let witness = other_filesystem::tempdir(root.path())?;
+    Some((root, witness))
 }
 
 #[derive(Clone, Default)]
@@ -136,7 +140,9 @@ fn deterministic_state_machine_matches_independent_file_oracle() {
 
     let mut operation_counts = [0usize; 8];
     for seed in SEEDS {
-        let (root, witness) = dirs();
+        let Some((root, witness)) = dirs() else {
+            return;
+        };
         let mut backing =
             RollbackBacking::create(root.path(), witness.path(), CAPACITY as u64).unwrap();
         let mut file = backing.open("model", true).unwrap();
@@ -221,7 +227,9 @@ fn deterministic_state_machine_matches_independent_file_oracle() {
 
 #[test]
 fn removed_open_identity_cannot_redirect_a_recreated_name() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY as u64).unwrap();
     let old = backing.open("same", true).unwrap();
     old.write_at(0, b"old").unwrap();
@@ -249,7 +257,9 @@ fn removed_open_identity_cannot_redirect_a_recreated_name() {
 
 #[test]
 fn deleted_file_capacity_is_reclaimed_after_commit_and_last_handle_drop() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), PAGE as u64).unwrap();
     let old = backing.open("old", true).unwrap();
     old.write_at(0, &[0x44; PAGE]).unwrap();
@@ -278,7 +288,9 @@ fn deleted_file_capacity_is_reclaimed_after_commit_and_last_handle_drop() {
 fn unlink_reclamation_obeys_namespace_and_handle_boundaries() {
     // Closing after an uncommitted unlink cannot reclaim the file selected by
     // the durable namespace. A restart must recover both its name and bytes.
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), PAGE as u64).unwrap();
     let old = backing.open("old", true).unwrap();
     old.write_at(0, &[0x31; PAGE]).unwrap();
@@ -308,7 +320,9 @@ fn unlink_reclamation_obeys_namespace_and_handle_boundaries() {
     // A committed unlink still retains the identity while a handle can read
     // it. Once that final handle closes, the next space query may safely
     // publish reclamation and report the page available.
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), PAGE as u64).unwrap();
     let old = backing.open("old", true).unwrap();
     old.write_at(0, &[0x73; PAGE]).unwrap();
@@ -325,7 +339,9 @@ fn unlink_reclamation_obeys_namespace_and_handle_boundaries() {
 
 #[test]
 fn replaying_old_valid_arena_bytes_under_current_witness_is_rejected() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY as u64).unwrap();
     let file = backing.open("data", true).unwrap();
     file.write_at(0, &[0x19; PAGE]).unwrap();

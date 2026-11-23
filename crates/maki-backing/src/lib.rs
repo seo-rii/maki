@@ -70,6 +70,11 @@ pub fn raise_open_file_limit() -> io::Result<u64> {
 #[cfg(test)]
 extern crate self as maki_backing;
 
+// Rollback fixtures put the witness on another filesystem than the backing.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::io;
 use std::sync::Arc;
 

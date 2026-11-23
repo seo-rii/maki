@@ -43,7 +43,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 OWN_OPTION = "--open-build-tree"
-# The fixtures hard-code /tmp (and /dev/shm for a second filesystem).
+# Other users can search /tmp; some fixtures hard-code it as well.
 SCRATCH_PARENT = "/tmp"
 
 # Source file of every test target with a case that skips without root.
