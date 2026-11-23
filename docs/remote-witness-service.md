@@ -562,13 +562,31 @@ sudo -u maki maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
-and `retained` namespace arrays. Each array retains at most the first 4,096
-names in that category. The corresponding fields in `counts` give the total
+and `retained` namespace arrays, and `skipped_unreadable`, an array of
+`{"name", "error"}` objects. Each array retains at most the first 4,096
+entries in that category. The corresponding fields in `counts` give the total
 numbers processed, including any omitted details; `details_truncated` is true
-if any array omitted names. Use `counts`, not array lengths, for totals.
+if any array omitted entries. Use `counts`, not array lengths, for totals.
 An entry whose name is not valid UTF-8 is never a namespace: GC keeps it,
 lists it under `skipped_unrecognized` with U+FFFD in place of each invalid
 byte sequence, and goes on.
+
+A lower-fence namespace, or the tombstone of one, that GC cannot open or
+examine is kept and listed under `skipped_unreadable` with the step that
+failed and the system error, for example
+`opening the namespace directory: Permission denied (os error 13)` or
+`opening rollback.arena: Is a directory (os error 21)`, and GC goes on to the
+next entry. Nothing about such a namespace has been changed, and a later pass
+examines it again. A lifetime lock file that cannot be opened or tried is
+such an error, never a free lock. The usual cause is an owner: a `takeover`,
+`restore` or `resume-enrollment` run as root that a crash interrupted while
+it was creating the new namespace leaves an empty root-owned `0700`
+directory, which the daemon user's GC then reports with `Permission denied`
+on every pass. Remove that directory with `rmdir`, which removes only an
+empty one, or hand the tree back with `chown -R`
+([volume lifecycle](operations.md#volume-lifecycle)); an empty namespace
+directory without a lock file is then listed under `skipped_unrecognized`
+until it is removed.
 
 GC walks the root in sorted pages of at most 4,096 names and continues past
 pages containing only retained, live or unrecognized entries. Each page scans
@@ -585,9 +603,17 @@ closed. The current arena's fixed footprint remains allocated.
 A root operation lock excludes source-copy races. A retired namespace is
 renamed without replacement to a tombstone and the root directory is synced
 before unlinking its contents. Later passes can finish partial tombstones.
-Authority failure, a changed record, unsafe paths, unexpected files or storage
-errors postpone reclamation; a failed automatic pass does not turn successful
-activation into an unacknowledged commit. GC never removes external backups.
+Unsafe paths, unexpected files and namespaces that cannot be examined
+postpone the reclamation of that namespace only. A pass ends with an error,
+keeping every namespace it has not yet retired, when it cannot tell what may
+be deleted or cannot delete it durably: an authority failure or a changed
+record, a root whose marker, current generation, binding or listing it
+cannot read, or any failure once the retirement of a namespace has begun
+(the tombstone rename, a directory sync, an unlink), which the error names.
+A failed automatic pass does not turn successful activation into an
+unacknowledged commit, and only the log reports it: a `WARN` event gives the
+error that ended the pass, or names the first namespace the pass could not
+examine and says how many there were. GC never removes external backups.
 
 The confined retirement path requires Linux kernel 5.8 or later with `statx`
 mount identity support, a local backing filesystem and same-host lifetime

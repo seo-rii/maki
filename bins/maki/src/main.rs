@@ -762,6 +762,7 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, Stri
                 "removed": report.removed,
                 "skipped_live": report.skipped_live,
                 "skipped_unrecognized": report.skipped_unrecognized,
+                "skipped_unreadable": report.skipped_unreadable,
                 "retained": report.retained,
                 "counts": report.counts,
                 "details_truncated": report.details_truncated,

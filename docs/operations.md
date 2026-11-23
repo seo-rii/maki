@@ -140,7 +140,11 @@ the daemon, which then fails to attach. `volume create` then warns with the
 follow the same rule. A root run that a crash interrupts can leave an empty
 root-owned directory behind (or, on a filesystem without `O_TMPFILE`, an empty
 root-owned file), which later runs open as it is; hand the tree back with
-`chown -R maki:maki` after such a crash.
+`chown -R maki:maki` after such a crash. In a remote rollback backing the
+leftover of an interrupted takeover, restore or enrollment recovery is a
+writer namespace directory: the daemon keeps attaching, and its namespace
+cleanup reports that directory as one it may not open
+([GC reports](remote-witness-service.md#retire-old-writer-namespaces)).
 
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
@@ -310,7 +314,7 @@ Events that matter operationally:
 | Level | Event |
 |---|---|
 | `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary; `maki-attach` rollback halted (attach record kept) |
-| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings |
+| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings; automatic remote namespace GC did not complete, or kept namespaces it could not examine |
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
 
