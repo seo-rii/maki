@@ -10,6 +10,10 @@
 //! helper died before it recorded the mapping.
 
 #[cfg(any(target_os = "linux", test))]
+use maki_privileged::config::AttachConfig;
+#[cfg(any(target_os = "linux", test))]
+use maki_privileged::plan::Plan;
+#[cfg(any(target_os = "linux", test))]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -141,61 +145,172 @@ fn unit_settled(unit: &str, wait: Duration) -> bool {
     }
 }
 
-/// The detach plan `maki-attach cleanup --volume <volume>` would run: the
-/// trusted default configuration when it exists, built-in defaults otherwise.
-#[cfg(target_os = "linux")]
-fn detach_plan(volume: &str) -> Result<maki_privileged::plan::Plan, String> {
-    use maki_privileged::config::{self, AttachConfig, AttachOverrides};
-    let path = PathBuf::from(config::default_path(volume));
-    let config = if path.exists() {
-        maki_privileged::exec::load_trusted_config(&path)?
-    } else {
-        AttachConfig::default()
-    };
-    let request = config
-        .into_existing_request(volume, AttachOverrides::default(), false)
-        .map_err(|error| error.to_string())?;
-    Ok(maki_privileged::plan::plan_detach(&request))
+/// The plan `maki-attach cleanup --volume <volume>` runs on `config`: the
+/// rollback acts on exactly the attachment the coordinator's cleanup would.
+#[cfg(any(target_os = "linux", test))]
+fn detach_plan(volume: &str, config: AttachConfig) -> Result<Plan, String> {
+    match crate::verb_plan("cleanup", volume, config, &[], false) {
+        Ok((_, plan)) => Ok(plan),
+        Err(crate::Refusal::Invalid(reason)) => Err(reason),
+        Err(crate::Refusal::Usage) => Err("cleanup has no plan for this volume".into()),
+    }
 }
 
-/// A line for the journal. `eprintln!` panics when the write fails, and
-/// nothing here may end the hook before it returns its result.
+/// The attach configuration `maki-attach cleanup --volume <volume>` reads
+/// from `path`, its default: only a root-controlled file, or the built-in
+/// defaults when there is none.
 #[cfg(target_os = "linux")]
-fn report(message: std::fmt::Arguments<'_>) {
-    use std::io::Write as _;
-    let _ = writeln!(std::io::stderr().lock(), "maki-attach: {message}");
+fn hook_config(path: &std::path::Path) -> Result<AttachConfig, String> {
+    crate::attach_config(path, false, false)
+}
+
+/// What the hook does once a failed `ExecStart` is established: ask the
+/// manager, read the attach state, roll back. `LinuxHost` does it; the
+/// tests record it.
+#[cfg(any(target_os = "linux", test))]
+trait Host {
+    /// Whether the manager still runs the original start job of `attach`.
+    fn start_job_running(&mut self, attach: &str) -> Result<bool, String>;
+    /// Ask the manager to queue `unit`, without waiting for its job.
+    fn schedule(&mut self, unit: &str) -> Result<(), String>;
+    /// Whether this hook is, or within `SETTLE_WAIT` becomes, the only
+    /// process in `attach`'s control group.
+    fn settled(&mut self, attach: &str) -> bool;
+    /// The attach configuration of `volume`, as `hook_config` reads it.
+    fn config(&mut self, volume: &str) -> Result<AttachConfig, String>;
+    /// `maki_privileged::exec::finish_interrupted_activation` with `plan`.
+    fn roll_back(&mut self, plan: &Plan) -> Result<bool, String>;
+    /// A line for the journal.
+    fn report(&mut self, message: &str);
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxHost;
+
+#[cfg(target_os = "linux")]
+impl Host for LinuxHost {
+    fn start_job_running(&mut self, attach: &str) -> Result<bool, String> {
+        let jobs = Command::new("/usr/bin/systemctl")
+            .args([
+                "--no-ask-password",
+                "--no-pager",
+                "--no-legend",
+                "--plain",
+                "--full",
+                "list-jobs",
+                attach,
+            ])
+            .env("LC_ALL", "C")
+            .env("SYSTEMD_COLORS", "0")
+            .env("SYSTEMD_URLIFY", "0")
+            .output()
+            .map_err(|error| format!("cannot inspect failed-start job: {error}"))?;
+        if !jobs.status.success() {
+            return Err("cannot inspect failed-start job; no recovery was queued".into());
+        }
+        let jobs = std::str::from_utf8(&jobs.stdout)
+            .map_err(|_| "invalid failed-start job response; no recovery was queued".to_string())?;
+        Ok(running_start_job(jobs, attach))
+    }
+
+    fn schedule(&mut self, unit: &str) -> Result<(), String> {
+        let status = Command::new("/usr/bin/systemctl")
+            .args([
+                "--no-ask-password",
+                "--no-block",
+                "--job-mode=replace",
+                "start",
+                unit,
+            ])
+            .status()
+            .map_err(|error| format!("cannot schedule failed-start recovery: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("failed-start recovery job was not accepted; inspect the stopped lifecycle".into())
+        }
+    }
+
+    fn settled(&mut self, attach: &str) -> bool {
+        unit_settled(attach, SETTLE_WAIT)
+    }
+
+    fn config(&mut self, volume: &str) -> Result<AttachConfig, String> {
+        hook_config(std::path::Path::new(
+            &maki_privileged::config::default_path(volume),
+        ))
+    }
+
+    fn roll_back(&mut self, plan: &Plan) -> Result<bool, String> {
+        maki_privileged::exec::finish_interrupted_activation(plan, Instant::now() + ROLLBACK_BUDGET)
+            .map_err(|error| error.to_string())
+    }
+
+    /// `eprintln!` panics when the write fails, and nothing here may end
+    /// the hook before it returns its result.
+    fn report(&mut self, message: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "maki-attach: {message}");
+    }
 }
 
 /// Roll back an LVM activation the failed helper did not live to record,
 /// while the daemon still serves the device. The coordinator is already
 /// queued and runs its cleanup whatever happens here, so every failure is
 /// only reported.
-#[cfg(target_os = "linux")]
-fn finish_interrupted_activation(volume: &str, attach: &str) {
-    if !unit_settled(attach, SETTLE_WAIT) {
-        report(format_args!(
+#[cfg(any(target_os = "linux", test))]
+fn finish_interrupted_activation(volume: &str, attach: &str, host: &mut impl Host) {
+    if !host.settled(attach) {
+        host.report(&format!(
             "processes of the failed start are still running, or the control group of {attach} \
              cannot be read; leaving all cleanup to the recovery coordinator"
         ));
         return;
     }
-    let outcome = detach_plan(volume).and_then(|plan| {
-        maki_privileged::exec::finish_interrupted_activation(
-            &plan,
-            Instant::now() + ROLLBACK_BUDGET,
-        )
-        .map_err(|error| error.to_string())
-    });
+    let outcome = host
+        .config(volume)
+        .and_then(|config| detach_plan(volume, config))
+        .and_then(|plan| host.roll_back(&plan));
     match outcome {
-        Ok(true) => report(format_args!(
+        Ok(true) => host.report(&format!(
             "rolled back the interrupted LVM activation of volume {volume}"
         )),
         Ok(false) => {}
-        Err(error) => report(format_args!(
+        Err(error) => host.report(&format!(
             "could not roll back an interrupted LVM activation of volume {volume}: {error}; \
              the recovery coordinator retries cleanup after it stopped the daemon"
         )),
     }
+}
+
+/// The hook after the failed main process is established: confirm the
+/// original start job, queue the coordinator, roll back.
+#[cfg(any(target_os = "linux", test))]
+fn recover(volume: &str, host: &mut impl Host) -> Result<(), String> {
+    // SIGTERM from an operator cancellation is a failure for Type=oneshot.
+    // Its stop/restart job is the distinguishing evidence, not SERVICE_RESULT.
+    let attach = format!("maki-attach@{volume}.service");
+    if !host.start_job_running(&attach)? {
+        return Ok(());
+    }
+
+    // Never run the general cleanup here. The coordinator first stops
+    // registered workloads, then cleans up, and starts a new lifecycle only
+    // on success. Waiting for its job would deadlock: it is ordered after
+    // this hook. The original start job remains installed until
+    // ExecStopPost ends, so the coordinator's Conflicts= stop job must
+    // replace it. This is not an atomic compare-and-replace: an operator
+    // stop between the read above and this enqueue can still be replaced.
+    // Deliberately interrupting recovery requires masking the coordinator
+    // before stopping it and the workload target. Do not use
+    // replace-irreversibly here.
+    let scheduled = host.schedule(&format!("maki-recover@{volume}.service"));
+    // Queue first, roll back second: if this process is killed or runs
+    // into the stop timeout below, the coordinator is already on its way.
+    // Its stop of the daemon is ordered after this unit's stop job, which
+    // cannot finish before this hook does, so the daemon is still serving.
+    finish_interrupted_activation(volume, &attach, host);
+    scheduled
 }
 
 pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
@@ -221,69 +336,7 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        // SIGTERM from an operator cancellation is a failure for Type=oneshot.
-        // Its stop/restart job is the distinguishing evidence, not SERVICE_RESULT.
-        let attach = format!("maki-attach@{volume}.service");
-        let jobs = Command::new("/usr/bin/systemctl")
-            .args([
-                "--no-ask-password",
-                "--no-pager",
-                "--no-legend",
-                "--plain",
-                "--full",
-                "list-jobs",
-                &attach,
-            ])
-            .env("LC_ALL", "C")
-            .env("SYSTEMD_COLORS", "0")
-            .env("SYSTEMD_URLIFY", "0")
-            .output()
-            .map_err(|error| format!("cannot inspect failed-start job: {error}"))?;
-        if !jobs.status.success() {
-            return Err("cannot inspect failed-start job; no recovery was queued".into());
-        }
-        let jobs = std::str::from_utf8(&jobs.stdout)
-            .map_err(|_| "invalid failed-start job response; no recovery was queued".to_string())?;
-        if !running_start_job(jobs, &attach) {
-            return Ok(());
-        }
-
-        // Never run the general cleanup here. The coordinator first stops
-        // registered workloads, then cleans up, and starts a new lifecycle only
-        // on success. Waiting for its job would deadlock: it is ordered after
-        // this hook. The original start job remains installed until
-        // ExecStopPost ends, so the coordinator's Conflicts= stop job must
-        // replace it. This is not an atomic compare-and-replace: an operator
-        // stop between the read above and this enqueue can still be replaced.
-        // Deliberately interrupting recovery requires masking the coordinator
-        // before stopping it and the workload target. Do not use
-        // replace-irreversibly here.
-        let scheduled = Command::new("/usr/bin/systemctl")
-            .args([
-                "--no-ask-password",
-                "--no-block",
-                "--job-mode=replace",
-                "start",
-                &unit,
-            ])
-            .status()
-            .map_err(|error| format!("cannot schedule failed-start recovery: {error}"))
-            .and_then(|status| {
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(
-                        "failed-start recovery job was not accepted; inspect the stopped lifecycle"
-                            .into(),
-                    )
-                }
-            });
-        // Queue first, roll back second: if this process is killed or runs
-        // into the stop timeout below, the coordinator is already on its way.
-        // Its stop of the daemon is ordered after this unit's stop job, which
-        // cannot finish before this hook does, so the daemon is still serving.
-        finish_interrupted_activation(volume, &attach);
-        scheduled
+        recover(volume, &mut LinuxHost)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -294,12 +347,267 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        failed_main_process, other_processes, running_start_job, unit_cgroup, ROLLBACK_BUDGET,
-        SETTLE_WAIT,
+        failed_main_process, other_processes, recover, running_start_job, unit_cgroup, Host,
+        ROLLBACK_BUDGET, SETTLE_WAIT,
     };
+    use maki_privileged::config::{parse, AttachConfig};
+    use maki_privileged::plan::Plan;
+    use std::ffi::OsString;
     use std::path::Path;
 
     const ATTACH: &str = "maki-attach@recovery-fixture.service";
+
+    /// A configuration that differs from the defaults in everything the
+    /// detach plan names.
+    const CONFIG: &str = r#"
+volume_uuid = "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"
+nbd_device = "/dev/nbd5"
+nbd_socket = "/run/maki/pg/other.sock"
+vg_name = "vg_custom"
+lv_name = "db"
+mountpoint = "/srv/custom"
+"#;
+
+    /// What the hook would do on a host whose manager, attach state and
+    /// rollback answer as configured, recorded in order.
+    struct FakeHost {
+        job_running: Result<bool, String>,
+        scheduled: Result<(), String>,
+        /// What the volume's trusted record holds: `Ok(true)` an activation
+        /// intent, `Ok(false)` no intent or no record, `Err` an unreadable
+        /// record. The rollback checks it again under the lock.
+        intent: Result<bool, String>,
+        settled: bool,
+        config: Result<AttachConfig, String>,
+        /// The rollback's answer for a record that holds an intent.
+        rollback: Result<bool, String>,
+        actions: Vec<String>,
+        reports: Vec<String>,
+        plan: Option<Plan>,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            Self {
+                job_running: Ok(true),
+                scheduled: Ok(()),
+                intent: Ok(true),
+                settled: true,
+                config: Ok(parse(CONFIG).unwrap()),
+                rollback: Ok(true),
+                actions: Vec::new(),
+                reports: Vec::new(),
+                plan: None,
+            }
+        }
+
+        fn did(&self, action: &str) -> Option<usize> {
+            self.actions.iter().position(|done| done == action)
+        }
+    }
+
+    impl Host for FakeHost {
+        fn start_job_running(&mut self, attach: &str) -> Result<bool, String> {
+            self.actions.push(format!("list-jobs {attach}"));
+            self.job_running.clone()
+        }
+        fn schedule(&mut self, unit: &str) -> Result<(), String> {
+            self.actions.push(format!("start {unit}"));
+            self.scheduled.clone()
+        }
+        fn settled(&mut self, attach: &str) -> bool {
+            self.actions.push(format!("settle {attach}"));
+            self.settled
+        }
+        fn config(&mut self, volume: &str) -> Result<AttachConfig, String> {
+            self.actions.push(format!("config {volume}"));
+            self.config.clone()
+        }
+        fn roll_back(&mut self, plan: &Plan) -> Result<bool, String> {
+            self.actions.push(format!("roll back {}", plan.volume));
+            self.plan = Some(plan.clone());
+            match &self.intent {
+                Ok(true) => self.rollback.clone(),
+                other => other.clone(),
+            }
+        }
+        fn report(&mut self, message: &str) {
+            self.reports.push(message.to_string());
+        }
+    }
+
+    /// The plan `maki-attach cleanup --volume pg` runs on `config`.
+    fn cleanup_plan(config: AttachConfig) -> Plan {
+        let args: Vec<OsString> = ["cleanup", "--volume", "pg"].map(OsString::from).into();
+        match crate::verb_plan("cleanup", "pg", config, &args, false) {
+            Ok((_, plan)) => plan,
+            Err(_) => panic!("cleanup has a plan"),
+        }
+    }
+
+    /// The hook rolls back with the coordinator's own cleanup plan, after it
+    /// has queued the coordinator.
+    #[test]
+    fn an_interrupted_activation_is_rolled_back_with_the_plan_cleanup_runs() {
+        let mut host = FakeHost::new();
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        let queued = host.did("start maki-recover@pg.service").expect("queued");
+        let rolled_back = host.did("roll back pg").expect("rolled back");
+        assert!(queued < rolled_back, "{:?}", host.actions);
+        assert_eq!(
+            host.actions
+                .iter()
+                .filter(|done| done.starts_with("roll back"))
+                .count(),
+            1
+        );
+        let expected = cleanup_plan(parse(CONFIG).unwrap());
+        assert_eq!(format!("{:?}", host.plan), format!("{:?}", Some(expected)));
+        assert_ne!(
+            format!("{:?}", host.plan),
+            format!("{:?}", Some(cleanup_plan(AttachConfig::default()))),
+            "the configuration did not reach the plan"
+        );
+        assert_eq!(
+            host.reports,
+            ["rolled back the interrupted LVM activation of volume pg"]
+        );
+    }
+
+    /// A masked coordinator refuses the request (the maintenance procedure
+    /// masks it). The rollback is identity-checked and never unmounts, so
+    /// it still runs; the hook fails with the refusal.
+    #[test]
+    fn the_rollback_runs_when_the_manager_refuses_the_coordinator() {
+        let refused = "failed-start recovery job was not accepted; inspect the stopped lifecycle";
+        let mut host = FakeHost::new();
+        host.scheduled = Err(refused.into());
+        assert_eq!(recover("pg", &mut host), Err(refused.into()));
+        assert!(host.did("roll back pg").is_some(), "{:?}", host.actions);
+    }
+
+    #[test]
+    fn only_the_running_start_job_lets_the_hook_act() {
+        for job in [
+            Ok(false),
+            Err("cannot inspect failed-start job".to_string()),
+        ] {
+            let mut host = FakeHost::new();
+            host.job_running = job.clone();
+            assert_eq!(recover("pg", &mut host), job.map(drop));
+            assert_eq!(host.actions, ["list-jobs maki-attach@pg.service"]);
+            assert!(host.reports.is_empty());
+        }
+    }
+
+    /// Most failed starts leave no intent: an attach config the hook cannot
+    /// use is then none of its business, and saying it "could not roll back
+    /// an interrupted activation" reported one that never happened.
+    #[test]
+    fn without_an_interrupted_activation_the_hook_reads_no_configuration() {
+        let mut host = FakeHost::new();
+        host.intent = Ok(false);
+        host.config = Err(
+            "attach config \"/etc/maki/attach/pg.toml\" must be a root-owned regular file below \
+             root-owned directories without group/other write access: mode 0664"
+                .into(),
+        );
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        assert_eq!(host.did("config pg"), None, "{:?}", host.actions);
+        assert_eq!(host.did("settle maki-attach@pg.service"), None);
+        assert_eq!(host.did("roll back pg"), None);
+        assert!(host.reports.is_empty(), "{:?}", host.reports);
+    }
+
+    #[test]
+    fn an_unreadable_attach_record_is_reported_as_what_could_not_be_checked() {
+        let unreadable = "attach state ancestor must be a root-owned directory without \
+                          group/other write access";
+        let mut host = FakeHost::new();
+        host.intent = Err(unreadable.into());
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        assert_eq!(host.did("config pg"), None, "{:?}", host.actions);
+        assert_eq!(host.did("roll back pg"), None);
+        assert_eq!(
+            host.reports,
+            [format!(
+                "cannot tell whether volume pg has an interrupted LVM activation to roll back: \
+                 {unreadable}; leaving all cleanup to the recovery coordinator"
+            )]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_activation_with_an_unusable_configuration_names_both() {
+        let unusable = "attach config parse error: expected `=`";
+        let mut host = FakeHost::new();
+        host.config = Err(unusable.into());
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        assert_eq!(host.did("roll back pg"), None);
+        assert_eq!(
+            host.reports,
+            [format!(
+                "could not roll back the interrupted LVM activation of volume pg: {unusable}; \
+                 the recovery coordinator retries cleanup after it stopped the daemon"
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unsettled_unit_leaves_the_interrupted_activation_to_the_coordinator() {
+        let mut host = FakeHost::new();
+        host.settled = false;
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        assert_eq!(host.did("config pg"), None, "{:?}", host.actions);
+        assert_eq!(host.did("roll back pg"), None);
+        assert_eq!(
+            host.reports,
+            ["volume pg has an interrupted LVM activation, but processes of the failed start are \
+              still running, or the control group of maki-attach@pg.service cannot be read; \
+              leaving all cleanup to the recovery coordinator"]
+        );
+    }
+
+    /// The record was read without the lock. Under it, an explicit cleanup
+    /// may have retired the record, or the device may no longer carry the
+    /// recorded connection: the rollback then does nothing, and says so.
+    #[test]
+    fn a_rollback_that_finds_nothing_to_do_under_the_lock_says_so() {
+        let mut host = FakeHost::new();
+        host.rollback = Ok(false);
+        assert_eq!(recover("pg", &mut host), Ok(()));
+        assert_eq!(
+            host.reports,
+            [
+                "did not roll back the interrupted LVM activation of volume pg: under the attach \
+              lock its record no longer holds the activation intent, or its device no longer \
+              carries the recorded connection; leaving cleanup to the recovery coordinator"
+            ]
+        );
+    }
+
+    /// The rollback runs as root on what the configuration says, exactly as
+    /// cleanup does: a file others can write is refused, a missing one is
+    /// the built-in defaults.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_rollback_reads_only_a_trusted_attach_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.toml");
+        assert_eq!(
+            format!("{:?}", super::hook_config(&missing)),
+            format!("{:?}", Ok::<_, String>(AttachConfig::default()))
+        );
+        let shared = directory.path().join("pg.toml");
+        std::fs::write(&shared, CONFIG).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let error = super::hook_config(&shared).unwrap_err();
+        assert!(
+            error.contains("must be a root-owned regular file"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn only_the_attach_units_own_unified_control_group_is_inspected() {

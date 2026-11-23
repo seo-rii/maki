@@ -268,6 +268,23 @@ impl TrustedState {
         }
     }
 
+    /// How many lock requests wait for `attach.lock`, from `/proc/locks`.
+    #[cfg(test)]
+    pub(crate) fn lock_waiters(&self) -> usize {
+        let inode = format!(":{}", self.lock_file().unwrap().metadata().unwrap().ino());
+        std::fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(1) == Some(&"->")
+                    && fields
+                        .iter()
+                        .any(|field| field.matches(':').count() == 2 && field.ends_with(&inode))
+            })
+            .count()
+    }
+
     /// Verification joins the same exclusive lock without creating a file.
     pub fn lock_existing(&self) -> io::Result<StateLock> {
         let name = CString::new("attach.lock").unwrap();

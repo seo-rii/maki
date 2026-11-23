@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use maki_privileged::config::{self, AttachConfig, AttachOverrides};
-use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, GrowRequest};
+use maki_privileged::plan::{
+    plan_attach, plan_detach, plan_grow, AttachRequest, GrowRequest, Plan,
+};
 
 mod failed_start;
 
@@ -154,6 +156,103 @@ fn validate_arguments(args: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
+/// The attach configuration a verb runs on: the file at `config_path` when
+/// it was named with `--config` or exists, built-in defaults otherwise. An
+/// executing verb runs as root on what the file says: only a root-controlled
+/// file is accepted (R5-030). A plan executes nothing and reads any file.
+fn attach_config(
+    config_path: &Path,
+    explicit: bool,
+    plan_only: bool,
+) -> Result<AttachConfig, String> {
+    if !explicit && !config_path.exists() {
+        return Ok(AttachConfig::default());
+    }
+    #[cfg(target_os = "linux")]
+    if !plan_only {
+        return maki_privileged::exec::load_trusted_config(config_path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = plan_only;
+    config::load(config_path).map_err(|e| e.to_string())
+}
+
+/// Why a verb has no plan: misuse, answered with the usage, or a value that
+/// is refused for the reason given. Both exit with status 2.
+enum Refusal {
+    Usage,
+    Invalid(String),
+}
+
+/// The request and plan of `attach`, `detach`, `recover`, `cleanup` or `grow`
+/// for `volume`: `config` with the command-line overrides in `args` applied.
+/// The failed-start hook rolls back with the plan of `cleanup --volume
+/// <volume>`, which has no overrides.
+fn verb_plan(
+    verb: &str,
+    volume: &str,
+    config: AttachConfig,
+    args: &[OsString],
+    plan_only: bool,
+) -> Result<(AttachRequest, Plan), Refusal> {
+    let overrides = AttachOverrides {
+        nbd_device: flag(args, "--nbd-device"),
+        nbd_socket: flag(args, "--socket"),
+        vg_name: flag(args, "--vg"),
+        lv_name: flag(args, "--lv"),
+        mountpoint: flag(args, "--mountpoint"),
+        volume_uuid: flag(args, "--uuid"),
+        fs_uuid: flag(args, "--fs-uuid"),
+        init_sentinel: args.iter().any(|a| a == "--init-sentinel"),
+    };
+    let require_uuid = verb == "attach" && !plan_only;
+    let request = if verb == "attach" {
+        config.into_request(volume, overrides, require_uuid)
+    } else {
+        config.into_existing_request(volume, overrides, require_uuid)
+    }
+    .map_err(|e| Refusal::Invalid(e.to_string()))?;
+
+    let plan = match verb {
+        "attach" => plan_attach(&request),
+        "detach" | "recover" | "cleanup" => plan_detach(&request),
+        "grow" => {
+            // Plain decimal digits only: `u64::from_str` accepts a leading
+            // `+`, which turned an intended relative "+N" into an absolute
+            // target that an existing larger LV already met (BUG-116).
+            let Some(target) = flag(args, "--size-bytes")
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|size| *size > 0)
+            else {
+                return Err(Refusal::Usage);
+            };
+            // LVM refuses a byte size that is not sector aligned, so such a
+            // target would fail on every attempt, retries included.
+            if target % 512 != 0 {
+                return Err(Refusal::Invalid(format!(
+                    "--size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
+                     byte sizes"
+                )));
+            }
+            plan_grow(&GrowRequest {
+                volume: volume.to_string(),
+                nbd_device: request.nbd_device.clone(),
+                volume_uuid: request.volume_uuid.clone(),
+                nbd_socket: request.nbd_socket.clone(),
+                vg_name: request.vg_name.clone(),
+                lv_name: request.lv_name.clone(),
+                lvm_identity: request.lvm_identity.clone(),
+                fs_uuid: request.fs_uuid.clone(),
+                target_bytes: target,
+                mountpoint: request.mountpoint.clone(),
+            })
+        }
+        _ => return Err(Refusal::Usage),
+    };
+    Ok((request, plan))
+}
+
 fn main() -> ExitCode {
     // Executed steps and every halted rollback are reported through
     // `tracing`; without a sink they vanish and the operator sees only the
@@ -262,90 +361,20 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     }
-    let attach_config = if explicit_config.is_some() || config_path.exists() {
-        // An executing verb runs as root on what the file says: only a
-        // root-controlled file is accepted (R5-030). A plan executes
-        // nothing and reads any file.
-        #[cfg(target_os = "linux")]
-        let loaded = if plan_only {
-            config::load(&config_path).map_err(|e| e.to_string())
-        } else {
-            maki_privileged::exec::load_trusted_config(&config_path)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let loaded = config::load(&config_path).map_err(|e| e.to_string());
-        match loaded {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                diagnostic!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        AttachConfig::default()
-    };
-
-    let overrides = AttachOverrides {
-        nbd_device: flag(&args, "--nbd-device"),
-        nbd_socket: flag(&args, "--socket"),
-        vg_name: flag(&args, "--vg"),
-        lv_name: flag(&args, "--lv"),
-        mountpoint: flag(&args, "--mountpoint"),
-        volume_uuid: flag(&args, "--uuid"),
-        fs_uuid: flag(&args, "--fs-uuid"),
-        init_sentinel: args.iter().any(|a| a == "--init-sentinel"),
-    };
-    let require_uuid = verb == "attach" && !plan_only;
-    let request = if verb == "attach" {
-        attach_config.into_request(&volume, overrides, require_uuid)
-    } else {
-        attach_config.into_existing_request(&volume, overrides, require_uuid)
-    };
-    let request = match request {
-        Ok(r) => r,
+    let attach_config = match attach_config(&config_path, explicit_config.is_some(), plan_only) {
+        Ok(cfg) => cfg,
         Err(e) => {
             diagnostic!("error: {e}");
-            return ExitCode::from(2);
+            return ExitCode::FAILURE;
         }
     };
-
-    let plan = match verb {
-        "attach" => plan_attach(&request),
-        "detach" | "recover" | "cleanup" => plan_detach(&request),
-        "grow" => {
-            // Plain decimal digits only: `u64::from_str` accepts a leading
-            // `+`, which turned an intended relative "+N" into an absolute
-            // target that an existing larger LV already met (BUG-116).
-            let Some(target) = flag(&args, "--size-bytes")
-                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|size| *size > 0)
-            else {
-                return usage();
-            };
-            // LVM refuses a byte size that is not sector aligned, so such a
-            // target would fail on every attempt, retries included.
-            if target % 512 != 0 {
-                diagnostic!(
-                    "error: --size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
-                     byte sizes"
-                );
-                return ExitCode::from(2);
-            }
-            plan_grow(&GrowRequest {
-                volume,
-                nbd_device: request.nbd_device.clone(),
-                volume_uuid: request.volume_uuid.clone(),
-                nbd_socket: request.nbd_socket.clone(),
-                vg_name: request.vg_name.clone(),
-                lv_name: request.lv_name.clone(),
-                lvm_identity: request.lvm_identity.clone(),
-                fs_uuid: request.fs_uuid.clone(),
-                target_bytes: target,
-                mountpoint: request.mountpoint.clone(),
-            })
+    let (request, plan) = match verb_plan(verb, &volume, attach_config, &args, plan_only) {
+        Ok(planned) => planned,
+        Err(Refusal::Usage) => return usage(),
+        Err(Refusal::Invalid(reason)) => {
+            diagnostic!("error: {reason}");
+            return ExitCode::from(2);
         }
-        _ => return usage(),
     };
 
     let mut printed = String::new();

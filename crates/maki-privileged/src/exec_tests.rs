@@ -118,6 +118,8 @@ struct FakeSystem {
     backend_fault_after: Option<(&'static str, BackendFault)>,
     backend_fault_on_probe: Option<(usize, BackendFault)>,
     backend_probes: std::cell::Cell<usize>,
+    /// The overall limit each step ran under ([`command::finish_by`]).
+    command_limits: Vec<Option<Instant>>,
 }
 
 fn lvm_report_fixture() -> serde_json::Value {
@@ -527,6 +529,7 @@ impl System for FakeSystem {
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
+        self.command_limits.push(command::finish_by_limit());
         if self.nonzero_at == Some(step.kind()) || self.signalled_at == Some(step.kind()) {
             return Err(ExecError::StepFailed {
                 step: step.to_string(),

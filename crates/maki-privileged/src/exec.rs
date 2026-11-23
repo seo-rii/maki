@@ -1691,7 +1691,13 @@ fn cleanup_with(
 /// runs inside the unit's stop timeout, and the coordinator waits for it.
 /// Returns whether an interrupted activation was found and rolled back.
 pub fn finish_interrupted_activation(plan: &Plan, deadline: Instant) -> Result<bool, ExecError> {
-    finish_interrupted_activation_by(plan, &TrustedState::open()?, &mut LinuxSystem, deadline)
+    finish_interrupted_activation_by(
+        plan,
+        &TrustedState::open()?,
+        &mut LinuxSystem,
+        deadline,
+        Duration::ZERO,
+    )
 }
 
 fn finish_interrupted_activation_by(
@@ -1699,6 +1705,7 @@ fn finish_interrupted_activation_by(
     state: &TrustedState,
     system: &mut impl System,
     deadline: Instant,
+    _commands: Duration,
 ) -> Result<bool, ExecError> {
     // Most failed starts leave no intent, and a start often fails because the
     // global lock was busy for too long. Only the volume's own helper writes
