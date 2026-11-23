@@ -50,6 +50,13 @@ impl fmt::Debug for FileWitness {
 }
 
 impl FileWitness {
+    /// True when this relative path would occupy or descend through a witness file.
+    pub fn reserves_path(relative: &Path) -> bool {
+        [ANCHOR_FILE, TEMP_FILE, LOCK_FILE]
+            .iter()
+            .any(|file| relative.starts_with(file))
+    }
+
     pub fn create(path: &Path, identity: [u8; 16], root: [u8; 32]) -> io::Result<Self> {
         validate_identity(&identity)?;
         let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(path)?);

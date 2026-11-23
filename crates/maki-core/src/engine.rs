@@ -49,7 +49,7 @@ use maki_format::{layout, FormatError};
 
 use crate::error::CoreError;
 use crate::recovery::RecoveryError;
-use crate::volume::{Volume, VolumeOptions};
+use crate::volume::{DiscardProbe, Volume, VolumeOptions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttachError {
@@ -355,8 +355,8 @@ struct EngineInner {
     /// A completed reclamation sweep left failed ranges. Its own backoff
     /// must not postpone checkpoints needed by unrelated journal writes.
     reclamation_retry_at: parking_lot::Mutex<Option<Duration>>,
-    free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
-    /// Published samples have their own memory-only locks: `free_space`
+    free_space_refresh: parking_lot::Mutex<()>,
+    /// Published samples have their own memory-only locks: `free_space_refresh`
     /// may be held across a stalled statvfs, and `volume` across storage I/O.
     observed_free_space: parking_lot::Mutex<Option<(Option<u64>, Duration)>>,
     observed_volume: parking_lot::Mutex<VolumeSnapshot>,
@@ -441,25 +441,30 @@ impl Drop for RequestGuard<'_> {
 
 /// Sum, count and maximum of a latency series, in nanoseconds.
 #[derive(Default)]
-struct LatencyStats {
-    nanos_sum: AtomicU64,
-    count: AtomicU64,
-    nanos_max: AtomicU64,
+struct LatencyStats(parking_lot::Mutex<LatencyTotals>);
+
+#[derive(Default, Clone, Copy)]
+struct LatencyTotals {
+    nanos_sum: u128,
+    count: u64,
+    nanos_max: u64,
 }
 
 impl LatencyStats {
     fn record(&self, elapsed: Duration) {
         let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.nanos_sum.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.nanos_max.fetch_max(nanos, Ordering::Relaxed);
+        let mut totals = self.0.lock();
+        totals.nanos_sum += u128::from(nanos);
+        totals.count += 1;
+        totals.nanos_max = totals.nanos_max.max(nanos);
     }
 
     fn snapshot(&self) -> LatencySnapshot {
+        let totals = *self.0.lock();
         LatencySnapshot {
-            seconds_sum: self.nanos_sum.load(Ordering::Relaxed) as f64 / 1e9,
-            count: self.count.load(Ordering::Relaxed),
-            seconds_max: self.nanos_max.load(Ordering::Relaxed) as f64 / 1e9,
+            seconds_sum: totals.nanos_sum as f64 / 1e9,
+            count: totals.count,
+            seconds_max: totals.nanos_max as f64 / 1e9,
         }
     }
 }
@@ -775,7 +780,7 @@ impl Engine {
             checkpoints_total: AtomicU64::new(0),
             checkpoint_failures_total: AtomicU64::new(0),
             space_refused: AtomicBool::new(false),
-            free_space: parking_lot::Mutex::new(None),
+            free_space_refresh: parking_lot::Mutex::new(()),
             observed_free_space: parking_lot::Mutex::new(None),
             observed_volume: parking_lot::Mutex::new(observed_volume),
             journal_uncertain: AtomicBool::new(false),
@@ -1051,37 +1056,19 @@ impl Engine {
             let mut cached = HashMap::new();
             let mut cts = Vec::new();
             let mut seqs = HashMap::new();
+            let cache = inner
+                .cache
+                .as_ref()
+                .filter(|cache| cache.can_hold(unit_size));
+            let mut shard_len = None;
             for unit in first..=last {
-                match &inner.cache {
-                    Some(cache) if !inner.cache_verify_on_hit => {
-                        match volume.current_sequence(unit)? {
-                            None => continue,
-                            Some(seq) => {
-                                if let Some(buf) = cache.get(unit, seq) {
-                                    cached.insert(unit, buf);
-                                    continue;
-                                }
-                            }
-                        }
+                if let Some((seq, data)) =
+                    inner.read_unit(&volume, unit, &mut shard_len, cache, &mut cached)?
+                {
+                    // A configured cache may grow while decryption is in flight.
+                    if inner.cache.is_some() {
+                        seqs.insert(unit, seq);
                     }
-                    Some(cache) => {
-                        if let Some((seq, data)) = volume.read_ct(unit)? {
-                            if let Some(buf) = cache.get(unit, seq) {
-                                cached.insert(unit, buf);
-                            } else {
-                                seqs.insert(unit, seq);
-                                cts.push(CiphertextUnit {
-                                    unit_index: unit,
-                                    data,
-                                });
-                            }
-                        }
-                        continue;
-                    }
-                    None => {}
-                }
-                if let Some((seq, data)) = volume.read_ct(unit)? {
-                    seqs.insert(unit, seq);
                     cts.push(CiphertextUnit {
                         unit_index: unit,
                         data,
@@ -1092,10 +1079,22 @@ impl Engine {
         })
         .await??;
         let mut plain = self.decrypt_units(cts).await?;
+        let cache = self
+            .inner
+            .cache
+            .as_ref()
+            .filter(|cache| !plain.is_empty() && cache.can_hold(unit_size));
 
-        if let Some(cache) = &self.inner.cache {
-            for (unit, buf) in plain.iter() {
-                cache.put(*unit, seqs[unit], buf.duplicate());
+        // A whole decrypted unit is already an owned, zeroizing result.
+        if cache.is_none() && len as u64 == unit_size && first == last {
+            if let Some(buf) = plain.remove(&first) {
+                // Keep provider scratch capacity inside its original guard.
+                // The caller only needs the requested length.
+                return Ok(if buf.capacity() == len {
+                    buf
+                } else {
+                    buf.duplicate()
+                });
             }
         }
 
@@ -1108,6 +1107,9 @@ impl Engine {
             let dst = &mut out.expose_mut()[cursor..cursor + (to - from)];
             if let Some(buf) = plain.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
+                if let Some(cache) = cache {
+                    cache.put_read_unit(unit, seqs[&unit], buf);
+                }
             } else if let Some(buf) = cached.remove(&unit) {
                 dst.copy_from_slice(&buf.expose()[from..to]);
             }
@@ -1174,7 +1176,8 @@ impl Engine {
         };
         let unit_size = self.unit_size();
         let first = offset / unit_size;
-        let last = (offset + data_len as u64 - 1) / unit_size;
+        let end = offset + data_len as u64;
+        let last = (end - 1) / unit_size;
 
         // Serialize against other writers/RMW of the same units (SPEC §28).
         let guards = Arc::new(self.inner.unit_locks.lock_range(first, last).await);
@@ -1184,74 +1187,53 @@ impl Engine {
         // when it holds `(unit, sequence)`, exactly as on the read path
         // (R4-006, including `verify_on_hit`); the unit locks keep the
         // sequence stable meanwhile (R5-032).
-        let volume = self.inner.read_volume().await?;
-        let inner = self.inner.clone();
-        let io_admission = admission.clone();
-        let io_guards = guards.clone();
-        let (rmw_cts, need_rmw, cached) = storage_task(move || {
-            let (_admission, _guards) = (io_admission, io_guards);
-            let mut rmw_cts = Vec::new();
-            let mut need_rmw = Vec::new();
-            let mut cached = HashMap::new();
-            for unit in first..=last {
-                let unit_start = unit * unit_size;
-                let full =
-                    offset <= unit_start && offset + data_len as u64 >= unit_start + unit_size;
-                if full {
-                    continue;
-                }
-                need_rmw.push(unit);
-                if let Some(cache) = &inner.cache {
-                    if !inner.cache_verify_on_hit {
-                        match volume.current_sequence(unit)? {
-                            None => continue,
-                            Some(seq) => {
-                                if let Some(buf) = cache.get(unit, seq) {
-                                    cached.insert(unit, buf);
-                                    continue;
-                                }
-                            }
-                        }
+        let head = (!offset.is_multiple_of(unit_size)).then_some(first);
+        let tail = (!end.is_multiple_of(unit_size) && head != Some(last)).then_some(last);
+        let mut existing = if head.is_some() || tail.is_some() {
+            let volume = self.inner.read_volume().await?;
+            let inner = self.inner.clone();
+            let io_admission = admission.clone();
+            let io_guards = guards.clone();
+            let (rmw_cts, cached) = storage_task(move || {
+                let (_admission, _guards) = (io_admission, io_guards);
+                let mut rmw_cts = Vec::new();
+                let mut cached = HashMap::new();
+                let cache = inner
+                    .cache
+                    .as_ref()
+                    .filter(|cache| cache.can_hold(unit_size));
+                let mut shard_len = None;
+                for unit in head.into_iter().chain(tail) {
+                    if let Some((_, ct)) =
+                        inner.read_unit(&volume, unit, &mut shard_len, cache, &mut cached)?
+                    {
+                        rmw_cts.push(CiphertextUnit {
+                            unit_index: unit,
+                            data: ct,
+                        });
                     }
                 }
-                if let Some((seq, ct)) = volume.read_ct(unit)? {
-                    // With `verify_on_hit` the payload was just read and
-                    // CRC-checked; the cache only saves the decryption.
-                    let hit = inner
-                        .cache
-                        .as_ref()
-                        .filter(|_| inner.cache_verify_on_hit)
-                        .and_then(|cache| cache.get(unit, seq));
-                    if let Some(buf) = hit {
-                        cached.insert(unit, buf);
-                        continue;
-                    }
-                    rmw_cts.push(CiphertextUnit {
-                        unit_index: unit,
-                        data: ct,
-                    });
-                }
+                Ok::<_, CoreError>((rmw_cts, cached))
+            })
+            .await??;
+            let mut existing = self.decrypt_units(rmw_cts).await?;
+            for (unit, buf) in cached {
+                existing.insert(unit, buf.duplicate());
             }
-            Ok::<_, CoreError>((rmw_cts, need_rmw, cached))
-        })
-        .await??;
-        let mut existing = self.decrypt_units(rmw_cts).await?;
-        for (unit, buf) in cached {
-            existing.insert(unit, buf.duplicate());
-        }
+            existing
+        } else {
+            self.inner.check_running()?;
+            HashMap::new()
+        };
 
         let mut items = Vec::with_capacity((last - first + 1) as usize);
         for unit in first..=last {
             let unit_start = unit * unit_size;
-            let mut buf = if need_rmw.contains(&unit) {
-                existing
-                    .remove(&unit)
-                    .unwrap_or_else(|| SecretBuffer::zeroed(unit_size as usize))
-            } else {
-                SecretBuffer::zeroed(unit_size as usize)
-            };
+            let mut buf = existing
+                .remove(&unit)
+                .unwrap_or_else(|| SecretBuffer::zeroed(unit_size as usize));
             let dst_from = offset.max(unit_start) - unit_start;
-            let dst_to = (offset + data_len as u64).min(unit_start + unit_size) - unit_start;
+            let dst_to = end.min(unit_start + unit_size) - unit_start;
             let destination = &mut buf.expose_mut()[dst_from as usize..dst_to as usize];
             match data {
                 WriteInput::Borrowed(bytes) => {
@@ -1323,7 +1305,7 @@ impl Engine {
         let end = (offset + len as u64) / unit_size;
         if first >= end {
             return if fua {
-                self.flush_inner().await
+                self.flush_inner(true).await
             } else {
                 let admission = Arc::new(self.inner.admission.acquire(0).await?);
                 self.check_freshness(admission).await
@@ -1363,7 +1345,7 @@ impl Engine {
 
     async fn publish_ciphertexts(
         &self,
-        cts: Vec<CiphertextUnit>,
+        mut cts: Vec<CiphertextUnit>,
         fua: bool,
         admission: Arc<maki_crypto::flow::DualPermit>,
         guards: Arc<Vec<OwnedMutexGuard<()>>>,
@@ -1375,22 +1357,20 @@ impl Engine {
         // the queue when the task ends, however the caller is cancelled.
         let engine = self.clone();
         tokio::spawn(async move {
-            let cts = Arc::new(cts);
             let (_admission, _guards) = (admission, guards);
             let mut ticket: Option<ReclaimTicket> = None;
             let mut reclaims = 0;
             loop {
                 let mut volume = engine.inner.write_volume().await?;
                 let io_engine = engine.clone();
-                let io_cts = cts.clone();
                 let io_admission = _admission.clone();
                 let io_guards = _guards.clone();
                 let mut io_ticket = ticket.take();
-                let (outcome, io_ticket) = storage_task(move || {
+                let (outcome, next_cts, io_ticket) = storage_task(move || {
                     let (_admission, _guards) = (io_admission, io_guards);
                     let outcome = io_engine.journal_request(
                         &mut volume,
-                        &io_cts,
+                        &mut cts,
                         fua,
                         &mut io_ticket,
                         reclaims,
@@ -1403,9 +1383,10 @@ impl Engine {
                     {
                         io_engine.inner.checkpoint_notify.notify_one();
                     }
-                    (outcome, io_ticket)
+                    (outcome, cts, io_ticket)
                 })
                 .await?;
+                cts = next_cts;
                 ticket = io_ticket;
                 match outcome? {
                     Admission::Admit => return Ok(()),
@@ -1434,7 +1415,7 @@ impl Engine {
     fn journal_request(
         &self,
         volume: &mut Volume,
-        cts: &[CiphertextUnit],
+        cts: &mut [CiphertextUnit],
         fua: bool,
         ticket: &mut Option<ReclaimTicket>,
         reclaims: usize,
@@ -1445,16 +1426,22 @@ impl Engine {
         // is never read, and a damaged unit is retired by its tombstone
         // instead of failing the discard with EIO (R5-012).
         let mut filtered = Vec::new();
+        let mut recheck = false;
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
-            for ct in cts {
-                if !volume.reclaim_unwritten(ct.unit_index)? {
-                    filtered.push(CiphertextUnit {
-                        unit_index: ct.unit_index,
-                        data: Vec::new(),
-                    });
+            for ct in cts.iter() {
+                match volume.reclaim_unwritten(ct.unit_index)? {
+                    DiscardProbe::Unwritten => continue,
+                    DiscardProbe::Written => {}
+                    // A transient read failure may have hidden a hole. Retry
+                    // classification on this batch before publishing its records.
+                    DiscardProbe::Unreadable => recheck = true,
                 }
+                filtered.push(CiphertextUnit {
+                    unit_index: ct.unit_index,
+                    data: Vec::new(),
+                });
             }
-            filtered.as_slice()
+            filtered.as_mut_slice()
         } else {
             cts
         };
@@ -1473,9 +1460,20 @@ impl Engine {
                 self.inner.sync_journal(volume)?;
             }
             if ct.data.is_empty() {
-                volume.discard_ct(ct.unit_index, false)?;
+                if recheck {
+                    volume.discard_ct(ct.unit_index, false)?;
+                } else {
+                    volume.check_freshness()?;
+                    volume.append_discard(ct.unit_index, false)?;
+                }
             } else {
-                volume.write_ct(ct.unit_index, &ct.data, false)?;
+                // Admission has committed to this batch. The overlay can take
+                // the provider buffer after the journal append succeeds.
+                volume.write_ciphertext(
+                    ct.unit_index,
+                    std::mem::take(&mut ct.data).into(),
+                    false,
+                )?;
             }
             // Any cached plaintext of an older version is now dead. The
             // version key alone already prevents stale reads; this frees
@@ -1566,7 +1564,7 @@ impl Engine {
                     "reserves {reserved} plus journal append footprint {append_footprint} exceeds free-space accounting range"
                 ))
             })?;
-            let Some(free) = self.backing_free_bytes(Duration::ZERO) else {
+            let Some(free) = self.inner.backing_free_bytes(Duration::ZERO) else {
                 return Err(enospc(
                     "backing free space unavailable while emergency reserve is enabled",
                 ));
@@ -1584,24 +1582,7 @@ impl Engine {
                 )));
             }
         }
-        // Overlay bound (R4-005): the RAM held by uncheckpointed records is
-        // independent of the disk journal limit. Charge the request at its
-        // eventual size — every unit ends up with a durable copy equal to its
-        // latest version, so the projection is 2x the latest bytes — and, if
-        // it does not fit, sync and checkpoint inline exactly like the hard
-        // journal limit; after a reclaim that still cannot make room the
-        // write is refused rather than growing memory.
-        let payload: u64 = cts.iter().map(|ct| ct.data.len() as u64).sum();
-        let over_bytes = self.inner.max_overlay_bytes > 0
-            && volume
-                .overlay_bytes()
-                .max(volume.overlay_latest_bytes().saturating_mul(2))
-                .saturating_add(payload.saturating_mul(2))
-                > self.inner.max_overlay_bytes;
-        let over_entries = self.inner.max_overlay_entries > 0
-            && (volume.overlay_len() as u64).saturating_add(cts.len() as u64)
-                > self.inner.max_overlay_entries;
-        let over_overlay = over_bytes || over_entries;
+        let over_overlay = self.inner.would_exceed_overlay_limit(volume, cts);
         let over_journal = volume
             .journal_total_bytes()
             .saturating_add(footprint(volume))
@@ -1649,29 +1630,6 @@ impl Engine {
             .try_enter()
     }
 
-    /// Backing free space (`None` = unknown), allowing samples younger than
-    /// `max_age`. A zero age forces a fresh sample for write admission; stats
-    /// retain their cache and monitoring reads only the published observation.
-    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
-        let now = self.inner.clock.now();
-        let mut cache = self.inner.free_space.lock();
-        if let Some((value, at)) = *cache {
-            if now.saturating_sub(at) < max_age {
-                return value;
-            }
-        }
-        let value = match self.inner.backing.free_bytes() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("backing free-space query failed: {e}");
-                None
-            }
-        };
-        *cache = Some((value, now));
-        *self.inner.observed_free_space.lock() = Some((value, now));
-        value
-    }
-
     /// Hot-resize the plaintext read cache (SPEC §20; 0 disables).
     /// Resize the plaintext read cache. Returns `false` when the engine runs
     /// without a cache (`cache.mode = off`): there is nothing to apply, and
@@ -1695,13 +1653,12 @@ impl Engine {
     /// FLUSH barrier: everything acknowledged before this call is durable
     /// when it returns.
     pub async fn flush(&self) -> Result<(), CoreError> {
-        self.observe_request(RequestKind::Flush, false, self.flush_inner())
+        self.observe_request(RequestKind::Flush, false, self.flush_inner(false))
             .await
     }
 
-    async fn flush_inner(&self) -> Result<(), CoreError> {
-        let admission = Arc::new(self.inner.admission.acquire(0).await?);
-        self.check_freshness(admission.clone()).await?;
+    async fn flush_inner(&self, fua: bool) -> Result<(), CoreError> {
+        let admission = self.inner.admission.acquire(0).await?;
         let mut volume = self.inner.write_volume().await?;
         let inner = self.inner.clone();
         storage_task(move || {
@@ -1709,9 +1666,12 @@ impl Engine {
             let started = inner.clock.now();
             let outcome = inner.sync_journal(&mut volume);
             outcome?;
-            inner
-                .flush_latency
-                .record(inner.clock.now().saturating_sub(started));
+            let latency = if fua {
+                &inner.fua_latency
+            } else {
+                &inner.flush_latency
+            };
+            latency.record(inner.clock.now().saturating_sub(started));
             Ok(())
         })
         .await?
@@ -1758,11 +1718,15 @@ impl Engine {
             .as_ref()
             .map(|c| c.stats())
             .unwrap_or_default();
-        let engine = self.clone();
-        let backing_free_bytes =
-            storage_task(move || engine.backing_free_bytes(FREE_SPACE_CACHE_TTL))
-                .await
-                .unwrap_or(None);
+        let backing_free_bytes = match self.inner.cached_free_bytes(FREE_SPACE_CACHE_TTL) {
+            Some(value) => value,
+            None => {
+                let inner = self.inner.clone();
+                storage_task(move || inner.backing_free_bytes(FREE_SPACE_CACHE_TTL))
+                    .await
+                    .unwrap_or(None)
+            }
+        };
         let volume = self.inner.volume.read().await;
         let snapshot = VolumeSnapshot::new(&volume, self.state(), self.inner.clock.now());
         self.stats_from_snapshot(&snapshot, cache, backing_free_bytes)
@@ -1826,6 +1790,7 @@ impl Engine {
             durable_sequence: volume.durable_sequence,
             appended_sequence: volume.appended_sequence,
             checkpoint_sequence: volume.checkpoint_sequence,
+            checkpoint_lag_bytes: volume.checkpoint_lag_bytes,
             journal_segments: volume.journal_segments,
             journal_pending_bytes: volume.journal_pending_bytes,
             journal_total_bytes: volume.journal_total_bytes,
@@ -1846,6 +1811,70 @@ impl Engine {
 }
 
 impl EngineInner {
+    /// A fresh sample may itself report unknown free space.
+    fn cached_free_bytes(&self, max_age: Duration) -> Option<Option<u64>> {
+        self.observed_free_space
+            .lock()
+            .filter(|(_, at)| self.clock.now().saturating_sub(*at) < max_age)
+            .map(|(value, _)| value)
+    }
+
+    /// Backing free space (`None` = unknown), allowing samples younger than
+    /// `max_age`. A zero age forces a fresh sample for write admission; stats
+    /// retain their cache and monitoring reads only the published observation.
+    fn backing_free_bytes(&self, max_age: Duration) -> Option<u64> {
+        let _refresh = self.free_space_refresh.lock();
+        if let Some(value) = self.cached_free_bytes(max_age) {
+            return value;
+        }
+        let value = match self.backing.free_bytes() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("backing free-space query failed: {e}");
+                None
+            }
+        };
+        let now = self.clock.now();
+        *self.observed_free_space.lock() = Some((value, now));
+        value
+    }
+
+    /// Record a plaintext hit or return ciphertext to decrypt. The caller
+    /// holds the same volume read guard across version lookup and payload I/O.
+    fn read_unit(
+        &self,
+        volume: &Volume,
+        unit: u64,
+        shard_len: &mut Option<(u64, u64)>,
+        cache: Option<&maki_cache::VersionedLruCache>,
+        cached: &mut HashMap<u64, Arc<SecretBuffer>>,
+    ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        let Some(cache) = cache else {
+            return volume.read_ct_if(unit, shard_len, |_| Ok(true));
+        };
+        let mut hit = |seq| {
+            if let Some(buf) = cache.get(unit, seq) {
+                cached.insert(unit, buf);
+                true
+            } else {
+                false
+            }
+        };
+        if self.cache_verify_on_hit {
+            return Ok(volume
+                .read_ct_if(unit, shard_len, |_| Ok(true))?
+                .filter(|(seq, _)| !hit(*seq)));
+        }
+        volume.read_ct_if(unit, shard_len, |seq| {
+            if hit(seq) {
+                return Ok(false);
+            }
+            // Keep the freshness check between a cache miss and payload I/O.
+            volume.check_freshness()?;
+            Ok(true)
+        })
+    }
+
     /// Explicit journal barriers, including failed syncs. This excludes
     /// provider, volume-lock and blocking-pool wait; public callback guards
     /// measure those waits in the full request latency instead.
@@ -1993,6 +2022,39 @@ impl EngineInner {
             && volume.journal_sealed_segment_count() > 0
     }
 
+    fn would_exceed_overlay_limit(&self, volume: &Volume, records: &[CiphertextUnit]) -> bool {
+        if self.max_overlay_entries == 0 && self.max_overlay_bytes == 0 {
+            return false;
+        }
+        let entries = volume.overlay_len() as u64;
+        let bytes = volume
+            .overlay_bytes()
+            .max(volume.overlay_latest_bytes().saturating_mul(2));
+        // A journal sync (including a segment roll within the batch) can
+        // promote each latest version to a second, durable charge.
+        let exceeds = |new_entries: u64, growth: u64| {
+            (self.max_overlay_entries > 0
+                && entries.saturating_add(new_entries) > self.max_overlay_entries)
+                || (self.max_overlay_bytes > 0
+                    && bytes.saturating_add(growth.saturating_mul(2)) > self.max_overlay_bytes)
+        };
+        // Skip overlay lookups while even a wholly new batch would fit.
+        let payload = records.iter().map(|ct| ct.data.len() as u64).sum();
+        if !exceeds(records.len() as u64, payload) {
+            return false;
+        }
+        let mut new_entries = 0;
+        let mut growth = 0;
+        for ct in records {
+            let previous = volume.overlay_ciphertext_len(ct.unit_index);
+            new_entries += u64::from(previous.is_none());
+            // Never spend space from a later shrinking overwrite. Every
+            // prefix must fit even if an append fails partway through.
+            growth += ct.data.len().saturating_sub(previous.unwrap_or(0)) as u64;
+        }
+        exceeds(new_entries, growth)
+    }
+
     /// The overlay has crossed half of a configured bound (R4-005): the
     /// worker should checkpoint before write admission has to do it inline.
     fn overlay_above_watermark(&self, volume: &Volume) -> bool {
@@ -2066,14 +2128,12 @@ impl EngineInner {
             return;
         }
         let by_space = if !reclaim && self.policy.low_space_checkpoint_bytes > 0 {
-            let backing = self.backing.clone();
-            storage_task(move || backing.free_bytes())
+            let inner = self.clone();
+            storage_task(move || inner.backing_free_bytes(Duration::ZERO))
                 .await
                 .ok()
-                .and_then(Result::ok)
                 .flatten()
-                .map(|free| free < self.policy.low_space_checkpoint_bytes)
-                .unwrap_or(false)
+                .is_some_and(|free| free < self.policy.low_space_checkpoint_bytes)
         } else {
             false
         };
@@ -2397,6 +2457,7 @@ struct VolumeSnapshot {
     durable_sequence: u64,
     appended_sequence: u64,
     checkpoint_sequence: u64,
+    checkpoint_lag_bytes: u64,
     journal_segments: usize,
     journal_pending_bytes: u64,
     journal_total_bytes: u64,
@@ -2414,6 +2475,7 @@ impl VolumeSnapshot {
             durable_sequence: volume.journal_durable_sequence(),
             appended_sequence: volume.journal_appended_sequence(),
             checkpoint_sequence: volume.checkpoint_sequence(),
+            checkpoint_lag_bytes: volume.checkpoint_lag_bytes(),
             journal_segments: volume.journal_segment_count(),
             journal_pending_bytes: volume.journal_pending_bytes(),
             journal_total_bytes: volume.journal_total_bytes(),
@@ -2478,6 +2540,8 @@ pub struct EngineStats {
     pub durable_sequence: u64,
     pub appended_sequence: u64,
     pub checkpoint_sequence: u64,
+    /// Durable journal record bytes newer than the published checkpoint.
+    pub checkpoint_lag_bytes: u64,
     pub journal_segments: usize,
     /// Appended but not yet fdatasync'd bytes.
     pub journal_pending_bytes: u64,
@@ -2499,4 +2563,35 @@ pub struct EngineStats {
     pub checkpoints_total: u64,
     pub checkpoint_failures_total: u64,
     pub state: EngineState,
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    #[test]
+    fn concurrent_snapshots_describe_one_set_of_observations() {
+        let series = LatencyStats::default();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for _ in 0..100_000 {
+                    series.record(Duration::from_millis(1));
+                }
+            });
+            start.wait();
+            loop {
+                let sample = series.snapshot();
+                assert_eq!((sample.seconds_sum * 1000.).round() as u64, sample.count);
+                if sample.count > 0 {
+                    assert_eq!(sample.seconds_max, 0.001);
+                }
+                if writer.is_finished() {
+                    break;
+                }
+            }
+            writer.join().unwrap();
+        });
+        assert_eq!(series.snapshot().count, 100_000);
+    }
 }

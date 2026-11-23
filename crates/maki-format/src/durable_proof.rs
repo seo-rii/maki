@@ -46,7 +46,7 @@ impl DurableProof {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(DURABLE_PROOF_SIZE);
         writer
             .bytes(DURABLE_PROOF_MAGIC)
             .u32(DURABLE_PROOF_VERSION)
@@ -159,15 +159,34 @@ impl AbRecord for DurableProof {
 /// files: their absence must never trigger legacy recovery or initialization.
 pub struct DurableProofStore;
 
+struct ProofCopy {
+    proof: DurableProof,
+    bytes: [u8; DURABLE_PROOF_SIZE],
+}
+
 impl DurableProofStore {
     /// Select the highest valid horizon without modifying storage. A single
     /// invalid/absent side is recoverable; hard I/O, an unsupported version,
     /// foreign UUID, inconsistent pair, or no valid side fails closed.
     pub fn load(backing: &dyn Backing, volume_uuid: Uuid) -> Result<DurableProof, FormatError> {
-        let a = Self::read_copy(backing, DURABLE_PROOF_A, volume_uuid)?;
-        let b = Self::read_copy(backing, DURABLE_PROOF_B, volume_uuid)?;
-        match (a, b) {
-            (Some(a), Some(b)) => {
+        let copies = Self::read_copies(backing, volume_uuid)?;
+        Ok(Self::current(&copies)?.clone())
+    }
+
+    fn read_copies(
+        backing: &dyn Backing,
+        volume_uuid: Uuid,
+    ) -> Result<[Option<ProofCopy>; 2], FormatError> {
+        Ok([
+            Self::read_copy(backing, DURABLE_PROOF_A, volume_uuid)?,
+            Self::read_copy(backing, DURABLE_PROOF_B, volume_uuid)?,
+        ])
+    }
+
+    fn current(copies: &[Option<ProofCopy>; 2]) -> Result<&DurableProof, FormatError> {
+        match copies {
+            [Some(a), Some(b)] => {
+                let (a, b) = (&a.proof, &b.proof);
                 if a.generation == b.generation && a != b {
                     return Err(FormatError::Invalid(
                         "durable proof copies disagree at the same generation".into(),
@@ -178,11 +197,11 @@ impl DurableProofStore {
                 } else {
                     (b, a)
                 };
-                newer.follows(&older)?;
+                newer.follows(older)?;
                 Ok(newer)
             }
-            (Some(proof), None) | (None, Some(proof)) => Ok(proof),
-            (None, None) => Err(FormatError::Invalid(
+            [Some(copy), None] | [None, Some(copy)] => Ok(&copy.proof),
+            [None, None] => Err(FormatError::Invalid(
                 "required durable proof has no valid copy".into(),
             )),
         }
@@ -221,27 +240,29 @@ impl DurableProofStore {
     /// the other side. Call only after the candidate's data is durable.
     pub fn advance(backing: &dyn Backing, proof: &mut DurableProof) -> Result<(), FormatError> {
         proof.validate()?;
-        let current = Self::load(backing, proof.volume_uuid)?;
-        proof.follows(&current)?;
-        if proof.generation > current.generation {
-            return Err(FormatError::Invalid(
-                "candidate proof generation is ahead of stored metadata".into(),
-            ));
-        }
-        current
-            .generation
-            .checked_add(2)
-            .ok_or_else(|| FormatError::Overflow("durable proof generation exhausted".into()))?;
         let mut candidate = proof.clone();
         let store = AbStore::new(DURABLE_PROOF_A, DURABLE_PROOF_B);
-        // Each store rewrites/syncs its preserved valid side before touching
-        // the lower/invalid side. Calling twice makes BOTH copies attest this
-        // horizon, even when one was absent or stale before this operation.
-        store.store(backing, &mut candidate)?;
-        backing.sync_dir(layout::JOURNAL_DIR)?;
-        Self::load(backing, proof.volume_uuid)?;
-        store.store(backing, &mut candidate)?;
-        backing.sync_dir(layout::JOURNAL_DIR)?;
+        for remaining in [2, 1] {
+            let copies = Self::read_copies(backing, proof.volume_uuid)?;
+            let current = Self::current(&copies)?;
+            candidate.follows(current)?;
+            if candidate.generation > current.generation {
+                return Err(FormatError::Invalid(
+                    "candidate proof generation is ahead of stored metadata".into(),
+                ));
+            }
+            current.generation.checked_add(remaining).ok_or_else(|| {
+                FormatError::Overflow("durable proof generation exhausted".into())
+            })?;
+            if let [Some(a), Some(b)] = &copies {
+                store.store_with_images(backing, &mut candidate, Some(&a.bytes), Some(&b.bytes))?;
+            } else {
+                // An invalid copy can still have a CRC-valid raw generation.
+                // Preserve ordinary A/B ranking when repairing that side.
+                store.store(backing, &mut candidate)?;
+            }
+            backing.sync_dir(layout::JOURNAL_DIR)?;
+        }
         *proof = candidate;
         Ok(())
     }
@@ -253,7 +274,7 @@ impl DurableProofStore {
         backing: &dyn Backing,
         path: &str,
         volume_uuid: Uuid,
-    ) -> Result<Option<DurableProof>, FormatError> {
+    ) -> Result<Option<ProofCopy>, FormatError> {
         let file = match backing.open(path, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -288,7 +309,7 @@ impl DurableProofStore {
             Err(error) => return Err(error.into()),
         }
         match DurableProof::decode(&bytes) {
-            Ok(proof) if proof.volume_uuid == volume_uuid => Ok(Some(proof)),
+            Ok(proof) if proof.volume_uuid == volume_uuid => Ok(Some(ProofCopy { proof, bytes })),
             Ok(_) => Err(FormatError::Invalid(
                 "durable proof belongs to a different volume".into(),
             )),

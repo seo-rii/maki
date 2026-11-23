@@ -86,3 +86,27 @@ async fn a_partial_write_without_a_cached_copy_still_reads_the_unit() {
     expected[512..1024].fill(2);
     assert_eq!(engine.read(0, 4096).await.unwrap(), expected);
 }
+
+#[tokio::test]
+async fn writes_preserve_both_partial_edges_around_a_whole_unit() {
+    let (_, engine) = engine(false).await;
+    let mut expected = vec![1; 3 * 4096];
+    engine.write(0, &expected, true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    let range = 512..(2 * 4096 + 512);
+    let update = vec![2; range.len()];
+    engine
+        .write(range.start as u64, &update, true)
+        .await
+        .unwrap();
+    expected[range.clone()].copy_from_slice(&update);
+    assert_eq!(engine.read(0, expected.len()).await.unwrap(), expected);
+
+    engine
+        .write_zeroes(range.start as u64, range.len(), true)
+        .await
+        .unwrap();
+    expected[range].fill(0);
+    assert_eq!(engine.read(0, expected.len()).await.unwrap(), expected);
+}

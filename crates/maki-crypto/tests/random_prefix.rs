@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -25,6 +28,8 @@ struct Call {
 struct RecordingProvider {
     caps: CryptoCapabilities,
     calls: Mutex<Vec<Call>>,
+    capability_calls: AtomicUsize,
+    decrypt_allocations: Mutex<Vec<usize>>,
     deadline: Option<Duration>,
     encrypt_error: bool,
     no_op: bool,
@@ -52,6 +57,8 @@ impl RecordingProvider {
                 replay_protection: Capability::Absent,
             },
             calls: Mutex::new(Vec::new()),
+            capability_calls: AtomicUsize::new(0),
+            decrypt_allocations: Mutex::new(Vec::new()),
             deadline: Some(Duration::from_secs(7)),
             encrypt_error: false,
             no_op: false,
@@ -67,6 +74,7 @@ impl CryptoProvider for RecordingProvider {
         self.deadline
     }
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
+        self.capability_calls.fetch_add(1, Ordering::Relaxed);
         Ok(self.caps.clone())
     }
     async fn encrypt_batch(
@@ -99,6 +107,11 @@ impl CryptoProvider for RecordingProvider {
                 out.pop();
             }
             Some("reordered") => out.reverse(),
+            Some("logical echo") => {
+                for (output, input) in out.iter_mut().zip(items) {
+                    output.data = input.data.expose()[PREFIX as usize..].to_vec();
+                }
+            }
             _ => {}
         }
         Ok(out)
@@ -133,6 +146,10 @@ impl CryptoProvider for RecordingProvider {
             indices: items.iter().map(|x| x.unit_index).collect(),
             plaintexts: vec![],
         });
+        *self.decrypt_allocations.lock().unwrap() = out
+            .iter()
+            .map(|item| item.data.expose().as_ptr() as usize)
+            .collect();
         Ok(out)
     }
 }
@@ -191,14 +208,10 @@ async fn prefixes_each_item_fresh_and_translates_only_compatibility_id() {
 
 #[tokio::test]
 async fn roundtrip_strips_prefix_and_preserves_order() {
-    let wrapper = RandomPrefixProvider::new(
-        Arc::new(RecordingProvider::new()),
-        LOGICAL,
-        PREFIX,
-        "outer-v1".into(),
-    )
-    .await
-    .unwrap();
+    let inner = Arc::new(RecordingProvider::new());
+    let wrapper = RandomPrefixProvider::new(inner.clone(), LOGICAL, PREFIX, "outer-v1".into())
+        .await
+        .unwrap();
     let ciphertext = wrapper
         .encrypt_batch(&context("outer-v1"), &units())
         .await
@@ -210,6 +223,14 @@ async fn roundtrip_strips_prefix_and_preserves_order() {
     assert_eq!(
         plaintext.iter().map(|x| x.unit_index).collect::<Vec<_>>(),
         vec![8, 2]
+    );
+    assert_eq!(inner.capability_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        plaintext
+            .iter()
+            .map(|item| item.data.expose().as_ptr() as usize)
+            .collect::<Vec<_>>(),
+        *inner.decrypt_allocations.lock().unwrap()
     );
     assert_eq!(plaintext[0].data.expose(), &[0x31; LOGICAL as usize]);
     assert_eq!(plaintext[1].data.expose(), &[0x72; LOGICAL as usize]);
@@ -449,5 +470,19 @@ async fn no_op_inner_provider_cannot_hide_behind_random_prefix() {
         .await,
         Err(error) if error.class() == maki_crypto::ErrorClass::ProviderFatal
             && error.to_string().contains("not encrypting")
+    ));
+}
+
+#[tokio::test]
+async fn checking_padded_input_does_not_exempt_the_logical_plaintext() {
+    let inner = Arc::new(RecordingProvider::new());
+    let wrapper = RandomPrefixProvider::new(inner.clone(), LOGICAL, PREFIX, "outer-v1".into())
+        .await
+        .unwrap();
+    let checked = maki_crypto::checked::CheckedProvider::new(Arc::new(wrapper));
+    *inner.encrypt_shape.lock().unwrap() = Some("logical echo");
+    assert!(matches!(
+        checked.encrypt_batch(&context("outer-v1"), &units()).await,
+        Err(CryptoError::Contract(reason)) if reason.contains("carries its plaintext")
     ));
 }

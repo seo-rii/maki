@@ -163,6 +163,20 @@ fn assert_inventory_attaches(count: usize, hidden: bool) {
 }
 
 #[test]
+fn allocated_nbd_device_conflicting_with_the_vg_fails_before_connect() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut request = request();
+    request.vg_name = "nbd3".into();
+    let mut system = FakeSystem::default();
+    let error = execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap_err();
+    assert!(error.to_string().contains("nbd_device"), "{error}");
+    assert!(system.backends.is_empty());
+    assert!(state.read("pg").unwrap().is_none());
+    assert_eq!(system.steps, ["modprobe-nbd"]);
+}
+
+#[test]
 fn supported_lvm_inventory_sizes_persist_activation_intent_and_attach() {
     for count in [1, 40, 64] {
         assert_inventory_attaches(count, false);
@@ -472,6 +486,7 @@ impl System for FakeSystem {
         }
         Ok(DetachObservation {
             mounted: self.mounted,
+            writable: self.mounted,
             vg_active: self.vg_active,
             nbd_in_use: self.vg_active || self.extra_holders,
             nested: false,
@@ -1054,11 +1069,13 @@ fn grow_request() -> GrowRequest {
     let r = request();
     GrowRequest {
         volume: r.volume,
+        nbd_device: r.nbd_device,
         volume_uuid: r.volume_uuid,
         nbd_socket: r.nbd_socket,
         vg_name: r.vg_name,
         lv_name: r.lv_name,
         lvm_identity: r.lvm_identity,
+        fs_uuid: None,
         target_bytes: 2 << 30,
         mountpoint: r.mountpoint,
     }
@@ -1098,7 +1115,8 @@ fn review_next_grow_rejects_reused_backend_and_changed_targets() {
     system.steps.clear();
 
     // Changed targets: a different VG/LV/mountpoint/uuid does not match.
-    let mutations: [fn(&mut GrowRequest); 4] = [
+    let mutations: [fn(&mut GrowRequest); 5] = [
+        |g| g.nbd_device = "/dev/nbd8".into(),
         |g| g.vg_name = "vg_other".into(),
         |g| g.lv_name = "other".into(),
         |g| g.mountpoint = "/srv/other".into(),
@@ -1951,4 +1969,35 @@ fn filesystem_uuid_probe_never_reads_a_mount_source_as_an_option() {
         ["--".to_string(), "/dev/mapper/vg-data".to_string()],
         "{args:?}"
     );
+}
+
+#[test]
+fn pinned_grow_probes_the_xfs_identity_before_either_mutation() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem::default();
+    execute_with(&plan_attach(&request()), Some(&state), &mut system).unwrap();
+    let mut grow = grow_request();
+    grow.fs_uuid = Some("9cb23df6-7933-403a-9c27-dec378eba46f".into());
+    let plan = plan_grow(&grow);
+    assert_eq!(
+        plan.steps.iter().map(PlannedStep::kind).collect::<Vec<_>>(),
+        [
+            "verify-filesystem-identity",
+            "lvextend",
+            "verify-filesystem-identity",
+            "xfs-growfs"
+        ]
+    );
+    for i in [0, 2] {
+        assert!(
+            matches!(&plan.steps[i], PlannedStep::VerifyFilesystemIdentity {fs_uuid, device}
+            if fs_uuid == &grow.fs_uuid && device == &format!("/dev/{}/{}", grow.vg_name, grow.lv_name))
+        );
+    }
+    system.steps.clear();
+    system.fail_at = Some("verify-filesystem-identity");
+    assert!(execute_with(&plan, Some(&state), &mut system).is_err());
+    assert_eq!(system.steps, ["verify-filesystem-identity"]);
 }

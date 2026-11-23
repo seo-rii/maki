@@ -9,10 +9,15 @@ use std::os::unix::fs::PermissionsExt;
 thread_local! {
     static WATCHING: Cell<bool> = const { Cell::new(false) };
     static COPIES: Cell<usize> = const { Cell::new(0) };
+    static REFERENCE_SIZE: Cell<Option<usize>> = const { Cell::new(None) };
+    static REFERENCE_ALLOCS: Cell<usize> = const { Cell::new(0) };
 }
 struct Observer;
 unsafe impl GlobalAlloc for Observer {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if REFERENCE_SIZE.try_with(Cell::get).unwrap_or(None) == Some(layout.size()) {
+            let _ = REFERENCE_ALLOCS.try_with(|counter| counter.set(counter.get() + 1));
+        }
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
@@ -30,6 +35,59 @@ unsafe impl GlobalAlloc for Observer {
 }
 #[global_allocator]
 static ALLOCATOR: Observer = Observer;
+
+#[tokio::test]
+async fn grpc_metadata_setup_scales_linearly_with_credential_references() {
+    let directory = tempfile::tempdir().unwrap();
+    let token = directory
+        .path()
+        .join("metadata-key-with-a-distinctive-reference-length");
+    std::fs::write(&token, "fixture").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let path = token.to_str().unwrap();
+    let mut counts = Vec::new();
+    for headers in [8, 32] {
+        let metadata: String = (0..headers)
+            .map(|i| format!("x-{i} = {{ source = 'file', name = '{path}' }}\n"))
+            .collect();
+        let root = directory.path().join(format!("volume-{headers}"));
+        let raw = format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "grpc-metadata"
+max_virtual_size = "1MiB"
+[crypto]
+provider = "remote-grpc"
+crypto_compatibility_id = "review-v1"
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4124
+[[crypto.grpc.endpoint]]
+name = "one"
+url = "http://127.0.0.1:9"
+[crypto.grpc.metadata]
+{metadata}[backing]
+root = "{}"
+"#,
+            root.display()
+        );
+        create_volume_from_config_str(&raw).unwrap();
+        let config = maki_format::config::parse_config(&raw).unwrap();
+        REFERENCE_ALLOCS.with(|counter| counter.set(0));
+        REFERENCE_SIZE.with(|size| size.set(Some(path.len())));
+        let result = build_provider(&config).await;
+        REFERENCE_SIZE.with(|size| size.set(None));
+        result.unwrap();
+        counts.push(REFERENCE_ALLOCS.with(Cell::get));
+    }
+    // Four times as many headers should not need a new copy of the whole
+    // routing table for each one. Allow slack for allocator size coincidences.
+    assert!(
+        counts[1] <= 6 * counts[0],
+        "reference allocations: {counts:?}"
+    );
+}
 
 #[tokio::test]
 async fn resolution_and_endpoint_errors_release_no_unerased_credential_copies() {

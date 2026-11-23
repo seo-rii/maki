@@ -1,6 +1,5 @@
 //! Pending-byte limits apply between every record, including inside one request.
 
-use maki_backing::Backing;
 use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::VolumeOptions;
 use maki_crypto::Clock;
@@ -55,7 +54,7 @@ async fn engine_with_backing(
     let backing = Arc::new(CrashableBacking::new().with_tearing(17));
     init::create_volume(backing.as_ref(), block()).unwrap();
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             volume: VolumeOptions {
@@ -229,7 +228,7 @@ async fn a_failed_intermediate_sync_stops_append_and_can_resume() {
     drop(e);
     backing.crash_all_lost();
     let reopened = Engine::attach(
-        backing as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             volume: VolumeOptions {

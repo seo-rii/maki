@@ -260,3 +260,53 @@ async fn cancelling_a_queued_tail_releases_its_data_and_admission_while_live_bat
     assert_eq!(provider.encrypt_calls(), 2);
     assert_eq!(scheduler.stats().pending_items(), 0);
 }
+
+#[tokio::test]
+async fn cancelling_several_waiters_together_releases_the_batch_and_its_queued_tail() {
+    let clock = Arc::new(ManualClock::new());
+    let provider = Arc::new(FakeCryptoProvider::new(64));
+    provider.set_latency(clock.clone(), Duration::from_secs(10));
+    let scheduler = Arc::new(BatchScheduler::new(
+        provider.clone(),
+        config(),
+        clock.clone(),
+    ));
+    let active = request(&scheduler, 0);
+    settle().await;
+
+    let ctx = context();
+    let inputs = [
+        [plaintext(1)],
+        [plaintext(2)],
+        [plaintext(3)],
+        [plaintext(4)],
+    ];
+    let mut waiting: Vec<_> = inputs
+        .iter()
+        .map(|units| scheduler.encrypt_batch(&ctx, units))
+        .collect();
+    std::future::poll_fn(|cx| {
+        for caller in &mut waiting {
+            assert!(caller.as_mut().poll(cx).is_pending());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+    settle().await;
+    assert_eq!(scheduler.stats().pending_items(), 4);
+
+    // Drop the slot waiter and two later requests before the lane can run.
+    let survivor = waiting.remove(2);
+    drop(waiting);
+    settle().await;
+    assert_eq!(scheduler.stats().pending_items(), 1);
+    assert_eq!(scheduler.stats().pending_bytes(), 64);
+    assert_eq!(provider.encrypt_calls(), 1);
+
+    provider.set_latency(clock.clone(), Duration::ZERO);
+    clock.advance(Duration::from_secs(10));
+    active.await.unwrap().unwrap();
+    assert_eq!(survivor.await.unwrap()[0].unit_index, 3);
+    assert_eq!(provider.encrypt_calls(), 2);
+    assert_eq!(scheduler.stats().pending_items(), 0);
+}

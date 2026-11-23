@@ -95,6 +95,19 @@ The line includes the actual listening address. Service-manager integration,
 network policy and independently managed persistent storage are operator
 provisioning steps.
 
+A local authority answers a change only after writing and syncing
+`remote.next`, renaming it over `remote.state` and syncing the directory. A
+failure before the rename (EMFILE, ENOSPC or EIO while opening, writing or
+syncing `remote.next`) leaves `remote.state` unchanged: that request is
+answered as unavailable and later requests are served normally. After a
+failed rename or directory sync either state may be the published one, so
+`serve` answers every request as unavailable until it is restarted; it keeps
+running and does not exit by itself. The restart serves and re-publishes the
+state it reads, and clients resolve their pending request against it. A
+`remote.state` that changes, disappears or stops decoding while `serve` holds
+its lock also makes it answer unavailable until a restart, which then serves
+whatever valid state the file holds: find out what changed it first.
+
 ## Initialize a replicated authority
 
 Provision an independently managed, persistent etcd cluster with at least three
@@ -349,7 +362,17 @@ as the EPERM Linux returns from `connect()` when a firewall drops the
 connection, is a transport failure like a refused connection, not a denial. A
 trusted client certificate that a frontend's allow-list does not name is a
 denial: the frontend answers it, so an allow-list mistake is reported as
-`PermissionDenied`, not as an unavailable witness.
+`PermissionDenied`, not as an unavailable witness. A certificate that the
+frontend's CA bundle does not trust is refused during the TLS handshake with a
+fatal alert, which the client reports as `PermissionDenied` once its side of
+the full handshake reaches the client authentication messages. Earlier alerts,
+alerts on resumed handshakes, and generic `HandshakeFailure` alerts report
+`InvalidData`. Both error kinds stop frontend failover. In TLS 1.3 the
+client writes its request before the frontend has checked its certificate, so
+the frontend has often closed the connection by then; the client then reads the
+alert the frontend sent before closing instead of reporting the broken pipe or
+reset. This relies on Linux keeping received data readable after a reset. A
+connection that closes without an alert remains a transport failure.
 
 Inspect through the configured client without claiming a session:
 
@@ -417,6 +440,21 @@ an authority read confirms the released new session. A concurrent new claim can
 cause confirmation failure even when the transition completed; inspect before
 proceeding.
 
+A restore cannot be undone from the backing root. Once the restored state is
+activated, the automatic GC pass ([below](#retire-old-writer-namespaces))
+retires every lower-fence namespace whose lifetime lock is free. With the
+daemon stopped (step 1), that includes the namespace holding the newer state
+the restore replaces, so the restore command itself deletes it; a process
+that still holds it open only defers the deletion to a later GC. The snapshot
+you restore from stays in its backup directory, which GC never touches. If
+the newer state may be needed again, as data or as evidence, first snapshot
+it into a new backup directory as described above and keep its approved
+root. That snapshot claims and releases a writer session, which raises the
+fence but keeps the current root, so inspect again with `maki volume witness`
+and use the new fence in the restore command. A current generation that no
+longer authenticates cannot be snapshotted; preserve a copy of the stopped
+backing directory as evidence instead.
+
 An intentional older-snapshot restoration requires its independently approved
 root as well:
 
@@ -429,6 +467,13 @@ an epoch change. It increases fence, generation and epoch. Malformed,
 truncated, oversized, noncanonical or symlinked descriptors are refused. Wrong
 approval values and writer credentials cannot authorize restore or takeover.
 Snapshot, takeover and restore require Linux.
+
+Restore only reads the snapshot directory: it opens its files read-only and
+shares the snapshot's `remote.operation.lock`, which an operation that changes
+that directory holds exclusively. The snapshot can therefore stay where nothing
+can change it, such as a read-only mount, immutable files, a read-only export,
+or files the administrator may not write. Keep the empty lock file in copies:
+restore creates a missing one, which needs write access.
 
 The configured `backing.root` must belong to the approved storage identity.
 Restore checks its immutable `remote.enrollment` identity and capacity before

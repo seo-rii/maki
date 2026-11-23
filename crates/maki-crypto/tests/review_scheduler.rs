@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_crypto::scheduler::{BatchScheduler, SchedulerConfig};
-use maki_crypto::{Clock, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer};
+use maki_crypto::{CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer};
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::ManualClock;
 
@@ -222,11 +222,98 @@ async fn pending_work_is_bounded() {
 }
 
 #[tokio::test]
-async fn capabilities_pass_through() {
-    let h = harness(cfg());
-    let caps = h.scheduler.capabilities().await.unwrap();
-    assert_eq!(caps.crypto_compatibility_id, "test-profile-v1");
-    let _ = h.clock.now();
+async fn capabilities_bound_self_test_batches_by_each_lane() {
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let inner = provider.capabilities().await.unwrap();
+    let full = cfg().max_bytes;
+    let two_units = 2 * UNIT as u64;
+    let two_frames = 2 * u64::from(inner.max_ciphertext_size);
+    for (config, expected_items, expected_bytes) in [
+        (
+            SchedulerConfig {
+                max_items: 2,
+                ..cfg()
+            },
+            2,
+            full,
+        ),
+        (
+            SchedulerConfig {
+                max_pending_items: 2,
+                ..cfg()
+            },
+            2,
+            full,
+        ),
+        (
+            SchedulerConfig {
+                max_pending_ciphertext_bytes: two_frames,
+                ..cfg()
+            },
+            2,
+            full,
+        ),
+        (
+            SchedulerConfig {
+                max_bytes: two_units,
+                ..cfg()
+            },
+            2,
+            two_units,
+        ),
+        (
+            SchedulerConfig {
+                max_pending_plaintext_bytes: two_units,
+                ..cfg()
+            },
+            16,
+            two_units,
+        ),
+    ] {
+        let scheduler = BatchScheduler::new(
+            provider.clone(),
+            SchedulerConfig {
+                target_items: 1,
+                ..config
+            },
+            Arc::new(ManualClock::new()),
+        );
+        let caps = scheduler.capabilities().await.unwrap();
+        assert_eq!(caps.crypto_compatibility_id, inner.crypto_compatibility_id);
+        assert_eq!(
+            (caps.batch.max_items, caps.batch.max_bytes),
+            (expected_items, expected_bytes)
+        );
+        maki_crypto::selftest::provider_self_test(&scheduler, &ctx(), UNIT, "test-profile-v1")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn capability_limits_preserve_a_smaller_inner_contract() {
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT as u32).with_max_batch(1, UNIT as u64));
+    let inner = provider.capabilities().await.unwrap();
+    let scheduler = BatchScheduler::new(provider, cfg(), Arc::new(ManualClock::new()));
+    assert_eq!(scheduler.capabilities().await.unwrap(), inner);
+}
+
+#[tokio::test]
+async fn capabilities_fail_when_the_ciphertext_queue_cannot_hold_one_frame() {
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT as u32));
+    let frame = provider.capabilities().await.unwrap().max_ciphertext_size;
+    let scheduler = BatchScheduler::new(
+        provider,
+        SchedulerConfig {
+            max_pending_ciphertext_bytes: u64::from(frame - 1),
+            ..cfg()
+        },
+        Arc::new(ManualClock::new()),
+    );
+    assert!(matches!(
+        scheduler.capabilities().await,
+        Err(CryptoError::Contract(_))
+    ));
 }
 
 /// Review R04 (2026-09-07): a single request larger than the lane's pending

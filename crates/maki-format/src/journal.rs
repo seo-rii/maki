@@ -163,18 +163,34 @@ pub struct JournalRecord {
     pub payload: Vec<u8>,
 }
 
-pub fn encode_record(rec: &JournalRecord) -> Vec<u8> {
-    let mut header = Writer::new();
+/// Encode a record whose payload fits the journal format.
+pub fn encode_record(rec: &JournalRecord) -> Result<Vec<u8>, FormatError> {
+    encode_record_parts(rec.sequence, rec.unit_index, &rec.payload)
+}
+
+/// Encode an append directly from the caller's ciphertext slice.
+pub fn encode_record_parts(
+    sequence: u64,
+    unit_index: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    if payload.len() > MAX_PAYLOAD as usize {
+        return Err(FormatError::Invalid(format!(
+            "journal payload length {} exceeds maximum {MAX_PAYLOAD}",
+            payload.len()
+        )));
+    }
+    let mut header = Writer::with_capacity(RECORD_HEADER_SIZE + payload.len());
     header
         .bytes(RECORD_MAGIC)
-        .u64(rec.sequence)
-        .u64(rec.unit_index)
-        .u32(rec.payload.len() as u32)
-        .u32(crc32fast::hash(&rec.payload));
+        .u64(sequence)
+        .u64(unit_index)
+        .u32(payload.len() as u32)
+        .u32(crc32fast::hash(payload));
     let mut out = header.finish_with_crc();
     debug_assert_eq!(out.len(), RECORD_HEADER_SIZE);
-    out.extend_from_slice(&rec.payload);
-    out
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +253,15 @@ pub fn scan_segment_bounded(
 
     loop {
         if pos == buf.len() {
-            return (records, ScanOutcome::Clean);
+            let outcome = if in_durable(pos) {
+                ScanOutcome::Corrupt {
+                    at: pos,
+                    reason: "segment ends before durable prefix".to_string(),
+                }
+            } else {
+                ScanOutcome::Clean
+            };
+            return (records, outcome);
         }
         let rem = &buf[pos..];
 
@@ -420,13 +444,14 @@ pub struct DurableMark {
 
 impl DurableMark {
     pub fn encode(&self) -> [u8; DURABLE_MARK_SIZE] {
-        let mut w = Writer::new();
-        w.bytes(DURABLE_MARK_MAGIC)
-            .u32(DURABLE_MARK_VERSION)
-            .u64(self.segment_index)
-            .u64(self.durable_size);
-        let out = w.finish_with_crc();
-        out.try_into().expect("durable mark is 32 bytes")
+        let mut bytes = [0; DURABLE_MARK_SIZE];
+        bytes[..8].copy_from_slice(DURABLE_MARK_MAGIC);
+        bytes[8..12].copy_from_slice(&DURABLE_MARK_VERSION.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.segment_index.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.durable_size.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..28]);
+        bytes[28..].copy_from_slice(&crc.to_le_bytes());
+        bytes
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {

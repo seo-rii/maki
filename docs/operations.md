@@ -152,7 +152,8 @@ maki check /etc/maki/volumes/example.toml --deep
 ```
 
 Without `--deep` the check covers the superblock, required v2 proof records,
-shard catalog, allocation-map sizes, and file presence. `--deep` additionally
+shard catalog, allocation-map sizes, and file presence, including at least one
+checkpoint state file. `--deep` additionally
 verifies both checkpoint state copies, the key canary, and every journal
 segment as recovery would scan it, including the required horizon and its
 exact record end (or the legacy advisory-mark policy). It reports the repairs
@@ -295,10 +296,22 @@ Events that matter operationally:
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
 
-`MAKI_LOG` selects the threshold with `tracing_subscriber::EnvFilter`
-directives, for example `MAKI_LOG=warn` or `MAKI_LOG=info,maki_core=debug`;
-unset or invalid values mean `info`. Set it through a drop-in on the packaged
-unit:
+`MAKI_LOG` selects the threshold with comma-separated
+`tracing_subscriber::EnvFilter` directives, for example `MAKI_LOG=warn` or
+`MAKI_LOG=info,maki_core=debug`. Each directive names its level: either a
+level alone (`off`, `error`, `warn`, `info`, `debug` or `trace`, in any case)
+or a target or span selector followed by `=<level>` (`maki_core::engine=debug`,
+`[name]=trace`). EnvFilter itself would read a word without a level, such as
+the misspelt `warning` or `err` or a bare `maki_core`, as a target enabled at
+`trace` and turn every other target off, ERROR included, so Maki refuses it.
+Unset or empty values mean `info`; so do invalid ones, and the process then
+logs one `WARN` line, `MAKI_LOG is not a valid filter`, with a fixed reason
+and the 1-based directive index when available. Selector values and detailed
+parser errors are omitted because they can contain user data. A list without
+a level alone logs only the targets it names:
+`MAKI_LOG=maki_core=debug` hides the plugin's own `maki_nbdkit` errors, so
+give the rest a threshold too, as in `info,maki_core=debug`. Set it through a
+drop-in on the packaged unit:
 
 ```ini
 [Service]
@@ -318,16 +331,21 @@ Read the journal with `journalctl -u maki@<volume>.service`.
 
 ## Rootless userspace smoke test
 
-The following test overwrites the complete disposable export:
+Use a disposable export at least 8 MiB in size. This test overwrites its first
+8 MiB. The readback uses the nbdkit offset filter to copy exactly that range:
 
 ```bash
+(
+set -euo pipefail
 uri='nbd+unix:///?socket=/run/maki/example/nbd.sock'
 test_dir="$(mktemp -d)"
 
 nbdinfo "$uri"
 dd if=/dev/urandom of="$test_dir/source.bin" bs=1M count=8 status=none
 nbdcopy --flush --synchronous "$test_dir/source.bin" "$uri"
-nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"
+export test_dir
+nbdkit -r -U - --filter=offset nbd "$uri" range=8M \
+  --run 'nbdcopy --synchronous "$uri" "$test_dir/roundtrip.bin"'
 cmp "$test_dir/source.bin" "$test_dir/roundtrip.bin"
 
 fio --name=maki-nbd-verify \
@@ -335,6 +353,7 @@ fio --name=maki-nbd-verify \
   --rw=write --bs=4k --size=8M --iodepth=1 --fsync=32 \
   --verify=crc32c --do_verify=1 --verify_fatal=1 \
   --verify_state_save=0
+)
 ```
 
 This covers Maki through nbdkit and libnbd without a kernel device. It does not
@@ -365,8 +384,14 @@ NBD isolation relies on the restricted ancestor: nbdkit resets its own umask,
 so a service `UMask` is not a socket-mode guarantee.
 [nbdkit plugin manual](https://libguestfs.org/nbdkit-plugin.3.html#UMASK)
 
-The unprivileged control socket accepts newline-delimited JSON with a 64 KiB
-line limit. The `maki` CLI exposes the supported operations:
+The unprivileged control socket uses one JSON object per line for requests and
+responses. Each payload can be up to 64 KiB, excluding its terminating newline.
+Writers send a newline after each object. A reader also accepts a complete
+final object when the peer closes its write side immediately after the JSON.
+An empty end of stream closes the session. Incomplete JSON at end of stream
+produces a parse error.
+
+The `maki` CLI exposes the supported operations:
 
 ```bash
 maki status /etc/maki/volumes/example.toml
@@ -377,11 +402,11 @@ maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456
 maki reload /etc/maki/volumes/example.toml cache --max-bytes 268435456 --ttl 1s
 ```
 
-The control commands use the configuration only to find the socket: they
-parse it but do not validate it, so a configuration edited for the next start
-cannot block `maki drain` on the running daemon. The packaged configuration is
-readable only by root and group `maki`; a `maki-admin` member names the socket
-instead, with `--socket` in place of the configuration:
+The control commands read the configured socket path and skip attach-time
+validation. The full file must still parse as a Maki configuration. If an edit
+prevents parsing, use `--socket` to reach the running daemon directly. The
+packaged configuration is readable only by root and group `maki`, so members
+of `maki-admin` also use this form.
 
 ```bash
 maki status --socket /run/maki-control/example/control.sock
@@ -421,7 +446,7 @@ The packaged data-plane service uses `Type=notify`. The native plugin opens
 the configured volume in nbdkit's `after_fork` callback, before the first NBD
 client, and sends `READY=1` after recovery, the configured provider checks, and
 control socket binding succeed. `maki-attach@` therefore waits for this initial
-data-plane readiness through its existing `Requires=` and `After=` ordering.
+data-plane readiness through its existing `BindsTo=` and `After=` ordering.
 An initialization or notification failure fails startup. The initial deadline
 is 180 seconds. During journal recovery, completed scan, repair and replay work
 can send `EXTEND_TIMEOUT_USEC=180000000`, at most once every 30 seconds. There
@@ -471,8 +496,10 @@ such as `/srv/<volume>` created by root (`install -d -m 0755 /srv/<volume>`):
 the mountpoint directory itself must also be root-owned and not writable by
 group or others, or a workload could stack a FUSE mount over it before the
 volume is mounted. It is hidden once the volume is mounted; the volume's own
-root directory carries the workload's ownership. `/` is refused as a
-mountpoint.
+root directory carries the workload's ownership. If the workload unit's
+`CapabilityBoundingSet=` drops both CAP_DAC_READ_SEARCH and CAP_DAC_OVERRIDE,
+that root must stay readable and searchable by root, or the workload's verify
+gate fails (see the gate requirements below). `/` is refused as a mountpoint.
 
 Before its LVM activation, attach inventories the recorded NBD and its kernel
 partitions, compares independently probed PV identifiers with the complete VG
@@ -741,15 +768,23 @@ backing storage:
 # Succeeds once every named unit is inactive; fails at once if one failed
 # (inspect it before continuing) or after WAIT_SECONDS (default 600).
 wait_stopped() {
-    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
-    for unit in "$@"; do
-        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
-            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
-                echo "$unit is $state: preserve the host state and inspect it" >&2
+    local unit state pending deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    while :; do
+        pending=
+        for unit in "$@"; do
+            state=$(systemctl show -P ActiveState "$unit") || return 1
+            if [ "$state" = failed ]; then
+                echo "$unit failed: preserve the host state and inspect it" >&2
                 return 1
             fi
-            sleep 1
+            if [ "$state" != inactive ]; then pending="$unit ($state)"; fi
         done
+        [ -n "$pending" ] || return 0
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Still waiting for $pending" >&2
+            return 1
+        fi
+        sleep 1
     done
 }
 systemctl stop maki-workload@pg.target
@@ -980,6 +1015,11 @@ unsuccessful outcomes; explicit journal-sync time is separate. See
 Do not add unit indexes, LBAs, request IDs, or other high-cardinality values as
 metric labels.
 
+`maki_checkpoint_lag_bytes` counts durable journal records newer than the
+published checkpoint, in bytes including record headers. Repeated writes to
+one unit count once per journal record. A TRIM tombstone counts its header.
+Unsynced records enter this gauge when they become durable.
+
 With batching enabled, `maki_crypto_deadline_exceeded_total` counts completed
 scheduler encrypt/decrypt calls that return an operation-deadline error.
 Queue admission, coalescing, batch-slot waits and RPC time share that caller's
@@ -1073,7 +1113,9 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
 - `maki status`, `metrics`, `checkpoint`, `drain` and `reload` give up when the
   daemon does not answer within 60 s (600 s for `checkpoint` and `drain`); pass
   `--timeout <seconds>` to wait longer. A timeout means the daemon is stalled
-  or busy, not that the command was rejected.
+  or busy, not that the command was rejected. Commands without a control
+  round trip (`volume`, `check`) refuse `--timeout` with the usage and exit
+  status 2.
 - While the journal cannot be synced (see the writeback item above) `maki
   status` reports `state: degraded` with the reason, and `maki_volume_state`
   is 2, until a barrier succeeds; a successful checkpoint alone does not clear

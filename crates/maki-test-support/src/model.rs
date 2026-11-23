@@ -91,6 +91,9 @@ impl ReferenceBlockModel {
 
     /// All values this unit may legally hold immediately after a crash.
     pub fn allowed_after_crash(&self, unit: u64) -> Vec<Vec<u8>> {
+        if unit >= self.num_units {
+            return Vec::new();
+        }
         let mut out = vec![self
             .durable
             .get(&unit)
@@ -109,19 +112,34 @@ impl ReferenceBlockModel {
     /// Check the observed post-crash content of `unit` against the allowed
     /// set, then adopt it as the new durable state.
     pub fn crash_adopt(&mut self, unit: u64, actual: &[u8]) -> Result<(), OracleViolation> {
-        let allowed = self.allowed_after_crash(unit);
-        if !allowed.iter().any(|v| v == actual) {
+        if unit >= self.num_units {
+            return Err(OracleViolation {
+                unit,
+                detail: format!("unit outside volume of {} units", self.num_units),
+            });
+        }
+        let matches_durable = match self.durable.get(&unit) {
+            Some(durable) => durable == actual,
+            None => actual.len() == self.unit_size && actual.iter().all(|&byte| byte == 0),
+        };
+        if !matches_durable
+            && !self
+                .pending
+                .get(&unit)
+                .is_some_and(|versions| versions.iter().any(|version| version == actual))
+        {
             return Err(OracleViolation {
                 unit,
                 detail: format!(
-                    "observed {} not in {} allowed value(s); observed-prefix={:02x?}",
+                    "observed {} matches no durable or pending value; observed-prefix={:02x?}",
                     summarize(actual),
-                    allowed.len(),
                     &actual[..actual.len().min(8)]
                 ),
             });
         }
-        self.durable.insert(unit, actual.to_vec());
+        if !matches_durable {
+            self.durable.insert(unit, actual.to_vec());
+        }
         self.pending.remove(&unit);
         Ok(())
     }
@@ -129,4 +147,37 @@ impl ReferenceBlockModel {
 
 fn summarize(v: &[u8]) -> String {
     format!("[{} bytes, first={:?}]", v.len(), v.first())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observations_outside_the_volume_are_never_legal() {
+        for count in [0, 1] {
+            let mut model = ReferenceBlockModel::new(4, count);
+            for invalid in [count, u64::MAX] {
+                assert!(model.allowed_after_crash(invalid).is_empty());
+                assert_eq!(
+                    model.crash_adopt(invalid, &[0; 4]).unwrap_err().unit,
+                    invalid
+                );
+                assert!(!model.durable.contains_key(&invalid));
+            }
+        }
+    }
+    #[test]
+    fn adoption_checks_borrowed_history_and_preserves_it_on_rejection() {
+        let mut model = ReferenceBlockModel::new(4, 1);
+        assert!(model.crash_adopt(0, &[0; 3]).is_err());
+        model.crash_adopt(0, &[0; 4]).unwrap();
+        model.write_fua(0, &[1; 4]);
+        for byte in [2, 2, 3] {
+            model.write(0, &[byte; 4]);
+        }
+        assert!(model.crash_adopt(0, &[0; 4]).is_err());
+        model.crash_adopt(0, &[2; 4]).unwrap();
+        assert_eq!(model.allowed_after_crash(0), vec![vec![2; 4]]);
+    }
 }

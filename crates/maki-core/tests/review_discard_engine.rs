@@ -10,7 +10,7 @@ use rand::SeedableRng;
 
 async fn attach(backing: &Arc<CrashableBacking>) -> Engine {
     Engine::attach(
-        backing.clone(),
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(1024)),
         EngineOptions {
             checkpoint: CheckpointPolicy {
@@ -89,6 +89,23 @@ async fn trim_preserves_partial_unit_edges_and_survives_fua_crash() {
 }
 
 #[tokio::test]
+async fn trim_reads_each_checkpointed_slot_header_once() {
+    let (backing, engine) = fixture(true).await;
+    engine.stop_checkpoint_worker().await;
+    engine.write(0, &[0x31; 4096], true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    let before = backing.read_bytes();
+    engine.trim(0, 4096, false).await.unwrap();
+    assert_eq!(backing.read_bytes() - before, 4 * 64);
+
+    let after = backing.read_bytes();
+    engine.trim(0, 4096, false).await.unwrap();
+    assert_eq!(backing.read_bytes(), after);
+    assert_eq!(engine.read(0, 4096).await.unwrap(), vec![0; 4096]);
+}
+
+#[tokio::test]
 async fn trimming_unwritten_units_and_partial_edges_does_not_append() {
     let (_backing, engine) = fixture(true).await;
     engine.trim(0, 16 * 1024, true).await.unwrap();
@@ -122,4 +139,23 @@ async fn concurrent_trim_and_write_have_whole_unit_ordering() {
         attach(&backing).await.read(0, 1024).await.unwrap(),
         expected
     );
+}
+
+#[tokio::test]
+async fn a_partial_fua_trim_records_a_fua_barrier() {
+    let (_backing, engine) = fixture(true).await;
+    engine.stop_checkpoint_worker().await;
+    for size in [512, 1024] {
+        engine.write(0, &[0x31; 1024], false).await.unwrap();
+        let before = engine.stats().await;
+        engine.trim(4096, size, true).await.unwrap();
+        let after = engine.stats().await;
+        assert_eq!(after.fua_latency.count, before.fua_latency.count + 1);
+        assert_eq!(after.flush_latency.count, before.flush_latency.count);
+        assert_eq!(
+            after.journal_sync_latency.count,
+            before.journal_sync_latency.count + 1
+        );
+        assert!(after.durable_sequence > before.durable_sequence);
+    }
 }

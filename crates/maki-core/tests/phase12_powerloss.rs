@@ -52,7 +52,7 @@ async fn attach(backing: &Arc<CrashableBacking>) -> Engine {
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(UNIT)),
         EngineOptions {
             checkpoint: CheckpointPolicy {

@@ -142,3 +142,23 @@ fn method_paths_the_provider_sends_as_written_still_validate() {
         .validate()
         .unwrap();
 }
+
+#[test]
+fn grpc_rejects_metadata_names_that_the_unary_client_would_drop() {
+    for keys in [
+        vec!["x region"],
+        vec!["trace-bin"],
+        vec!["user-agent"],
+        vec!["grpc-status"],
+        vec!["content-type"],
+        vec!["X-Region", "x-region"],
+    ] {
+        let fields = keys
+            .iter()
+            .map(|key| format!("{key:?} = \"fixture\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = grpc(&format!("[crypto.grpc.metadata]\n{fields}"));
+        assert!(parse(&text).validate().is_err(), "{keys:?}");
+    }
+}

@@ -68,7 +68,7 @@ async fn idle_worker_retries_a_late_directory_sync_failure() {
         sleeps: AtomicUsize::new(0),
     });
     let engine = Engine::attach(
-        backing,
+        backing.process(),
         Arc::new(FakeCryptoProvider::new(1024)),
         EngineOptions {
             checkpoint: CheckpointPolicy {
@@ -128,7 +128,7 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
     let options = VolumeOptions {
         journal_segment_size: 4096,
     };
-    let mut volume = Volume::recover(backing.clone(), options.clone()).unwrap();
+    let mut volume = Volume::recover(backing.process(), options.clone()).unwrap();
     for unit in 0..8 {
         volume
             .write_ct(unit, &[unit as u8 + 1; 1032], true)
@@ -159,7 +159,11 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
         "cleanup must retry the failed barrier even without sealed segments"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(volume.overlay_len(), 8);
+    let newer = volume.write_ct(0, &[0x55; 32], false).unwrap();
     volume.checkpoint().unwrap();
+    assert_eq!(volume.overlay_len(), 1);
+    assert_eq!(volume.read_ct(0).unwrap(), Some((newer, vec![0x55; 32])));
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     // Once the barrier succeeds, an idle pass need not repeat it.
     volume.checkpoint().unwrap();
@@ -167,7 +171,7 @@ fn deleted_segments_do_not_hide_a_failed_journal_directory_barrier() {
     drop(volume);
     backing.set_fault_hook(None);
     backing.crash_all_lost();
-    let recovered = Volume::recover(backing, options).unwrap();
+    let recovered = Volume::recover(backing.process(), options).unwrap();
     for unit in 0..8 {
         assert_eq!(
             recovered.read_ct(unit).unwrap().unwrap().1,

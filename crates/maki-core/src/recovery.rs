@@ -27,6 +27,8 @@
 //!   it is read into memory;
 //! - the selected checkpoint never lies above the required proof's horizon
 //!   (checkpoints only consume records the proof attests);
+//! - a surviving contiguous journal suffix through the checkpoint must
+//!   agree with readable slot metadata for units recovery will not replay;
 //! - metadata read errors other than "not found" are I/O errors, never
 //!   "invalid copy" (an initialized volume must have checkpoint state).
 //!
@@ -50,8 +52,8 @@ use maki_format::journal::{
 };
 use maki_format::layout;
 use maki_format::superblock::{
-    load_volume_superblock, persist_volume_superblock, Superblock, VolumeSuperblock,
-    SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+    load_volume_superblock, load_volume_superblock_with_fallback, persist_volume_superblock,
+    Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
 };
 use maki_format::FormatError;
 
@@ -60,7 +62,11 @@ use crate::store::SlotStore;
 
 #[path = "recovery_scan.rs"]
 mod scan;
-use scan::{range_is_zero, SegmentScanner};
+use scan::{range_is_zero, RecordHeader, SegmentScanner};
+
+#[path = "checkpoint_evidence.rs"]
+mod checkpoint_evidence;
+use checkpoint_evidence::{CheckpointEvidence, MAX_CHECKPOINT_UNITS};
 
 /// Observes completed, bounded recovery work, without claiming that a new
 /// checkpoint is durable. The callback is borrowed only during recovery and
@@ -131,6 +137,7 @@ pub struct JournalScan {
     /// Fingerprints bind recovery's later rewrite to the exact bytes this
     /// read-only scan accepted, with constant metadata per segment.
     verified_prefixes: Vec<VerifiedPrefix>,
+    checkpoint_evidence: Option<CheckpointEvidence>,
 }
 
 struct VerifiedPrefix {
@@ -139,12 +146,76 @@ struct VerifiedPrefix {
     fingerprint: u64,
 }
 
+impl JournalScan {
+    /// Validate covered record effects before any recovery writes. The
+    /// initial scan collected the first window. On larger journals, reread
+    /// the verified prefixes with fixed memory to check further unit ranges.
+    fn verify_checkpoint_slots(
+        &mut self,
+        backing: &Arc<dyn Backing>,
+        superblock: &Superblock,
+        store: &SlotStore,
+        checkpoint_sequence: u64,
+        progress: &RecoveryProgress<'_>,
+    ) -> Result<(), RecoveryError> {
+        let Some(mut evidence) = self.checkpoint_evidence.take() else {
+            return Ok(());
+        };
+        let suffix_start = evidence.suffix_start();
+        while let Some(first_unit) = evidence.verify(store, progress)? {
+            evidence =
+                CheckpointEvidence::new(checkpoint_sequence, first_unit, MAX_CHECKPOINT_UNITS);
+            for (segment, prefix) in self.segments.iter().zip(&self.verified_prefixes) {
+                if segment.record_count == 0
+                    || suffix_start.is_some_and(|first| segment.last_sequence() < first)
+                {
+                    continue;
+                }
+                let file = backing.open(&prefix.path, false)?;
+                let mut header = [0u8; SEGMENT_HEADER_SIZE];
+                file.read_at(0, &mut header)?;
+                let body_len = prefix.len - SEGMENT_HEADER_SIZE as u64;
+                let scan = SegmentScanner {
+                    file: file.as_ref(),
+                    header: &header,
+                    body_len,
+                    first_sequence: segment.base_sequence,
+                    durable_len: body_len,
+                    required_boundary: None,
+                    geometry: &superblock.geometry,
+                    // This pass needs only metadata from the accepted prefix.
+                    checkpoint_sequence: u64::MAX,
+                    name: &prefix.path,
+                    progress,
+                }
+                .scan_observing(false, |header, _| {
+                    evidence.observe(header);
+                    Ok(())
+                })?;
+                if !matches!(scan.outcome, ScanOutcome::Clean)
+                    || scan.valid_body_bytes != body_len
+                    || scan.record_count != segment.record_count
+                    || scan.fingerprint != prefix.fingerprint
+                {
+                    return Err(RecoveryError::Corrupt(format!(
+                        "{} changed during checkpoint verification",
+                        prefix.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The public scan/recovery APIs expose every uncovered record. Volume attach
 /// discards payloads during validation and reads them again through a bounded
 /// checkpoint batch. Select retention independently of validation so the
 /// public API and attach can share every durability check.
 enum ReplayRecords {
     All(Vec<JournalRecord>),
+    /// The public journal-only API returns records without comparing slots.
+    ScanOnly(Vec<JournalRecord>),
     Discard,
     /// Only the units that have an uncovered replay record: what the deep
     /// checker needs to tell recoverable slot damage from unrecoverable
@@ -157,21 +228,28 @@ enum ReplayRecords {
 }
 
 impl ReplayRecords {
-    fn push(&mut self, record: JournalRecord) -> Result<(), RecoveryError> {
+    fn retain_payloads(&self) -> bool {
+        matches!(self, Self::All(_) | Self::ScanOnly(_))
+    }
+
+    fn push(&mut self, header: RecordHeader, payload: Option<Vec<u8>>) {
         match self {
-            Self::All(records) => records.push(record),
+            Self::All(records) | Self::ScanOnly(records) => records.push(JournalRecord {
+                sequence: header.sequence,
+                unit_index: header.unit,
+                payload: payload.expect("uncovered replay payload requested"),
+            }),
             Self::Discard => {}
             Self::Units { units, written } => {
-                units.insert(record.unit_index);
+                units.insert(header.unit);
                 // Records arrive in sequence order: the newest one decides.
-                if record.payload.is_empty() {
-                    written.remove(&record.unit_index);
+                if header.payload_len == 0 {
+                    written.remove(&header.unit);
                 } else {
-                    written.insert(record.unit_index);
+                    written.insert(header.unit);
                 }
             }
         }
-        Ok(())
     }
 
     /// (retained records, units with an uncovered record, those of them
@@ -185,7 +263,9 @@ impl ReplayRecords {
         std::collections::BTreeSet<u64>,
     ) {
         match self {
-            Self::All(records) => (records, Default::default(), Default::default()),
+            Self::All(records) | Self::ScanOnly(records) => {
+                (records, Default::default(), Default::default())
+            }
             Self::Discard => Default::default(),
             Self::Units { units, written } => (Vec::new(), units, written),
         }
@@ -234,7 +314,7 @@ fn recover_with_replay(
     progress();
 
     // 2. superblock
-    let envelope = load_volume_superblock(backing.as_ref())?;
+    let (envelope, invalid_partner) = load_volume_superblock_with_fallback(backing.as_ref())?;
     if !matches!(
         envelope.metadata_version,
         SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
@@ -250,8 +330,7 @@ fn recover_with_replay(
     progress();
 
     // 3./4. catalog + allocation metadata
-    let mut store =
-        SlotStore::open_with_progress(backing.clone(), superblock.geometry.clone(), progress)?;
+    let mut store = SlotStore::open_from_superblock(backing.clone(), &envelope, progress)?;
 
     // checkpoint state
     let checkpoint_state = load_checkpoint_state(backing)?;
@@ -259,7 +338,7 @@ fn recover_with_replay(
     progress();
 
     // 5./6. scan journal, then apply the repairs the scan decided on
-    let scan = scan_journal_with_proof(
+    let mut scan = scan_journal_with_proof(
         backing,
         &superblock,
         checkpoint_state.checkpoint_sequence,
@@ -268,9 +347,20 @@ fn recover_with_replay(
         replay,
         progress,
     )?;
+    scan.verify_checkpoint_slots(
+        backing,
+        &superblock,
+        &store,
+        checkpoint_state.checkpoint_sequence,
+        progress,
+    )?;
     // This recovery, the attach after it and later checkpoints store A/B
     // metadata; refuse a generation that leaves no room before any write.
-    check_metadata_generations(backing, &store)?;
+    check_metadata_generations(
+        backing,
+        &store,
+        invalid_partner.is_none().then_some(superblock.generation),
+    )?;
     // The superblock is the volume's commit point; every repair below, and
     // the resumed writer, depends on it. A failed or interrupted creation, or
     // a restart, can hand recovery a copy that exists only in the page cache
@@ -417,8 +507,7 @@ fn checkpoint_validated_replay(
     scan: &JournalScan,
     progress: &RecoveryProgress<'_>,
 ) -> Result<CheckpointState, RecoveryError> {
-    let allow_discard =
-        load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
+    let allow_discard = store.supports_discard();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
 
@@ -596,14 +685,13 @@ pub fn scan_journal(
         superblock,
         checkpoint_sequence,
         segment_size,
-        ReplayRecords::All(Vec::new()),
+        ReplayRecords::ScanOnly(Vec::new()),
     )
 }
 
 /// The checker needs counts and repair decisions, not replay payloads. Keep
 /// the empty replay representation private so the public all-record API keeps
-/// its contract. Each candidate is still fully read and validated; at most
-/// one geometry-bounded payload allocation is alive at a time.
+/// its contract. Each candidate is fully validated with fixed read scratch.
 pub(crate) struct JournalSummary {
     pub segment_count: usize,
     pub uncovered_records: u64,
@@ -618,17 +706,19 @@ pub(crate) struct JournalSummary {
 
 pub(crate) fn summarize_journal(
     backing: &Arc<dyn Backing>,
-    superblock: &Superblock,
+    envelope: &VolumeSuperblock,
     checkpoint_sequence: u64,
     segment_size: u64,
+    store: Option<&SlotStore>,
 ) -> Result<JournalSummary, RecoveryError> {
     // The deep check scans against the volume's stored checkpoint state, so
     // it applies the rule recovery applies to that state.
-    let proof = load_required_proof(backing, superblock)?;
+    let superblock = &envelope.superblock;
+    let proof = load_required_proof(backing, envelope)?;
     if let Some(proof) = &proof {
         check_checkpoint_horizon(checkpoint_sequence, proof)?;
     }
-    let scan = scan_journal_with_proof(
+    let mut scan = scan_journal_with_proof(
         backing,
         superblock,
         checkpoint_sequence,
@@ -640,6 +730,9 @@ pub(crate) fn summarize_journal(
         },
         &|| {},
     )?;
+    if let Some(store) = store {
+        scan.verify_checkpoint_slots(backing, superblock, store, checkpoint_sequence, &|| {})?;
+    }
     let uncovered_records = scan
         .segments
         .iter()
@@ -666,7 +759,13 @@ fn scan_journal_with_replay(
     segment_size: u64,
     replay: ReplayRecords,
 ) -> Result<JournalScan, RecoveryError> {
-    let proof = load_required_proof(backing, superblock)?;
+    let envelope = load_volume_superblock(backing.as_ref())?;
+    if envelope.superblock.volume_uuid != superblock.volume_uuid {
+        return Err(RecoveryError::Corrupt(
+            "journal scan superblock identity mismatch".into(),
+        ));
+    }
+    let proof = load_required_proof(backing, &envelope)?;
     scan_journal_with_proof(
         backing,
         superblock,
@@ -682,14 +781,8 @@ fn scan_journal_with_replay(
 /// volume, whose read-only inspection retains its historical classification.
 fn load_required_proof(
     backing: &Arc<dyn Backing>,
-    superblock: &Superblock,
+    envelope: &VolumeSuperblock,
 ) -> Result<Option<DurableProof>, RecoveryError> {
-    let envelope = load_volume_superblock(backing.as_ref())?;
-    if envelope.superblock.volume_uuid != superblock.volume_uuid {
-        return Err(RecoveryError::Corrupt(
-            "journal scan superblock identity mismatch".into(),
-        ));
-    }
     if !matches!(
         envelope.metadata_version,
         SUPERBLOCK_VERSION_V2 | SUPERBLOCK_VERSION_V3
@@ -698,7 +791,7 @@ fn load_required_proof(
     }
     Ok(Some(DurableProofStore::load(
         backing.as_ref(),
-        superblock.volume_uuid,
+        envelope.superblock.volume_uuid,
     )?))
 }
 
@@ -741,6 +834,9 @@ fn scan_journal_with_proof(
     let mark = load_durable_mark(backing)?;
     let required = proof.filter(|proof| proof.durable_sequence > checkpoint_sequence);
     let mut required_seen = false;
+    let mut checkpoint_evidence = proof
+        .filter(|_| checkpoint_sequence != 0 && !matches!(&replay, ReplayRecords::ScanOnly(_)))
+        .map(|_| CheckpointEvidence::new(checkpoint_sequence, 0, MAX_CHECKPOINT_UNITS));
 
     let mut names: Vec<(u64, String)> = backing
         .list(layout::JOURNAL_DIR)?
@@ -893,7 +989,15 @@ fn scan_journal_with_proof(
             name: &name,
             progress,
         }
-        .scan(|record| replay.push(record))?;
+        .scan_observing(replay.retain_payloads(), |header, payload| {
+            if let Some(evidence) = &mut checkpoint_evidence {
+                evidence.observe(header);
+            }
+            if header.sequence > checkpoint_sequence {
+                replay.push(header, payload);
+            }
+            Ok(())
+        })?;
         if required.is_some_and(|p| p.segment_index == index) {
             required_seen = true;
         }
@@ -1078,6 +1182,7 @@ fn scan_journal_with_proof(
         repairs,
         mark: final_mark,
         verified_prefixes,
+        checkpoint_evidence,
     })
 }
 
@@ -1150,6 +1255,9 @@ const MAX_METADATA_GENERATION: u64 = u64::MAX - (1 << 62);
 pub(crate) fn check_metadata_generations(
     backing: &Arc<dyn Backing>,
     store: &SlotStore,
+    // Known only when both superblocks decoded under this lock. A malformed
+    // partner can still contain a CRC-valid raw generation above the selected one.
+    known_superblock_generation: Option<u64>,
 ) -> Result<(), RecoveryError> {
     fn highest<T: AbRecord>(
         backing: &Arc<dyn Backing>,
@@ -1163,7 +1271,14 @@ pub(crate) fn check_metadata_generations(
     for (what, generation) in [
         (
             "superblock",
-            highest::<VolumeSuperblock>(backing, layout::SUPERBLOCK_A, layout::SUPERBLOCK_B)?,
+            match known_superblock_generation {
+                Some(generation) => Some(generation),
+                None => highest::<VolumeSuperblock>(
+                    backing,
+                    layout::SUPERBLOCK_A,
+                    layout::SUPERBLOCK_B,
+                )?,
+            },
         ),
         (
             "checkpoint state",

@@ -191,6 +191,12 @@ impl FakeCryptoProvider {
         out
     }
 
+    fn ciphertext_size(&self) -> Result<u32, CryptoError> {
+        self.unit_size.checked_add(self.overhead).ok_or_else(|| {
+            CryptoError::ProviderFatal("fake provider ciphertext size exceeds u32".into())
+        })
+    }
+
     /// Checks every call makes before doing work. `plaintext_bytes` is what
     /// the batch carries against `batch.max_bytes`: the plaintext sent for
     /// an encrypt, one unit of plaintext per item for a decrypt (the
@@ -228,40 +234,31 @@ impl FakeCryptoProvider {
         Ok(())
     }
 
-    fn misbehave_ct(&self, mut out: Vec<CiphertextUnit>) -> Vec<CiphertextUnit> {
-        match *self.misbehavior.lock() {
-            None => out,
-            Some(Misbehavior::ReorderResults) => {
-                if out.len() >= 2 {
-                    out.swap(0, 1);
-                }
-                out
-            }
+    fn alter_batch<T>(
+        mut out: Vec<T>,
+        fault: Option<Misbehavior>,
+        duplicate: impl FnOnce(&T) -> T,
+        index: impl FnOnce(&mut T) -> &mut u64,
+    ) -> Vec<T> {
+        match fault {
+            Some(Misbehavior::ReorderResults) if out.len() >= 2 => out.swap(0, 1),
             Some(Misbehavior::DropLastItem) => {
                 out.pop();
-                out
             }
             Some(Misbehavior::DuplicateFirstItem) => {
-                if let Some(first) = out.first().cloned() {
-                    out.push(first);
+                if let Some(first) = out.first() {
+                    out.push(duplicate(first));
                 }
-                out
-            }
-            Some(Misbehavior::OversizeCiphertext) => {
-                if let Some(first) = out.first_mut() {
-                    first
-                        .data
-                        .extend(std::iter::repeat_n(0u8, self.overhead as usize + 64));
-                }
-                out
             }
             Some(Misbehavior::MismatchedIndex) => {
                 if let Some(first) = out.first_mut() {
-                    first.unit_index = first.unit_index.wrapping_add(1_000_000);
+                    let value = index(first);
+                    *value = value.wrapping_add(1_000_000);
                 }
-                out
             }
+            _ => (),
         }
+        out
     }
 }
 
@@ -272,7 +269,7 @@ impl CryptoProvider for FakeCryptoProvider {
             provider_id: "fake".to_string(),
             crypto_compatibility_id: self.compat_id.clone(),
             supported_plaintext_sizes: vec![self.unit_size],
-            max_ciphertext_size: self.unit_size + self.overhead,
+            max_ciphertext_size: self.ciphertext_size()?,
             stateless: true,
             retry_safe: true,
             batch: BatchCapability {
@@ -305,6 +302,7 @@ impl CryptoProvider for FakeCryptoProvider {
             .iter()
             .fold(0u64, |sum, item| sum.saturating_add(item.data.len() as u64));
         self.common(context, items.len(), plaintext_bytes).await?;
+        let ciphertext_size = self.ciphertext_size()? as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let pt = item.data.expose();
@@ -315,17 +313,27 @@ impl CryptoProvider for FakeCryptoProvider {
                 )));
             }
             let ks = self.keystream(context, item.unit_index, pt.len());
-            let mut data = Vec::with_capacity(pt.len() + self.overhead as usize);
+            let mut data = Vec::with_capacity(ciphertext_size);
             data.extend_from_slice(MAGIC);
             data.extend_from_slice(&crc32fast::hash(pt).to_le_bytes());
             data.extend(pt.iter().zip(ks.iter()).map(|(p, k)| p ^ k));
-            data.resize(pt.len() + self.overhead as usize, 0);
+            data.resize(ciphertext_size, 0);
             out.push(CiphertextUnit {
                 unit_index: item.unit_index,
                 data,
             });
         }
-        Ok(self.misbehave_ct(out))
+        let fault = *self.misbehavior.lock();
+        if fault == Some(Misbehavior::OversizeCiphertext) {
+            if let Some(first) = out.first_mut() {
+                first
+                    .data
+                    .extend(std::iter::repeat_n(0u8, self.overhead as usize + 64));
+            }
+        }
+        Ok(Self::alter_batch(out, fault, Clone::clone, |item| {
+            &mut item.unit_index
+        }))
     }
 
     async fn decrypt_batch(
@@ -337,7 +345,7 @@ impl CryptoProvider for FakeCryptoProvider {
         self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
         let plaintext_bytes = (items.len() as u64).saturating_mul(u64::from(self.unit_size));
         self.common(context, items.len(), plaintext_bytes).await?;
-        let expected_len = (self.unit_size + self.overhead) as usize;
+        let expected_len = self.ciphertext_size()? as usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let ct = &item.data;
@@ -365,6 +373,15 @@ impl CryptoProvider for FakeCryptoProvider {
                 data: SecretBuffer::from_vec(pt),
             });
         }
-        Ok(out)
+        let fault = *self.misbehavior.lock();
+        Ok(Self::alter_batch(
+            out,
+            fault,
+            |item| PlaintextUnit {
+                unit_index: item.unit_index,
+                data: item.data.duplicate(),
+            },
+            |item| &mut item.unit_index,
+        ))
     }
 }

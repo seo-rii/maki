@@ -26,31 +26,31 @@ fn main() -> ExitCode {
     if let Err(e) = maki_backing::raise_open_file_limit() {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut root: Option<String> = None;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut root: Option<&std::path::Path> = None;
     let mut deep = false;
     let mut segment_size: u64 = 256 << 20;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
+        match args[i].to_str() {
+            Some("--help" | "-h") => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            "--version" | "-V" => {
+            Some("--version" | "-V") => {
                 println!("maki-check {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            "--deep" => deep = true,
-            "--journal-segment-size" => {
+            Some("--deep") => deep = true,
+            Some("--journal-segment-size") => {
                 i += 1;
-                match args.get(i).and_then(|v| v.parse().ok()) {
+                match args.get(i).and_then(|v| v.to_str()?.parse().ok()) {
                     Some(v) => segment_size = v,
                     None => return usage(),
                 }
             }
-            flag if flag.starts_with('-') => return usage(),
-            path if root.is_none() => root = Some(path.to_string()),
+            _ if args[i].as_encoded_bytes().starts_with(b"-") => return usage(),
+            _ if root.is_none() => root = Some(std::path::Path::new(&args[i])),
             _ => return usage(),
         }
         i += 1;
@@ -61,30 +61,31 @@ fn main() -> ExitCode {
     // `FileBacking::new` creates a missing root; an offline checker must
     // never mutate, so a root that is not an existing directory is refused
     // first (R5-026).
-    match std::fs::metadata(&root) {
+    let display = root.display();
+    match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
-            eprintln!("error: {root}: not a directory");
+            eprintln!("error: {display}: not a directory");
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("error: {root}: {e}");
+            eprintln!("error: {display}: {e}");
             return ExitCode::FAILURE;
         }
     }
     // A rollback-protected root keeps the volume inside an outer format that
     // only the configured daemon path can open (BUG-110).
-    if std::path::Path::new(&root).join("rollback.format").exists() {
+    if root.join("rollback.format").exists() {
         eprintln!(
-            "error: {root} is a rollback-protected backing; maki-check cannot open its \
+            "error: {display} is a rollback-protected backing; maki-check cannot open its \
              outer format. Run `maki check <config.toml> [--deep]` with the volume configuration"
         );
         return ExitCode::FAILURE;
     }
-    let backing = match maki_backing::FileBacking::new(root.as_str()) {
+    let backing = match maki_backing::FileBacking::new(root) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: {root}: {e}");
+            eprintln!("error: {display}: {e}");
             return ExitCode::FAILURE;
         }
     };

@@ -8,7 +8,7 @@ background supervisor. stdout from Firecracker is a serial control channel,
 recorded from launch; diagnostic files are inspected only after child exit.
 """
 import argparse
-import hashlib
+from functools import lru_cache
 import json
 import os
 import pathlib
@@ -20,22 +20,42 @@ import subprocess
 import time
 import uuid
 
+try:
+    from campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                             handle_termination, ledger_block_pattern, save_json)
+except ModuleNotFoundError:
+    from scripts.campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                                     handle_termination, ledger_block_pattern, save_json)
+
 PREFIX = b"MAKI_FC_V1 "
+MAX_CYCLES = 64
 MAX_FRAME = 16384
+MAX_OUTPUT = 8 << 20
 
 
-def expected_records(cycle):
+def expected_records(cycle, pattern=CURRENT_BLOCK_PATTERN):
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        data = hashlib.sha256(f"maki-firecracker-v1:{cycle}:{index}".encode()).digest() * 128
-        records.append({"offset": offset, "length": 4096, "sha256": hashlib.sha256(data).hexdigest()})
+        digest = block_digest(f"maki-firecracker-v1:{cycle}:{index}", pattern)
+        records.append({"offset": offset, "length": 4096, "sha256": digest})
     return records
+
+
+@lru_cache(maxsize=MAX_CYCLES)
+def expected_records_json(cycle, pattern):
+    """Keep the immutable host expectation across verification boots."""
+    return json.dumps(expected_records(cycle, pattern), sort_keys=True)
 
 
 def decode_frame(line, token, boot):
     if len(line) > MAX_FRAME:
         raise ValueError("oversized serial line")
+    # Before /proc and the serial device are available PID 1 reports setup
+    # failures on its inherited console and stays alive for host diagnostics.
+    setup_error = b"MAKI guest setup failed: "
+    if line.startswith(setup_error):
+        raise RuntimeError("guest setup failed: " + line[len(setup_error):2048].decode(errors="replace"))
     if not line.startswith(PREFIX):
         return None
     value = json.loads(line[len(PREFIX):])
@@ -48,18 +68,19 @@ def decode_frame(line, token, boot):
     return value
 
 
-def validate_ack(event, cycle):
+def validate_ack(event, cycle, *, pattern=CURRENT_BLOCK_PATTERN):
     mode = "flush" if cycle % 2 == 0 else "fua"
     if (event.get("event") != "ack" or event.get("command") != f"write-{cycle}"
             or type(event.get("cycle")) is not int or event["cycle"] != cycle
             or event.get("mode") != mode
-            or json.dumps(event.get("records"), sort_keys=True) != json.dumps(expected_records(cycle), sort_keys=True)):
+            or json.dumps(event.get("records"), sort_keys=True) != expected_records_json(cycle, pattern)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
 
 
 def record_ack(ledger, event, cycle):
     validate_ack(event, cycle)
     record = {key: event[key] for key in ("event", "command", "cycle", "mode", "records")}
+    record["block_pattern"] = CURRENT_BLOCK_PATTERN
     fd = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -73,16 +94,21 @@ def record_ack(ledger, event, cycle):
         os.close(parent)
 
 
-def load_ledger(ledger):
+def load_ledger(ledger, expected_cycles, *, require_current=False):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ledger")
     raw = ledger.read_text(encoding="utf-8")
     if not raw or not raw.endswith("\n"):
         raise ValueError("empty or truncated ACK ledger")
     latest = None
-    for cycle, line in enumerate(raw.splitlines()):
+    lines = raw.splitlines()
+    if len(lines) != expected_cycles:
+        raise ValueError(f"ACK count {len(lines)} does not match {expected_cycles} completed cycles")
+    pattern = CURRENT_BLOCK_PATTERN if require_current else None
+    for cycle, line in enumerate(lines):
         event = json.loads(line)
-        validate_ack(event, cycle)
+        pattern = ledger_block_pattern(event, pattern)
+        validate_ack(event, cycle, pattern=pattern)
         latest = event["records"]
     return latest
 
@@ -94,13 +120,13 @@ def verify_readbacks(expected, actual):
 
 
 def make_config(args, boot, token):
-    if not re.fullmatch("[0-9a-f]{32}", token) or type(boot) is not int or not 0 <= boot <= 64:
+    if not re.fullmatch("[0-9a-f]{32}", token) or type(boot) is not int or not 0 <= boot <= MAX_CYCLES:
         raise ValueError("invalid boot identity")
     return {
         "boot-source": {"kernel_image_path": str(args.kernel), "boot_args":
                         "console=ttyS0 root=/dev/vda ro rootfstype=ext4 reboot=k panic=1 "
                         "pci=off quiet loglevel=0 init=/opt/maki/firecracker-guest-agent.py "
-                        f"maki_token={token} maki_boot={boot}"},
+                        f"maki_token={token} maki_boot={boot} maki_ready_timeout={args.timeout}"},
         "drives": [
             {"drive_id": "rootfs", "path_on_host": str(args.rootfs), "is_root_device": True,
              "is_read_only": True, "cache_type": "Writeback", "io_engine": "Sync"},
@@ -122,9 +148,11 @@ class SerialProcess:
         os.chmod(directory / "stderr.log", 0o600)
         self.selector = selectors.DefaultSelector()
         self.child = None
+        self.diagnostics_reader = None
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                          stderr=self.stderr, start_new_session=True, bufsize=0)
+                                          stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+            self.diagnostics_reader = DiagnosticLog(self.child.stderr, self.stderr, MAX_OUTPUT)
             self.selector.register(self.child.stdout, selectors.EVENT_READ)
         except BaseException:
             self.close()
@@ -148,8 +176,12 @@ class SerialProcess:
             writable.register(descriptor, selectors.EVENT_WRITE)
             until = time.monotonic() + 5
             while raw:
-                if not writable.select(max(0, until - time.monotonic())):
+                check_termination()
+                remaining = until - time.monotonic()
+                if remaining <= 0:
                     raise TimeoutError("guest serial input timeout")
+                if not writable.select(min(0.1, remaining)):
+                    continue
                 try:
                     written = os.write(descriptor, raw)
                 except BlockingIOError:
@@ -161,24 +193,29 @@ class SerialProcess:
     def event(self, timeout):
         until = time.monotonic() + timeout
         while True:
+            check_termination()
             newline = self.buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self.buffer[:newline]).rstrip(b"\r")
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.boot)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest serial event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:
                 raise ValueError("unterminated oversized serial line")
             left = until - time.monotonic()
-            if left <= 0 or not self.selector.select(left):
+            if left <= 0:
                 raise TimeoutError("guest serial event deadline")
+            if not self.selector.select(min(0.1, left)):
+                continue
             chunk = os.read(self.child.stdout.fileno(), 4096)
             if not chunk:
                 raise RuntimeError("Firecracker exited or closed serial before expected event")
             self.total += len(chunk)
-            if self.total > (8 << 20):
+            if self.total > MAX_OUTPUT:
                 raise ValueError("serial output limit exceeded")
             self.serial.write(chunk)
             self.buffer.extend(chunk)
@@ -221,7 +258,13 @@ class SerialProcess:
             self.child.stdout.close()
         self.selector.close()
         self.serial.close()
-        self.stderr.close()
+        try:
+            if self.diagnostics_reader is not None:
+                self.diagnostics_reader.finish()
+            elif self.child is not None:
+                self.child.stderr.close()
+        finally:
+            self.stderr.close()
 
     def diagnostics(self):
         if self.child is None or self.child.returncode is None:
@@ -236,17 +279,10 @@ class SerialProcess:
         return "\n".join(parts)
 
 
-def save_json(path, value):
-    with open(path, "w", encoding="utf-8") as stream:
-        os.chmod(path, 0o600)
-        json.dump(value, stream, indent=2)
-        stream.write("\n")
-
-
 def campaign(args):
     os.umask(0o077)
-    if not 2 <= args.cycles <= 64 or not 64 <= args.memory_mib <= 16384 or not 1 <= args.vcpus <= 8:
-        raise ValueError("require cycles 2..64, memory 64..16384 MiB, vcpus 1..8")
+    if not 2 <= args.cycles <= MAX_CYCLES or not 64 <= args.memory_mib <= 16384 or not 1 <= args.vcpus <= 8:
+        raise ValueError(f"require cycles 2..{MAX_CYCLES}, memory 64..16384 MiB, vcpus 1..8")
     if not 1 <= args.timeout <= 600:
         raise ValueError("timeout must be 1..600 seconds")
     for name in ("firecracker", "kernel", "rootfs", "data"):
@@ -264,6 +300,7 @@ def campaign(args):
     fs_uuid = None
     try:
         for boot in range(args.cycles + 1):
+            check_termination()
             config = args.output / f"boot-{boot}.json"
             save_json(config, make_config(args, boot, token))
             process = SerialProcess([str(args.firecracker), "--no-api", "--config-file", str(config)],
@@ -275,12 +312,14 @@ def campaign(args):
                     ready = process.expect("ready", args.timeout)
                     if not ready.get("fs_uuid") or ready.get("write_cache") != "write back":
                         raise ValueError("missing filesystem identity or guest writeback advertisement")
+                    if ready.get("native_fua") is not True:
+                        raise ValueError("guest did not confirm native FUA")
                     if fs_uuid is not None and fs_uuid != ready["fs_uuid"]:
                         raise ValueError("data filesystem changed across boot")
                     fs_uuid = ready["fs_uuid"]
                     entry["ready"] = ready
                     if boot:
-                        expected = load_ledger(ledger)
+                        expected = load_ledger(ledger, expected_cycles=boot, require_current=True)
                         command = f"verify-{boot}"
                         process.send({"command": command, "op": "verify",
                                       "offsets": [r["offset"] for r in expected]})
@@ -308,6 +347,7 @@ def campaign(args):
                 entry["diagnostics"] = process.diagnostics()
                 raise
             save_json(args.output / "results.json", result)
+        check_termination()
         result["passed"] = True
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -325,7 +365,9 @@ def main():
     parser.add_argument("--memory-mib", type=int, default=512)
     parser.add_argument("--vcpus", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=120)
-    campaign(parser.parse_args())
+    args = parser.parse_args()
+    with handle_termination():
+        campaign(args)
 
 
 if __name__ == "__main__":

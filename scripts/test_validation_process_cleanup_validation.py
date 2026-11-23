@@ -1,9 +1,11 @@
 """Owned launcher cleanup, using local processes without cloud or KVM calls."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import select
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -61,6 +63,119 @@ class ProcessCleanupTests(unittest.TestCase):
             # safe group cleanup. The controller itself must do the same.
             os.waitid(os.P_PID, process.child.pid, os.WEXITED | os.WNOWAIT)
         return module, process, exited
+
+    def test_sigterm_reaps_each_first_boot_process_and_publishes_failure(self):
+        launcher = self.root / "launcher"
+        marker = self.root / "child.pid"
+        launcher.write_text(f"""#!{sys.executable}
+import json, os, signal, sys, time
+from pathlib import Path
+if 'describe' in sys.argv:
+    link = 'https://www.googleapis.com/compute/v1/projects/test-abc/zones/test-zone/disks/data'
+    if 'instances' in sys.argv:
+        print(json.dumps({{'id':'123', 'disks':[{{'boot':False, 'source':link, 'deviceName':'data'}}],
+                          'status':'RUNNING'}}))
+    else:
+        print(json.dumps({{'id':'456', 'selfLink':link}}))
+else:
+    Path({str(marker)!r}).write_text(str(os.getpid()))
+    os.kill(os.getppid(), signal.SIGTERM)
+    time.sleep(5)
+""")
+        launcher.chmod(0o700)
+        images = [self.root / name for name in ("kernel", "rootfs", "data")]
+        for path in images:
+            path.touch()
+        for name, options in (
+                ("firecracker", ["--firecracker", launcher, "--kernel", images[0], "--rootfs",
+                                 images[1], "--data", images[2]]),
+                ("gcp", ["--gcloud", launcher, "--project", "test-abc", "--zone", "test-zone",
+                         "--instance", "testvm", "--data-disk", "data"])):
+            with self.subTest(name=name):
+                output = self.root / name
+                script = self.runners[name][0].__file__
+                result = subprocess.run([sys.executable, "-B", script, "--output", output, *options],
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 128 + signal.SIGTERM, result.stderr)
+                pid = int(marker.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                marker.unlink()
+                report = json.loads((output / "results.json").read_text())
+                self.assertFalse(report["passed"])
+                self.assertIn("SIGTERM", report["error"])
+
+    def test_event_received_after_deadline_is_rejected(self):
+        token = "a" * 32
+        for name, (module, runner) in self.runners.items():
+            for observed in (4, 10, 12):
+                with self.subTest(name=name, observed=observed):
+                    process = runner.__new__(runner)
+                    process.token, process.boot, process.cycle = token, 0, 0
+                    process.buffer, process.total = bytearray(), 0
+                    process.selector = mock.Mock()
+                    process.child = mock.Mock()
+                    process.serial = process.stdout_log = mock.Mock()
+                    frame = {"event": "ready", "token": token, "boot": 0, "cycle": 0,
+                             "boot_id": "00112233-4455-6677-8899-aabbccddeeff"}
+                    wire = module.PREFIX + json.dumps(frame).encode() + b"\n"
+                    times = [0, 0, observed]
+                    with mock.patch.object(module.time, "monotonic", side_effect=times), \
+                            mock.patch.object(module.os, "read", return_value=wire):
+                        if observed < 10:
+                            self.assertEqual(process.expect("ready", 10), frame)
+                        else:
+                            with self.assertRaises(TimeoutError):
+                                process.expect("ready", 10)
+
+    def test_campaign_save_failure_preserves_the_previous_complete_report(self):
+        for name, (module, _) in self.runners.items():
+            with self.subTest(name=name):
+                folder = self.root / name
+                folder.mkdir()
+                path = folder / "results.json"
+                module.save_json(path, {"boots": [1]})
+                def fail_after_prefix(value, stream, **options):
+                    stream.write('{"partial":')
+                    raise OSError("no space left on device")
+                with mock.patch.object(json, "dump", side_effect=fail_after_prefix):
+                    with self.assertRaisesRegex(OSError, "no space"):
+                        module.save_json(path, {"boots": [1, 2]})
+                self.assertEqual(json.loads(path.read_text()), {"boots": [1]})
+                self.assertEqual(list(folder.iterdir()), [path])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_stderr_is_bounded_and_cannot_block_control_stdout(self):
+        for name, (module, runner) in self.runners.items():
+            with self.subTest(name=name), mock.patch.object(module, "MAX_OUTPUT", 8192):
+                folder = self.root / name
+                # Write more than fits in either the stderr pipe or the diagnostic log.
+                program = ("import os; data=b'x'*4096; "
+                           "[os.write(2,data) for _ in range(128)]; print('finished',flush=True)")
+                with runner([sys.executable, "-c", program], folder, "a" * 32, 0) as process:
+                    self.assertTrue(select.select([process.child.stdout], [], [], 5)[0])
+                    self.assertEqual(process.child.stdout.readline(), b"finished\n")
+                diagnostics = (folder / "stderr.log").read_bytes()
+                self.assertEqual(len(diagnostics), 8192)
+                self.assertTrue(diagnostics.endswith(b"[stderr truncated]\n"))
+
+    def test_diagnostics_capture_high_numbered_pipe(self):
+        import fcntl
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+            self.skipTest("needs a pipe descriptor above the select() limit")
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as original, os.fdopen(write_fd, "wb") as writer:
+            high_fd = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1024)
+            with os.fdopen(high_fd, "rb") as pipe, tempfile.TemporaryFile() as log:
+                writer.write(b"campaign diagnostics")
+                writer.close()
+                module, _ = self.runners["gcp"]
+                module.DiagnosticLog(pipe, log, 8192).finish()
+                log.seek(0)
+                self.assertEqual(log.read(), b"campaign diagnostics")
 
     def test_bug155_close_terminates_descendant_after_early_leader_exit(self):
         for name in self.runners:

@@ -55,7 +55,7 @@ async fn encrypt_chunked(
     for range in batch_ranges(items, caps, |p| p.data.len() as u64) {
         let chunk = &items[range];
         let cts = provider.encrypt_batch(context, chunk).await?;
-        out.extend(validate_owned_encrypt_result(chunk, cts, caps)?);
+        out.extend(validate_owned_encrypt_result(provider, chunk, cts, caps)?);
     }
     Ok(out)
 }
@@ -362,46 +362,83 @@ pub async fn cross_endpoint_self_test(
     context: &CryptoContext,
     unit_size: usize,
 ) -> Result<(), CryptoError> {
-    let caps_a = a.capabilities().await?;
-    let caps_b = b.capabilities().await?;
+    cross_endpoint_self_test_attributed(a, b, context, unit_size)
+        .await
+        .map_err(|(_, error)| error)
+}
+
+/// Side performing the RPC when a cross-check failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossCheckSide {
+    Reference,
+    Candidate,
+}
+
+/// Preserve the failing RPC's side so startup can replace an unavailable reference.
+pub async fn cross_endpoint_self_test_attributed(
+    a: &dyn CryptoProvider,
+    b: &dyn CryptoProvider,
+    context: &CryptoContext,
+    unit_size: usize,
+) -> Result<(), (CrossCheckSide, CryptoError)> {
+    let a_error = |error| (CrossCheckSide::Reference, error);
+    let b_error = |error| (CrossCheckSide::Candidate, error);
+    let caps_a = a.capabilities().await.map_err(a_error)?;
+    let caps_b = b.capabilities().await.map_err(b_error)?;
     if caps_a.crypto_compatibility_id != caps_b.crypto_compatibility_id {
-        return Err(CryptoError::ProviderFatal(format!(
+        return Err(b_error(CryptoError::ProviderFatal(format!(
             "endpoints report different compatibility ids: {:?} vs {:?}",
             caps_a.crypto_compatibility_id, caps_b.crypto_compatibility_id
-        )));
+        ))));
     }
-
-    for (enc, caps_enc, dec, caps_dec, dir) in [
-        (a, &caps_a, b, &caps_b, "A→B"),
-        (b, &caps_b, a, &caps_a, "B→A"),
+    for (enc, caps_enc, dec, caps_dec, dir, enc_side, dec_side) in [
+        (
+            a,
+            &caps_a,
+            b,
+            &caps_b,
+            "A→B",
+            CrossCheckSide::Reference,
+            CrossCheckSide::Candidate,
+        ),
+        (
+            b,
+            &caps_b,
+            a,
+            &caps_a,
+            "B→A",
+            CrossCheckSide::Candidate,
+            CrossCheckSide::Reference,
+        ),
     ] {
         let items = patterns(unit_size);
-        // Both sides split into capability-respecting RPCs so a small-batch
-        // endpoint is not spuriously rejected (MAKI-010).
-        let cts = encrypt_chunked(enc, context, &items, caps_enc).await?;
-        let mut pts = Vec::with_capacity(cts.len());
+        let cts = encrypt_chunked(enc, context, &items, caps_enc)
+            .await
+            .map_err(|error| (enc_side, error))?;
         for range in batch_ranges(&cts, caps_dec, |_| unit_size as u64) {
-            let chunk = &cts[range];
-            let got = dec.decrypt_batch(context, chunk).await.map_err(|e| {
-                // A transport-level failure is not proof of incompatibility —
-                // preserve its class so the caller can distinguish "down" from
-                // "not interchangeable".
-                if e.is_retryable() || matches!(e.class(), ErrorClass::EndpointFatal) {
-                    e
+            let chunk = &cts[range.clone()];
+            let got = dec.decrypt_batch(context, chunk).await.map_err(|error| {
+                let error = if error.is_retryable() || matches!(error.class(), ErrorClass::EndpointFatal) {
+                    error
                 } else {
                     CryptoError::ProviderFatal(format!(
-                        "cross-endpoint decrypt {dir} failed: {e} — endpoints are not interchangeable"
+                        "cross-endpoint decrypt {dir} failed: {error} — endpoints are not interchangeable"
                     ))
-                }
+                };
+                (dec_side, error)
             })?;
-            validate_decrypt_result(chunk, &got, caps_dec)?;
-            pts.extend(got);
-        }
-        for (orig, got) in items.iter().zip(pts.iter()) {
-            if orig.data != got.data {
-                return Err(CryptoError::ProviderFatal(format!(
-                    "cross-endpoint round trip {dir} produced different plaintext"
-                )));
+            validate_decrypt_result(chunk, &got, caps_dec).map_err(|error| (dec_side, error))?;
+            if items[range]
+                .iter()
+                .zip(&got)
+                .any(|(orig, got)| orig.data != got.data)
+            {
+                return Err((
+                    dec_side,
+                    CryptoError::ProviderFatal(format!(
+                        "cross-endpoint round trip {dir} produced different plaintext"
+                    )),
+                ));
             }
         }
     }

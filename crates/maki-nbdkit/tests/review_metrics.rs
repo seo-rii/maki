@@ -105,7 +105,7 @@ fn dispatch_config() -> DispatchConfig {
 
 async fn engine(provider: Arc<dyn CryptoProvider>) -> Engine {
     let backing = Arc::new(CrashableBacking::new());
-    init::create_volume(backing.as_ref(), superblock()).unwrap();
+    init::create_volume_with_discard(backing.as_ref(), superblock()).unwrap();
     Engine::attach(
         backing as Arc<dyn Backing>,
         provider,
@@ -197,4 +197,26 @@ async fn every_spec_required_metric_is_reported_without_a_dispatcher() {
     assert_eq!(metrics["maki_retry_budget_tokens"], json!({}));
     assert_eq!(metrics["maki_crypto_latency_seconds_count"], json!(0));
     assert_eq!(backend.status().await["crypto"]["endpoints"], json!([]));
+}
+
+#[tokio::test]
+async fn checkpoint_lag_counts_durable_writes_overwrites_and_trim_headers() {
+    let engine = engine(Arc::new(FakeCryptoProvider::new(UNIT))).await;
+    let backend = EngineControlBackend::new(engine.clone(), "vol");
+    let header = maki_format::journal::RECORD_HEADER_SIZE as u64;
+    let record = u64::from(UNIT + 8) + header;
+    assert_eq!(backend.metrics().await["maki_checkpoint_lag_bytes"], 0);
+    engine.write(0, &[3; UNIT as usize], false).await.unwrap();
+    assert_eq!(backend.metrics().await["maki_checkpoint_lag_bytes"], 0);
+    engine.write(0, &[4; UNIT as usize], true).await.unwrap();
+    assert_eq!(
+        backend.metrics().await["maki_checkpoint_lag_bytes"],
+        record * 2
+    );
+    engine.checkpoint().await.unwrap();
+    assert_eq!(backend.metrics().await["maki_checkpoint_lag_bytes"], 0);
+    engine.trim(0, UNIT as usize, true).await.unwrap();
+    assert_eq!(backend.metrics().await["maki_checkpoint_lag_bytes"], header);
+    engine.checkpoint().await.unwrap();
+    assert_eq!(backend.metrics().await["maki_checkpoint_lag_bytes"], 0);
 }

@@ -361,3 +361,38 @@ fn retry_rewrites_a_preserved_copy_after_writeback_discards_its_dirty_bits() {
     assert_eq!(loaded.generation(), 3);
     assert!(loaded.get(12000));
 }
+
+#[test]
+fn store_reads_each_existing_side_once() {
+    let backing = CrashableBacking::new();
+    let store = AbStore::new("a", "b");
+    let mut map = AllocationMap::new(16384);
+    store.store(&backing, &mut map).unwrap();
+    store.store(&backing, &mut map).unwrap();
+    let before = backing.read_bytes();
+    store.store(&backing, &mut map).unwrap();
+    assert_eq!(
+        backing.read_bytes() - before,
+        2 * AllocationMap::encoded_len(16384)
+    );
+}
+
+#[test]
+fn bounded_store_rejects_an_unreadable_update_before_publishing() {
+    let backing = CrashableBacking::new();
+    let store = AbStore::new("a", "b").with_max_len(ShardCatalog::max_encoded_len(1));
+    let mut catalog = ShardCatalog::new();
+    catalog.insert(0);
+    store.store(&backing, &mut catalog).unwrap();
+    let generation = catalog.generation();
+    let prior = bytes(&backing, "a");
+    catalog.insert(1);
+    assert!(store.store(&backing, &mut catalog).is_err());
+    assert_eq!(catalog.generation(), generation);
+    assert_eq!(bytes(&backing, "a"), prior);
+    assert!(!backing.exists("b").unwrap());
+    assert_eq!(
+        store.load::<ShardCatalog>(&backing).unwrap().unwrap().len(),
+        1
+    );
+}

@@ -12,7 +12,7 @@
 //! - between passes: full-jitter backoff; retries into an endpoint are gated
 //!   by that endpoint's own retry budget, whose minimum probe rate keeps a
 //!   recovery path alive even at zero budget (§32);
-//! - `max_attempts: None` = the `stall` availability policy (§35);
+//! - `stall` retries without an attempt limit or deadline (§35);
 //!   `max_operation_time` is an absolute wall-clock deadline for
 //!   `bounded-error`: it bounds backoff *and* cancels an in-flight RPC
 //!   (review M-010);
@@ -39,8 +39,8 @@ use crate::breaker::{BreakerConfig, CircuitBreaker, CircuitState};
 use crate::checked::{validate_decrypt_result, validate_owned_encrypt_result, CheckedProvider};
 use crate::clock::Clock;
 use crate::error::{CryptoError, ErrorClass};
-use crate::flow::{DualPermit, DualSemaphore};
-use crate::provider::CryptoProvider;
+use crate::flow::{semaphore_limits, DualPermit, DualSemaphore};
+use crate::provider::{private::ValidationCaller, CryptoProvider};
 use crate::retry::{full_jitter_delay, RetryBudget, RetryBudgetConfig, RetryPolicy};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
@@ -53,8 +53,8 @@ pub struct DispatchConfig {
     pub global_max_inflight_bytes: u64,
     pub per_endpoint_max_inflight: u32,
     pub per_endpoint_max_bytes: u64,
-    /// `None` = stall (retry forever, bounded memory and frequency);
-    /// `Some(n)` = bounded-error after n passes (SPEC §35).
+    /// Optional pass limit for callers that explicitly bound attempts. The
+    /// daemon uses the operation deadline for its bounded-error policy.
     pub max_attempts: Option<u32>,
     /// Absolute wall-clock budget for one operation (SPEC §35
     /// `bounded-error`): backoff never sleeps past it and an in-flight RPC
@@ -76,11 +76,14 @@ pub struct DispatchMetrics {
     failovers: AtomicU64,
     deadline_exceeded: AtomicU64,
     retries_refused_unsafe: AtomicU64,
-    /// Completed RPC attempts and their total latency in nanoseconds
-    /// (SPEC §40 `maki_crypto_latency_seconds`); an attempt abandoned at
-    /// the deadline is not a sample.
-    rpc_count: AtomicU64,
-    rpc_nanos: AtomicU64,
+    /// Only completed attempts contribute a sample (SPEC §40).
+    rpc: parking_lot::Mutex<RpcLatency>,
+}
+
+#[derive(Default)]
+struct RpcLatency {
+    count: u64,
+    total: Duration,
 }
 
 impl DispatchMetrics {
@@ -90,12 +93,18 @@ impl DispatchMetrics {
 
     /// Completed RPC attempts (successful or failed).
     pub fn rpc_count(&self) -> u64 {
-        self.rpc_count.load(Ordering::SeqCst)
+        self.rpc.lock().count
     }
 
     /// Total latency of completed RPC attempts, in seconds.
     pub fn rpc_seconds_sum(&self) -> f64 {
-        self.rpc_nanos.load(Ordering::SeqCst) as f64 / 1e9
+        self.rpc.lock().total.as_secs_f64()
+    }
+
+    /// Count and total seconds of completed RPCs from one observation.
+    pub fn rpc_latency(&self) -> (u64, f64) {
+        let rpc = self.rpc.lock();
+        (rpc.count, rpc.total.as_secs_f64())
     }
 
     pub fn failovers_total(&self) -> u64 {
@@ -161,7 +170,7 @@ pub struct EndpointStatus {
 
 pub struct EndpointSet {
     endpoints: Vec<Arc<Endpoint>>,
-    global: Arc<DualSemaphore>,
+    global: Arc<GlobalRpcBudget>,
     admission_gate: AsyncMutex<()>,
     capacity_changed: Arc<Notify>,
     policy: RetryPolicy,
@@ -179,11 +188,56 @@ pub struct EndpointSet {
     plaintext_size: Option<u32>,
 }
 
+/// Serving and validation RPCs try to reserve both dimensions together. The
+/// admission waiters already use `capacity_changed` to await a release.
+struct GlobalRpcBudget {
+    max_batches: u64,
+    max_bytes: u64,
+    inflight: parking_lot::Mutex<(u64, u64)>,
+}
+
+impl GlobalRpcBudget {
+    fn new(max_batches: u32, max_bytes: u64) -> Self {
+        let (max_batches, max_bytes) = semaphore_limits(max_batches, max_bytes);
+        Self {
+            max_batches: max_batches as u64,
+            max_bytes,
+            inflight: Default::default(),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<GlobalRpcPermit> {
+        let mut usage = self.inflight.lock();
+        if usage.0 >= self.max_batches || bytes > self.max_bytes - usage.1 {
+            return None;
+        }
+        usage.0 += 1;
+        usage.1 += bytes;
+        Some(GlobalRpcPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+struct GlobalRpcPermit {
+    budget: Arc<GlobalRpcBudget>,
+    bytes: u64,
+}
+
+impl Drop for GlobalRpcPermit {
+    fn drop(&mut self) {
+        let mut usage = self.budget.inflight.lock();
+        usage.0 -= 1;
+        usage.1 -= self.bytes;
+    }
+}
+
 /// Both budgets are acquired without waiting, then retained only for the RPC.
 /// Release capacity before notifying the FIFO admission waiter.
 struct EndpointAdmission {
     endpoint: Arc<Endpoint>,
-    global: Option<DualPermit>,
+    global: Option<GlobalRpcPermit>,
     local: Option<DualPermit>,
     changed: Arc<Notify>,
 }
@@ -221,7 +275,7 @@ impl Drop for ValidationGuard {
 /// calls the other peer, including when global capacity is just one RPC.
 struct ValidationProvider {
     endpoint: Arc<Endpoint>,
-    global: Arc<DualSemaphore>,
+    global: Arc<GlobalRpcBudget>,
     changed: Arc<Notify>,
     reference: bool,
 }
@@ -254,9 +308,9 @@ impl ValidationProvider {
     }
 
     async fn admit(&self, bytes: u64) -> Result<EndpointAdmission, CryptoError> {
-        if self.global.max_items() == 0
+        if self.global.max_batches == 0
             || self.endpoint.semaphore.max_items() == 0
-            || bytes > self.global.max_bytes()
+            || bytes > self.global.max_bytes
             || bytes > self.endpoint.semaphore.max_bytes()
         {
             return Err(CryptoError::NonRetryableRequest(
@@ -301,11 +355,10 @@ impl CryptoProvider for ValidationProvider {
             .await
             .map_err(|error| self.failure("capabilities", error))?;
         // Split self-test probes to fit both logical batch limits and the
-        // worst-case resident ciphertext budget. Serving capabilities stay
-        // unchanged; only these background probes use the smaller batches.
+        // worst-case resident ciphertext budget of this validation endpoint.
         let byte_budget = self
             .global
-            .max_bytes()
+            .max_bytes
             .min(self.endpoint.semaphore.max_bytes());
         let largest_plaintext = caps
             .supported_plaintext_sizes
@@ -374,14 +427,26 @@ impl Request<'_> {
     }
 }
 
+/// Count whole items that fit both limits without overflowing a byte sum.
+fn rpc_chunk_len(sizes: impl Iterator<Item = usize>, max_items: usize, mut bytes: u64) -> usize {
+    let mut count = 0;
+    for size in sizes.take(max_items) {
+        let Some(remaining) = bytes.checked_sub(size as u64) else {
+            break;
+        };
+        bytes = remaining;
+        count += 1;
+    }
+    count
+}
+
 const DEADLINE_MESSAGE: &str = "operation deadline exceeded";
 
 pub(crate) fn deadline_error() -> CryptoError {
     CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
 }
 
-/// The *operation's* wall-clock budget ran out; says nothing about the
-/// health of whichever endpoint happened to be in flight.
+/// Recognize reported deadline outcomes for scheduler caller metrics.
 pub(crate) fn is_deadline_error(err: &CryptoError) -> bool {
     matches!(err, CryptoError::Retryable(m) if m == DEADLINE_MESSAGE)
 }
@@ -443,7 +508,7 @@ impl EndpointSet {
             .collect();
         Self {
             endpoints,
-            global: Arc::new(DualSemaphore::new(
+            global: Arc::new(GlobalRpcBudget::new(
                 config.global_max_inflight_batches,
                 config.global_max_inflight_bytes,
             )),
@@ -468,6 +533,16 @@ impl EndpointSet {
         self.plaintext_size = Some(plaintext_size);
         self.caps = OnceCell::new();
         self
+    }
+
+    /// All serving endpoints have the same semaphore limits. Use the actual,
+    /// platform-clamped budget shared by both directions.
+    fn rpc_byte_limit(&self) -> u64 {
+        let endpoint = &self.endpoints[0].semaphore;
+        if self.global.max_batches == 0 || endpoint.max_items() == 0 {
+            return 0;
+        }
+        self.global.max_bytes.min(endpoint.max_bytes())
     }
 
     /// Freeze the contract across all configured peers, including ones that
@@ -521,6 +596,7 @@ impl EndpointSet {
                         common = common.intersect(&caps);
                     }
                 }
+                common.retry_safe &= self.config.retry_safe;
                 common.supported_plaintext_sizes.sort_unstable();
                 common.supported_plaintext_sizes.dedup();
                 if !common.batch.supported {
@@ -544,15 +620,30 @@ impl EndpointSet {
         &self,
         deadline: Option<Duration>,
     ) -> Result<&CryptoCapabilities, CryptoError> {
+        self.until_deadline(deadline, self.common_caps()).await?
+    }
+
+    /// One absolute budget covers every await. If polling was delayed, both
+    /// futures can be ready; even synchronous work in the operation's poll
+    /// can take us past the deadline after checking the timer.
+    async fn until_deadline<T>(
+        &self,
+        deadline: Option<Duration>,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T, CryptoError> {
         let Some(deadline) = deadline else {
-            return self.common_caps().await;
+            return Ok(operation.await);
         };
         let remaining = deadline.saturating_sub(self.clock.now());
         if !remaining.is_zero() {
-            let timer = self.clock.sleep(remaining);
             tokio::select! {
-                result = self.common_caps() => return result,
-                _ = timer => {}
+                biased;
+                _ = self.clock.sleep(remaining) => {},
+                result = operation => {
+                    if self.clock.now() < deadline {
+                        return Ok(result);
+                    }
+                }
             }
         }
         self.metrics
@@ -591,10 +682,7 @@ impl EndpointSet {
     /// RPCs and bytes currently holding the set's global permits
     /// (`maki_crypto_inflight_batches`, `maki_crypto_inflight_bytes`).
     pub fn global_inflight(&self) -> (u64, u64) {
-        (
-            (self.global.max_items() - self.global.available_items()) as u64,
-            self.global.max_bytes() - self.global.available_bytes(),
-        )
+        *self.global.inflight.lock()
     }
 
     pub fn endpoint_status(&self) -> Vec<EndpointStatus> {
@@ -793,22 +881,7 @@ impl EndpointSet {
                 }
             }
         };
-        match deadline {
-            None => Ok(admit.await),
-            Some(deadline) => {
-                let remaining = deadline.saturating_sub(self.clock.now());
-                if remaining.is_zero() {
-                    return Err(deadline_error());
-                }
-                tokio::select! {
-                    result = admit => Ok(result),
-                    _ = self.clock.sleep(remaining) => {
-                        self.metrics.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
-                        Err(deadline_error())
-                    }
-                }
-            }
-        }
+        self.until_deadline(deadline, admit).await
     }
 
     async fn call_endpoint(
@@ -841,7 +914,8 @@ impl EndpointSet {
         let result = result.and_then(|response| {
             match (request, response) {
                 (Request::Encrypt(items), Response::Encrypted(output)) => {
-                    validate_owned_encrypt_result(items, output, caps).map(Response::Encrypted)
+                    validate_owned_encrypt_result(endpoint.provider.as_ref(), items, output, caps)
+                        .map(Response::Encrypted)
                 }
                 (Request::Decrypt(items), Response::Decrypted(output)) => {
                     validate_decrypt_result(items, &output, caps)?;
@@ -861,42 +935,10 @@ impl EndpointSet {
             }
         });
         let elapsed = self.clock.now().saturating_sub(started);
-        self.metrics.rpc_count.fetch_add(1, Ordering::SeqCst);
-        self.metrics.rpc_nanos.fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::SeqCst,
-        );
+        let mut rpc = self.metrics.rpc.lock();
+        rpc.count = rpc.count.saturating_add(1);
+        rpc.total = rpc.total.saturating_add(elapsed);
         result
-    }
-
-    /// The RPC, abandoned at the deadline (the dropped future cancels the
-    /// transport request).
-    async fn call_with_deadline(
-        &self,
-        endpoint: &Endpoint,
-        context: &CryptoContext,
-        request: &Request<'_>,
-        deadline: Option<Duration>,
-        caps: &CryptoCapabilities,
-    ) -> Result<Response, CryptoError> {
-        let call = self.call_endpoint(endpoint, context, request, caps);
-        match deadline {
-            None => call.await,
-            Some(deadline) => {
-                let remaining = deadline.saturating_sub(self.clock.now());
-                if remaining.is_zero() {
-                    return Err(deadline_error());
-                }
-                let timer = self.clock.sleep(remaining);
-                tokio::select! {
-                    result = call => result,
-                    _ = timer => {
-                        self.metrics.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
-                        Err(deadline_error())
-                    }
-                }
-            }
-        }
     }
 
     async fn dispatch(
@@ -928,16 +970,16 @@ impl EndpointSet {
         sent: &mut bool,
     ) -> Result<Response, CryptoError> {
         let bytes = request.bytes();
-        if self.global.max_items() == 0
+        if self.global.max_batches == 0
             || self.endpoints[0].semaphore.max_items() == 0
-            || bytes > self.global.max_bytes()
+            || bytes > self.global.max_bytes
             || bytes > self.endpoints[0].semaphore.max_bytes()
         {
             return Err(CryptoError::NonRetryableRequest(
                 "request exceeds global or endpoint admission capacity".into(),
             ));
         }
-        let mut calls_made = 0u32;
+        let mut attempted = false;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
         // The previous actual RPC survives retry-pass boundaries. A newly
@@ -976,7 +1018,7 @@ impl EndpointSet {
             let mut excluded = contract_failed.clone();
             loop {
                 let admission = match self
-                    .admit_endpoint(&excluded, bytes, deadline, calls_made == 0)
+                    .admit_endpoint(&excluded, bytes, deadline, !attempted)
                     .await
                 {
                     Ok(Some(admission)) => admission,
@@ -993,7 +1035,7 @@ impl EndpointSet {
                     continue;
                 };
                 excluded.push(endpoint.clone());
-                if calls_made > 0 {
+                if attempted {
                     // Another attempt. A request that may already have
                     // reached a provider is never re-sent unless retry-safe;
                     // one every earlier attempt proved unsent may go out.
@@ -1028,28 +1070,23 @@ impl EndpointSet {
                     tried.push(endpoint.clone());
                 }
                 last_endpoint = Some(endpoint.clone());
-                calls_made += 1;
-                match self
-                    .call_with_deadline(&endpoint, context, &request, deadline, caps)
-                    .await
-                {
-                    Ok(response) => {
+                attempted = true;
+                let call = self.call_endpoint(&endpoint, context, &request, caps);
+                match self.until_deadline(deadline, call).await {
+                    Err(expired) => {
+                        // Our timer canceled the RPC. Its delivery is unknown;
+                        // dropping the probe returns its slot without a verdict.
+                        *sent = true;
+                        return Err(expired);
+                    }
+                    Ok(Ok(response)) => {
                         probe.on_success();
                         return Ok(response);
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         // Only a transport's proof keeps the request unsent.
                         let unsent = err.is_not_sent();
                         *sent |= !unsent;
-                        if is_deadline_error(&err) {
-                            // The operation's budget ran out mid-RPC: not
-                            // an endpoint failure, so no breaker or budget
-                            // charge (C-06). The probe permit drops here
-                            // and returns its half-open slot without a
-                            // verdict, or abandoned probes would wedge the
-                            // circuit (BUG-004 / N-10).
-                            return Err(err);
-                        }
                         match err.class() {
                             class @ (ErrorClass::Retryable
                             | ErrorClass::Throttled
@@ -1152,19 +1189,48 @@ impl EndpointSet {
                 delay = delay.min(dl.saturating_sub(self.clock.now()));
             }
             self.clock.sleep(delay).await;
-            pass += 1;
+            pass = pass.saturating_add(1);
         }
     }
 }
 
 #[async_trait]
 impl CryptoProvider for EndpointSet {
+    fn checks_plaintext_echo(&self, _: ValidationCaller) -> bool {
+        // Every endpoint is checked before dispatch accepts its result.
+        // Concatenating whole chunks preserves each input/output pair.
+        true
+    }
+
     fn max_operation_time(&self) -> Option<Duration> {
         self.config.max_operation_time
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        Ok(self.common_caps().await?.clone())
+        let mut caps = self.common_caps().await?.clone();
+        let budget = self.rpc_byte_limit();
+        // Callers may plan either direction. Account for the largest ciphertext
+        // they could have to submit, as well as the plaintext byte limit.
+        caps.batch.max_bytes = caps.batch.max_bytes.min(budget);
+        caps.batch.max_items = u64::from(caps.batch.max_items)
+            .min(budget / u64::from(caps.max_ciphertext_size))
+            as u32;
+        if caps.batch.max_items == 0
+            || caps
+                .supported_plaintext_sizes
+                .first()
+                .is_some_and(|&size| u64::from(size) > budget)
+            || self
+                .plaintext_size
+                .is_some_and(|size| u64::from(size) > budget)
+        {
+            return Err(CryptoError::NonRetryableRequest(
+                "one endpoint unit exceeds RPC admission capacity".into(),
+            ));
+        }
+        caps.supported_plaintext_sizes
+            .retain(|&size| u64::from(size) <= budget);
+        Ok(caps)
     }
 
     async fn encrypt_batch(
@@ -1177,10 +1243,11 @@ impl CryptoProvider for EndpointSet {
             .max_operation_time
             .map(|d| self.clock.now().saturating_add(d));
         let caps = self.common_caps_with_deadline(deadline).await?;
+        let max_bytes = caps.batch.max_bytes.min(self.rpc_byte_limit());
         // Validate the entire input before sending even the first chunk.
         if items.iter().any(|item| {
             !caps.accepts_plaintext_size(item.data.len())
-                || item.data.len() as u64 > caps.batch.max_bytes
+                || item.data.len() as u64 > max_bytes
                 || self
                     .plaintext_size
                     .is_some_and(|size| item.data.len() != size as usize)
@@ -1192,23 +1259,19 @@ impl CryptoProvider for EndpointSet {
         let mut out = Vec::with_capacity(items.len());
         let mut start = 0;
         while start < items.len() {
-            let mut end = start;
-            let mut bytes = 0u64;
-            while end < items.len() && end - start < caps.batch.max_items as usize {
-                let size = items[end].data.len() as u64;
-                if size > caps.batch.max_bytes - bytes {
-                    break;
-                }
-                bytes += size;
-                end += 1;
-            }
+            let end = start
+                + rpc_chunk_len(
+                    items[start..].iter().map(|item| item.data.len()),
+                    caps.batch.max_items as usize,
+                    max_bytes,
+                );
             let chunk = &items[start..end];
             let result = self
                 .dispatch(
                     context,
                     Request::Encrypt(chunk),
                     deadline,
-                    self.config.retry_safe && caps.retry_safe,
+                    caps.retry_safe,
                     caps,
                 )
                 .await;
@@ -1234,10 +1297,11 @@ impl CryptoProvider for EndpointSet {
             .max_operation_time
             .map(|d| self.clock.now().saturating_add(d));
         let caps = self.common_caps_with_deadline(deadline).await?;
-        if items
-            .iter()
-            .any(|item| item.data.is_empty() || item.data.len() > caps.max_ciphertext_size as usize)
-        {
+        let budget = self.rpc_byte_limit();
+        if items.iter().any(|item| {
+            item.data.is_empty()
+                || item.data.len() as u64 > budget.min(u64::from(caps.max_ciphertext_size))
+        }) {
             return Err(CryptoError::NonRetryableRequest(
                 "ciphertext unit exceeds the common endpoint contract".into(),
             ));
@@ -1261,23 +1325,32 @@ impl CryptoProvider for EndpointSet {
             ));
         }
         let mut out = Vec::with_capacity(items.len());
-        for (index, chunk) in items.chunks(chunk_size).enumerate() {
+        let mut start = 0;
+        while start < items.len() {
+            let end = start
+                + rpc_chunk_len(
+                    items[start..].iter().map(|item| item.data.len()),
+                    chunk_size,
+                    budget,
+                );
+            let chunk = &items[start..end];
             let result = self
                 .dispatch(
                     context,
                     Request::Decrypt(chunk),
                     deadline,
-                    self.config.retry_safe && caps.retry_safe,
+                    caps.retry_safe,
                     caps,
                 )
                 .await;
             // Earlier chunks of this call were sent.
-            match result.map_err(|error| if index > 0 { error.maybe_sent() } else { error })? {
+            match result.map_err(|error| if start > 0 { error.maybe_sent() } else { error })? {
                 Response::Decrypted(mut result) => {
                     out.append(&mut result);
                 }
                 Response::Encrypted(_) => unreachable!(),
             }
+            start = end;
         }
         Ok(out)
     }

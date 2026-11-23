@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use maki_crypto::breaker::{BreakerConfig, CircuitState};
 use maki_crypto::checked::CheckedProvider;
+use maki_crypto::clock::{Clock, SleepFuture};
 use maki_crypto::endpoint::{DispatchConfig, EndpointSet};
 use maki_crypto::retry::{RetryBudgetConfig, RetryPolicy};
 use maki_crypto::scheduler::{BatchScheduler, SchedulerConfig};
@@ -285,4 +286,52 @@ async fn a_provider_without_a_deadline_keeps_stall_semantics() {
     settle().await;
     task.await.unwrap().unwrap();
     assert_eq!(provider.encrypt_calls(), 1);
+}
+
+/// Model a timer wheel that wakes a millisecond after the target while the
+/// monotonic clock still reports the exact elapsed time.
+struct LateTimer(Arc<ManualClock>);
+
+impl Clock for LateTimer {
+    fn now(&self) -> Duration {
+        self.0.now()
+    }
+
+    fn sleep(&self, duration: Duration) -> SleepFuture {
+        self.0.sleep(duration + Duration::from_millis(1))
+    }
+}
+
+#[tokio::test]
+async fn a_late_timer_wakeup_cannot_extend_the_callers_operation_budget() {
+    for (service_us, should_succeed) in [(59_500, true), (60_500, false)] {
+        let clock = Arc::new(ManualClock::new());
+        let provider = Arc::new(FakeCryptoProvider::new(64));
+        provider.set_latency(clock.clone(), Duration::from_micros(service_us));
+        let mut config = scheduler_config();
+        config.max_wait = Duration::from_millis(39);
+        let scheduler = Arc::new(BatchScheduler::new(
+            endpoint(provider.clone(), clock.clone()),
+            config,
+            Arc::new(LateTimer(clock.clone())),
+        ));
+        let task = request(&scheduler, 1);
+        settle().await;
+        clock.advance(Duration::from_millis(40));
+        settle().await;
+        assert_eq!(provider.encrypt_calls(), 1);
+        clock.advance(Duration::from_micros(service_us));
+        settle().await;
+        assert!(task.is_finished());
+        let result = task.await.unwrap();
+        if should_succeed {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("deadline"));
+        }
+        assert_eq!(
+            scheduler.stats().deadline_exceeded_total(),
+            u64::from(!should_succeed)
+        );
+    }
 }

@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import sys
+import stat
 import tempfile
 import traceback
 import unittest
@@ -42,24 +43,27 @@ class GuestProviderContracts(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="maki-gcp-provider-")
         self.addCleanup(temporary.cleanup)
         self.path = pathlib.Path(temporary.name)
-        self.config = self.path / "config.toml"
+        self.config = self.path / "my-profile.toml"
         self.plugin = self.path / "libmaki_nbdkit.so"
         self.plugin.write_bytes(b"not-loaded-by-this-test")
         self.runtime = self.path / "runtime"
         self.runtime.mkdir()
+        (self.runtime / "connections.log").write_text('00:00:00 connection=1 Connect export="" fua=2\n')
         previous_umask = os.umask(0o077)
         self.addCleanup(os.umask, previous_umask)
 
-    def run_guest(self, text, *, profile="v2", verify_only=True, read_error=None):
+    def run_guest(self, text, *, profile="v2", verify_only=True, read_error=None, shutdown_error=None):
         self.config.write_bytes(text.encode() if isinstance(text, str) else text)
-        client = mock.Mock(can_fua=True, can_flush=True, can_trim=True)
+        client = mock.Mock(can_fua=True, can_flush=True, can_trim=profile == "v3-discard")
         client.read.side_effect = lambda offset: self.guest.payload(
-            0, self.guest.index_for_offset(offset))
+            0, self.guest.index_for_offset(offset), "a" * 32)
         captured = io.BytesIO()
         stream = io.TextIOWrapper(captured, encoding="utf-8", write_through=True)
         resolve, open_path = pathlib.Path.resolve, pathlib.Path.open
 
         def redirect_mount(path, *args, **kwargs):
+            if path == pathlib.Path("/mnt/maki-data/synthetic-provider-backing"):
+                return self.path
             if path == pathlib.Path("/mnt/maki-data"):
                 return self.path
             return resolve(path, *args, **kwargs)
@@ -69,7 +73,7 @@ class GuestProviderContracts(unittest.TestCase):
                 raise read_error
             return open_path(path, *args, **kwargs)
 
-        argv = ["gcp-reset-guest.py", "--token", "a" * 32,
+        argv = ["gcp-reset-guest.py", "--token", "a" * 32, "--device-name", "data",
                 "--cycle", "1" if verify_only else "0", "--profile", profile,
                 "--config", str(self.config), "--plugin", str(self.plugin)]
         if verify_only:
@@ -78,7 +82,7 @@ class GuestProviderContracts(unittest.TestCase):
             stack.enter_context(mock.patch.object(sys, "argv", argv))
             stack.enter_context(mock.patch.object(pathlib.Path, "resolve", redirect_mount))
             stack.enter_context(mock.patch.object(pathlib.Path, "open", read_config))
-            stack.enter_context(mock.patch.object(self.guest, "filesystem_uuid",
+            stack.enter_context(mock.patch.object(self.guest, "validate_disk",
                                                  return_value="10000000-0000-0000-0000-000000000001"))
             stack.enter_context(mock.patch.object(self.guest, "shutdown_witness", return_value={
                 "witness_service": "active", "graceful_stop_witness": "absent"}))
@@ -88,7 +92,7 @@ class GuestProviderContracts(unittest.TestCase):
                 mock.sentinel.process, None, self.runtime / "nbd.sock")))
             stack.enter_context(mock.patch.object(self.guest, "Nbd", return_value=client))
             stack.enter_context(mock.patch.object(self.guest, "wait_for_reset"))
-            stack.enter_context(mock.patch.object(self.guest, "cleanup"))
+            stack.enter_context(mock.patch.object(self.guest, "cleanup", side_effect=shutdown_error))
             stack.enter_context(contextlib.redirect_stdout(stream))
             error = None
             try:
@@ -107,7 +111,9 @@ class GuestProviderContracts(unittest.TestCase):
         launch.assert_not_called()
         client.read.assert_not_called()
         client.write.assert_not_called()
-        self.assertEqual(events, [])
+        self.assertEqual([event["event"] for event in events], ["error"])
+        self.assertEqual(events[0]["message"], f"ValueError: {error}")
+        self.assertNotIn("provider", events[0])
         return error
 
     def test_expected_provider_runs_both_profiles_and_reports_validated_identity(self):
@@ -124,6 +130,11 @@ class GuestProviderContracts(unittest.TestCase):
                         self.assertEqual(ready["provider"], "local-aes-gcm-siv")
                         self.host.validate_ready(ready, None, profile)
                         self.assertEqual(events[-1]["event"], "verified" if verify_only else "ack")
+
+    def test_final_guest_emits_an_error_before_verified_if_shutdown_fails(self):
+        error, events, _, _ = self.run_guest(VALID_CONFIG, shutdown_error=RuntimeError("shutdown failed"))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual([record["event"] for record in events], ["ready", "readback", "error"])
 
     def test_bom_does_not_admit_wrong_provider_or_malformed_config(self):
         marker = "synthetic-bom-private-marker"
@@ -179,8 +190,42 @@ class GuestProviderContracts(unittest.TestCase):
         self.assertNotIn("secret-marker", str(error))
         self.assertTrue(error.__suppress_context__)
 
+    def test_device_binding_requires_config_and_backing_on_attached_disk(self):
+        mount = mock.Mock()
+        config = mock.Mock()
+        backing = mock.Mock()
+        backing.is_dir.return_value = True
+        expected = os.makedev(8, 16)
+        boot = os.makedev(8, 0)
+        partition = os.makedev(8, 17)
+        mount.stat.return_value.st_dev = expected
+        config.stat.return_value.st_dev = expected
+        backing.stat.return_value.st_dev = expected
+        with mock.patch.object(self.guest.pathlib.Path, "stat") as disk_stat, \
+                mock.patch.object(self.guest, "filesystem_uuid", return_value="disk-uuid"):
+            disk_stat.return_value.st_mode = stat.S_IFBLK
+            disk_stat.return_value.st_rdev = expected
+            self.assertEqual(self.guest.validate_disk(mount, config, backing, "custom-name"), "disk-uuid")
+            for misplaced in (config, backing):
+                misplaced.stat.return_value.st_dev = boot
+                with self.assertRaisesRegex(ValueError, "qualified filesystem"):
+                    self.guest.validate_disk(mount, config, backing, "custom-name")
+                misplaced.stat.return_value.st_dev = expected
+            for path in (mount, config, backing):
+                path.stat.return_value.st_dev = partition
+            # sysfs reports the parent disk of the mounted partition.
+            with mock.patch.object(pathlib.Path, "resolve", return_value=self.path / "sdb1"), \
+                    mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                    mock.patch.object(pathlib.Path, "read_text", return_value="8:16"):
+                self.assertEqual(self.guest.validate_disk(mount, config, backing, "custom-name"), "disk-uuid")
+            with mock.patch.object(pathlib.Path, "resolve", return_value=self.path / "sda1"), \
+                    mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                    mock.patch.object(pathlib.Path, "read_text", return_value="8:0"):
+                with self.assertRaisesRegex(ValueError, "does not belong"):
+                    self.guest.validate_disk(mount, config, backing, "custom-name")
+
     def test_host_still_rejects_a_mismatched_ready_provider(self):
-        error, events, _, _ = self.run_guest('[crypto]\nprovider = "local-aes-gcm-siv"\n')
+        error, events, _, _ = self.run_guest(VALID_CONFIG)
         self.assertIsNone(error)
         for provider in ("local-aes-xts", "remote-http", None):
             with self.subTest(provider=provider), self.assertRaises(ValueError):

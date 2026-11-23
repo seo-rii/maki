@@ -46,13 +46,29 @@ impl AllocationMap {
         }
     }
 
+    /// Set units below an exclusive limit, in ascending order. Skip empty
+    /// bytes and stop at the addressable end of a partially filled shard.
+    pub fn set_units(&self, limit: u64) -> impl Iterator<Item = u64> + '_ {
+        let limit = limit.min(self.units);
+        self.bits[..limit.div_ceil(8) as usize]
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, byte)| *byte != 0)
+            .flat_map(|(index, byte)| {
+                let base = index as u64 * 8;
+                (0..8).filter_map(move |bit| (byte & (1 << bit) != 0).then_some(base + bit))
+            })
+            .take_while(move |&unit| unit < limit)
+    }
+
     /// Number of allocated units (padding bits are always clear).
     pub fn set_count(&self) -> u64 {
         self.bits.iter().map(|b| b.count_ones() as u64).sum()
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(Self::encoded_len(self.units) as usize);
         w.bytes(ALLOCATION_MAGIC)
             .u32(ALLOCATION_VERSION)
             .u64(self.generation)
@@ -66,7 +82,7 @@ impl AllocationMap {
         ENCODED_FIXED_BYTES + units.div_ceil(8)
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
+    fn decode_parts(data: &[u8]) -> Result<(u64, u64, &[u8]), FormatError> {
         let payload = strip_verify_crc(data, "allocation map")?;
         let mut r = Reader::new(payload);
         let magic = r.take(8)?;
@@ -85,12 +101,24 @@ impl AllocationMap {
             return Err(FormatError::Invalid(format!("allocation units {units}")));
         }
         let expected = units.div_ceil(8) as usize;
-        let mut bits = r.take(expected)?.to_vec();
+        let bits = r.take(expected)?;
         if r.remaining() != 0 {
             return Err(FormatError::Invalid(
                 "trailing bytes after allocation bitmap".to_string(),
             ));
         }
+        Ok((generation, units, bits))
+    }
+
+    /// Check the entire frame and return its generation and geometry.
+    pub(crate) fn decode_geometry(data: &[u8]) -> Result<(u64, u64), FormatError> {
+        let (generation, units, _) = Self::decode_parts(data)?;
+        Ok((generation, units))
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
+        let (generation, units, bits) = Self::decode_parts(data)?;
+        let mut bits = bits.to_vec();
         // The last byte's bits past `units` name no unit. No writer sets
         // them, but they were never checked, so a copy with them set stays
         // valid; they are cleared here instead. Counted, they would make an
@@ -126,5 +154,24 @@ impl AbRecord for AllocationMap {
 
     fn decode(data: &[u8]) -> Result<Self, FormatError> {
         AllocationMap::decode(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AllocationMap;
+
+    #[test]
+    fn set_units_stops_at_the_addressable_limit() {
+        let mut map = AllocationMap::new(67);
+        for slot in [0, 7, 32, 35, 63, 65] {
+            map.set(slot, true);
+        }
+        for limit in [0, 1, 7, 8, 24, 35, 36, 64, 66, 67, u64::MAX] {
+            let expected: Vec<_> = (0..limit.min(map.units()))
+                .filter(|&slot| map.get(slot))
+                .collect();
+            assert_eq!(map.set_units(limit).collect::<Vec<_>>(), expected);
+        }
     }
 }

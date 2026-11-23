@@ -2,15 +2,20 @@
 //! verification of a volume's metadata (SPEC §43; deep slot checks are
 //! exercised further by recovery in Phase 3).
 
+use std::io::ErrorKind;
+
 use maki_backing::Backing;
 
-use crate::ab::AbStore;
+use crate::ab::{AbRecord, AbStore};
 use crate::allocation::AllocationMap;
 use crate::catalog::ShardCatalog;
+use crate::checkpoint::{CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use crate::durable_proof::DurableProofStore;
 use crate::error::FormatError;
 use crate::layout;
-use crate::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3};
+use crate::superblock::{
+    load_volume_superblock_with_fallback, SUPERBLOCK_VERSION_V2, SUPERBLOCK_VERSION_V3,
+};
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -28,7 +33,7 @@ impl CheckReport {
 pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     let mut report = CheckReport::default();
 
-    let envelope = match load_volume_superblock(backing) {
+    let (envelope, invalid_copy) = match load_volume_superblock_with_fallback(backing) {
         Ok(envelope) => envelope,
         Err(error @ FormatError::Io(_)) => return Err(error),
         Err(error) => {
@@ -38,6 +43,11 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             return Ok(report);
         }
     };
+    if let Some(path) = invalid_copy {
+        report.warnings.push(format!(
+            "superblock: {path} is missing or invalid (A/B fallback in use)"
+        ));
+    }
     let superblock = envelope.superblock;
     if matches!(
         envelope.metadata_version,
@@ -61,19 +71,46 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         superblock.volume_uuid, superblock.generation, superblock.geometry.slot_size
     ));
 
+    // Recovery requires at least one checkpoint state file. The deep check
+    // handles decoding and comparing its contents.
+    let mut has_checkpoint_file = false;
+    for path in [CHECKPOINT_STATE_A, CHECKPOINT_STATE_B] {
+        match backing.open(path, false) {
+            Ok(_) => has_checkpoint_file = true,
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if matches!(e.kind(), ErrorKind::IsADirectory | ErrorKind::InvalidInput) => {
+                report
+                    .errors
+                    .push(format!("invalid checkpoint state file {path}: {e}"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !has_checkpoint_file {
+        report
+            .errors
+            .push("no checkpoint state file is present".into());
+    }
+
     // Valid sizes follow from the geometry; longer copies are never read
     // (R5-025).
-    let map_len = AllocationMap::encoded_len(superblock.geometry.units_per_shard());
     let cat_ab = AbStore::new(layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B).with_max_len(
         ShardCatalog::max_encoded_len(superblock.geometry.num_shards()),
     );
-    let catalog = match cat_ab.load::<ShardCatalog>(backing)? {
+    let (catalog, copies) = cat_ab.load_with_copy_count::<ShardCatalog>(backing)?;
+    let catalog = match catalog {
         Some(c) => c,
         None => {
             report.errors.push("no valid shard catalog".to_string());
             return Ok(report);
         }
     };
+    // Creation intentionally publishes the empty generation-one catalog once.
+    if copies == 1 && catalog.generation() > 1 {
+        report
+            .warnings
+            .push("shard catalog has one valid copy".into());
+    }
     report
         .info
         .push(format!("catalog: {} shard(s)", catalog.len()));
@@ -86,22 +123,13 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
                 .push(format!("catalog shard {shard} out of range"));
             continue;
         }
-        let alloc_ab = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
-            .with_max_len(map_len);
-        match alloc_ab.load::<AllocationMap>(backing)? {
-            None => report
-                .errors
-                .push(format!("shard {shard}: no valid allocation map")),
-            Some(map) => {
-                if map.units() != geometry.units_per_shard() {
-                    report.errors.push(format!(
-                        "shard {shard}: allocation map covers {} units, geometry says {}",
-                        map.units(),
-                        geometry.units_per_shard()
-                    ));
-                }
-            }
-        }
+        check_allocation_map(
+            backing,
+            shard,
+            geometry.units_per_shard(),
+            true,
+            &mut report,
+        )?;
         if envelope.metadata_version == SUPERBLOCK_VERSION_V3 {
             check_discard_map(backing, shard, geometry.units_per_shard(), &mut report)?;
         }
@@ -114,11 +142,7 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         // allocation map says. Report it as an error, matching recovery,
         // rather than a benign warning that lets `maki check` pass on a
         // volume `maki attach` would reject.
-        if !backing.exists(&layout::shard_data(shard))? {
-            report.errors.push(format!(
-                "shard {shard}: cataloged but its data file is missing; recovery would refuse to attach"
-            ));
-        }
+        check_data_file(backing, shard, &mut report)?;
     }
 
     // A shard data file the loaded catalog copy does not list results from a
@@ -126,36 +150,102 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     // to an older catalog copy. Recovery adopts it and serves its slots
     // (S-01); one beyond the geometry is never read. Only the canonical
     // spelling is a shard file, exactly as recovery parses it.
-    if backing.exists(layout::DATA_DIR)? {
-        for name in backing.list(layout::DATA_DIR)? {
-            let Some(idx) = layout::parse_shard_data(&name) else {
-                continue;
-            };
-            if catalog.contains(idx) {
+    let entries = match backing.list(layout::DATA_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report
+                .errors
+                .push("required data directory is missing".into());
+            return Ok(report);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for name in entries {
+        let Some(idx) = layout::parse_shard_data(&name) else {
+            continue;
+        };
+        if catalog.contains(idx) {
+            continue;
+        }
+        let warning = if idx < geometry.num_shards() {
+            if !check_data_file(backing, idx, &mut report)? {
                 continue;
             }
-            let warning = if idx < geometry.num_shards() {
-                let adoptable = envelope.metadata_version != SUPERBLOCK_VERSION_V3
-                    || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
-                format!(
-                    "shard data file {name} (index {idx}) is not in the catalog; {}",
-                    if adoptable {
-                        "recovery adopts it"
-                    } else {
-                        "invalid discard metadata prevents recovery from adopting it"
-                    }
-                )
-            } else {
-                format!(
-                    "shard data file {name} (index {idx}) lies beyond the volume \
+            let allocation_ok =
+                check_allocation_map(backing, idx, geometry.units_per_shard(), false, &mut report)?;
+            let discard_ok = envelope.metadata_version != SUPERBLOCK_VERSION_V3
+                || check_discard_map(backing, idx, geometry.units_per_shard(), &mut report)?;
+            format!(
+                "shard data file {name} (index {idx}) is not in the catalog; {}",
+                match (allocation_ok, discard_ok) {
+                    (false, _) => "invalid allocation metadata prevents recovery from adopting it",
+                    (_, false) => "invalid discard metadata prevents recovery from adopting it",
+                    (true, true) => "recovery adopts it",
+                }
+            )
+        } else {
+            format!(
+                "shard data file {name} (index {idx}) lies beyond the volume \
                      geometry and is ignored"
-                )
-            };
-            report.warnings.push(warning);
-        }
+            )
+        };
+        report.warnings.push(warning);
     }
 
     Ok(report)
+}
+
+/// Recovery can start an uncataloged shard with an empty map if neither side
+/// decodes. Any map it actually selects must match the stored geometry.
+fn check_allocation_map(
+    backing: &dyn Backing,
+    shard: u64,
+    units: u64,
+    cataloged: bool,
+    report: &mut CheckReport,
+) -> Result<bool, FormatError> {
+    let store = AbStore::new(layout::shard_alloc_a(shard), layout::shard_alloc_b(shard))
+        .with_max_len(AllocationMap::encoded_len(units));
+    let (map_units, copies) = store
+        .load_with_copy_count_by::<AllocationMap, _>(backing, AllocationMap::decode_geometry)?;
+    match map_units {
+        Some(found) if found != units => report.errors.push(format!(
+            "shard {shard}: allocation map covers {found} units, geometry says {units}"
+        )),
+        Some(_) if copies == 1 => {
+            report.warnings.push(format!(
+                "shard {shard}: allocation map has one valid copy; using fallback"
+            ));
+            return Ok(true);
+        }
+        None if cataloged => report
+            .errors
+            .push(format!("shard {shard}: no valid allocation map")),
+        _ => return Ok(true),
+    }
+    Ok(false)
+}
+
+/// Recovery opens each cataloged or adoptable shard as a data file.
+fn check_data_file(
+    backing: &dyn Backing,
+    shard: u64,
+    report: &mut CheckReport,
+) -> Result<bool, FormatError> {
+    match backing.open(&layout::shard_data(shard), false) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let reason = match error.kind() {
+                ErrorKind::NotFound => "data file is missing",
+                ErrorKind::IsADirectory | ErrorKind::InvalidInput => "invalid data file",
+                _ => return Err(error.into()),
+            };
+            report
+                .errors
+                .push(format!("shard {shard}: {reason}: {error}"));
+            Ok(false)
+        }
+    }
 }
 
 /// V3 adoption needs the same discard evidence as a cataloged shard. Keep
@@ -171,21 +261,21 @@ fn check_discard_map(
         layout::shard_discard_b(shard),
     )
     .with_max_len(AllocationMap::encoded_len(units));
-    let sides = discard_ab.side_generations::<AllocationMap>(backing)?;
-    let Some(map) = discard_ab.load::<AllocationMap>(backing)? else {
+    let (map_units, copies) = discard_ab
+        .load_with_copy_count_by::<AllocationMap, _>(backing, AllocationMap::decode_geometry)?;
+    let Some(found) = map_units else {
         report
             .errors
             .push(format!("shard {shard}: no valid discard map"));
         return Ok(false);
     };
-    if map.units() != units {
+    if found != units {
         report.errors.push(format!(
-            "shard {shard}: discard map covers {} units, geometry says {units}",
-            map.units()
+            "shard {shard}: discard map covers {found} units, geometry says {units}"
         ));
         return Ok(false);
     }
-    if matches!(sides, (Some(_), None) | (None, Some(_))) {
+    if copies == 1 {
         report.warnings.push(format!(
             "shard {shard}: discard map has one valid copy; using fallback"
         ));

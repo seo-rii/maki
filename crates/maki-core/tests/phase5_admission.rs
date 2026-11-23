@@ -43,7 +43,7 @@ async fn engine_with(
         init::create_volume(backing.as_ref(), superblock()).unwrap();
     }
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         provider,
         EngineOptions {
             identity: None,

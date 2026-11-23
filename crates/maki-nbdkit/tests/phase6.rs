@@ -40,7 +40,11 @@ fn superblock() -> Superblock {
 }
 
 fn adapter_over(backing: &Arc<CrashableBacking>) -> NbdAdapter {
-    adapter_with_provider(backing, Arc::new(FakeCryptoProvider::new(UNIT)))
+    adapter_with_provider(
+        backing,
+        Arc::new(FakeCryptoProvider::new(UNIT)),
+        simulated_engine_options(),
+    )
 }
 
 fn simulated_engine_options() -> EngineOptions {
@@ -56,6 +60,7 @@ fn simulated_engine_options() -> EngineOptions {
 fn adapter_with_provider(
     backing: &Arc<CrashableBacking>,
     provider: Arc<dyn CryptoProvider>,
+    options: EngineOptions,
 ) -> NbdAdapter {
     if !backing.exists("superblock.a").unwrap() {
         init::create_volume(backing.as_ref(), superblock()).unwrap();
@@ -66,11 +71,7 @@ fn adapter_with_provider(
         .build()
         .unwrap();
     let engine = runtime
-        .block_on(Engine::attach(
-            backing.clone() as Arc<dyn Backing>,
-            provider,
-            simulated_engine_options(),
-        ))
+        .block_on(Engine::attach(backing.process(), provider, options))
         .unwrap();
     NbdAdapter::from_engine(engine, runtime)
 }
@@ -86,6 +87,29 @@ fn get_size_and_block_sizes() {
     assert_eq!(min, BLOCK);
     assert_eq!(preferred, UNIT);
     assert_eq!(max, 1 << 20);
+}
+
+#[test]
+fn from_engine_negotiates_block_sizes_within_the_engine_and_wire_limits() {
+    for (engine_maximum, preferred, maximum) in [
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (1536, 1024, 1536),
+        (8192, UNIT, 8192),
+        (1_u64 << 32, UNIT, u32::MAX - (BLOCK - 1)),
+    ] {
+        let backing = Arc::new(CrashableBacking::new());
+        let mut options = simulated_engine_options();
+        options.limits.max_request_bytes = engine_maximum;
+        let adapter =
+            adapter_with_provider(&backing, Arc::new(FakeCryptoProvider::new(UNIT)), options);
+        assert_eq!(adapter.block_sizes(), (BLOCK, preferred, maximum));
+        let data = vec![0xa5; UNIT as usize];
+        adapter.pwrite(&data, 0, false).unwrap();
+        let mut out = vec![0; data.len()];
+        adapter.pread(&mut out, 0).unwrap();
+        assert_eq!(out, data);
+    }
 }
 
 // ---------- capability flags ----------
@@ -226,7 +250,7 @@ fn panic_inside_engine_becomes_eio_and_adapter_survives() {
     let provider = Arc::new(PanickingProvider {
         inner: FakeCryptoProvider::new(UNIT),
     });
-    let adapter = adapter_with_provider(&backing, provider);
+    let adapter = adapter_with_provider(&backing, provider, simulated_engine_options());
 
     // unit 13 → provider panics → EIO
     let err = adapter

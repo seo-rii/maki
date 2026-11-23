@@ -145,3 +145,49 @@ fn checker_validates_v3_discard_maps_and_reports_single_copy_fallback() {
     assert!(check_volume(&valid).unwrap().ok());
     assert_ne!(layout::shard_discard_a(0), layout::shard_alloc_a(0));
 }
+
+#[test]
+fn checker_reports_lost_allocation_redundancy_until_both_copies_validate() {
+    let backing = MemBacking::new();
+    init::create_volume_with_discard(&backing, sb()).unwrap();
+    let units = sb().geometry.units_per_shard();
+    catalog_shard(&backing, units, true);
+    let store = AbStore::new(layout::shard_alloc_a(0), layout::shard_alloc_b(0));
+    let mut map = AllocationMap::new(units);
+    let has_warning = || {
+        let report = check_volume(&backing).unwrap();
+        assert!(report.ok(), "{:?}", report.errors);
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("allocation map has one valid copy"))
+    };
+
+    assert!(has_warning());
+    store.store(&backing, &mut map).unwrap();
+    assert!(!has_warning());
+    backing
+        .open(&layout::shard_alloc_a(0), false)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(has_warning());
+}
+
+#[test]
+fn checker_warns_about_a_missing_catalog_mirror_after_the_initial_generation() {
+    let backing = MemBacking::new();
+    init::create_volume_with_discard(&backing, sb()).unwrap();
+    let warning = || {
+        check_volume(&backing)
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|msg| msg.contains("catalog") && msg.contains("one valid copy"))
+    };
+    assert!(!warning());
+    catalog_shard(&backing, sb().geometry.units_per_shard(), true);
+    assert!(!warning());
+    backing.remove(layout::SHARD_CATALOG_A).unwrap();
+    assert!(warning());
+}

@@ -240,3 +240,14 @@ fn ciphertext_probe_keeps_v2_empty_ciphertext_semantics() {
     volume.checkpoint().unwrap();
     assert_eq!(volume.first_ciphertext_unit().unwrap(), Some((0, vec![])));
 }
+
+#[test]
+fn fua_discard_of_unwritten_unit_only_returns_a_durable_sequence() {
+    let backing = Arc::new(MemBacking::new());
+    create_volume_with_discard(backing.as_ref(), superblock(0xc011)).unwrap();
+    let mut v = Volume::recover(backing, VolumeOptions::default()).unwrap();
+    v.write_ct(1, &[0x42; 1032], false).unwrap();
+    let seq = v.discard_ct(2, true).unwrap();
+    assert!(seq <= v.journal_durable_sequence());
+    assert!(v.read_ct(2).unwrap().is_none());
+}

@@ -119,6 +119,31 @@ impl Future for WaitGate {
     }
 }
 
+#[test]
+fn a_finished_tasks_waker_cannot_wake_a_new_task() {
+    let mut sched = DeterministicScheduler::new(7);
+    let first = Rc::new(Gate::default());
+    sched.spawn(WaitGate(first.clone()));
+    assert!(!sched.run_bounded(1));
+    let stale = first.waiter.borrow_mut().take().unwrap();
+    first.open.set(true);
+    stale.wake_by_ref();
+    assert!(sched.run_bounded(1));
+
+    let next = Rc::new(Gate::default());
+    sched.spawn(WaitGate(next.clone()));
+    assert!(!sched.run_bounded(1));
+    stale.wake();
+    assert!(!sched.run_bounded(1));
+    assert_eq!(next.polls.get(), 1);
+    assert_eq!(sched.pending(), 1);
+
+    next.open.set(true);
+    next.waiter.borrow_mut().take().unwrap().wake();
+    assert!(sched.run_bounded(1));
+    assert_eq!(sched.pending(), 0);
+}
+
 /// A task is polled again only after its waker fires: exactly once to park
 /// and once after the release, however long the releasing task runs first.
 /// Every seed must complete (the wake-up is delivered) and none may poll
@@ -271,6 +296,34 @@ fn manual_clock_wakes_due_sleepers_in_deadline_then_registration_order() {
     }
 }
 
+#[test]
+fn concurrent_sets_only_reach_the_requested_deadline() {
+    const THREADS: usize = 8;
+    const ROUNDS: u64 = 256;
+    let clock = ManualClock::new();
+    let barrier = std::sync::Barrier::new(THREADS + 1);
+    let mut greatest_overshoot = Duration::ZERO;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for round in 1..=ROUNDS {
+                    barrier.wait();
+                    clock.set(Duration::from_secs(round));
+                    barrier.wait();
+                }
+            });
+        }
+        for round in 1..=ROUNDS {
+            barrier.wait();
+            barrier.wait();
+            let target = Duration::from_secs(round);
+            greatest_overshoot = greatest_overshoot.max(clock.now().saturating_sub(target));
+        }
+    });
+    assert_eq!(greatest_overshoot, Duration::ZERO);
+    assert_eq!(clock.now(), Duration::from_secs(ROUNDS));
+}
+
 // ---------- FakeCryptoProvider: no framing check without integrity ----------
 
 fn damaged_ciphertexts(original: &CiphertextUnit) -> Vec<(&'static str, CiphertextUnit)> {
@@ -370,4 +423,64 @@ mod namespace_parity;
 #[test]
 fn crashable_backing_namespace_follows_posix_path_rules() {
     namespace_parity::check("CrashableBacking", || Box::new(CrashableBacking::new()));
+}
+
+#[test]
+fn torn_overwrite_preserves_the_earlier_pending_suffix() {
+    for (offset, keep, expected) in [
+        (1, 0, &b"ABCDEFGH"[..]),
+        (1, 2, b"AxyDEFGH"),
+        (10, 0, b"ABCDEFGH"),
+    ] {
+        let backing = CrashableBacking::new().with_tearing(1);
+        let file = backing.process().open("sample", true).unwrap();
+        file.write_at(0, b"ABCDEFGH").unwrap();
+        file.write_at(offset, b"xyz").unwrap();
+        backing.crash_keep_torn_prefix("sample", keep);
+        let recovered = backing.process().open("sample", false).unwrap();
+        let mut data = vec![0; recovered.len().unwrap() as usize];
+        recovered.read_at(0, &mut data).unwrap();
+        assert_eq!(data, expected);
+    }
+}
+
+#[test]
+fn a_new_crash_backing_lock_has_an_ordinary_file_name() {
+    let backing = CrashableBacking::new();
+    let live = backing.process();
+    let guard = live.try_lock("lock").unwrap();
+    assert_eq!(live.list("").unwrap(), ["lock"]);
+    assert!(live.try_lock("lock").is_err());
+    assert_eq!(live.open("lock", false).unwrap().len().unwrap(), 0);
+    drop(guard);
+    live.sync_dir("").unwrap();
+    backing.crash_all_lost();
+    let recovered = backing.process();
+    assert!(recovered.exists("lock").unwrap());
+    drop(recovered.try_lock("lock").unwrap());
+    drop(recovered.try_lock("unsynced").unwrap());
+    backing.crash_all_lost();
+    assert!(!backing.process().exists("unsynced").unwrap());
+}
+
+#[test]
+fn fake_decrypt_applies_batch_shape_faults() {
+    use maki_test_support::fake_provider::Misbehavior::*;
+    let provider = FakeCryptoProvider::new(UNIT);
+    let ctx = context();
+    let valid = block_on(provider.encrypt_batch(&ctx, &plaintexts(3))).unwrap();
+    for (fault, expected) in [
+        (ReorderResults, vec![1, 0, 2]),
+        (DropLastItem, vec![0, 1]),
+        (DuplicateFirstItem, vec![0, 1, 2, 0]),
+        (MismatchedIndex, vec![1_000_000, 1, 2]),
+        (OversizeCiphertext, vec![0, 1, 2]),
+    ] {
+        provider.set_misbehavior(Some(fault));
+        let out = block_on(provider.decrypt_batch(&ctx, &valid)).unwrap();
+        assert_eq!(
+            out.iter().map(|item| item.unit_index).collect::<Vec<_>>(),
+            expected
+        );
+    }
 }

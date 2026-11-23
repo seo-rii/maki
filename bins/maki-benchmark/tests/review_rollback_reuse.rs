@@ -289,3 +289,15 @@ fn protected_root_without_configuration_still_refuses_plain_backing() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("protected backing requires"));
     assert_eq!(snapshot(fixture.witness.path()), before);
 }
+
+#[test]
+fn refusal_checks_only_the_outer_marker_before_opening_any_writer() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.root()).unwrap();
+    std::fs::write(fixture.root().join("rollback.format"), b"existing layout").unwrap();
+    // No witness is enrolled. Opening the backing would fail before refusal.
+    let output = fixture.run(false);
+    assert_failed_without_report(&output, 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--destroy-data"));
+    assert!(snapshot(fixture.witness.path()).is_empty());
+}

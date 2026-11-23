@@ -5,6 +5,7 @@
 //! the daemon control socket (Unix). `attach`/`detach`/`grow` delegate to
 //! the privileged helper.
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -25,7 +26,8 @@ const USAGE: &str = "usage:
   maki reload <config.toml> cache --max-bytes <bytes> [--ttl <duration>]
   maki reload <config.toml> <section>  hot config reload (control socket)
     control commands take --socket <path> in place of <config.toml>, e.g.
-    --socket /run/maki-control/<volume>/control.sock for maki-admin members
+    --socket /run/maki-control/<volume>/control.sock for maki-admin members,
+    and --timeout <seconds> (default 60; 600 for checkpoint and drain)
   maki attach|detach|grow ...          delegated to maki-attach (privileged)
   maki --help | --version";
 
@@ -35,8 +37,11 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn read_config(path: &str) -> Result<maki_format::config::VolumeConfig, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+fn read_config(
+    path: impl AsRef<std::path::Path>,
+) -> Result<maki_format::config::VolumeConfig, String> {
+    let path = path.as_ref();
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cfg = maki_format::config::parse_config(&raw).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -65,6 +70,33 @@ fn take_timeout(args: &mut Vec<String>) -> Result<Option<Duration>, String> {
         .ok_or_else(|| format!("--timeout: {value:?} is not a positive number of seconds"))?;
     args.drain(i..i + 2);
     Ok(Some(Duration::from_secs(secs)))
+}
+
+/// The commands that take `--timeout`: the control commands, which bound
+/// their round trip with it, and the helper verbs, whose delegation route
+/// keeps a leading `--timeout` out of the printed `maki-attach` command.
+const TIMEOUT_COMMANDS: [&str; 8] = [
+    "status",
+    "metrics",
+    "checkpoint",
+    "drain",
+    "reload",
+    "attach",
+    "detach",
+    "grow",
+];
+
+/// The command word: the first argument that is neither `--timeout` nor
+/// `--socket` nor the value after one of them.
+fn command_word(args: &[String]) -> Option<&str> {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if !matches!(arg, "--timeout" | "--socket") {
+            return Some(arg);
+        }
+        args.next();
+    }
+    None
 }
 
 /// Remove `--socket <path>` from the arguments, if present.
@@ -125,7 +157,24 @@ fn main() -> ExitCode {
     if let Err(e) = maki_backing::raise_open_file_limit() {
         eprintln!("warning: cannot raise the open-file soft limit: {e}");
     }
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [volume, verb, config] = raw_args.as_slice() {
+        if volume == "volume" && verb == "inspect" && config != "--socket" && config != "--timeout"
+        {
+            return match inspect(std::path::Path::new(config)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
+            };
+        }
+    }
+    let Ok(mut args) = raw_args
+        .into_iter()
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        eprintln!("error: command-line arguments must be valid UTF-8");
+        return ExitCode::from(2);
+    };
     // Helper options belong to the helper, including its NBD --socket
     // override. Preserve them before interpreting any control options.
     if matches!(
@@ -133,6 +182,13 @@ fn main() -> ExitCode {
         Some("attach" | "detach" | "grow")
     ) {
         return privileged_helper(&args);
+    }
+    // A command outside `TIMEOUT_COMMANDS` refuses `--timeout` as misuse,
+    // whatever its value, rather than ignoring it.
+    if args.iter().any(|arg| arg == "--timeout")
+        && !command_word(&args).is_some_and(|command| TIMEOUT_COMMANDS.contains(&command))
+    {
+        return usage();
     }
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,
@@ -169,49 +225,66 @@ fn main() -> ExitCode {
                 Ok(raw) => raw,
                 Err(e) => return fail(format!("{config}: {e}")),
             };
-            let created = if argv.len() == 4 {
-                maki_nbdkit::daemon::create_volume_with_discard_from_config_str(&raw)
-            } else {
-                maki_nbdkit::daemon::create_volume_from_config_str(&raw)
+            let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
+                Ok(creation) => creation,
+                Err(error) => return fail(error.to_string()),
             };
-            match created {
+            match creation.create(argv.len() == 4) {
                 Ok(sb) => {
-                    // The superblock does not record the volume name.
-                    let cfg = maki_format::config::parse_config(&raw).ok();
-                    let name = cfg
-                        .as_ref()
-                        .map(|cfg| cfg.volume.name.as_str())
-                        .unwrap_or_default();
-                    println!(
+                    let cfg = creation.config();
+                    let name = &cfg.volume.name;
+                    // Creation is already durable. Report output errors without
+                    // making callers retry a successfully initialized volume.
+                    let summary = writeln!(
+                        io::stdout().lock(),
                         "created volume {name} (provider {}, uuid {}, {} bytes virtual, slot size {})",
                         sb.provider_type,
                         sb.volume_uuid,
                         sb.geometry.max_virtual_size,
                         sb.geometry.slot_size
                     );
-                    if let Some(hint) = ownership_hint(running_as_root(), cfg.as_ref()) {
-                        eprintln!("warning: {hint}");
+                    if let Err(error) = summary {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            let _ = writeln!(
+                                io::stderr().lock(),
+                                "warning: volume {name} was created, but writing the creation summary failed: {error}"
+                            );
+                        }
+                    }
+                    if let Some(hint) = ownership_hint(running_as_root(), cfg) {
+                        let _ = writeln!(io::stderr().lock(), "warning: {hint}");
                     }
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e.to_string()),
             }
         }
-        ["volume", command, ..]
-            if matches!(
-                *command,
-                "witness" | "snapshot" | "takeover" | "restore" | "resume-enrollment" | "gc"
-            ) =>
-        {
-            match remote_volume(&argv[1..]) {
+        ["volume", verb, config, tail @ ..] => {
+            let command = match (*verb, tail) {
+                ("witness", []) => RemoteVolume::Witness,
+                ("gc", []) => RemoteVolume::Gc,
+                ("snapshot", [directory]) => RemoteVolume::Snapshot { directory },
+                ("resume-enrollment", [fence, identity] | [fence, identity, "--discard"]) => {
+                    RemoteVolume::ResumeEnrollment {
+                        fence,
+                        identity,
+                        discard: tail.len() == 3,
+                    }
+                }
+                ("takeover", [fence, root]) => RemoteVolume::Takeover { fence, root },
+                ("restore", [directory, fence, root, approved_source]) => RemoteVolume::Restore {
+                    directory,
+                    fence,
+                    root,
+                    approved_source,
+                },
+                _ => return usage(),
+            };
+            match remote_volume(config, command) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(error),
             }
         }
-        ["volume", "inspect", config] => match inspect(config) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(e),
-        },
         ["check", config] => match check(config, false) {
             Ok(clean) => {
                 if clean {
@@ -276,12 +349,25 @@ fn main() -> ExitCode {
     }
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn privileged_helper(args: &[String]) -> ExitCode {
-    eprintln!(
-        "this operation requires the privileged helper: run `maki-attach {}` \
-         (or systemctl start maki-attach@<volume>)",
-        args.join(" ")
-    );
+    let command = args
+        .iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("this operation requires the privileged helper: run `maki-attach {command}`");
     ExitCode::from(3)
 }
 
@@ -370,26 +456,24 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
 /// The backing tree is created owner-only; a root-created volume is
 /// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
 /// rollback witness is created the same way, so name both paths.
-fn ownership_hint(
-    as_root: bool,
-    cfg: Option<&maki_format::config::VolumeConfig>,
-) -> Option<String> {
+fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;
     }
-    let local_witness = cfg.and_then(|cfg| {
-        cfg.backing
-            .rollback_protection
-            .as_ref()
-            .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
-            .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()))
-    });
+    let local_witness = cfg
+        .backing
+        .rollback_protection
+        .as_ref()
+        .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
+        .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()));
     Some(match local_witness {
         Some((root, witness)) => format!(
             "the volume tree {root} and the rollback witness in {witness} were created \
              owner-only by root; the daemon runs as the maki user and cannot open them. Run \
              `maki volume create` as that user (sudo -u maki ...) or \
-             `chown -R maki:maki {root} {witness}` before starting the service"
+             `chown -R maki:maki {root_arg} {witness_arg}` before starting the service",
+            root_arg = shell_word(root),
+            witness_arg = shell_word(witness)
         ),
         None => "the volume tree was created owner-only by root; the daemon runs as the maki \
                  user and cannot open it. Run `maki volume create` as that user \
@@ -497,7 +581,8 @@ fn read_snapshot(
     if !directory.is_dir() {
         return Err("snapshot directory does not exist".into());
     }
-    let disk = FileBacking::new(directory).map_err(|e| e.to_string())?;
+    // Restore only reads the snapshot, which may be kept on read-only media.
+    let disk = FileBacking::read_only(directory).map_err(|e| e.to_string())?;
     let file = disk
         .open("snapshot.json", false)
         .map_err(|e| e.to_string())?;
@@ -518,17 +603,37 @@ fn read_snapshot(
     Ok(descriptor)
 }
 
-fn remote_volume(args: &[&str]) -> Result<(), String> {
+enum RemoteVolume<'a> {
+    Witness,
+    Gc,
+    Snapshot {
+        directory: &'a str,
+    },
+    Takeover {
+        fence: &'a str,
+        root: &'a str,
+    },
+    Restore {
+        directory: &'a str,
+        fence: &'a str,
+        root: &'a str,
+        approved_source: &'a str,
+    },
+    ResumeEnrollment {
+        fence: &'a str,
+        identity: &'a str,
+        discard: bool,
+    },
+}
+
+fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<(), String> {
     use maki_backing::remote_witness::Phase;
     use maki_backing::{Backing, FileBacking, RollbackBacking};
     use std::path::Path;
     #[cfg(not(target_os = "linux"))]
-    if args.first() != Some(&"witness") {
+    if !matches!(command, RemoteVolume::Witness) {
         return Err("remote rollback volume operations are supported only on Linux".into());
     }
-    let config = args
-        .get(1)
-        .ok_or("remote volume command requires a configuration file")?;
     let cfg = read_config(config)?;
     let remote = cfg
         .backing
@@ -537,14 +642,14 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
         .and_then(|rollback| rollback.remote.as_ref())
         .ok_or("command requires remote rollback protection")?;
     let rpc = maki_nbdkit::daemon::remote_witness_client(remote).map_err(|e| e.to_string())?;
-    match args {
-        ["witness", _] => {
+    match command {
+        RemoteVolume::Witness => {
             println!(
                 "{}",
                 serde_json::to_string(&witness_record(rpc.as_ref())?).map_err(|e| e.to_string())?
             );
         }
-        ["gc", _] => {
+        RemoteVolume::Gc => {
             let report =
                 RollbackBacking::collect_remote(Path::new(&cfg.backing.root), rpc.as_ref())
                     .map_err(|e| e.to_string())?;
@@ -560,8 +665,11 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 })
             );
         }
-        ["resume-enrollment", _, fence, identity]
-        | ["resume-enrollment", _, fence, identity, "--discard"] => {
+        RemoteVolume::ResumeEnrollment {
+            fence,
+            identity,
+            discard,
+        } => {
             let fence: u64 = fence
                 .parse()
                 .map_err(|_| "approved fence must be an unsigned integer")?;
@@ -583,13 +691,8 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                     "enrollment approval does not match a never-activated authority".into(),
                 );
             }
-            maki_nbdkit::daemon::resume_enrollment_from_config(
-                &cfg,
-                rpc.clone(),
-                &before,
-                args.len() == 5,
-            )
-            .map_err(|e| e.to_string())?;
+            maki_nbdkit::daemon::resume_enrollment_from_config(&cfg, rpc.clone(), &before, discard)
+                .map_err(|e| e.to_string())?;
             let after = witness_record(rpc.as_ref())?;
             if after.identity != before.identity
                 || Some(after.fence) != before.fence.checked_add(1)
@@ -603,8 +706,9 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&after).map_err(|e| e.to_string())?
             );
         }
-        ["snapshot", _, directory] => {
+        RemoteVolume::Snapshot { directory } => {
             let target = Path::new(directory);
+            RollbackBacking::check_snapshot_destination(target).map_err(|e| e.to_string())?;
             let backing = RollbackBacking::open_remote(Path::new(&cfg.backing.root), rpc.clone())
                 .map_err(|e| e.to_string())?;
             let descriptor = backing.snapshot_remote(target).map_err(|e| e.to_string())?;
@@ -635,7 +739,7 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
             );
         }
-        ["takeover", _, fence, root] => {
+        RemoteVolume::Takeover { fence, root } => {
             let before = approved_record(rpc.as_ref(), fence, root)?;
             let backing = RollbackBacking::takeover_remote(
                 Path::new(&cfg.backing.root),
@@ -650,7 +754,12 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        ["restore", _, directory, fence, root, approved_source] => {
+        RemoteVolume::Restore {
+            directory,
+            fence,
+            root,
+            approved_source,
+        } => {
             let approved_source = approved_hash(approved_source)?;
             let source = read_snapshot(Path::new(directory))?;
             if source.anchor.root != approved_source {
@@ -672,7 +781,6 @@ fn remote_volume(args: &[&str]) -> Result<(), String> {
                 serde_json::to_string(&record).map_err(|e| e.to_string())?
             );
         }
-        _ => return Err("invalid remote volume command arguments; see maki usage".into()),
     }
     Ok(())
 }
@@ -700,7 +808,7 @@ fn existing_backing(
     maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
 }
 
-fn inspect(config: &str) -> Result<(), String> {
+fn inspect(config: &std::path::Path) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
@@ -755,6 +863,17 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
+async fn within_control_timeout<T>(
+    timeout: Duration,
+    round_trip: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(timeout, round_trip).await.ok()?;
+    // Tokio can poll a ready reply first when the CLI resumes after its timer.
+    (started.elapsed() < timeout).then_some(result)
+}
+
+#[cfg(unix)]
 fn control(
     target: &ControlTarget<'_>,
     command: &str,
@@ -774,21 +893,22 @@ fn control(
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
             .map_err(|e| format!("{socket}: {e}"))?;
-        let (mut rd, mut wr) = tokio::io::split(stream);
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut rd = tokio::io::BufReader::new(rd);
         let mut request = maki_control::protocol::Request::new(command);
         request.section = section.map(|s| s.to_string());
         request.payload = payload;
         maki_control::protocol::send_command(&mut wr, &request)
             .await
             .map_err(|e| e.to_string())?;
-        maki_control::protocol::read_response(&mut rd)
+        maki_control::protocol::read_buffered_response(&mut rd)
             .await
             .map_err(|e| e.to_string())
     };
     let result: Result<serde_json::Value, String> = runtime.block_on(async {
-        match tokio::time::timeout(timeout, round_trip).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(format!(
+        match within_control_timeout(timeout, round_trip).await {
+            Some(result) => result,
+            None => Err(format!(
                 "{command}: no response from {socket} within {}s; the daemon may be stalled \
                  (pass --timeout <seconds> to wait longer)",
                 timeout.as_secs()
@@ -797,8 +917,21 @@ fn control(
     });
     match result {
         Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
-            if v["ok"] == serde_json::Value::Bool(true) {
+            let ok = v["ok"] == serde_json::Value::Bool(true);
+            let mut out = io::stdout().lock();
+            let written = serde_json::to_writer_pretty(&mut out, &v)
+                .map_err(io::Error::from)
+                .and_then(|()| writeln!(out))
+                .and_then(|()| out.flush());
+            if let Err(error) = written {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    let verdict = if ok { "success" } else { "failure" };
+                    let _ = writeln!(io::stderr().lock(),
+                        "{command}: daemon reported {verdict}, but writing the response failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if ok {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -817,4 +950,21 @@ fn control(
     _timeout: Duration,
 ) -> ExitCode {
     fail("control socket commands require a Unix host".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_response_after_the_control_deadline_is_rejected() {
+        let timeout = Duration::from_millis(5);
+        let response = within_control_timeout(timeout, async {
+            // The reply and timer are both ready before the executor regains control.
+            std::thread::sleep(timeout * 2);
+            "reply"
+        })
+        .await;
+        assert_eq!(response, None);
+    }
 }

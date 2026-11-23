@@ -512,8 +512,9 @@ async fn byte_capacity_wait_returns_partial_permits_and_preserves_fifo() {
     let mut config = cfg();
     config.global_max_inflight_batches = 4;
     config.per_endpoint_max_inflight = 3;
-    config.global_max_inflight_bytes = 2 * UNIT as u64;
-    config.per_endpoint_max_bytes = UNIT as u64;
+    let one_ciphertext = u64::from(left.inner.capabilities().await.unwrap().max_ciphertext_size);
+    config.global_max_inflight_bytes = 2 * one_ciphertext;
+    config.per_endpoint_max_bytes = one_ciphertext;
     let set = EndpointSet::new(
         vec![
             ("left".into(), left.clone()),
@@ -554,8 +555,9 @@ async fn global_byte_shortage_returns_a_tentative_idle_peers_local_permit() {
     let right = Arc::new(GatedProvider::new(None));
     let mut config = cfg();
     config.global_max_inflight_batches = 4;
-    config.global_max_inflight_bytes = UNIT as u64;
-    config.per_endpoint_max_bytes = UNIT as u64;
+    let one_ciphertext = u64::from(left.inner.capabilities().await.unwrap().max_ciphertext_size);
+    config.global_max_inflight_bytes = one_ciphertext;
+    config.per_endpoint_max_bytes = one_ciphertext;
     config.breaker.failure_threshold = 1;
     config.retry_safe = false;
     let set = EndpointSet::new(
@@ -632,4 +634,36 @@ async fn all_open_peers_keep_backoff_and_do_not_consume_capacity_before_recovery
     assert!(matches!(once(request.as_mut()).await, Poll::Ready(Ok(_))));
     assert_eq!(set.global_inflight(), (0, 0));
     assert_eq!(clock.sleeper_count(), 0);
+}
+
+#[test]
+fn inflight_snapshot_pairs_each_batch_with_its_bytes() {
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT));
+    let set = EndpointSet::new(
+        vec![("only".into(), provider)],
+        cfg(),
+        Arc::new(ManualClock::new()),
+    );
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let ctx = context();
+                let items = [pt(10)];
+                for _ in 0..1024 {
+                    set.encrypt_batch(&ctx, &items).await.unwrap();
+                }
+            });
+        });
+        while !writer.is_finished() {
+            let (batches, bytes) = set.global_inflight();
+            assert_eq!(bytes, batches * u64::from(UNIT));
+            std::hint::spin_loop();
+        }
+        writer.join().unwrap();
+    });
+    assert_eq!(set.global_inflight(), (0, 0));
 }

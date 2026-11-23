@@ -44,8 +44,8 @@ the session: the next check either matches the claimed record again or
 observes the change and stops it. Besides an observed change, only the
 witness's own denial, a predecessor conflict, an invalid answer or a TLS failure
 stops the session. A frontend whose allow-list no longer names the writer
-certificate denies it, which stops the session too; correcting the allow-list
-does not resume it.
+certificate, or whose CA bundle no longer trusts it, denies it, which stops the
+session too; correcting the allow-list or the bundle does not resume it.
 Cached plaintext and journal-overlay reads also check the freshness authority.
 The provider's advertised replay-protection capability is not changed by this
 storage option.
@@ -114,6 +114,9 @@ and intentionally restore an approved older snapshot under the same identity.
 Restore requires administrator credentials, an exact current fence/root and a
 separately approved snapshot hash. It increases generation and epoch; it never
 lowers the authority. See the service guide for copy-pasteable commands.
+The automatic GC pass after a restore deletes the replaced newer state from
+the backing root; snapshot it first if it may be needed again
+([restore procedure](remote-witness-service.md#snapshot-takeover-and-restore)).
 An administrator can resume initial enrollment while the authority has never
 activated a descriptor, using the procedure below. An initialized descriptor
 cannot be reset through enrollment recovery, including when its activation

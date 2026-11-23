@@ -49,6 +49,7 @@ impl RandomPrefixProvider {
         let wire_unit_size = logical_unit_size.checked_add(prefix_bytes).ok_or_else(|| {
             CryptoError::ProviderFatal("logical unit plus random prefix overflows u32".into())
         })?;
+        let inner = CheckedProvider::pinned(inner, wire_unit_size);
         let inner_caps = inner.capabilities().await?;
         if !inner_caps
             .supported_plaintext_sizes
@@ -106,7 +107,7 @@ impl RandomPrefixProvider {
         };
         let max_operation_time = inner.max_operation_time();
         Ok(Self {
-            inner: CheckedProvider::pinned(inner, wire_unit_size),
+            inner,
             inner_compatibility_id: inner_caps.crypto_compatibility_id,
             logical_unit_size,
             wire_unit_size,
@@ -135,6 +136,45 @@ impl RandomPrefixProvider {
         }
         Ok(())
     }
+}
+
+fn expand_units(
+    items: &[PlaintextUnit],
+    wire_size: usize,
+    prefix_len: usize,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), CryptoError>,
+) -> Result<Vec<PlaintextUnit>, CryptoError> {
+    let mut expanded = Vec::new();
+    expanded.try_reserve_exact(items.len()).map_err(|_| {
+        CryptoError::ProviderFatal("failed to allocate expanded plaintext batch".into())
+    })?;
+    for item in items {
+        let mut data = SecretBuffer::zeroed(wire_size);
+        data.expose_mut()[prefix_len..].copy_from_slice(item.data.expose());
+        expanded.push(PlaintextUnit {
+            unit_index: item.unit_index,
+            data,
+        });
+    }
+    match expanded.as_mut_slice() {
+        [] => {}
+        [unit] => fill(&mut unit.data.expose_mut()[..prefix_len])?,
+        units => {
+            // Limit temporary locked memory even when the provider accepts
+            // large batches. Each prefix consumes a disjoint slice of fresh entropy.
+            const MAX_ENTROPY_BYTES: usize = 16 * 1024;
+            let chunk_units = MAX_ENTROPY_BYTES / prefix_len;
+            let mut entropy = SecretBuffer::zeroed(units.len().min(chunk_units) * prefix_len);
+            for chunk in units.chunks_mut(chunk_units) {
+                let bytes = &mut entropy.expose_mut()[..chunk.len() * prefix_len];
+                fill(bytes)?;
+                for (unit, prefix) in chunk.iter_mut().zip(bytes.chunks_exact(prefix_len)) {
+                    unit.data.expose_mut()[..prefix_len].copy_from_slice(prefix);
+                }
+            }
+        }
+    }
+    Ok(expanded)
 }
 
 #[async_trait]
@@ -172,23 +212,16 @@ impl CryptoProvider for RandomPrefixProvider {
             )));
         }
 
-        let mut expanded = Vec::new();
-        expanded.try_reserve_exact(items.len()).map_err(|_| {
-            CryptoError::ProviderFatal("failed to allocate expanded plaintext batch".into())
-        })?;
-        for item in items {
-            let mut data = SecretBuffer::zeroed(self.wire_unit_size as usize);
-            OsRng
-                .try_fill_bytes(&mut data.expose_mut()[..self.prefix_bytes as usize])
-                .map_err(|_| {
+        let expanded = expand_units(
+            items,
+            self.wire_unit_size as usize,
+            self.prefix_bytes as usize,
+            |bytes| {
+                OsRng.try_fill_bytes(bytes).map_err(|_| {
                     CryptoError::ProviderFatal("operating-system random source failed".into())
-                })?;
-            data.expose_mut()[self.prefix_bytes as usize..].copy_from_slice(item.data.expose());
-            expanded.push(PlaintextUnit {
-                unit_index: item.unit_index,
-                data,
-            });
-        }
+                })
+            },
+        )?;
         let mut encrypted = self.inner.encrypt_batch(&inner_context, &expanded).await?;
         if expanded
             .iter()
@@ -231,25 +264,79 @@ impl CryptoProvider for RandomPrefixProvider {
                 self.caps.max_ciphertext_size
             )));
         }
-        let expanded = self.inner.decrypt_batch(&inner_context, items).await?;
-        let mut stripped = Vec::new();
-        stripped.try_reserve_exact(expanded.len()).map_err(|_| {
-            CryptoError::ProviderFatal("failed to allocate decrypted plaintext batch".into())
-        })?;
-        for item in expanded {
-            let payload = &item.data.expose()[self.prefix_bytes as usize..];
-            let mut data =
-                SecretBuffer::with_capacity(self.logical_unit_size as usize).map_err(|_| {
-                    CryptoError::ProviderFatal("failed to allocate decrypted plaintext unit".into())
-                })?;
-            data.try_extend_from_slice(payload).map_err(|_| {
-                CryptoError::ProviderFatal("decrypted plaintext capacity invariant failed".into())
-            })?;
-            stripped.push(PlaintextUnit {
-                unit_index: item.unit_index,
-                data,
-            });
+        let mut units = self.inner.decrypt_batch(&inner_context, items).await?;
+        for item in &mut units {
+            // The checked provider has pinned each expanded unit to the wire
+            // size. Keep its guarded allocation and erase the vacated tail.
+            item.data
+                .expose_mut()
+                .copy_within(self.prefix_bytes as usize.., 0);
+            item.data.truncate(self.logical_unit_size as usize);
         }
-        Ok(stripped)
+        Ok(units)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_request_entropy_in_bounded_batches() {
+        for (count, prefix_len, requests) in [
+            (0, 16, vec![]),
+            (1, 16, vec![16]),
+            (64, 16, vec![1024]),
+            (65, 256, vec![16384, 256]),
+        ] {
+            let items: Vec<_> = (0..count)
+                .map(|index| PlaintextUnit {
+                    unit_index: index,
+                    data: SecretBuffer::from_slice(&index.to_le_bytes()),
+                })
+                .collect();
+            let mut sizes = Vec::new();
+            let mut sequence = 0_u8;
+            let expanded = expand_units(&items, prefix_len + 8, prefix_len, |bytes| {
+                sizes.push(bytes.len());
+                for prefix in bytes.chunks_exact_mut(prefix_len) {
+                    prefix.fill(sequence);
+                    sequence += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(sizes, requests);
+            assert_eq!(expanded.len(), items.len());
+            for (index, unit) in expanded.iter().enumerate() {
+                assert_eq!(unit.unit_index, items[index].unit_index);
+                let (prefix, payload) = unit.data.expose().split_at(prefix_len);
+                assert!(prefix.iter().all(|byte| *byte == index as u8));
+                assert_eq!(payload, items[index].data.expose());
+            }
+        }
+    }
+
+    #[test]
+    fn a_later_entropy_failure_discards_the_batch() {
+        let items: Vec<_> = (0..65)
+            .map(|unit_index| PlaintextUnit {
+                unit_index,
+                data: SecretBuffer::zeroed(1),
+            })
+            .collect();
+        let mut requests = 0;
+        let result = expand_units(&items, 257, 256, |bytes| {
+            requests += 1;
+            if requests == 2 {
+                return Err(CryptoError::ProviderFatal("entropy unavailable".into()));
+            }
+            bytes.fill(42);
+            Ok(())
+        });
+        assert_eq!(requests, 2);
+        assert!(
+            matches!(result, Err(CryptoError::ProviderFatal(message)) if message == "entropy unavailable")
+        );
     }
 }

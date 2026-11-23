@@ -6,16 +6,27 @@ An existing local image built with cgroup-validation.Dockerfile is required.
 The host needs Docker, libnbd.so.0, and Python 3. No Python packages are needed.
 """
 import argparse
+from contextlib import contextmanager
 import ctypes
+from fractions import Fraction
 import hashlib
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
 import time
 import uuid
+
+try:
+    from campaign_io import save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import save_json
+
+
+PIDS_LIMIT = "64"
 
 
 def ensure(condition, message):
@@ -49,14 +60,35 @@ def durable_write(client, ledger, writes, mode):
             os.fsync(stream.fileno())
 
 
-def verify(client, ledger):
+def epoch_writes(epoch):
+    flush = [(i * 4096, hashlib.shake_256(f"{epoch}:{i}".encode()).digest(4096))
+             for i in range(128)]
+    fua = [((128 + i) * 4096, hashlib.shake_256(f"{epoch}:{128 + i}".encode()).digest(4096)) for i in range(8)]
+    return (("flush", flush), ("fua", fua))
+
+
+def check_planned_acks(records, rounds):
+    expected = ({"offset": offset, "length": len(data), "barrier": mode,
+                 "sha256": hashlib.sha256(data).hexdigest()}
+                for epoch in range(rounds)
+                for mode, writes in epoch_writes(epoch) for offset, data in writes)
+    for recorded, planned in zip(records, expected, strict=True):
+        if recorded != planned:
+            raise ValueError("durable ACK ledger differs from the planned workload")
+        yield recorded
+
+
+def verify(client, ledger, expected_rounds=None):
     latest = {}
-    for line in ledger.read_text(encoding="utf-8").splitlines():
-        record = json.loads(line)
-        offset, length = record["offset"], record["length"]
-        if offset < 0 or offset % 4096 or length != 4096:
-            raise ValueError("oracle accepts aligned, non-overlapping 4 KiB units only")
-        latest[offset] = record
+    with ledger.open(encoding="utf-8") as stream:
+        records = map(json.loads, stream)
+        if expected_rounds is not None:
+            records = check_planned_acks(records, expected_rounds)
+        for record in records:
+            offset, length = record["offset"], record["length"]
+            if offset < 0 or offset % 4096 or length != 4096:
+                raise ValueError("oracle accepts aligned, non-overlapping 4 KiB units only")
+            latest[offset] = record
     if not latest:
         raise ValueError("an empty oracle cannot qualify durable data")
     for offset, record in latest.items():
@@ -77,14 +109,27 @@ def require_pressure(progress):
            "workload-triggered OOM requires completed pressure I/O")
 
 
+@contextmanager
+def unix_socket_path(path):
+    # Linux resolves this short path through the calling process's open directory.
+    # Both the socket inode and the Docker bind mount stay in the artifact directory.
+    path = pathlib.Path(path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        yield f"/proc/self/fd/{directory}/{path.name}"
+    finally:
+        os.close(directory)
+
+
 class Nbd:
     """Small libnbd synchronous client, always run in a deadline-bound child."""
-    def __init__(self, path):
+    def __init__(self, path, connected_fd=None):
         self.lib = ctypes.CDLL("libnbd.so.0")
         signatures = {
             "create": (ctypes.c_void_p, []),
             "get_error": (ctypes.c_char_p, []),
             "connect_unix": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_char_p]),
+            "connect_socket": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_int]),
             "can_fua": (ctypes.c_int, [ctypes.c_void_p]),
             "can_flush": (ctypes.c_int, [ctypes.c_void_p]),
             "pwrite": (ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint32]),
@@ -98,9 +143,31 @@ class Nbd:
         self.handle = self.lib.nbd_create()
         if not self.handle:
             raise RuntimeError("libnbd handle allocation failed")
-        self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(path)))
-        ensure(self.lib.nbd_can_fua(self.handle) == 1, "native FUA required")
-        ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
+        try:
+            connections = pathlib.Path(path).with_name("connections.log")
+            # A previous client of this daemon may already have logged a negotiation.
+            log_offset = connections.stat().st_size
+            with unix_socket_path(path) as address:
+                if connected_fd is None:
+                    self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(address)))
+                else:
+                    # Queue the connection on the frozen server's socket before
+                    # telling the controller to start its observation interval.
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(os.fsencode(address))
+                        os.write(connected_fd, b"C")
+                        os.close(connected_fd)
+                        self.check(self.lib.nbd_connect_socket(self.handle, client.fileno()))
+                        client.detach()  # libnbd owns the descriptor on success
+            ensure(self.lib.nbd_can_fua(self.handle) == 1, "FUA unavailable on the NBD connection")
+            with connections.open("rb") as log:
+                log.seek(log_offset)
+                connection = next((line for line in log if re.search(rb' connection=\d+ Connect export="" ', line)), b"")
+                ensure(b"fua=2" in connection.split(), "plugin does not provide native FUA")
+            ensure(self.lib.nbd_can_flush(self.handle) == 1, "FLUSH required")
+        except BaseException:
+            self.close()
+            raise
 
     def check(self, result):
         if result < 0:
@@ -123,10 +190,10 @@ class Nbd:
 
 
 def client_main(args):
-    client = Nbd(args.socket)
+    client = Nbd(args.socket, args.connected_fd)
     try:
         if args.mode == "verify":
-            print(json.dumps({"verified_units": verify(client, args.ledger)}))
+            print(json.dumps({"verified_units": verify(client, args.ledger, args.rounds)}))
         elif args.mode == "pressure":
             # Distinct non-durable writes cannot overwrite the durable oracle.
             # 64 MiB of pending ciphertext deliberately exceeds a 32 MiB cgroup.
@@ -140,13 +207,9 @@ def client_main(args):
                 progress_path.write_text(json.dumps(progress))
             print(json.dumps({"pressure_bytes_written": 64 << 20}))
         else:
-            for epoch in range(args.rounds):
-                writes = [(index * 4096, hashlib.sha256(f"{epoch}:{index}".encode()).digest() * 128)
-                          for index in range(128)]
-                durable_write(client, args.ledger, writes, "flush")
-                writes = [((128 + index) * 4096, bytes([(epoch + index + 1) % 256]) * 4096)
-                          for index in range(8)]
-                durable_write(client, args.ledger, writes, "fua")
+            for epoch in range(args.start_epoch, args.start_epoch + args.rounds):
+                for mode, writes in epoch_writes(epoch):
+                    durable_write(client, args.ledger, writes, mode)
             # No barrier for the tail: its survival is not claimed or required.
             client.write(1 << 20, b"T" * 4096)
             print(json.dumps({"flush_acks": args.rounds, "fua_acks": args.rounds * 8}))
@@ -161,6 +224,22 @@ def run(command, *, timeout=45, check=True):
     return result
 
 
+@contextmanager
+def remove_after(target):
+    try:
+        yield
+    except BaseException as error:
+        name = target.pending_identifier or target.identifier
+        try:
+            target.remove()
+        except Exception as cleanup_error:
+            raise RuntimeError(f"{type(error).__name__}: {error}; "
+                               f"cleanup for {name} failed: {cleanup_error}") from error
+        raise
+    else:
+        target.remove()
+
+
 class Target:
     def __init__(self, image, directory):
         self.image = image
@@ -169,6 +248,7 @@ class Target:
         self.case.mkdir(mode=0o700)
         self.ledger = directory / "host-acks.jsonl"
         self.identifier = None
+        self.pending_identifier = None
         self.serial = 0
         self.token = uuid.uuid4().hex
         self.notify = None
@@ -200,52 +280,82 @@ socket = "/case/control.sock"
         self.one_shot(["/opt/maki/maki", "volume", "create", "/case/config.toml"])
 
     def one_shot(self, command):
-        try:
+        # Killing the Docker CLI does not terminate its container.
+        with remove_after(self):
             self.create("192m", "1", command)
             return run(["docker", "start", "--attach", self.identifier], timeout=120)
-        finally:
-            # Killing the Docker CLI does not terminate its container.
-            self.remove()
 
     def options(self, memory, cpus):
+        # --mount uses CSV, including for a single argv element.
+        source = str(self.case).replace('"', '""')
         return ["--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--user", f"{os.getuid()}:{os.getgid()}",
-                "--pids-limit", "64", "--memory", memory, "--memory-swap", memory,
+                "--pids-limit", PIDS_LIMIT, "--memory", memory, "--memory-swap", memory,
                 "--cpus", cpus, "--label", "maki.failure-validation=" + self.token,
-                "--mount", f"type=bind,src={self.case},dst=/case"]
+                "--mount", f'type=bind,"src={source}",dst=/case']
 
-    def state(self):
-        return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier]).stdout)
+    def state(self, timeout=45):
+        return json.loads(run(["docker", "inspect", "--format", "{{json .State}}", self.identifier],
+                              timeout=timeout).stdout)
+
+    def wait_for_oom(self):
+        until = time.monotonic() + 10
+        while (remaining := until - time.monotonic()) > 0:
+            try:
+                state = self.state(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                break
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            if not state["Running"]:
+                require_oom(state)
+                return state
+            time.sleep(min(0.1, remaining))
+        raise TimeoutError("container OOM was not observed within 10 seconds")
 
     def create(self, memory, cpus, command, extra=()):
-        ensure(self.identifier is None, "previous owned container has not been removed")
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
         self.serial += 1
-        # Preserve an identity even if the create CLI times out before returning its ID.
-        self.identifier = f"maki-fault-{self.token}-{self.serial}"
-        run(["docker", "create", "--name", self.identifier, *self.options(memory, cpus),
+        # Docker may have created the container even if its CLI did not return success.
+        self.pending_identifier = f"maki-fault-{self.token}-{self.serial}"
+        run(["docker", "create", "--name", self.pending_identifier, *self.options(memory, cpus),
              *extra, self.image, *command])
+        self.identifier = self.pending_identifier
+        self.pending_identifier = None
 
     def start(self, memory="192m", cpus="1"):
-        ensure(self.identifier is None, "previous owned container has not been removed")
-        for name in ("nbd.sock", "ready.sock"):
+        ensure(self.identifier is None and self.pending_identifier is None,
+               "previous owned container has not been removed")
+        for name in ("nbd.sock", "ready.sock", "connections.log"):
             (self.case / name).unlink(missing_ok=True)
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.notify.bind(str(self.case / "ready.sock"))
-        self.notify.settimeout(0.1)
+        with unix_socket_path(self.case / "ready.sock") as address:
+            self.notify.bind(address)
         # Maki is PID 1: no shell, init, sidecar or stress helper is the OOM victim.
         self.create(memory, cpus, [
             "nbdkit", "--foreground", "--threads", "4", "-U", "/case/nbd.sock",
-            "/opt/maki/libmaki_nbdkit.so", "config=/case/config.toml",
+            "--filter=log", "/opt/maki/libmaki_nbdkit.so", "config=/case/config.toml",
+            "logfile=/case/connections.log",
         ], extra=["--env", "NOTIFY_SOCKET=/case/ready.sock"])
         run(["docker", "start", self.identifier])
         until = time.monotonic() + 30
-        while time.monotonic() < until:
+        while (remaining := until - time.monotonic()) > 0:
+            self.notify.settimeout(min(0.1, remaining))
             try:
-                if b"READY=1" in self.notify.recv(4096).splitlines():
+                if b"READY=1" in self.notify.recv(4096).splitlines() and time.monotonic() < until:
                     return
             except socket.timeout:
                 pass
-            if not self.state()["Running"]:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                state = self.state(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                break
+            if not state["Running"]:
                 raise RuntimeError("native startup failed before READY")
         raise TimeoutError("native startup did not announce READY")
 
@@ -254,8 +364,8 @@ socket = "/case/control.sock"
         # Startup can remain alive without READY. Resolve the current PID,
         # rather than reusing the previous (removed) container's cgroup.
         state = self.state()
-        memberships = pathlib.Path(f"/proc/{state['Pid']}/cgroup").read_text().splitlines()
-        relative = next(line[3:] for line in memberships if line.startswith("0::"))
+        memberships = pathlib.Path(f"/proc/{state['Pid']}/cgroup").read_bytes().split(b"\n")
+        relative = os.fsdecode(next(line[3:] for line in memberships if line.startswith(b"0::")))
         cgroup = pathlib.Path("/sys/fs/cgroup") / relative.lstrip("/")
         for name in ("memory.current", "memory.peak", "memory.max", "memory.swap.max",
                      "memory.events", "cpu.max", "cpu.stat", "pids.max", "pids.events"):
@@ -277,17 +387,42 @@ socket = "/case/control.sock"
             result["process.status"] = f"unavailable: {error.__class__.__name__}"
         return result
 
-    def client_command(self, mode, rounds=1):
+    def client_command(self, mode, rounds=1, start_epoch=0):
         return [sys.executable, str(pathlib.Path(__file__).resolve()), "--client",
                 "--socket", str(self.case / "nbd.sock"), "--ledger", str(self.ledger),
-                "--mode", mode, "--rounds", str(rounds)]
+                "--mode", mode, "--rounds", str(rounds), "--start-epoch", str(start_epoch)]
 
     def client(self, mode, rounds=1, check=True):
         result = run(self.client_command(mode, rounds), timeout=120, check=check)
         record = {"exit_code": result.returncode, "stdout": result.stdout[-2000:], "stderr": result.stderr[-2000:]}
         if check:
             ensure(result.stdout.strip(), "client returned no verification evidence")
+        if mode == "verify":
+            ensure(json.loads(result.stdout)["verified_units"] == 136, "incomplete recovery readback")
         return record
+
+    def freeze_and_resume(self, directory, start_epoch):
+        before = self.ledger.read_bytes()
+        run(["docker", "pause", self.identifier])
+        receiver, sender = socket.socketpair()
+        with receiver, sender, (directory / "paused-client.log").open("w") as stream:
+            command = self.client_command("write", start_epoch=start_epoch)
+            descriptor = sender.fileno()
+            child = subprocess.Popen([*command, "--connected-fd", str(descriptor)],
+                                     pass_fds=(descriptor,), stdout=stream, stderr=subprocess.STDOUT)
+            sender.close()
+            try:
+                receiver.settimeout(30)
+                ensure(receiver.recv(1) == b"C", "client did not connect to the paused server")
+                time.sleep(0.5)
+                ensure(child.poll() is None, "paused server unexpectedly completed client")
+                ensure(self.ledger.read_bytes() == before, "paused server produced a durable ACK")
+                run(["docker", "unpause", self.identifier])
+                ensure(child.wait(timeout=120) == 0, "resumed client failed")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
 
     def kill(self):
         run(["docker", "kill", "--signal", "KILL", self.identifier])
@@ -301,119 +436,154 @@ socket = "/case/control.sock"
         if self.notify is not None:
             self.notify.close()
             self.notify = None
+        if self.pending_identifier is not None:
+            # Only act on the reserved name if Docker also confirms this campaign's label.
+            owned = run(["docker", "ps", "--all", "--filter", "label=maki.failure-validation=" + self.token,
+                         "--format", "{{.Names}}"])
+            if self.pending_identifier in owned.stdout.splitlines():
+                self.identifier = self.pending_identifier
+            self.pending_identifier = None
         if self.identifier is None:
             return
         state = self.state()
-        if state.get("Paused"):
-            run(["docker", "unpause", self.identifier])
-        if self.state()["Running"]:
-            self.kill()
+        if state["Running"]:
+            try:
+                if state.get("Paused"):
+                    run(["docker", "unpause", self.identifier])
+                run(["docker", "kill", "--signal", "KILL", self.identifier])
+                run(["docker", "wait", self.identifier])
+            except (RuntimeError, subprocess.TimeoutExpired):
+                # The container can exit between inspect and unpause/kill.
+                # Only continue cleanup once Docker confirms it has stopped.
+                if self.state()["Running"]:
+                    raise
         # Logs are inspected/saved only after the container process has exited.
-        output = run(["docker", "logs", "--tail", "60", self.identifier])
-        (self.directory / f"container-{self.serial}.log").write_text(output.stdout + output.stderr)
-        run(["docker", "rm", self.identifier])
-        self.identifier = None
-
-
-def constrained_recovery(target, memory="32m"):
-    """Report availability at the requested cap without relaxing durability."""
-    try:
         try:
-            target.start(memory=memory)
-        except TimeoutError:
-            result = {"ready": False, "outcome": "startup-timeout", "deadline_seconds": 30,
-                      "resources": target.stats(), "state_before_cleanup": target.state()}
-            if target.state()["Running"]:
-                result["cleanup_termination"] = target.kill()
-            return result
-        except RuntimeError:
+            output = run(["docker", "logs", "--tail", "60", self.identifier])
+            (self.directory / f"container-{self.serial}.log").write_text(output.stdout + output.stderr)
+        finally:
+            run(["docker", "rm", self.identifier])
+            self.identifier = None
+
+
+def require_limits(resources, memory_mib, cpus="1"):
+    expected = {"memory.max": str(memory_mib << 20), "memory.swap.max": "0", "pids.max": PIDS_LIMIT}
+    for field, limit in expected.items():
+        observed = resources.get(field)
+        ensure(observed == limit, f"expected {field}={limit}, observed {observed!r}")
+    observed = resources.get("cpu.max")
+    pair = re.fullmatch(r"([0-9]+)\s+([0-9]+)", observed or "")
+    message = f"expected cpu.max quota/period of {cpus}, observed {observed!r}"
+    ensure(pair, message)
+    quota, period = map(int, pair.groups())
+    ensure(period > 0 and quota == Fraction(cpus) * period, message)
+
+
+def constrained_recovery(target, memory_mib=32, rounds=1):
+    """Report availability at the requested cap without relaxing durability."""
+    with remove_after(target):
+        try:
+            target.start(memory=f"{memory_mib}m")
+        except (TimeoutError, RuntimeError) as error:
+            if target.identifier is None:
+                raise
             state = target.state()
+            if isinstance(error, TimeoutError) and state["Running"]:
+                try:
+                    resources = target.stats()
+                    termination = target.kill()
+                except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired):
+                    # The process can OOM between inspect and reading /proc or killing it.
+                    state = target.state()
+                    if state["Running"]:
+                        raise
+                else:
+                    require_limits(resources, memory_mib)
+                    return {"ready": False, "outcome": "startup-timeout", "limits_verified": True,
+                            "deadline_seconds": 30,
+                            "resources": resources, "state_before_cleanup": state,
+                            "cleanup_termination": termination}
             require_oom(state)
-            return {"ready": False, "outcome": "startup-oom", "termination": state}
+            # Docker can confirm OOM after the task exits, when its live
+            # cgroup limits can no longer be verified.
+            return {"ready": False, "outcome": "startup-oom", "limits_verified": False,
+                    "termination": state}
         else:
-            result = {"ready": True, "outcome": "verified", "verification": target.client("verify"),
-                      "resources": target.stats()}
+            require_limits(target.stats(), memory_mib)
+            verification = target.client("verify", rounds=rounds)
+            resources = target.stats()
+            require_limits(resources, memory_mib)
             target.kill()
-            return result
-    finally:
-        target.remove()
+            return {"ready": True, "outcome": "verified", "limits_verified": True,
+                    "verification": verification, "resources": resources}
 
 
 def campaign(args):
     os.umask(0o077)
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    details = json.loads(run(["docker", "info", "--format", "{{json .}}"]).stdout)
-    ensure(details["CgroupVersion"] == "2", "cgroup v2 is required")
-    for feature in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit"):
-        ensure(details[feature], f"Docker lacks {feature}")
-    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
-    report = {"image": image_id, "kernel": os.uname().release, "docker": details["ServerVersion"],
-              "cgroup": 2, "provider": "local-aes-gcm-siv", "cases": [], "passed": False}
+    report = {"requested_image": args.image, "provider": "local-aes-gcm-siv", "cases": [], "passed": False}
     try:
+        details = json.loads(run(["docker", "info", "--format", "{{json .}}"]).stdout)
+        ensure(details["CgroupVersion"] == "2", "cgroup v2 is required")
+        for feature in ("MemoryLimit", "SwapLimit", "CpuCfsQuota", "PidsLimit"):
+            ensure(details[feature], f"Docker lacks {feature}")
+        report.update(kernel=os.uname().release, docker=details["ServerVersion"], cgroup=2)
+        image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.image]).stdout.strip()
+        report["image"] = image_id
         for scenario in ("cpu-memory-kill", "freeze-resume", "memory-oom"):
+            record = {"scenario": scenario, "passed": False}
+            report["cases"].append(record)
             directory = args.output / scenario
             directory.mkdir(mode=0o700)
             target = Target(image_id, directory)
-            record = {"scenario": scenario}
-            report["cases"].append(record)
-            try:
-                target.start(memory="96m", cpus="0.25" if scenario == "cpu-memory-kill" else "1")
+            with remove_after(target):
+                cpus = "0.25" if scenario == "cpu-memory-kill" else "1"
+                target.start(memory="96m", cpus=cpus)
                 record["workload"] = target.client("write", rounds=args.rounds)
                 record["resources"] = target.stats()
+                require_limits(record["resources"], 96, cpus)
                 if scenario == "cpu-memory-kill":
                     cpu = dict(line.split() for line in record["resources"]["cpu.stat"].splitlines())
                     ensure(int(cpu["nr_throttled"]) > 0, "no observed CPU throttling")
                     record["termination"] = target.kill()
                 elif scenario == "freeze-resume":
-                    before = target.ledger.read_bytes()
-                    run(["docker", "pause", target.identifier])
-                    with (directory / "paused-client.log").open("w") as stream:
-                        child = subprocess.Popen(target.client_command("write"), stdout=stream, stderr=subprocess.STDOUT)
-                        try:
-                            time.sleep(0.5)
-                            ensure(child.poll() is None, "paused server unexpectedly completed client")
-                            ensure(target.ledger.read_bytes() == before, "paused server produced a durable ACK")
-                            run(["docker", "unpause", target.identifier])
-                            ensure(child.wait(timeout=120) == 0, "resumed client failed")
-                        finally:
-                            if child.poll() is None:
-                                child.kill()
-                                child.wait(timeout=5)
+                    target.freeze_and_resume(directory, args.rounds)
+                    record["connected_while_paused"] = True
                     record["pause_seconds"] = 0.5
                     record["termination"] = target.kill()
                 else:
                     run(["docker", "update", "--memory", "32m", "--memory-swap", "32m", target.identifier])
                     ensure(target.state()["Running"], "limit shrink killed target before pressure I/O")
                     record["pressure_resources"] = target.stats()
+                    require_limits(record["pressure_resources"], 32, cpus)
                     record["pressure_client"] = target.client("pressure", check=False)
                     record["pressure_progress"] = json.loads(target.ledger.with_name("pressure-progress.json").read_text())
                     require_pressure(record["pressure_progress"])
-                    until = time.monotonic() + 10
-                    while target.state()["Running"] and time.monotonic() < until:
-                        time.sleep(0.1)
-                    record["termination"] = target.state()
-                    require_oom(record["termination"])
+                    record["termination"] = target.wait_for_oom()
                 target.remove()
                 if scenario == "memory-oom":
                     # A safe recovery result is separate from availability at
                     # the original cap. Preserve both outcomes explicitly.
-                    memory = f"{args.recovery_memory_mib}m"
-                    record[f"recovery_at_{memory}"] = constrained_recovery(target, memory=memory)
+                    record[f"recovery_at_{args.recovery_memory_mib}m"] = constrained_recovery(
+                        target, memory_mib=args.recovery_memory_mib, rounds=args.rounds)
                 target.start()
-                record["recovery"] = target.client("verify")
+                record["recovery"] = target.client("verify", rounds=args.rounds + int(scenario == "freeze-resume"))
                 record["recovery_resources"] = target.stats()
+                require_limits(record["recovery_resources"], 192)
                 target.kill()
                 target.remove()
                 # Offline format/CRC check complements authenticated NBD readback.
                 check = target.one_shot(["/opt/maki/maki", "check", "/case/config.toml", "--deep"])
                 record["deep_check"] = {"exit_code": check.returncode, "stdout": check.stdout[-2000:]}
-                record["passed"] = True
-                print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
-            finally:
-                target.remove()
+            record["passed"] = True
+            save_json(args.output / "results.json", report)
+            print(json.dumps({"scenario": scenario, "passed": True}), flush=True)
         report["passed"] = True
+    except BaseException as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        raise
     finally:
-        (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+        save_json(args.output / "results.json", report)
 
 
 def main():
@@ -423,13 +593,16 @@ def main():
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--recovery-memory-mib", type=int, default=32,
                         help="memory and swap cap for the post-OOM constrained recovery")
+    parser.add_argument("--start-epoch", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--socket", help=argparse.SUPPRESS)
+    parser.add_argument("--connected-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--ledger", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("write", "verify", "pressure"), help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not 1 <= args.rounds <= 64:
-        parser.error("--rounds must be 1..64")
+    max_rounds = 65 if args.client and args.mode == "verify" else 64
+    if not 1 <= args.rounds <= max_rounds:
+        parser.error(f"--rounds must be 1..{max_rounds}")
     if not 32 <= args.recovery_memory_mib <= 4096:
         parser.error("--recovery-memory-mib must be 32..4096")
     if args.client:

@@ -29,7 +29,7 @@ Related: [qualification tiers](../testing.md),
 | Boot disk | Separate 30 GiB balanced Persistent Disk, deleted with the instance |
 | Data disk | Separate 20 GiB balanced Persistent Disk, attached as `maki-data`; ext4 mounted at `/mnt/maki-data` through `/dev/disk/by-id/google-maki-data` |
 | Maki | Normal release CLI/native plugin, real `local-aes-gcm-siv`, disposable 32-byte key; 128 MiB logical volume and eight 16 MiB logical ranges |
-| Client | libnbd through Python `ctypes`; native FLUSH and FUA both required before READY |
+| Client | libnbd through Python `ctypes`; negotiated FLUSH and FUA before READY |
 | Reset controller | Independent host process invoking `gcloud compute instances reset`; private ACK ledger fsynced on the controller before each reset |
 
 The CLI SHA-256 was
@@ -58,7 +58,10 @@ instance ID, data disk ID and self-link, attachment URL and device name, and
 filesystem UUID. The [guest agent](../../scripts/gcp-reset-guest.py) starts the
 real nbdkit plugin and waits for its startup READY notification. It then opens
 the Unix NBD endpoint with libnbd and refuses to proceed unless FLUSH and FUA
-are both available.
+are both available. For the historical run, the wire negotiation recorded
+FUA support. Current runs additionally load nbdkit's log filter and require
+its connection record to report the plugin's native FUA mode before READY.
+This distinguishes native FUA from nbdkit's flush-based emulation.
 
 Each generation changes sixteen 4 KiB units: two offsets in each of eight
 16 MiB logical ranges. Even generations issue all writes and then one FLUSH.
@@ -158,9 +161,13 @@ Launcher filenames use UTC timestamps; the report date uses Asia/Seoul time.
 
 The harness has no third-party Python dependencies. Prepare an explicitly
 authorized disposable GCE instance with a separate persistent data disk, mount
-that disk at `/mnt/maki-data`, install the pinned Maki binaries and guest agent,
+that disk at `/mnt/maki-data`, install the pinned Maki binaries, guest agent and its sibling `campaign_io.py`,
 and create the configuration, key, volume, and shutdown witness. Run the
-controller outside the workload VM. `--output` must name a new private
+controller outside the workload VM. Use matching controller and guest scripts. The
+controller passes the GCE attachment device name and READY timeout on each boot.
+The guest verifies the backing directory and the selected config file under
+`/mnt/maki-data` against the mounted disk or its partition. Each campaign uses
+its own data patterns, including the rewrite in the discard profile. `--output` must name a new private
 directory.
 
 ```bash

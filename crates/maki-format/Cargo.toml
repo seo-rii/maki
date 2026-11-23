@@ -6,12 +6,16 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+http = "1"
+url = "2"
 maki-backing.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }
 serde.workspace = true
 toml.workspace = true
 crc32fast.workspace = true
 uuid.workspace = true
+rustls-pki-types = "1"
 
 [dev-dependencies]
 maki-test-support.workspace = true

@@ -2,6 +2,8 @@
 """Build a deterministic Debian package from Maki release artifacts."""
 
 import argparse
+from email.utils import formatdate
+import gzip
 import os
 import pathlib
 import re
@@ -14,6 +16,7 @@ import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+MAINTAINER = "Maki Developers <me@seorii.page>"
 RELEASE_FILES = {
     "maki": "usr/bin/maki",
     "maki-attach": "usr/bin/maki-attach",
@@ -21,6 +24,19 @@ RELEASE_FILES = {
     "libmaki_nbdkit.so": "usr/lib/maki/maki-nbdkit.so",
 }
 SHARED_OBJECTS = {"libmaki_nbdkit.so"}
+SYSTEMD_UNITS = (
+    "maki@.service",
+    "maki-attach@.service",
+    "maki-recover@.service",
+    "maki-workload@.target",
+)
+EXAMPLE_FILES = (
+    "attach.toml",
+    "maki-crypto.proto",
+    "maki-workload.service.d/10-maki.conf",
+    "maki@.service.d/20-memory-budget.conf",
+    "postgres-prod.toml",
+)
 
 # ELF identity a Debian architecture's binaries must carry:
 # (e_machine, ELF class, byte order). The builder refuses an artifact that
@@ -51,8 +67,12 @@ ELF_MACHINE_NAMES = {
 }
 ET_REL, ET_EXEC, ET_DYN = 1, 2, 3
 PT_DYNAMIC, PT_INTERP = 2, 3
+PT_MIPS_ABIFLAGS = 0x70000003
 DT_NULL, DT_FLAGS_1 = 0, 0x6FFFFFFB
 DF_1_PIE = 0x08000000
+EF_PPC64_ABI = 0x3
+EF_RISCV_FLOAT_ABI_MASK, EF_RISCV_FLOAT_ABI_DOUBLE = 0x6, 0x4
+EF_LARCH_ABI_MODIFIER_MASK, EF_LARCH_ABI_DOUBLE_FLOAT = 0x7, 0x3
 EF_ARM_EABIMASK, EF_ARM_EABI_VER5 = 0xFF000000, 0x05000000
 EF_ARM_ABI_FLOAT_SOFT, EF_ARM_ABI_FLOAT_HARD = 0x200, 0x400
 
@@ -85,6 +105,8 @@ def inspect_elf(path):
         header = handle.read(64)
     if len(header) < 52 or header[:4] != b"\x7fELF":
         fail(f"{path.name} is not an ELF image")
+    if header[7] not in (0, 3):  # ELFOSABI_SYSV and ELFOSABI_GNU
+        fail(f"{path.name} declares ELF OS ABI {header[7]}, incompatible with Debian Linux")
     elf_class = {1: 32, 2: 64}.get(header[4])
     endian = {1: "little", 2: "big"}.get(header[5])
     if elf_class is None or endian is None:
@@ -97,7 +119,7 @@ def inspect_elf(path):
     return e_type, e_machine, elf_class, endian, e_flags
 
 
-def inspect_loader(path, elf_class, endian):
+def inspect_loader(path, elf_class, endian, architecture):
     """Read entry point and PIE markers from bounded loader metadata."""
     order = "<" if endian == "little" else ">"
     is_64 = elf_class == 64
@@ -110,15 +132,14 @@ def inspect_loader(path, elf_class, endian):
         if len(header) < (64 if is_64 else 52):
             fail(f"{path.name} has a truncated ELF header")
         entry_point = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header, 24)[0]
-        interpreter, pie = False, False
+        interpreter, pie = None, False
+        mips_abi_seen = False
         program_offset = struct.unpack_from(f"{order}{'Q' if is_64 else 'I'}", header,
                                             32 if is_64 else 28)[0]
         entry_size, count = struct.unpack_from(f"{order}HH", header, 54 if is_64 else 42)
-        if count == 0:
-            return entry_point, interpreter, pie
         if count == 0xFFFF:
             fail(f"{path.name} uses an unsupported extended ELF program-header count")
-        if entry_size < program_size:
+        if count and entry_size < program_size:
             fail(f"{path.name} has truncated ELF program-header entries")
         file_size = os.fstat(handle.fileno()).st_size
         if program_offset + count * entry_size > file_size:
@@ -131,11 +152,28 @@ def inspect_loader(path, elf_class, endian):
             if len(program) != program_size:
                 fail(f"{path.name} has a truncated ELF program-header entry")
             fields = struct.unpack(program_format, program)
+            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
             if fields[0] == PT_INTERP:
-                interpreter = True
+                # Linux binfmt_elf caps this record at PATH_MAX including NUL.
+                if interpreter is not None or not 2 <= size <= 4096 or offset + size > file_size:
+                    fail(f"{path.name} has an invalid PT_INTERP segment")
+                handle.seek(offset)
+                raw = handle.read(size)
+                if len(raw) != size or not raw.startswith(b"/") or not raw.endswith(b"\0") or b"\0" in raw[:-1]:
+                    fail(f"{path.name} PT_INTERP must contain one complete absolute interpreter path")
+                interpreter = os.fsdecode(raw[:-1])
+            if fields[0] == PT_MIPS_ABIFLAGS and architecture == "mips64el":
+                # Elf_MIPS_ABIFlags_v0 is a 24-byte loader record, also
+                # available in stripped binaries. Byte 7 holds the FP ABI.
+                if mips_abi_seen or size != 24 or offset + size > file_size:
+                    fail(f"{path.name} has invalid mips64el ABI flags")
+                handle.seek(offset)
+                abi = handle.read(24)
+                if len(abi) != 24 or abi[:2] != b"\0\0" or abi[7] not in (0, 1):
+                    fail(f"{path.name} must use a double-float compatible ABI for mips64el")
+                mips_abi_seen = True
             if fields[0] != PT_DYNAMIC:
                 continue
-            offset, size = (fields[2], fields[5]) if is_64 else (fields[1], fields[4])
             if offset + size > file_size or size % dynamic_size:
                 fail(f"{path.name} has a truncated ELF dynamic table")
             handle.seek(offset)
@@ -148,19 +186,19 @@ def inspect_loader(path, elf_class, endian):
                     break
                 if tag == DT_FLAGS_1 and value & DF_1_PIE:
                     pie = True
+        if architecture == "mips64el" and not mips_abi_seen:
+            fail(f"{path.name} is missing mips64el ABI flags")
         return entry_point, interpreter, pie
 
 
-def validate_shared_object(path, elf_class, endian):
+def validate_shared_object(path, interpreter, pie):
     """A plugin must not carry the loader markers of an executable."""
-    _, interpreter, pie = inspect_loader(path, elf_class, endian)
     if interpreter or pie:
         marker = "PT_INTERP" if interpreter else "DF_1_PIE"
         fail(f"{path.name} must be an ELF shared object, not a PIE executable ({marker})")
 
 
-def validate_executable(path, e_type, elf_class, endian):
-    entry_point, interpreter, pie = inspect_loader(path, elf_class, endian)
+def validate_executable(path, e_type, entry_point, interpreter, pie):
     if entry_point == 0:
         fail(f"{path.name} must have a nonzero ELF executable entry point")
     # Older dynamic PIEs may only carry PT_INTERP. Static PIEs have no
@@ -182,6 +220,7 @@ def validate_release_files(args):
             "identity to ELF_ARCHITECTURES before packaging for it"
         )
     machine, elf_class, endian = expected
+    interpreters = {}
     for source_name in RELEASE_FILES:
         path = args.release_dir / source_name
         if not path.is_file() or path.is_symlink():
@@ -193,6 +232,12 @@ def validate_release_files(args):
                 f"package architecture is {args.architecture} "
                 f"({describe(machine, elf_class, endian)})"
             )
+        if args.architecture == "riscv64" and e_flags & EF_RISCV_FLOAT_ABI_MASK != EF_RISCV_FLOAT_ABI_DOUBLE:
+            fail(f"{source_name} must use the double-float LP64D ABI for riscv64")
+        if args.architecture == "loong64" and e_flags & EF_LARCH_ABI_MODIFIER_MASK != EF_LARCH_ABI_DOUBLE_FLOAT:
+            fail(f"{source_name} must use the double-float LP64D ABI for loong64")
+        if args.architecture == "ppc64el" and e_flags & EF_PPC64_ABI not in (0, 2):
+            fail(f"{source_name} must be ABI-neutral or use ELFv2 for ppc64el")
         if args.architecture in ("armel", "armhf"):
             # Both Debian ports use ARM EABI5, but their floating-point
             # procedure-call standards differ despite identical ELF identity.
@@ -207,14 +252,58 @@ def validate_release_files(args):
                 actual_abi = "hard-float" if hard_float else "soft-float"
                 fail(f"{source_name} uses the ARM {actual_abi} ABI but the "
                      f"package architecture is {args.architecture}")
+        entry_point, interpreter, pie = inspect_loader(path, file_class, file_endian, args.architecture)
         if source_name in SHARED_OBJECTS:
             if e_type != ET_DYN:
                 fail(f"{source_name} must be an ELF shared object (ET_DYN), found type {e_type}")
-            validate_shared_object(path, file_class, file_endian)
+            validate_shared_object(path, interpreter, pie)
         elif e_type not in (ET_EXEC, ET_DYN):
             fail(f"{source_name} must be an ELF executable (ET_EXEC or PIE), found type {e_type}")
         else:
-            validate_executable(path, e_type, file_class, file_endian)
+            validate_executable(path, e_type, entry_point, interpreter, pie)
+            if interpreter:
+                interpreters.setdefault(interpreter, source_name)
+    return interpreters
+
+
+def interpreter_dependencies(interpreters, architecture):
+    """PT_INTERP has no DT_NEEDED entry for dpkg-shlibdeps to resolve."""
+    if not interpreters:
+        return set()
+    owners = {}
+    for runtime in ("libc6", "musl"):
+        listing = subprocess.run(["dpkg-query", "-L", f"{runtime}:{architecture}"],
+                                 capture_output=True, text=True)
+        if listing.returncode == 0:
+            for line in listing.stdout.splitlines():
+                path = pathlib.Path(line)
+                if path.is_absolute() and re.fullmatch(r"ld[\w.-]*\.so(?:\.\d+)*", path.name):
+                    owners[path] = runtime
+
+    # Different distro releases record opposite sides of the merged-/usr
+    # symlinks. Only translate the distribution's top-level library dirs:
+    # resolving arbitrary aliases would accept a build-host-only symlink.
+    merged = {}
+    for directory in ("/lib", "/lib32", "/lib64", "/libx32"):
+        old = pathlib.Path(directory)
+        new = pathlib.Path("/usr" + directory)
+        if old.is_symlink() and old.resolve() == new:
+            merged[old] = new
+            merged[new] = old
+
+    dependencies = set()
+    for spelling, source in interpreters.items():
+        path = pathlib.Path(spelling)
+        owner = owners.get(path)
+        for prefix, alias in merged.items():
+            if owner is None and path.is_relative_to(prefix):
+                owner = owners.get(alias / path.relative_to(prefix))
+        # The kernel opens the original spelling. A directory-only suffix on
+        # a valid loader is an error even though pathlib normalizes it away.
+        if owner is None or not os.path.isfile(spelling) or not os.access(spelling, os.X_OK):
+            fail(f"{source} interpreter {spelling!r} is not a packaged runtime loader for {architecture}")
+        dependencies.add(owner)
+    return dependencies
 
 
 def shared_library_dependencies(package_root):
@@ -225,7 +314,7 @@ def shared_library_dependencies(package_root):
         source = pathlib.Path(temporary)
         write_file(
             source / "debian/control",
-            "Source: maki\nMaintainer: Maki Developers\n\nPackage: maki\nArchitecture: any\n",
+            f"Source: maki\nMaintainer: {MAINTAINER}\n\nPackage: maki\nArchitecture: any\n",
             0o644,
         )
         result = subprocess.run(
@@ -264,6 +353,10 @@ def write_file(path, contents, mode):
 def validate(args):
     if not args.release_dir.is_dir():
         fail(f"release directory does not exist: {args.release_dir}")
+    if args.output.name in RELEASE_FILES:
+        output_parent = args.output.parent.resolve()
+        if output_parent.is_dir() and output_parent.samefile(args.release_dir):
+            fail(f"output would overwrite a release input: {args.output}")
     version = subprocess.run(
         ["dpkg", "--validate-version", args.version],
         capture_output=True,
@@ -273,7 +366,7 @@ def validate(args):
         fail(version.stderr.strip() or "invalid Debian version")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.architecture):
         fail(f"invalid Debian architecture: {args.architecture}")
-    validate_release_files(args)
+    interpreters = validate_release_files(args)
     if args.shlibdeps and shutil.which("dpkg-shlibdeps") is None:
         fail(
             "computing native library dependencies requires dpkg-shlibdeps "
@@ -292,10 +385,19 @@ def validate(args):
         fail("SOURCE_DATE_EPOCH must be an integer")
     if epoch < 0:
         fail("SOURCE_DATE_EPOCH must not be negative")
-    return epoch
+    runtimes = interpreter_dependencies(interpreters, args.architecture) if args.shlibdeps else set()
+    return epoch, runtimes
 
 
-def create_tree(package_root, args):
+def install_gzip(contents, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+            compressed.write(contents)
+    destination.chmod(0o644)
+
+
+def create_tree(package_root, args, runtimes, epoch):
     for source_name, installed_name in RELEASE_FILES.items():
         install_file(
             args.release_dir / source_name,
@@ -303,9 +405,8 @@ def create_tree(package_root, args):
             0o755,
         )
 
-    for source in sorted((ROOT / "packaging/systemd").iterdir()):
-        if source.is_file():
-            install_file(source, package_root / "usr/lib/systemd/system" / source.name, 0o644)
+    for unit in SYSTEMD_UNITS:
+        install_file(ROOT / "packaging/systemd" / unit, package_root / "usr/lib/systemd/system" / unit, 0o644)
     install_file(
         ROOT / "packaging/sysusers.d/maki.conf",
         package_root / "usr/lib/sysusers.d/maki.conf",
@@ -316,27 +417,31 @@ def create_tree(package_root, args):
         package_root / "usr/lib/tmpfiles.d/maki.conf",
         0o644,
     )
-    for source in sorted((ROOT / "packaging/examples").rglob("*")):
-        if source.is_file():
-            relative = source.relative_to(ROOT / "packaging/examples")
-            install_file(source, package_root / "usr/share/doc/maki/examples" / relative, 0o644)
+    for example in EXAMPLE_FILES:
+        install_file(ROOT / "packaging/examples" / example,
+                     package_root / "usr/share/doc/maki/examples" / example, 0o644)
+    install_file(ROOT / "packaging/debian/copyright", package_root / "usr/share/doc/maki/copyright", 0o644)
 
-    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd"]
+    docs = package_root / "usr/share/doc/maki"
+    changelog = (
+        f"maki ({args.version}) unstable; urgency=medium\n\n"
+        "  * Build Maki from the supplied release artifacts. See NEWS.gz for upstream changes.\n\n"
+        f" -- {MAINTAINER}  {formatdate(epoch)}\n"
+    )
+    install_gzip(changelog.encode("utf-8"), docs / "changelog.Debian.gz")
+    install_gzip((ROOT / "CHANGELOG.md").read_bytes(), docs / "NEWS.gz")
+    for name in ("maki", "maki-attach", "maki-check"):
+        page = ROOT / "packaging/debian/man" / f"{name}.8"
+        install_gzip(page.read_bytes(), package_root / "usr/share/man/man8" / f"{name}.8.gz")
+
+    depends = ["nbd-client (>= 1:3.27.0)", "nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd (>= 249)", "kmod"]
     if args.shlibdeps:
         for entry in shared_library_dependencies(package_root):
             if entry not in depends:
                 depends.append(entry)
-    control = f"""Package: maki
-Version: {args.version}
-Section: admin
-Priority: optional
-Architecture: {args.architecture}
-Maintainer: Maki Developers
-Depends: {", ".join(depends)}
-Description: encrypted block storage daemon and recovery controller
- Maki exposes encrypted backing storage through nbdkit and provides a
- fail-closed privileged helper for NBD, LVM, XFS, and workload recovery.
-"""
+        for runtime in sorted(runtimes):
+            if not any(entry.split()[0] == runtime for entry in depends):
+                depends.append(runtime)
     postinst = """#!/bin/sh
 set -e
 if [ "$1" = configure ]; then
@@ -401,10 +506,30 @@ if [ "$1" = remove ] || [ "$1" = purge ]; then
 fi
 exit 0
 """
-    write_file(package_root / "DEBIAN/control", control, 0o644)
     write_file(package_root / "DEBIAN/postinst", postinst, 0o755)
     write_file(package_root / "DEBIAN/prerm", prerm, 0o755)
     write_file(package_root / "DEBIAN/postrm", postrm, 0o755)
+
+    # dpkg-gencontrol counts the staged tree, including its root and maintainer
+    # scripts, before writing control. Each directory costs one KiB and each
+    # regular file is rounded up individually. This tree contains no hardlinks.
+    installed_size = 1 + sum(
+        1 if path.is_dir() else (path.stat().st_size + 1023) // 1024
+        for path in package_root.rglob("*")
+    )
+    control = f"""Package: maki
+Version: {args.version}
+Section: admin
+Priority: optional
+Architecture: {args.architecture}
+Installed-Size: {installed_size}
+Maintainer: {MAINTAINER}
+Depends: {", ".join(depends)}
+Description: encrypted block storage daemon and recovery controller
+ Maki exposes encrypted backing storage through nbdkit and provides a
+ fail-closed privileged helper for NBD, LVM, XFS, and workload recovery.
+"""
+    write_file(package_root / "DEBIAN/control", control, 0o644)
 
 
 def normalize_timestamps(root, epoch):
@@ -422,28 +547,30 @@ def normalize_directory_permissions(root):
 
 def main():
     args = parse_args()
-    epoch = validate(args)
+    epoch, runtimes = validate(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="maki-deb-") as temporary:
         package_root = pathlib.Path(temporary) / "root"
         package_root.mkdir(mode=0o755)
         (package_root / "DEBIAN").mkdir(mode=0o755)
-        create_tree(package_root, args)
+        create_tree(package_root, args, runtimes, epoch)
         normalize_directory_permissions(package_root)
         normalize_timestamps(package_root, epoch)
-        temporary_output = pathlib.Path(temporary) / "maki.deb"
-        subprocess.run(
-            [
-                "dpkg-deb",
-                "--build",
-                "--root-owner-group",
-                str(package_root),
-                str(temporary_output),
-            ],
-            check=True,
-        )
-        shutil.copyfile(temporary_output, args.output)
-        args.output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        with tempfile.TemporaryDirectory(prefix=".maki-deb-", dir=args.output.parent) as staging:
+            temporary_output = pathlib.Path(staging) / "maki.deb"
+            subprocess.run(
+                [
+                    "dpkg-deb",
+                    "--build",
+                    "--root-owner-group",
+                    str(package_root),
+                    str(temporary_output),
+                ],
+                env={**os.environ, "SOURCE_DATE_EPOCH": str(epoch)},
+                check=True,
+            )
+            temporary_output.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+            temporary_output.replace(args.output)
     print(args.output)
 
 

@@ -1,0 +1,27 @@
+.TH MAKI-CHECK 8
+.SH NAME
+maki-check \- check an offline Maki volume backing directory
+.SH SYNOPSIS
+.B maki-check
+.I volume-backing-root
+.RB [ \-\-deep ]
+.RB [ \-\-journal-segment-size
+.IR bytes ]
+.SH DESCRIPTION
+The default check inspects the on-disk metadata.
+Pass the backing directory itself. To check by volume configuration, use
+.BR "maki check" .
+.TP
+.B \-\-deep
+Acquire the volume lock and inspect checkpoint state, key canary, journal and
+data slots. Detach the volume before running this check.
+.TP
+.BI \-\-journal-segment-size " bytes"
+Use the configured journal segment size for the deep check. The default is
+268435456 bytes.
+.SH EXIT STATUS
+Zero indicates a successful check. A failing check or I/O error returns 1.
+Invalid command usage returns 2.
+.SH SEE ALSO
+.BR maki (8),
+.BR maki-attach (8)

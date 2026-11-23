@@ -18,6 +18,11 @@ import sys
 import time
 import uuid
 
+try:
+    from campaign_io import save_json
+except ModuleNotFoundError:
+    from scripts.campaign_io import save_json
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -37,12 +42,14 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def unit_argument(value):
+def unit_argument(value, *, executable=False):
     value = str(value)
     if any(ord(character) < 32 for character in value):
         raise ValueError("control character in unit argument")
+    if not executable:
+        value = value.replace("$", "$$")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace(
-        "%", "%%").replace("$", "$$") + '"'
+        "%", "%%") + '"'
 
 
 def names(volume):
@@ -75,12 +82,15 @@ def packaged_unit_section(template, volume):
 
 def fixture_units(volume, directory, helper):
     units = names(volume)
-    actor_command = " ".join(unit_argument(argument) for argument in
-                             (sys.executable, Path(__file__).resolve(), "actor", directory))
+    actor_command = " ".join((unit_argument(sys.executable, executable=True),
+                              unit_argument(Path(__file__).resolve()), unit_argument("actor"), unit_argument(directory)))
     daemon = packaged_unit_section("maki@.service", volume)
     daemon += ("\n[Service]\nType=notify\nNotifyAccess=main\n"
                "TimeoutStartSec=3\nTimeoutStopSec=3\n"
-               f"ExecStart={actor_command} daemon\n")
+               f"ExecStart={actor_command} daemon\n"
+               # Type=notify runs this after the manager receives READY=1 and
+               # completes it before any service ordered After= the daemon.
+               f"ExecStartPost={actor_command} daemon-ready\n")
     attach = packaged_unit_section("maki-attach@.service", volume)
     attach += ("\n[Service]\nType=oneshot\nRemainAfterExit=yes\n"
                "TimeoutStartSec=2\nTimeoutStopSec=3\n"
@@ -97,7 +107,7 @@ def fixture_units(volume, directory, helper):
              if line.startswith("ExecStopPost=")]
     if hooks != ["ExecStopPost=/usr/bin/maki-attach recover-failed-start --volume %i"]:
         raise ValueError("unexpected failed-start hook contract")
-    attach += hooks[0].replace("/usr/bin/maki-attach", unit_argument(helper)).replace("%i", volume) + "\n"
+    attach += hooks[0].replace("%i", volume).replace("/usr/bin/maki-attach", unit_argument(helper, executable=True)) + "\n"
     recovery = packaged_unit_section("maki-recover@.service", volume)
     recovery += ("JobTimeoutSec=12\n\n[Service]\nType=oneshot\nTimeoutStartSec=3\n"
                  f"ExecStart={actor_command} cleanup-recover\n")
@@ -125,7 +135,9 @@ def event(directory, name, **fields):
     record = {"event": name, "monotonic_ns": time.monotonic_ns(), **fields}
     descriptor = os.open(directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(descriptor, (json.dumps(record) + "\n").encode())
+        line = (json.dumps(record) + "\n").encode()
+        if os.write(descriptor, line) != len(line):
+            raise OSError("short write to systemd event log")
     finally:
         os.close(descriptor)
 
@@ -134,6 +146,9 @@ def actor(directory, action):
     mode = (directory / "mode").read_text().strip()
     resource = directory / "resource"
     workload = directory / "workload-running"
+    if action == "daemon-ready":
+        event(directory, action)
+        return 0
     if action == "attach":
         attempts = directory / "attempts"
         attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
@@ -211,8 +226,14 @@ class Fixture:
         self.units = names(self.volume)
         self.files = fixture_units(self.volume, self.directory, helper)
         self.linked = []
+        self.reload_pending = False
+        self.wait_deadline = None
 
     def ctl(self, *arguments, check=True, timeout=20):
+        if self.wait_deadline is not None:
+            timeout = min(timeout, self.wait_deadline - time.monotonic())
+            if timeout <= 0:
+                raise AssertionError("timed out waiting for unit state")
         result = subprocess.run([SYSTEMCTL, "--no-ask-password", *arguments],
                                 capture_output=True, text=True, timeout=timeout)
         if check and result.returncode:
@@ -223,39 +244,74 @@ class Fixture:
         output = self.ctl("show", "--property=ActiveState", self.units[which]).stdout
         return output.strip().removeprefix("ActiveState=")
 
-    def events(self):
+    def events(self, *, final=False):
         path = self.directory / "events.jsonl"
         if not path.exists():
             return []
         text = path.read_text()
+        if final and text and not text.endswith("\n"):
+            raise ValueError("incomplete final record in systemd event log")
         return [json.loads(line) for line in text.splitlines(keepends=True) if line.endswith("\n")]
 
     def count(self, name):
         return sum(record["event"] == name for record in self.events())
 
     def wait(self, condition, label, timeout=18):
-        until = time.monotonic() + timeout
-        while time.monotonic() < until:
-            if condition():
-                return
-            time.sleep(0.1)
+        self.wait_deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < self.wait_deadline:
+                ready = condition()
+                remaining = self.wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if ready:
+                    return
+                time.sleep(min(0.1, remaining))
+        finally:
+            self.wait_deadline = None
         raise AssertionError(f"timed out: {label}")
 
     def install(self):
+        # Keep the units as executed alongside the case evidence. Only runtime
+        # copies are rewritten to disable automatic transitions during cleanup.
+        runtime_units = self.directory / "runtime-units"
+        runtime_units.mkdir(mode=0o700)
         for name, content in self.files.items():
             destination = Path("/run/systemd/system") / name
             if destination.exists() or destination.is_symlink():
                 raise RuntimeError("generated fixture instance already exists")
-            source = self.directory / name
+            evidence = self.directory / name
+            evidence.write_text(content)
+            evidence.chmod(0o600)
+            source = runtime_units / name
             source.write_text(content)
             source.chmod(0o600)
-            self.ctl("link", "--runtime", str(source))
-            self.linked.append((destination, source))
+            try:
+                self.ctl("link", "--runtime", str(source))
+            finally:
+                # systemctl can create the link and then fail during reload.
+                installed = destination.is_symlink() and destination.resolve() == source.resolve()
+                if installed:
+                    self.linked.append((destination, source))
+            if not installed:
+                raise RuntimeError("systemctl did not install the expected fixture link")
         self.ctl("daemon-reload")
 
     def cleanup(self):
-        if not self.linked:
-            return
+        if self.linked and not self.reload_pending:
+            self.stop_units()
+            self.reload_pending = True
+        while self.linked:
+            destination, source = self.linked[0]
+            if not destination.is_symlink() or destination.resolve() != source.resolve():
+                raise RuntimeError("fixture link identity changed; refusing removal")
+            destination.unlink()
+            self.linked.pop(0)
+        if self.reload_pending:
+            self.ctl("daemon-reload")
+            self.reload_pending = False
+
+    def stop_units(self):
         # Remove automatic transitions before stopping these exact instances.
         # Otherwise a still-running failure scenario could restart itself while
         # the test removes its files. Nothing outside this owned list is touched.
@@ -272,11 +328,6 @@ class Fixture:
         if remaining:
             raise RuntimeError(f"fixture units did not stop: {remaining}; {result.stderr[-1000:]}")
         self.ctl("reset-failed", *installed, check=False)
-        for destination, source in self.linked:
-            if not destination.is_symlink() or destination.resolve() != source.resolve():
-                raise RuntimeError("fixture link identity changed; refusing removal")
-            destination.unlink()
-        self.ctl("daemon-reload")
 
     def diagnostics(self):
         status = self.ctl("show", "--property=ActiveState", "--property=Result",
@@ -305,7 +356,9 @@ class Fixture:
     def verify(self, mode):
         self.ctl("start", "--no-block", self.units["target"])
         if mode == "cancel-start":
-            self.wait(lambda: self.count("attach-start") == 1, "attach started")
+            resource = self.directory / "resource"
+            self.wait(lambda: self.count("attach-start") == 1 and resource.is_file()
+                      and resource.read_bytes() == b"owned", "partial attachment created")
             self.ctl("stop", self.units["target"])
             # A cancelled start skips ExecStop. Its partial attachment is not
             # evidence that shutting down the still-healthy daemon is safe.
@@ -321,10 +374,16 @@ class Fixture:
         elif mode in ("exit-once", "timeout-once", "kill-once"):
             self.wait(lambda: self.count("attach-ready") == 1 and self.count("workload-start") == 1
                       and self.state("target") == "active", "failed target start recovered")
+            require(self.state("daemon") == "active", "recovered workload lost its daemon")
             require(self.count("attach-start") == 2, "unexpected attach attempt count")
             require(self.count("cleanup-recover") == 1, "failed start did not recover exactly once")
         elif mode in ("cleanup-failure", "foreign-resource"):
             self.wait(lambda: self.state("recovery") == "failed", "coordinator refusal")
+            events = [record["event"] for record in self.events()]
+            refusal = "foreign-resource-preserved" if mode == "foreign-resource" else "cleanup-refused"
+            require(events.count("cleanup-recover") == 1 and
+                    refusal in events[events.index("cleanup-recover") + 1:],
+                    "recovery did not reject cleanup for the expected reason")
             time.sleep(0.5)
             require(self.count("attach-start") == 1, "failed cleanup allowed a new attach")
             require(self.count("workload-start") == 0, "failed cleanup started the workload")
@@ -390,21 +449,33 @@ class Fixture:
             expected_cycles = 2 if mode in ("target-restart", "stop-start", "active-recovery") else 1
             require(self.count("attach-start") == expected_cycles, "planned stop allowed a new attach")
             require(self.count("workload-stop") == expected_cycles, "planned stop did not quiesce workload")
-        needs_cleanup = False
+        daemon = "stopped"
+        attachment = "absent"
         for record in self.events():
             name = record["event"]
             require(not name.startswith("unsafe-"), "unsafe ordering in simulated lifecycle")
-            if name == "attach-start":
-                require(not needs_cleanup, "reattach began before previous cleanup completed")
-                # Each attempt consumes the preceding cleanup. An earlier
-                # completion cannot authorize a later retry in a failure loop.
-                needs_cleanup = True
+            if name == "daemon-start":
+                daemon = "starting"
+            elif name == "daemon-ready":
+                require(daemon == "starting", "daemon became ready outside a start")
+                daemon = "ready"
+            elif name == "attach-start":
+                require(daemon == "ready", "attachment began before its daemon was ready")
+                require(attachment == "absent", "reattach began before previous cleanup completed")
+                attachment = "starting"
+            elif name == "attach-ready":
+                require(attachment == "starting", "attachment became ready outside a start attempt")
+                attachment = "ready"
+            elif name == "workload-start":
+                require(daemon == "ready", "workload started without a ready daemon")
+                require(attachment == "ready", "workload started before its attachment was ready")
             elif name == "cleanup-complete":
-                needs_cleanup = False
-            elif name == "daemon-stop" and mode in (
-                    "normal-stop", "failed-stop", "timeout-stop", "kill-stop",
-                    "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
-                require(not needs_cleanup, "daemon stopped before successful cleanup")
+                attachment = "absent"
+            elif name == "daemon-stop":
+                daemon = "stopped"
+                if mode in ("normal-stop", "failed-stop", "timeout-stop", "kill-stop",
+                            "retry-failed-stop", "target-restart", "stop-start", "active-recovery", "cancel-start"):
+                    require(attachment == "absent", "daemon stopped before successful cleanup")
 
 
 def main():
@@ -425,8 +496,16 @@ def main():
     output.mkdir(mode=0o700)
     results = []
     for mode in CASES:
-        fixture = Fixture(output, helper, mode)
-        result = {"case": mode, "volume": fixture.volume, "status": "failed"}
+        result = {"case": mode, "status": "failed"}
+        results.append(result)
+        try:
+            fixture = Fixture(output, helper, mode)
+        except Exception as error:
+            result["error"] = str(error)
+            save_json(output / "results.json", results)
+            print(f"FAIL {mode}: {error}", flush=True)
+            return 1
+        result["volume"] = fixture.volume
         try:
             fixture.install()
             fixture.verify(mode)
@@ -444,9 +523,18 @@ def main():
             except Exception as error:
                 result["status"] = "failed"
                 result["cleanup_error"] = str(error)
-            result["events"] = fixture.events()
-            results.append(result)
-            (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+                if fixture.reload_pending:
+                    # Stopping succeeded. Retry the remaining links and final reload once.
+                    try:
+                        fixture.cleanup()
+                    except Exception as retry_error:
+                        result["cleanup_retry_error"] = str(retry_error)
+            try:
+                result["events"] = fixture.events(final=True)
+            except (OSError, ValueError) as error:
+                result["status"] = "failed"
+                result["events_error"] = str(error)
+            save_json(output / "results.json", results)
         print(f"{result['status'].upper()} {mode}", flush=True)
         if result["status"] != "passed":
             return 1

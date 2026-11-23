@@ -11,10 +11,14 @@ directory:
 ```bash
 set -euo pipefail
 maki_version="$(python3 -B scripts/prepare_release.py --print-version)"
-cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
-SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+maki_target_dir="$(cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+maki_host="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --release --locked --target "$maki_host" \
+  -p maki -p maki-attach -p maki-check -p maki-nbdkit
+SOURCE_DATE_EPOCH="$(git --no-replace-objects show --no-show-signature -s --format=%ct HEAD)" \
 python3 packaging/debian/build-deb.py \
-  --release-dir target/release \
+  --release-dir "$maki_target_dir/$maki_host/release" \
   --version "$maki_version" \
   --architecture "$(dpkg --print-architecture)" \
   --output ../maki.deb
@@ -29,7 +33,18 @@ complete history before building. Existing packages made with the old
 [explicitly reviewed one-time downgrade migration](../../docs/releasing.md#migrating-legacy-source-build-packages).
 
 The package installs the daemon, helper, checker, plugin, service templates,
-sysusers/tmpfiles rules, and examples. It deliberately owns no file below
+sysusers/tmpfiles rules, examples and a plain UTF-8 copyright notice at
+`/usr/share/doc/maki/copyright`. When changing dependencies, release crate
+features or supported targets, run `python3 packaging/debian/update-copyright.py`
+and review the updated notices alongside the dependency changes. This
+maintenance step uses Cargo; assembling the package uses the checked-in notice.
+Review additional notices from toolchain components or custom linked inputs
+for the actual release as described in [the release handoff](../../docs/releasing.md#qualification-and-publication-handoff).
+The package installs section 8 manual pages for all three commands.
+The package version and upstream release notes are available under
+`/usr/share/doc/maki` in `changelog.Debian.gz` and `NEWS.gz`.
+
+The package deliberately owns no file below
 `/etc/maki`, does not enable a volume, and does not start or restart a service
 during install or upgrade. Stop and detach the workload with the old package,
 install the new package, update root-controlled configuration if required, and
@@ -58,6 +73,9 @@ package it unless its machine, class and byte order match the requested
 and the binaries are executables. A wrong artifact used to produce a
 "valid" package for the wrong CPU (R4-007).
 
+Every file must carry the generic System V or GNU/Linux ELF OS ABI. A FreeBSD
+executable can otherwise have the same CPU, word size, and byte order as Linux.
+
 For `armel` and `armhf`, the builder also requires EABI version 5 and checks
 the ARM floating-point procedure-call flags in every artifact. `armhf`
 requires the hard-float flag; `armel` accepts the soft-float flag or the
@@ -65,12 +83,29 @@ implicit base standard when neither flag is set. Conflicting flags are
 rejected. These meanings follow the
 [AAELF32 header contract](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#elf-header).
 
+For Debian `riscv64` and `loong64`, all artifacts must declare the LP64D (double-float)
+calling convention in their ELF flags.
+
+For Debian `ppc64el`, a PowerPC64 ABI marker must be ELFv2 or unspecified
+(ABI-neutral). The builder rejects ELFv1 and the reserved ABI value.
+
+For `mips64el`, the builder reads the version-zero MIPS ABI flags program
+header. It accepts the double-precision hardware calling convention and
+ABI-independent code. Missing flags or incompatible conventions fail validation.
+
 Both shared libraries and PIE executables use ELF type `ET_DYN`. For the
 plugin, the builder also rejects a `PT_INTERP` program header or the
 `DF_1_PIE` dynamic flag, including static PIE without an interpreter. These
 checks use program headers and work without section headers; they do not
 load or execute the artifact. PIE remains allowed for the CLI binaries.
 This checks artifact kind, not the plugin API or runtime compatibility.
+
+For dynamically linked programs, the default native dependency scan also
+checks the actual `PT_INTERP` path against the target architecture's installed
+Debian glibc or musl package and adds its owner to `Depends`. A private loader
+path can work on a build host and still prevent the packaged executable from
+starting elsewhere. Standard merged-`/usr` aliases are recognized. Static
+executables, including static PIE, have no interpreter dependency.
 
 The builder then computes the native library dependencies of the binaries
 with `dpkg-shlibdeps` (package `dpkg-dev`) and appends them to `Depends`, for

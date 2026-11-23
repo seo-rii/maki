@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -18,9 +19,8 @@ use crate::{Backing, BackingFile, VolumeLock};
 
 #[derive(Default)]
 struct Namespace {
-    files: BTreeMap<String, Arc<Mutex<Vec<u8>>>>,
+    files: BTreeMap<String, Arc<MemFile>>,
     dirs: HashSet<String>,
-    locks: HashSet<String>,
 }
 
 impl Namespace {
@@ -63,7 +63,7 @@ fn parent(path: &str) -> &str {
 /// In-memory `Backing`. All operations are immediately "durable".
 #[derive(Default)]
 pub struct MemBacking {
-    ns: Arc<Mutex<Namespace>>,
+    ns: Mutex<Namespace>,
 }
 
 impl MemBacking {
@@ -72,12 +72,17 @@ impl MemBacking {
     }
 }
 
+#[derive(Default)]
 pub struct MemFile {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Mutex<Vec<u8>>,
+    locked: AtomicBool,
 }
 
 impl BackingFile for MemFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         let data = self.data.lock();
         let start = usize::try_from(offset).map_err(bad_offset)?;
         let end = start
@@ -94,6 +99,9 @@ impl BackingFile for MemFile {
     }
 
     fn write_at(&self, offset: u64, src: &[u8]) -> io::Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
         let mut data = self.data.lock();
         let start = usize::try_from(offset).map_err(bad_offset)?;
         let end = start
@@ -109,7 +117,28 @@ impl BackingFile for MemFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut data = self.data.lock();
         let len = usize::try_from(len).map_err(bad_offset)?;
+        let truncated = len < data.len();
         data.resize(len, 0);
+        // Leave room for Vec's growth so alternating a tail write and a small
+        // truncation doesn't repeatedly free and reallocate the same buffer.
+        if truncated && len <= data.capacity() / 4 {
+            data.shrink_to_fit();
+        }
+        Ok(())
+    }
+
+    fn allocate_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| bad_offset("allocation overflow"))?;
+        let end = usize::try_from(end).map_err(bad_offset)?;
+        let mut data = self.data.lock();
+        if data.len() < end {
+            data.resize(end, 0);
+        }
         Ok(())
     }
 
@@ -144,15 +173,14 @@ fn bad_offset<E: std::fmt::Debug>(e: E) -> io::Error {
 }
 
 struct MemLock {
-    ns: Arc<Mutex<Namespace>>,
-    path: String,
+    file: Arc<MemFile>,
 }
 
 impl VolumeLock for MemLock {}
 
 impl Drop for MemLock {
     fn drop(&mut self) {
-        self.ns.lock().locks.remove(&self.path);
+        self.file.locked.store(false, Ordering::Release);
     }
 }
 
@@ -161,8 +189,8 @@ impl Backing for MemBacking {
         validate(path, false)?;
         let mut ns = self.ns.lock();
         ns.require_file_name(path)?;
-        if let Some(data) = ns.files.get(path) {
-            return Ok(Arc::new(MemFile { data: data.clone() }));
+        if let Some(file) = ns.files.get(path) {
+            return Ok(file.clone());
         }
         if !create {
             return Err(io::Error::new(
@@ -170,9 +198,9 @@ impl Backing for MemBacking {
                 format!("no such file: {path}"),
             ));
         }
-        let data = Arc::new(Mutex::new(Vec::new()));
-        ns.files.insert(path.to_string(), data.clone());
-        Ok(Arc::new(MemFile { data }))
+        let file = Arc::new(MemFile::default());
+        ns.files.insert(path.to_string(), file.clone());
+        Ok(file)
     }
 
     fn exists(&self, path: &str) -> io::Result<bool> {
@@ -200,6 +228,12 @@ impl Backing for MemBacking {
         validate(to, false)?;
         let mut ns = self.ns.lock();
         ns.require_dir(parent(from))?;
+        if ns.dirs.contains(from) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory rename is unsupported",
+            ));
+        }
         ns.require_file_name(to)?;
         let data = ns
             .files
@@ -257,19 +291,46 @@ impl Backing for MemBacking {
         validate(path, false)?;
         let mut ns = self.ns.lock();
         ns.require_file_name(path)?;
-        if !ns.locks.insert(path.to_string()) {
+        let file = ns.files.entry(path.to_string()).or_default();
+        if file.locked.swap(true, Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VOLUME_ALREADY_ATTACHED",
             ));
         }
-        // Ensure the lock file exists in the namespace.
-        ns.files
-            .entry(path.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
-        Ok(Box::new(MemLock {
-            ns: self.ns.clone(),
-            path: path.to_string(),
-        }))
+        Ok(Box::new(MemLock { file: file.clone() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_truncations_keep_room_for_repeated_tail_writes() {
+        let file = MemFile::default();
+        file.set_len(4096).unwrap();
+        file.write_at(4096, b"x").unwrap();
+        let capacity = file.data.lock().capacity();
+        file.set_len(4096).unwrap();
+        assert_eq!(file.data.lock().capacity(), capacity);
+    }
+
+    #[test]
+    fn truncating_a_memory_file_releases_its_large_buffer() {
+        let file = MemFile::default();
+        file.set_len(1 << 20).unwrap();
+        file.write_at(0, b"abc").unwrap();
+        file.set_len(3).unwrap();
+        assert!(file.data.lock().capacity() < 1 << 20);
+        let mut prefix = [0; 3];
+        file.read_at(0, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"abc");
+
+        file.set_len(0).unwrap();
+        assert_eq!(file.data.lock().capacity(), 0);
+        file.write_at(2, b"z").unwrap();
+        file.read_at(0, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"\0\0z");
     }
 }

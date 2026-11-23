@@ -45,6 +45,7 @@ struct Inner {
     generation: u64,
     half_open_inflight: u32,
     half_open_successes: u32,
+    legacy_admission: Option<u64>,
 }
 
 pub struct CircuitBreaker {
@@ -66,18 +67,22 @@ enum Verdict {
 
 /// Owns an admission until its outcome is known or its operation is dropped.
 /// A stale admission must never release a newer half-open window's slot.
-pub(crate) struct BreakerPermit<'a> {
+/// Dropping an unfinished permit cancels it and releases its probe slot.
+#[must_use = "keep the permit until the operation completes"]
+pub struct BreakerPermit<'a> {
     breaker: &'a CircuitBreaker,
     generation: u64,
     outcome: Option<Verdict>,
 }
 
 impl BreakerPermit<'_> {
-    pub(crate) fn on_success(mut self) {
+    /// Record success for the window that admitted this request.
+    pub fn on_success(mut self) {
         self.outcome = Some(Verdict::Success);
     }
 
-    pub(crate) fn on_failure(mut self) {
+    /// Record failure for the window that admitted this request.
+    pub fn on_failure(mut self) {
         self.outcome = Some(Verdict::Failure);
     }
 
@@ -89,7 +94,7 @@ impl BreakerPermit<'_> {
 
 impl Drop for BreakerPermit<'_> {
     fn drop(&mut self) {
-        self.breaker.finish(Some(self.generation), self.outcome);
+        self.breaker.finish(self.generation, self.outcome);
     }
 }
 
@@ -107,6 +112,7 @@ impl CircuitBreaker {
                 generation: 0,
                 half_open_inflight: 0,
                 half_open_successes: 0,
+                legacy_admission: None,
             }),
         }
     }
@@ -139,14 +145,40 @@ impl CircuitBreaker {
         }
     }
 
-    /// Admit a request. In HALF_OPEN this consumes one of the limited probe
-    /// slots until the probe completes.
+    /// Compatibility API for a single serial caller. Only one outstanding
+    /// boolean admission can be identified by the argument-free completion
+    /// methods. Callers requiring concurrency or cancellation use `acquire`.
+    #[deprecated(note = "keep the permit from acquire() to report the outcome")]
     pub fn allow(&self) -> bool {
         let mut inner = self.inner.lock();
-        self.admit(&mut inner)
+        if inner.legacy_admission.is_some() || !self.admit(&mut inner) {
+            return false;
+        }
+        inner.legacy_admission = Some(inner.generation);
+        true
     }
 
-    pub(crate) fn acquire(&self) -> Option<BreakerPermit<'_>> {
+    #[deprecated(note = "report success on the permit returned by acquire()")]
+    pub fn on_success(&self) {
+        self.finish_legacy(Verdict::Success);
+    }
+
+    #[deprecated(note = "report failure on the permit returned by acquire()")]
+    pub fn on_failure(&self) {
+        self.finish_legacy(Verdict::Failure);
+    }
+
+    fn finish_legacy(&self, verdict: Verdict) {
+        let generation = self.inner.lock().legacy_admission.take();
+        if let Some(generation) = generation {
+            self.finish(generation, Some(verdict));
+        }
+    }
+
+    /// Admit one request and bind its eventual verdict to this circuit window.
+    /// Use the returned permit's completion methods even if the circuit has
+    /// changed state while the operation was in flight.
+    pub fn acquire(&self) -> Option<BreakerPermit<'_>> {
         let mut inner = self.inner.lock();
         if self.admit(&mut inner) {
             Some(BreakerPermit {
@@ -184,17 +216,9 @@ impl CircuitBreaker {
         }
     }
 
-    pub fn on_success(&self) {
-        self.finish(None, Some(Verdict::Success));
-    }
-
-    pub fn on_failure(&self) {
-        self.finish(None, Some(Verdict::Failure));
-    }
-
-    fn finish(&self, generation: Option<u64>, outcome: Option<Verdict>) {
+    fn finish(&self, generation: u64, outcome: Option<Verdict>) {
         let mut inner = self.inner.lock();
-        if generation.is_some_and(|generation| generation != inner.generation) {
+        if generation != inner.generation {
             return;
         }
         if inner.state == CircuitState::HalfOpen {

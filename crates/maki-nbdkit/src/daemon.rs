@@ -163,13 +163,9 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
-/// Open and validate an existing volume before a tool chooses creation or
-/// explicitly authorized reuse. Protected backing must be opened through its
-/// witness; trying enrollment first cannot classify its AlreadyExists error.
-/// A present format marker with incomplete contents is an error, never a reset.
-pub fn existing_volume_from_config(
-    config: &VolumeConfig,
-) -> Result<Option<Superblock>, DaemonError> {
+/// Check for volume markers without opening a writer session or contacting the witness.
+/// A marker is sufficient to require explicit authorization before benchmarking.
+pub fn volume_layout_present(config: &VolumeConfig) -> Result<bool, DaemonError> {
     config.validate()?;
     let root = Path::new(&config.backing.root);
     match std::fs::metadata(root) {
@@ -179,13 +175,22 @@ pub fn existing_volume_from_config(
                 "backing root is not a directory".into(),
             ))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    if !root.join("rollback.format").try_exists()?
-        && !root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
-        && !root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?
-    {
+    Ok(root.join("rollback.format").try_exists()?
+        || root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
+        || root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?)
+}
+
+/// Open and validate an existing volume before a tool chooses creation or
+/// explicitly authorized reuse. Protected backing must be opened through its
+/// witness; trying enrollment first cannot classify its AlreadyExists error.
+/// A present format marker with incomplete contents is an error, never a reset.
+pub fn existing_volume_from_config(
+    config: &VolumeConfig,
+) -> Result<Option<Superblock>, DaemonError> {
+    if !volume_layout_present(config)? {
         return Ok(None);
     }
     let backing = build_backing(config)?;
@@ -233,42 +238,52 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
 pub async fn build_provider_with_endpoints(
     config: &VolumeConfig,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
-    build_provider_for_volume(config, None).await
+    prepare_provider(config).await?.verify(config, None).await
 }
 
-async fn build_provider_for_volume(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+enum PreparedProvider {
+    Local(Arc<dyn CryptoProvider>),
+    Remote(Vec<NamedEndpoint>),
+}
+
+impl PreparedProvider {
+    async fn verify(
+        self,
+        config: &VolumeConfig,
+        volume: Option<&Arc<Volume>>,
+    ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
+        let set = match self {
+            Self::Local(provider) => return Ok((provider, None)),
+            Self::Remote(endpoints) => dispatch_endpoint_set(config, endpoints, volume).await?,
+        };
+        // Expand before entering the dispatcher, so retry and admission account
+        // for the actual provider payload and reuse one prepared prefix per call.
+        let provider = apply_random_prefix(
+            set.clone(),
+            config.volume.crypto_unit_size,
+            config.crypto.random_prefix_bytes,
+            &config.crypto.effective_compatibility_id(),
+        )
+        .await?;
+        Ok((provider, Some(set)))
+    }
+}
+
+async fn prepare_provider(config: &VolumeConfig) -> Result<PreparedProvider, DaemonError> {
     // Public callers can supply an unvalidated configuration. Refuse name
     // collisions before the name-only credential router loads any secret.
     config.validate_credential_sources()?;
     let unit = config.provider_plaintext_size()?;
     let compat = config.crypto.crypto_compatibility_id.as_str();
-    let volume_compat = config.crypto.effective_compatibility_id();
-    let set = match config.crypto.provider.as_str() {
+    let provider: Arc<dyn CryptoProvider> = match config.crypto.provider.as_str() {
         #[cfg(feature = "fake-provider")]
-        "fake" => {
-            return Ok((
-                apply_random_prefix(
-                    Arc::new(
-                        maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat),
-                    ),
-                    config.volume.crypto_unit_size,
-                    config.crypto.random_prefix_bytes,
-                    &volume_compat,
-                )
-                .await?,
-                None,
-            ))
-        }
+        "fake" => Arc::new(maki_test_support::FakeCryptoProvider::new(unit).with_compat_id(compat)),
         "local-aes-gcm-siv" | "local-aes-xts" => {
             let cred = config.crypto.key.as_ref().ok_or_else(|| {
                 DaemonError::Unsupported("local provider requires [crypto].key".to_string())
             })?;
             let (source, name) = resolve_key_source(cred)?;
-            let provider: Arc<dyn CryptoProvider> = if config.crypto.provider == "local-aes-gcm-siv"
-            {
+            if config.crypto.provider == "local-aes-gcm-siv" {
                 Arc::new(AesGcmSivProvider::new(
                     source.as_ref(),
                     &name,
@@ -277,33 +292,22 @@ async fn build_provider_for_volume(
                 )?)
             } else {
                 Arc::new(AesXtsProvider::new(source.as_ref(), &name, unit, compat)?)
-            };
-            return Ok((
-                apply_random_prefix(
-                    provider,
-                    config.volume.crypto_unit_size,
-                    config.crypto.random_prefix_bytes,
-                    &volume_compat,
-                )
-                .await?,
-                None,
-            ));
+            }
         }
-        "remote-http" => remote_http_provider(config, volume).await?,
-        "remote-websocket" => remote_websocket_provider(config, volume).await?,
-        "remote-grpc" => remote_grpc_provider(config, volume).await?,
+        "remote-http" => return Ok(PreparedProvider::Remote(http_endpoints(config)?)),
+        "remote-websocket" => return Ok(PreparedProvider::Remote(websocket_endpoints(config)?)),
+        "remote-grpc" => return Ok(PreparedProvider::Remote(grpc_endpoints(config)?)),
         other => return Err(DaemonError::Unsupported(format!("provider {other:?}"))),
     };
-    // Expand before entering the dispatcher, so retry and admission account
-    // for the actual provider payload and reuse one prepared prefix per call.
-    let provider = apply_random_prefix(
-        set.clone(),
-        config.volume.crypto_unit_size,
-        config.crypto.random_prefix_bytes,
-        &volume_compat,
-    )
-    .await?;
-    Ok((provider, Some(set)))
+    Ok(PreparedProvider::Local(
+        apply_random_prefix(
+            provider,
+            config.volume.crypto_unit_size,
+            config.crypto.random_prefix_bytes,
+            &config.crypto.effective_compatibility_id(),
+        )
+        .await?,
+    ))
 }
 
 async fn apply_random_prefix(
@@ -397,13 +401,8 @@ impl RoutedKeySource {
     }
 }
 
-/// Assemble the multi-endpoint HTTP provider: per-endpoint transports,
-/// cross-endpoint interchangeability check (SPEC §34), and the dispatcher
-/// (retry/budget/breaker/failover) from configuration.
-async fn remote_http_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+/// Construct the HTTP transports and resolve their local configuration.
+fn http_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let http = config
         .crypto
         .http
@@ -414,7 +413,7 @@ async fn remote_http_provider(
             "remote-http requires at least one [[crypto.http.endpoint]]".to_string(),
         ));
     }
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &http.endpoint {
         let provider = maki_crypto_http::HttpCryptoProvider::from_config(
             config,
@@ -423,7 +422,7 @@ async fn remote_http_provider(
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 fn read_tls_file(
@@ -441,11 +440,8 @@ fn read_tls_file(
     .transpose()
 }
 
-/// Per-endpoint verified WS/WSS transports through the shared dispatcher.
-async fn remote_websocket_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+/// Construct the WS/WSS transports and verify their TLS configuration.
+fn websocket_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let ws = config
         .crypto
         .websocket
@@ -456,6 +452,7 @@ async fn remote_websocket_provider(
             "remote-websocket requires at least one [[crypto.websocket.endpoint]]".to_string(),
         ));
     }
+    let max_frame_bytes = ws.frame_byte_limit()?;
     let tls = ws
         .tls
         .as_ref()
@@ -476,7 +473,7 @@ async fn remote_websocket_provider(
             })
         })
         .transpose()?;
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &ws.endpoint {
         let provider = maki_crypto_websocket::WsCryptoProvider::new_checked(
             maki_crypto_websocket::WsProviderSpec {
@@ -486,25 +483,19 @@ async fn remote_websocket_provider(
                     .timeout
                     .map(|d| d.0)
                     .unwrap_or(std::time::Duration::from_secs(10)),
-                max_frame_bytes: ws
-                    .max_frame_bytes
-                    .map(|b| b.0 as usize)
-                    .unwrap_or(maki_format::config::DEFAULT_WS_MAX_FRAME_BYTES as usize),
+                max_frame_bytes,
                 tls: tls.clone(),
             },
         )?;
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 /// `remote-grpc`: fixed reference contract
 /// (`packaging/examples/maki-crypto.proto`) at configurable method paths,
 /// with credential-resolved ASCII metadata and verified HTTPS/mTLS support.
-async fn remote_grpc_provider(
-    config: &VolumeConfig,
-    volume: Option<&Arc<Volume>>,
-) -> Result<Arc<EndpointSet>, DaemonError> {
+fn grpc_endpoints(config: &VolumeConfig) -> Result<Vec<NamedEndpoint>, DaemonError> {
     let grpc = config
         .crypto
         .grpc
@@ -515,6 +506,7 @@ async fn remote_grpc_provider(
             "remote-grpc requires at least one [[crypto.grpc.endpoint]]".to_string(),
         ));
     }
+    let keys = std::cell::LazyCell::new(|| RoutedKeySource::from_config(config));
     let tls = grpc
         .tls
         .as_ref()
@@ -523,7 +515,7 @@ async fn remote_grpc_provider(
                 (Some(cert), Some(key)) => Some(maki_crypto_grpc::GrpcClientIdentity {
                     certificate_pem: read_tls_file("grpc", "client_cert_file", Some(cert))?
                         .expect("certificate path is present"),
-                    private_key_pem: RoutedKeySource::from_config(config).load_text(&key.name)?,
+                    private_key_pem: keys.load_text(&key.name)?,
                 }),
                 (None, None) => None,
                 _ => return Err(DaemonError::Unsupported(
@@ -543,29 +535,25 @@ async fn remote_grpc_provider(
         encrypt_path: grpc
             .encrypt_path
             .clone()
-            .unwrap_or_else(|| "/maki.CryptoService/EncryptBatch".to_string()),
+            .unwrap_or_else(|| maki_format::config::DEFAULT_GRPC_ENCRYPT_PATH.to_string()),
         decrypt_path: grpc
             .decrypt_path
             .clone()
-            .unwrap_or_else(|| "/maki.CryptoService/DecryptBatch".to_string()),
+            .unwrap_or_else(|| maki_format::config::DEFAULT_GRPC_DECRYPT_PATH.to_string()),
         metadata: Vec::new(),
         capabilities: capabilities_from_config(config, "remote-grpc"),
         timeout: grpc
             .timeout
             .map(|d| d.0)
             .unwrap_or(std::time::Duration::from_secs(10)),
-        max_message_bytes: grpc
-            .max_message_bytes
-            .map(|b| b.0 as usize)
-            .unwrap_or(maki_format::config::DEFAULT_GRPC_MAX_MESSAGE_BYTES as usize),
+        max_message_bytes: grpc.message_byte_limit()?,
     };
     for (name, value) in &grpc.metadata {
-        template.metadata.push((
-            name.clone(),
-            resolve_metadata_value(&RoutedKeySource::from_config(config), value)?,
-        ));
+        template
+            .metadata
+            .push((name.clone(), resolve_metadata_value(&keys, value)?));
     }
-    let mut endpoints: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut endpoints: Vec<NamedEndpoint> = Vec::new();
     for endpoint in &grpc.endpoint {
         let mut spec = template.clone();
         spec.url = endpoint.url.clone();
@@ -583,7 +571,7 @@ async fn remote_grpc_provider(
         };
         endpoints.push((endpoint.name.clone(), Arc::new(provider)));
     }
-    dispatch_endpoint_set(config, endpoints, volume).await
+    Ok(endpoints)
 }
 
 /// Declared `[crypto.capabilities]` as `CryptoCapabilities` (the same
@@ -657,6 +645,80 @@ fn resolve_metadata_value(
     }
 }
 
+fn transport_failure(e: &maki_crypto::CryptoError) -> bool {
+    matches!(
+        e.class(),
+        maki_crypto::ErrorClass::Retryable
+            | maki_crypto::ErrorClass::Throttled
+            | maki_crypto::ErrorClass::EndpointFatal
+    )
+}
+
+type NamedEndpoint = (String, Arc<dyn CryptoProvider>);
+type CheckedEndpoint = (String, Arc<dyn CryptoProvider>, bool);
+
+async fn cross_validate_reachable(
+    reachable: Vec<NamedEndpoint>,
+    context: &maki_crypto::CryptoContext,
+    unit: usize,
+    prefix_bytes: u32,
+) -> Result<Vec<CheckedEndpoint>, maki_crypto::CryptoError> {
+    use maki_crypto::selftest::{cross_endpoint_self_test_attributed, CrossCheckSide};
+    let mut quarantined = Vec::new();
+    let mut verified = Vec::new();
+    let mut remaining = std::collections::VecDeque::from(reachable);
+    let mut reference = remaining.pop_front().expect("at least one reachable peer");
+    while let Some(candidate) = remaining.pop_front() {
+        let a = apply_random_prefix(
+            reference.1.clone(),
+            unit as u32,
+            prefix_bytes,
+            &context.crypto_compatibility_id,
+        )
+        .await?;
+        let b = apply_random_prefix(
+            candidate.1.clone(),
+            unit as u32,
+            prefix_bytes,
+            &context.crypto_compatibility_id,
+        )
+        .await?;
+        match cross_endpoint_self_test_attributed(a.as_ref(), b.as_ref(), context, unit).await {
+            Ok(()) => verified.push(candidate),
+            Err((side, error)) if transport_failure(&error) => {
+                let unavailable = match side {
+                    CrossCheckSide::Candidate => candidate,
+                    CrossCheckSide::Reference => {
+                        // Compare the candidate with a surviving verified peer when one
+                        // exists. Otherwise use its successful individual check to start
+                        // a new reference and cross-check the remaining peers against it.
+                        let next = match verified.pop() {
+                            Some(peer) => {
+                                remaining.push_front(candidate);
+                                peer
+                            }
+                            None => candidate,
+                        };
+                        std::mem::replace(&mut reference, next)
+                    }
+                };
+                tracing::warn!(endpoint = %unavailable.0, "quarantined: cross-endpoint self-test could not run ({error})");
+                quarantined.push(unavailable);
+            }
+            Err((_, error)) => return Err(error),
+        }
+    }
+    let mut flagged: Vec<_> = std::iter::once(reference)
+        .chain(verified)
+        .map(|(name, provider)| (name, provider, true))
+        .collect();
+    for (name, provider) in quarantined {
+        flagged.push((name, provider, false));
+    }
+
+    Ok(flagged)
+}
+
 /// Cross-endpoint interchangeability check (SPEC 34) plus the dispatcher
 /// (retry/budget/breaker/failover) shared by every remote transport.
 ///
@@ -698,14 +760,6 @@ async fn dispatch_endpoint_set(
     let unit = config.volume.crypto_unit_size as usize;
     let prefix_bytes = config.crypto.random_prefix_bytes;
     let compat = config.crypto.effective_compatibility_id();
-    let transport_failure = |e: &maki_crypto::CryptoError| {
-        matches!(
-            e.class(),
-            maki_crypto::ErrorClass::Retryable
-                | maki_crypto::ErrorClass::Throttled
-                | maki_crypto::ErrorClass::EndpointFatal
-        )
-    };
     let superblock = volume.superblock();
     if superblock.provider_type != config.crypto.provider
         || superblock.crypto_compatibility_id != compat
@@ -797,39 +851,12 @@ async fn dispatch_endpoint_set(
     }
 
     // 2. Interchangeability among the reachable ones (SPEC 34).
-    let mut flagged: Vec<(String, Arc<dyn CryptoProvider>, bool)> = Vec::new();
-    let reference =
-        apply_random_prefix(reachable[0].1.clone(), unit as u32, prefix_bytes, &compat).await?;
-    for (index, (name, provider)) in reachable.into_iter().enumerate() {
-        if index == 0 {
-            flagged.push((name, provider, true));
-            continue;
-        }
-        let validation_provider =
-            apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
-        match cross_endpoint_self_test(
-            reference.as_ref(),
-            validation_provider.as_ref(),
-            &context,
-            unit,
-        )
-        .await
-        {
-            Ok(()) => flagged.push((name, provider, true)),
-            Err(e) if transport_failure(&e) => {
-                tracing::warn!(
-                    "endpoint {name:?} quarantined: cross-endpoint self-test could not run ({e})"
-                );
-                flagged.push((name, provider, false));
-            }
-            // Proven non-interchangeability (ProviderFatal / contract)
-            // refuses attach (SPEC 12, 34).
-            Err(e) => return Err(e.into()),
-        }
-    }
-    for (name, provider) in quarantined {
-        flagged.push((name, provider, false));
-    }
+    let mut flagged = cross_validate_reachable(reachable, &context, unit, prefix_bytes).await?;
+    flagged.extend(
+        quarantined
+            .into_iter()
+            .map(|(name, provider)| (name, provider, false)),
+    );
 
     // Snapshot the canary for later endpoint revalidation without blocking
     // the async dispatcher; cancellation retains the recovered volume lock.
@@ -896,25 +923,15 @@ async fn dispatch_endpoint_set(
     let budget = &config.crypto.retry_budget;
     let breaker = &config.crypto.circuit_breaker;
     let limits = &config.limits;
-    let (max_attempts, max_operation_time) = match config.crypto.availability_policy {
-        maki_format::config::AvailabilityPolicy::Stall => (None, None),
-        maki_format::config::AvailabilityPolicy::BoundedError => {
-            // The absolute deadline is the contract (SPEC 35); the pass
-            // bound is a belt-and-braces cap derived from it.
-            let op_time = config
+    let max_operation_time = match config.crypto.availability_policy {
+        maki_format::config::AvailabilityPolicy::Stall => None,
+        maki_format::config::AvailabilityPolicy::BoundedError => Some(
+            config
                 .crypto
                 .max_operation_time
                 .map(|d| d.0)
-                .unwrap_or(std::time::Duration::from_secs(30));
-            let initial = retry
-                .initial_delay
-                .0
-                .max(std::time::Duration::from_millis(1));
-            (
-                Some((op_time.as_millis() / initial.as_millis()).clamp(1, 1000) as u32),
-                Some(op_time),
-            )
-        }
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        ),
     };
     let dispatch = DispatchConfig {
         retry: maki_crypto::retry::RetryPolicy {
@@ -937,7 +954,7 @@ async fn dispatch_endpoint_set(
         global_max_inflight_bytes: limits.max_crypto_inflight_bytes.0,
         per_endpoint_max_inflight: limits.max_inflight_per_endpoint,
         per_endpoint_max_bytes: limits.max_inflight_bytes_per_endpoint.0,
-        max_attempts,
+        max_attempts: None,
         max_operation_time,
         retry_safe: config.crypto.capabilities.retry_safe,
         validation_interval: breaker.open_initial.0,
@@ -1087,13 +1104,28 @@ pub(crate) async fn attach_from_config_with_progress(
 > {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
+    attach_hardened(config, progress, None).await
+}
+
+async fn attach_hardened(
+    config: &VolumeConfig,
+    progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    prepared: Option<PreparedProvider>,
+) -> Result<
+    (
+        Engine,
+        Option<Arc<maki_crypto::scheduler::SchedulerStats>>,
+        Option<Arc<EndpointSet>>,
+    ),
+    DaemonError,
+> {
     // Every cataloged shard keeps a descriptor (BUG-124). A refusal leaves
     // the inherited limit; an open that then fails reports EMFILE.
     if let Err(e) = maki_backing::raise_open_file_limit() {
         tracing::warn!("cannot raise the open-file soft limit: {e}");
     }
     let backing = build_backing(config)?;
-    let options = engine_options(config);
+    let mut options = engine_options(config);
     let recovery_options = options.volume.clone();
     let volume = Arc::new(
         tokio::task::spawn_blocking(move || match progress {
@@ -1107,7 +1139,28 @@ pub(crate) async fn attach_from_config_with_progress(
         .map_err(AttachError::from)?,
     );
     validate_recovered_geometry(config, &volume)?;
-    let (provider, endpoints) = build_provider_for_volume(config, Some(&volume)).await?;
+    // Older builds opened `key/.` and `key/` as `key` but persisted the
+    // original string. Recognize only that trailing directory syntax on a
+    // stored file identity. The caller still supplies the validated file
+    // path and the engine still verifies the key canary.
+    if let (Some(key), Some(identity)) = (&config.crypto.key, &mut options.identity) {
+        let stored = &volume.superblock().key_identity;
+        if key.source == "file"
+            && stored.strip_prefix(&key.name).is_some_and(|suffix| {
+                suffix.starts_with(std::path::is_separator)
+                    && suffix
+                        .split(std::path::is_separator)
+                        .all(|part| part.is_empty() || part == ".")
+            })
+        {
+            identity.key_identity.clone_from(stored);
+        }
+    }
+    let prepared = match prepared {
+        Some(provider) => provider,
+        None => prepare_provider(config).await?,
+    };
+    let (provider, endpoints) = prepared.verify(config, Some(&volume)).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
@@ -1174,20 +1227,53 @@ pub fn scheduler_config(config: &VolumeConfig) -> maki_crypto::scheduler::Schedu
     }
 }
 
-/// `maki volume create`: initialize the on-disk layout for a configured
-/// volume.
+/// Configuration checked for volume creation with the providers in this build.
+/// Keep it immutable so the options inspected by the CLI are those used on disk.
+pub struct VolumeCreationConfig(VolumeConfig);
+
+impl VolumeCreationConfig {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        parse_and_validate(raw).map(Self)
+    }
+
+    pub fn config(&self) -> &VolumeConfig {
+        &self.0
+    }
+
+    /// Initialize the layout. Discard support is chosen only at creation.
+    pub fn create(&self, discard: bool) -> Result<Superblock, DaemonError> {
+        create_volume_from_config(&self.0, discard)
+    }
+
+    /// Resolve credentials and construct transports before publishing the layout.
+    /// Remote endpoint self-tests then use the recovered volume's identity.
+    pub async fn create_and_attach(&self) -> Result<Engine, DaemonError> {
+        crate::security::apply(&self.0)?;
+        let prepared = prepare_provider(&self.0).await?;
+        self.create(false)?;
+        Ok(attach_hardened(&self.0, None, Some(prepared)).await?.0)
+    }
+}
+
+/// Initialize the on-disk layout for a configured volume.
 pub fn create_volume_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(raw, false)
+    VolumeCreationConfig::parse(raw)?.create(false)
 }
 
-/// Initialize a new v3 volume with discard support. Existing volumes are
-/// refused by the format initializer; this never upgrades an attached volume.
+/// Initialize a new v3 volume with discard support.
 pub fn create_volume_with_discard_from_config_str(raw: &str) -> Result<Superblock, DaemonError> {
-    create_volume_from_config(raw, true)
+    VolumeCreationConfig::parse(raw)?.create(true)
 }
 
-fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, DaemonError> {
-    let config = parse_and_validate(raw)?;
+/// Create and attach a new volume using the supplied configuration.
+pub async fn create_and_attach_from_config_str(raw: &str) -> Result<Engine, DaemonError> {
+    VolumeCreationConfig::parse(raw)?.create_and_attach().await
+}
+
+fn create_volume_from_config(
+    config: &VolumeConfig,
+    discard: bool,
+) -> Result<Superblock, DaemonError> {
     let backing: Arc<dyn Backing> = match &config.backing.rollback_protection {
         Some(rollback) => {
             #[cfg(target_os = "linux")]
@@ -1213,9 +1299,9 @@ fn create_volume_from_config(raw: &str, discard: bool) -> Result<Superblock, Dae
                 ));
             }
         }
-        None => build_backing(&config)?,
+        None => build_backing(config)?,
     };
-    initialize_volume(&config, backing.as_ref(), discard)
+    initialize_volume(config, backing.as_ref(), discard)
 }
 
 /// Finish initial registration only after an explicitly approved, never-active
@@ -1467,5 +1553,36 @@ mod capability_mode_tests {
         assert_eq!(capabilities.integrity, Capability::Verified);
         assert_eq!(capabilities.context_binding, Capability::Verified);
         assert_eq!(capabilities.replay_protection, Capability::Absent);
+    }
+}
+
+#[cfg(all(test, feature = "fake-provider"))]
+mod startup_reference_tests {
+    use super::*;
+    use maki_test_support::fake_provider::FakeCryptoProvider;
+
+    #[tokio::test]
+    async fn elects_a_healthy_pair_after_the_reference_goes_offline() {
+        let context = maki_crypto::CryptoContext {
+            volume_uuid: uuid::Uuid::nil(),
+            format_version: 1,
+            crypto_compatibility_id: "test-profile-v1".into(),
+        };
+        let a = Arc::new(FakeCryptoProvider::new(512));
+        a.fail_next([maki_crypto::CryptoError::Retryable("offline".into())]);
+        let peers: Vec<NamedEndpoint> = vec![
+            ("a".into(), a),
+            ("b".into(), Arc::new(FakeCryptoProvider::new(512))),
+            ("c".into(), Arc::new(FakeCryptoProvider::new(512))),
+        ];
+        let checked = cross_validate_reachable(peers, &context, 512, 0)
+            .await
+            .unwrap();
+        let flags: std::collections::BTreeMap<_, _> = checked
+            .into_iter()
+            .map(|(name, _, accepted)| (name, accepted))
+            .collect();
+        assert!(!flags["a"]);
+        assert!(flags["b"] && flags["c"]);
     }
 }

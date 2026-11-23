@@ -56,6 +56,8 @@ pub struct AttachRequest {
 #[derive(Debug, Clone)]
 pub struct GrowRequest {
     pub volume: String,
+    /// A concrete device pin, or AUTO_NBD_DEVICE to use the attachment record.
+    pub nbd_device: String,
     /// The Maki volume UUID and NBD socket of the attachment being grown;
     /// carried so the executor can verify the grow against the trusted
     /// attach record before running LVM/XFS commands (BUG-018).
@@ -66,6 +68,8 @@ pub struct GrowRequest {
     pub lvm_identity: Option<LvmIdentityPins>,
     /// Absolute minimum LV size; reuse the same target when retrying.
     pub target_bytes: u64,
+    /// Optional expected XFS UUID, checked before each growth operation.
+    pub fs_uuid: Option<String>,
     pub mountpoint: String,
 }
 
@@ -122,6 +126,7 @@ pub enum PlannedStep {
         device: String,
     },
     LvExtend {
+        nbd_device: String,
         vg_name: String,
         lv_name: String,
         target_bytes: u64,
@@ -169,6 +174,19 @@ impl PlannedStep {
     }
 }
 
+/// Render one argument in command-shaped plan output, preserving simple paths.
+fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-.,/@%:=".contains(&b))
+    {
+        word.into()
+    } else {
+        format!("'{}'", word.replace(char::from(39), "'\\''")).into()
+    }
+}
+
 impl fmt::Display for PlannedStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -179,11 +197,12 @@ impl fmt::Display for PlannedStep {
                 block_size,
             } => write!(
                 f,
-                "nbd-client -unix {socket} {} -b {block_size}",
-                device.strip_prefix("/dev/").unwrap_or(device)
+                "nbd-client -unix {} {} -b {block_size} -identifier '<generated-connection-uuid>'",
+                shell_word(socket),
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::SetBlockSize { device, block_size } => {
-                write!(f, "blockdev --setbsz {block_size} {device}")
+                write!(f, "blockdev --setbsz {block_size} {}", shell_word(device))
             }
             PlannedStep::LvmActivate { vg_name } => write!(f,
                 "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
@@ -194,7 +213,7 @@ impl fmt::Display for PlannedStep {
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
             PlannedStep::MountXfs { device, mountpoint } => {
-                write!(f, "mount -t xfs -o {MOUNT_OPTIONS} {device} {mountpoint}")
+                write!(f, "mount -t xfs -o {MOUNT_OPTIONS} {} {}", shell_word(device), shell_word(mountpoint))
             }
             PlannedStep::VerifyMountDevice {
                 mountpoint,
@@ -208,7 +227,7 @@ impl fmt::Display for PlannedStep {
                 volume_uuid,
             } => write!(
                 f,
-                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (only if absent)"
+                "write sentinel {mountpoint}/{SENTINEL_FILE} = {volume_uuid} (create if absent, rewrite and sync a matching UUID, refuse a different UUID)"
             ),
             PlannedStep::VerifyMountIdentity {
                 mountpoint,
@@ -220,18 +239,19 @@ impl fmt::Display for PlannedStep {
                 "verify mount identity at {mountpoint} (volume {volume_uuid}, fs uuid {}, nbd {nbd_device})",
                 fs_uuid.as_deref().unwrap_or("unpinned")
             ),
-            PlannedStep::Umount { mountpoint } => write!(f, "umount {mountpoint}"),
+            PlannedStep::Umount { mountpoint } => write!(f, "umount {}", shell_word(mountpoint)),
             PlannedStep::NbdDisconnect { device } => write!(
                 f,
                 "nbd-client -d {}",
-                device.strip_prefix("/dev/").unwrap_or(device)
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::LvExtend {
                 vg_name,
                 lv_name,
                 target_bytes,
+                ..
             } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
-            PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {mountpoint}"),
+            PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {}", shell_word(mountpoint)),
         }
     }
 }
@@ -433,20 +453,39 @@ pub fn plan_detach(request: &AttachRequest) -> Plan {
 
 /// Online growth (SPEC §38): `lvextend` then `xfs_growfs`; no NBD resize.
 pub fn plan_grow(request: &GrowRequest) -> Plan {
+    let identity_check =
+        request
+            .fs_uuid
+            .as_ref()
+            .map(|uuid| PlannedStep::VerifyFilesystemIdentity {
+                device: format!("/dev/{}/{}", request.vg_name, request.lv_name),
+                fs_uuid: Some(uuid.clone()),
+            });
+    let mut steps = Vec::new();
+    steps.extend(identity_check.clone());
+    steps.push(PlannedStep::LvExtend {
+        nbd_device: request.nbd_device.clone(),
+        vg_name: request.vg_name.clone(),
+        lv_name: request.lv_name.clone(),
+        target_bytes: request.target_bytes,
+    });
+    steps.extend(identity_check);
+    steps.push(PlannedStep::XfsGrowfs {
+        mountpoint: request.mountpoint.clone(),
+    });
     Plan {
-        description: format!("grow volume {}", request.volume),
+        description: format!(
+            "grow volume {} on {}",
+            request.volume,
+            if request.nbd_device == AUTO_NBD_DEVICE {
+                "the recorded NBD device"
+            } else {
+                &request.nbd_device
+            }
+        ),
         volume: request.volume.clone(),
         attachment: Some(request.into()),
-        steps: vec![
-            PlannedStep::LvExtend {
-                vg_name: request.vg_name.clone(),
-                lv_name: request.lv_name.clone(),
-                target_bytes: request.target_bytes,
-            },
-            PlannedStep::XfsGrowfs {
-                mountpoint: request.mountpoint.clone(),
-            },
-        ],
+        steps,
     }
 }
 

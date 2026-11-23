@@ -10,6 +10,19 @@ use maki_crypto_http::HttpCryptoProvider;
 use maki_crypto_local::keysource::MapKeySource;
 use maki_format::config::parse_config;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Counting(AtomicUsize);
+impl maki_crypto_local::keysource::KeySource for Counting {
+    fn load(&self, _name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(maki_crypto::SecretBuffer::from_slice(b"test-token"))
+    }
+    fn load_text(&self, name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
+        self.load(name)
+    }
+}
+
 fn provider_with_token(token: &[u8]) -> Result<HttpCryptoProvider, CryptoError> {
     let config = parse_config(include_str!(
         "../../../packaging/examples/postgres-prod.toml"
@@ -44,19 +57,6 @@ fn a_header_credential_with_a_control_character_is_refused_at_attach() {
 /// loaded.
 #[test]
 fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct Counting(AtomicUsize);
-    impl maki_crypto_local::keysource::KeySource for Counting {
-        fn load(&self, _name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(maki_crypto::SecretBuffer::from_slice(b"test-token"))
-        }
-        fn load_text(&self, name: &str) -> Result<maki_crypto::SecretBuffer, CryptoError> {
-            self.load(name)
-        }
-    }
-
     // Windows checkouts may carry CRLF line endings.
     let original =
         include_str!("../../../packaging/examples/postgres-prod.toml").replace("\r\n", "\n");
@@ -67,7 +67,7 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
     );
     assert_ne!(text, original, "the fixture substitution must apply");
     let config = parse_config(&text).unwrap();
-    config.validate().unwrap();
+    assert!(config.validate().is_err());
     let keys = Counting(AtomicUsize::new(0));
     let Err(error) = HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys)
     else {
@@ -79,4 +79,20 @@ fn an_invalid_header_name_is_refused_before_its_credential_is_loaded() {
         0,
         "the credential was loaded for a header that can never be sent"
     );
+}
+
+#[test]
+fn case_equivalent_headers_are_rejected_before_credential_lookup() {
+    for op in ["encrypt", "decrypt"] {
+        let table = format!("[crypto.http.{op}.headers]");
+        let text = include_str!("../../../packaging/examples/postgres-prod.toml")
+            .replace(&table, &format!("{table}\nauthorization = \"duplicate\""));
+        let config = parse_config(&text).unwrap();
+        assert!(config.validate().is_err());
+        let keys = Counting(AtomicUsize::new(0));
+        assert!(
+            HttpCryptoProvider::from_config(&config, "https://crypto.internal", &keys).is_err()
+        );
+        assert_eq!(keys.0.load(Ordering::SeqCst), 0, "{op}");
+    }
 }

@@ -53,6 +53,8 @@ fn remote_witness_requires_bounded_authenticated_transport() {
         ("127.0.0.1:9443", "witness.example.test:9443"),
         ("127.0.0.1:9443", "127.0.0.1:0"),
         ("witness.example.test", ""),
+        ("witness.example.test", "witness.example.test:9443"),
+        ("witness.example.test", "witness..test"),
         ("timeout_ms = 1500", "timeout_ms = 0"),
         ("timeout_ms = 1500", "timeout_ms = 60001"),
         ("/etc/maki/witness-ca.pem", "relative.pem"),
@@ -89,4 +91,36 @@ fn multiple_witness_addresses_require_an_explicit_storage_identity() {
             "accepted {bad}"
         );
     }
+}
+
+#[test]
+fn witness_tls_names_accept_both_ip_families() {
+    for address in ["127.0.0.1", "::1"] {
+        let cfg =
+            parse_config(&config(&remote().replace("witness.example.test", address))).unwrap();
+        cfg.validate().unwrap();
+    }
+}
+
+#[test]
+fn remote_rollback_sockets_respect_writer_namespaces() {
+    let mut volume = parse_config(&config(&remote())).unwrap();
+    let namespace = "remote-0000000000000001-10000000000000000000000000000000";
+    for entry in [
+        "remote.enrollment".to_string(),
+        "remote.enroll.lock".to_string(),
+        "remote.operation.lock".to_string(),
+        "rollback.format".to_string(),
+        format!("{namespace}/rollback.arena"),
+        format!(".remote-gc-{namespace}/rollback.lock"),
+    ] {
+        volume.control.socket = Some(format!("{}/{entry}", volume.backing.root));
+        assert!(volume
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+    }
+    volume.control.socket = Some(format!("{}/custom.sock", volume.backing.root));
+    volume.validate().unwrap();
 }

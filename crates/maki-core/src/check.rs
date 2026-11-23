@@ -4,7 +4,7 @@
 //! The fast checker in `maki-format` looks at the superblock, the shard
 //! catalog, allocation-map sizes and file presence. That is not enough to
 //! justify "check passed" for a volume that holds data: it says nothing
-//! about checkpoint state, the journal, or the slots themselves. The deep
+//! about checkpoint contents, the journal, or the slots themselves. The deep
 //! check reuses the *real* recovery scanner and the *real* slot reader, so
 //! anything that would refuse attach or return EIO at runtime is reported
 //! here, and nothing the runtime accepts is reported as an error.
@@ -20,15 +20,16 @@ use maki_format::canary::KeyCanary;
 use maki_format::checker::CheckReport;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 use maki_format::layout;
+use maki_format::superblock::load_volume_superblock_with_fallback;
 use maki_format::FormatError;
 
 use crate::error::CoreError;
 use crate::journal::effective_segment_size;
 use crate::recovery::{
     acquire_lock, check_metadata_generations, load_checkpoint_state, load_durable_mark,
-    load_superblock, summarize_journal, JournalRepair, RecoveryError,
+    summarize_journal, JournalRepair, RecoveryError,
 };
-use crate::store::{SlotRead, SlotStore};
+use crate::store::SlotStore;
 
 /// Cap on individually reported slot errors (the count is always exact).
 const MAX_SLOT_ERRORS: usize = 64;
@@ -68,16 +69,16 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // means the check cannot run (I/O) or the copy changed since; neither
     // may end in a report without errors, which would claim a pass for a
     // journal and slots nobody examined (BUG-090).
-    let superblock = match load_superblock(&backing) {
-        Ok(sb) => sb,
-        Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
-            return Err(CoreError::Io(e))
-        }
+    let (envelope, invalid_copy) = match load_volume_superblock_with_fallback(backing.as_ref()) {
+        Ok(copies) => copies,
+        Err(FormatError::Io(e)) => return Err(CoreError::Io(e)),
         Err(e) => {
             report.errors.push(format!("superblock: {e}"));
             return Ok(report);
         }
     };
+
+    let superblock = &envelope.superblock;
 
     // Checkpoint state: both copies inspected, at least one required.
     let ck_ab = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
@@ -160,15 +161,17 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // Apply recovery's validation and repair policy without retaining the
     // replay payloads: this report needs counts, repair decisions and the
     // set of units a replay would rewrite.
+    let store = SlotStore::open_from_superblock(backing.clone(), &envelope, &|| {});
     let mut replay_units = std::collections::BTreeSet::new();
     let mut replay_written = std::collections::BTreeSet::new();
     let mut journal_durable = None;
     let mut journal_ok = false;
     match summarize_journal(
         &backing,
-        &superblock,
+        &envelope,
         checkpoint_sequence,
         effective_segment_size(segment_size),
+        store.as_ref().ok(),
     ) {
         Ok(scan) => {
             report.info.push(format!(
@@ -213,11 +216,12 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // unit that replay neither rewrites nor discards first.
     let mut stored_ciphertext = false;
     let mut shard_count = None;
-    match SlotStore::open(backing.clone(), superblock.geometry.clone()) {
+    match store {
         Ok(store) => {
             shard_count = Some(store.shard_count());
             // The A/B generations recovery checks before its first write.
-            match check_metadata_generations(&backing, &store) {
+            let known_generation = invalid_copy.is_none().then_some(superblock.generation);
+            match check_metadata_generations(&backing, &store, known_generation) {
                 Ok(()) => {}
                 Err(RecoveryError::Io(e) | RecoveryError::Format(FormatError::Io(e))) => {
                     return Err(CoreError::Io(e))
@@ -226,19 +230,13 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
             }
             let mut checked = 0u64;
             let mut probed = 0u64;
-            let listed = store.allocated_units().map(|unit| (unit, true));
-            let unlisted = store.unlisted_units().map(|unit| (unit, false));
-            for (unit, allocated) in listed.chain(unlisted) {
+            for (unit, allocated, read) in store.checked_slots() {
                 if allocated {
                     checked += 1;
                 } else {
                     probed += 1;
                 }
-                let read = store.read_slot(unit);
-                if allocated
-                    && !replay_units.contains(&unit)
-                    && matches!(read, Ok(SlotRead::Ciphertext { .. }))
-                {
+                if !replay_units.contains(&unit) && matches!(read, Ok(true)) {
                     stored_ciphertext = true;
                 }
                 if let Err(e) = read {
@@ -351,6 +349,7 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     } else {
         "clean"
     };
+    backing.check_freshness()?;
     report.info.push(format!("deep check verdict: {verdict}"));
 
     Ok(report)

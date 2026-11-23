@@ -79,6 +79,17 @@ fn scheduler(provider: Arc<dyn CryptoProvider>, cap: u64, pending: u64) -> Batch
     )
 }
 
+#[test]
+fn extreme_capacities_are_bounded_on_the_host_platform() {
+    let sem = DualSemaphore::new(u32::MAX, u64::MAX);
+    let platform = tokio::sync::Semaphore::MAX_PERMITS;
+    assert_eq!(sem.max_items(), (u32::MAX as usize).min(platform));
+    assert_eq!(
+        sem.max_bytes(),
+        u64::from(u32::MAX >> 1).min(platform as u64)
+    );
+}
+
 #[tokio::test]
 async fn oversized_semaphore_acquires_do_not_consume_capacity() {
     for (items, bytes) in [(1, 1025), (3, 1024)] {

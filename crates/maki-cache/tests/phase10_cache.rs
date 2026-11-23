@@ -93,6 +93,80 @@ fn lru_evicts_least_recently_used_within_byte_budget() {
 }
 
 #[test]
+fn retained_capacity_is_charged_on_insert_replacement_and_eviction() {
+    let (cache, _) = cache(1024, Duration::from_secs(60));
+    let buffer = |capacity| {
+        let mut data = SecretBuffer::with_capacity(capacity).unwrap();
+        data.try_extend_from_slice(&[1]).unwrap();
+        data
+    };
+
+    cache.put(1, 1, buffer(512));
+    cache.put(2, 1, buffer(256));
+    assert_eq!(cache.stats().bytes, 768);
+    cache.put(1, 2, buffer(1024));
+    assert!(cache.get(2, 1).is_none());
+    assert_eq!(cache.stats().bytes, 1024);
+    cache.set_max_bytes(512);
+    assert!(cache.get(1, 2).is_none());
+    assert_eq!(cache.stats().bytes, 0);
+    cache.put(1, 3, buffer(1024));
+    cache.put(2, 2, SecretBuffer::with_capacity(256).unwrap());
+    assert_eq!(cache.stats().entries, 0);
+}
+
+#[test]
+fn prefixed_units_recover_the_logical_working_set_after_a_resize() {
+    let (cache, _) = cache(288, Duration::from_secs(60));
+    let padded = |byte| {
+        let mut data = SecretBuffer::with_capacity(72).unwrap();
+        data.try_extend_from_slice(&[byte; 64]).unwrap();
+        data
+    };
+    for unit in 0..4 {
+        cache.put_read_unit(unit, 1, padded(unit as u8));
+    }
+    let held = cache.get(0, 1).unwrap();
+    assert_eq!(held.capacity(), 72);
+    assert_eq!(cache.stats().bytes, 288);
+
+    cache.set_max_bytes(256);
+    for _ in 0..3 {
+        for unit in 0..4 {
+            if cache.get(unit, 1).is_none() {
+                cache.put_read_unit(unit, 1, padded(unit as u8));
+            }
+            assert!(cache.stats().bytes <= 256);
+        }
+    }
+    assert_eq!(cache.stats().entries, 4);
+    assert_eq!(cache.stats().bytes, 256);
+    for unit in 0..4 {
+        assert_eq!(cache.get(unit, 1).unwrap().expose(), &[unit as u8; 64]);
+    }
+    assert_eq!(held.expose(), &[0; 64]);
+}
+
+#[test]
+fn fixed_units_with_large_provider_allocations_stay_within_the_active_limit() {
+    let (cache, _) = cache(270, Duration::from_secs(60));
+    for (unit, capacity) in [65, 91, 4096, 73].into_iter().enumerate() {
+        let mut data = SecretBuffer::with_capacity(capacity).unwrap();
+        data.try_extend_from_slice(&[unit as u8; 64]).unwrap();
+        cache.put_read_unit(unit as u64, 1, data);
+        assert!(cache.stats().bytes <= 270);
+    }
+    for unit in 0..4 {
+        assert_eq!(cache.get(unit, 1).unwrap().expose(), &[unit as u8; 64]);
+    }
+    assert_eq!(cache.get(2, 1).unwrap().capacity(), 64);
+
+    cache.set_max_bytes(63);
+    cache.put_read_unit(0, 2, buf(5, 64));
+    assert_eq!(cache.stats().entries, 0);
+}
+
+#[test]
 fn oversized_entry_is_not_cached() {
     let (cache, _clock) = cache(512, Duration::from_secs(60));
     cache.put(1, 1, buf(1, 4096));

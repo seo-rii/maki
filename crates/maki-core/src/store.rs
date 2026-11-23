@@ -52,7 +52,7 @@ use maki_format::catalog::ShardCatalog;
 use maki_format::geometry::Geometry;
 use maki_format::layout;
 use maki_format::slot::SlotHeader;
-use maki_format::superblock::{load_volume_superblock, SUPERBLOCK_VERSION_V3};
+use maki_format::superblock::{load_volume_superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V3};
 use maki_format::FormatError;
 
 use crate::error::CoreError;
@@ -185,6 +185,10 @@ pub struct SlotStore {
     /// Shards adopted from the data directory that the loaded catalog copy
     /// did not list; persisted with the next allocation persist.
     catalog_dirty: bool,
+    // Counts of shards that still need the corresponding metadata barrier.
+    // A failed barrier keeps its count until directory durability is proven.
+    pending_allocations: usize,
+    pending_discards: usize,
     shards: HashMap<u64, Shard>,
     /// Units whose bit was repaired from slot headers at open.
     repaired_units: Vec<u64>,
@@ -278,8 +282,14 @@ fn probe_header(
     }
     Ok(SlotHeader::decode(&header_bytes)
         .ok()
-        .filter(|h| h.unit_index == unit && h.write_sequence > 0)
+        .filter(|h| h.unit_index == unit)
         .map_or(Probe::Damaged, Probe::Header))
+}
+
+/// Only these slots belong to the export; the on-disk maps use full shard geometry.
+fn addressable_units(geometry: &Geometry, shard: u64) -> u64 {
+    let per_shard = geometry.units_per_shard();
+    per_shard.min(geometry.num_units().saturating_sub(shard * per_shard))
 }
 
 /// Units of `shard` whose bit is clear but whose slot holds a header for
@@ -288,12 +298,13 @@ fn probe_shard(
     geometry: &Geometry,
     shard: &Shard,
     shard_idx: u64,
+    in_device: u64,
     progress: &crate::recovery::RecoveryProgress<'_>,
 ) -> Result<Vec<u64>, CoreError> {
     let len = shard.data.len()?;
     let per_shard = geometry.units_per_shard();
     let mut out = Vec::new();
-    for in_shard in 0..shard.alloc.units() {
+    for in_shard in 0..in_device {
         if in_shard > 0 && in_shard.is_multiple_of(256) {
             progress();
         }
@@ -377,8 +388,22 @@ impl SlotStore {
         geometry: Geometry,
         progress: &crate::recovery::RecoveryProgress<'_>,
     ) -> Result<Self, CoreError> {
-        let discard_enabled =
-            load_volume_superblock(backing.as_ref())?.metadata_version == SUPERBLOCK_VERSION_V3;
+        let envelope = load_volume_superblock(backing.as_ref())?;
+        if geometry != envelope.superblock.geometry {
+            return Err(CoreError::Invalid(
+                "slot store geometry differs from the volume superblock".into(),
+            ));
+        }
+        Self::open_from_superblock(backing, &envelope, progress)
+    }
+
+    pub(crate) fn open_from_superblock(
+        backing: Arc<dyn Backing>,
+        envelope: &VolumeSuperblock,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<Self, CoreError> {
+        let geometry = envelope.superblock.geometry.clone();
+        let discard_enabled = envelope.metadata_version == SUPERBLOCK_VERSION_V3;
         let catalog_ab = catalog_store(&geometry);
         let mut catalog = catalog_ab
             .load::<ShardCatalog>(backing.as_ref())?
@@ -386,7 +411,14 @@ impl SlotStore {
 
         let mut catalog_dirty = false;
         let mut orphans: Vec<u64> = Vec::new();
-        for name in backing.list(layout::DATA_DIR)? {
+        let data_entries = backing.list(layout::DATA_DIR).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => CoreError::Corrupt(format!(
+                "required {} directory is missing",
+                layout::DATA_DIR
+            )),
+            _ => CoreError::Io(e),
+        })?;
+        for name in data_entries {
             if let Some(idx) = layout::parse_shard_data(&name) {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
@@ -419,40 +451,42 @@ impl SlotStore {
                 layout::shard_alloc_b(shard_idx),
                 &geometry,
             );
-            let (side_a, side_b) = alloc_ab.side_generations::<AllocationMap>(backing.as_ref())?;
-            let (alloc, dirty_alloc, map_stored) =
-                match alloc_ab.load::<AllocationMap>(backing.as_ref())? {
-                    // Even a cataloged shard's valid copies may be cache-only
-                    // after sync failure and a plain restart (K-01). Defer
-                    // persistence until reservation or checkpoint, then
-                    // establish both copies before accepting a new record.
-                    Some(alloc) => (alloc, false, false),
-                    // A shard the catalog never committed may have died before
-                    // its (empty) map was stored: start it empty.
-                    None if adopted.contains(&shard_idx) => {
-                        (AllocationMap::new(geometry.units_per_shard()), true, false)
-                    }
-                    // SPEC §27: a cataloged shard with no valid copy refuses
-                    // attach rather than guess (offline repair territory).
-                    None => {
-                        return Err(CoreError::Corrupt(format!(
-                            "shard {shard_idx}: no valid allocation map copy"
-                        )))
-                    }
-                };
+            let (alloc, valid_copies) =
+                alloc_ab.load_with_copy_count::<AllocationMap>(backing.as_ref())?;
+            let (alloc, dirty_alloc, map_stored) = match alloc {
+                // Even a cataloged shard's valid copies may be cache-only
+                // after sync failure and a plain restart (K-01). Defer
+                // persistence until reservation or checkpoint, then
+                // establish both copies before accepting a new record.
+                Some(alloc) => (alloc, false, false),
+                // A shard the catalog never committed may have died before
+                // its (empty) map was stored: start it empty.
+                None if adopted.contains(&shard_idx) => {
+                    (AllocationMap::new(geometry.units_per_shard()), true, false)
+                }
+                // SPEC §27: a cataloged shard with no valid copy refuses
+                // attach rather than guess (offline repair territory).
+                None => {
+                    return Err(CoreError::Corrupt(format!(
+                        "shard {shard_idx}: no valid allocation map copy"
+                    )))
+                }
+            };
             if alloc.units() != geometry.units_per_shard() {
                 return Err(CoreError::Corrupt(format!(
                     "shard {shard_idx}: allocation map size mismatch"
                 )));
             }
-            // Only an absent file is damage. Every cataloged shard stays
-            // open, so a large volume can meet the descriptor limit here:
-            // EMFILE and other open failures keep their errno (BUG-124).
+            // A missing or invalid shard path is a structural error, as in
+            // the fast checker. Resource and device failures retain their errno.
             let data = backing
                 .open(&layout::shard_data(shard_idx), false)
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => {
                         CoreError::Corrupt(format!("shard {shard_idx}: data file missing: {e}"))
+                    }
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::InvalidInput => {
+                        CoreError::Corrupt(format!("shard {shard_idx}: invalid data file: {e}"))
                     }
                     _ => CoreError::Io(e),
                 })?;
@@ -461,6 +495,10 @@ impl SlotStore {
             let mut dirty_alloc = dirty_alloc;
             let len = data.len()?;
             let physical = geometry.units_per_shard() * geometry.slot_size;
+            // Positions below this name a unit of the device; a partial last
+            // shard's positions past the device's last unit never hold data
+            // (R5-027).
+            let in_device = addressable_units(&geometry, shard_idx);
             // Creation finished ⇔ the shard was ever checkpointed into: the
             // catalog names it (its commit follows the synced full-size
             // file), or an allocation copy lists a slot (a checkpoint wrote
@@ -469,8 +507,11 @@ impl SlotStore {
             // earlier attempt can leave one behind after its never-dir-synced
             // data file vanished in the crash. Nor does the observed length:
             // after a failed sync and a plain restart the page cache shows
-            // the full size that the disk does not have (K-01).
-            let short = if adopted.contains(&shard_idx) && alloc.set_count() == 0 {
+            // the full size that the disk does not have (K-01). Only a bit
+            // at an in-device position lists a slot.
+            let short = if adopted.contains(&shard_idx)
+                && !(0..in_device).any(|in_shard| alloc.get(in_shard))
+            {
                 if len < physical {
                     tracing::warn!(
                         shard = shard_idx,
@@ -495,9 +536,7 @@ impl SlotStore {
                 // Positions past the device's last unit (a partial last
                 // shard) never held data and are never marked (R5-027).
                 let mut marked = 0u64;
-                let base = shard_idx * geometry.units_per_shard();
-                let in_device = geometry.num_units().saturating_sub(base);
-                for in_shard in 0..alloc.units().min(in_device) {
+                for in_shard in 0..in_device {
                     if !alloc.get(in_shard) && geometry.slot_offset(in_shard) + 64 > len {
                         alloc.set(in_shard, true);
                         marked += 1;
@@ -536,8 +575,6 @@ impl SlotStore {
                     layout::shard_discard_b(shard_idx),
                     &geometry,
                 );
-                let (discard_a, discard_b) =
-                    discard_ab.side_generations::<AllocationMap>(backing.as_ref())?;
                 let discard = discard_ab
                     .load::<AllocationMap>(backing.as_ref())?
                     .ok_or_else(|| {
@@ -553,7 +590,6 @@ impl SlotStore {
                 // Both sides may decode yet diverge after an interrupted
                 // two-copy publication. Always rewrite the selected logical
                 // state into both copies before journal reclamation/punching.
-                let _ = (discard_a, discard_b);
                 shard.dirty_discard = true;
             }
             // With one copy invalid or absent the loaded copy may be the
@@ -561,8 +597,8 @@ impl SlotStore {
             // the shard's headers and repair the map in memory (persisted
             // by the next allocation persist). Healthy shards (both copies
             // valid) skip this.
-            if side_a.is_none() || side_b.is_none() {
-                let found = probe_shard(&geometry, &shard, shard_idx, progress)?;
+            if valid_copies < 2 {
+                let found = probe_shard(&geometry, &shard, shard_idx, in_device, progress)?;
                 if !found.is_empty() {
                     tracing::warn!(
                         shard = shard_idx,
@@ -587,6 +623,11 @@ impl SlotStore {
             catalog,
             catalog_ab,
             catalog_dirty,
+            pending_allocations: shards
+                .values()
+                .filter(|s| s.dirty_alloc || !s.map_stored)
+                .count(),
+            pending_discards: shards.values().filter(|s| s.dirty_discard).count(),
             shards,
             repaired_units,
             damaged_units,
@@ -617,11 +658,7 @@ impl SlotStore {
     /// to apply: an adopted shard, repaired map, or loaded pair awaiting
     /// durability proof in this store session is pending.
     pub fn has_pending_repairs(&self) -> bool {
-        self.catalog_dirty
-            || self
-                .shards
-                .values()
-                .any(|s| s.dirty_alloc || !s.map_stored || s.dirty_discard)
+        self.catalog_dirty || self.pending_allocations != 0 || self.pending_discards != 0
     }
 
     pub(crate) fn supports_discard(&self) -> bool {
@@ -804,18 +841,19 @@ impl SlotStore {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
-        let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
-            (0..shard.alloc.units()).filter_map(move |in_shard| {
-                (shard_idx * per_shard + in_shard < units
-                    && shard.alloc.get(in_shard)
-                    && !shard
+            let base = shard_idx * per_shard;
+            shard
+                .alloc
+                .set_units(addressable_units(&self.geometry, shard_idx))
+                .filter(move |&in_shard| {
+                    !shard
                         .discard
                         .as_ref()
-                        .is_some_and(|discard| discard.get(in_shard)))
-                .then_some(shard_idx * per_shard + in_shard)
-            })
+                        .is_some_and(|discard| discard.get(in_shard))
+                })
+                .map(move |in_shard| base + in_shard)
         })
     }
 
@@ -827,42 +865,23 @@ impl SlotStore {
         let mut shards: Vec<u64> = self.shards.keys().copied().collect();
         shards.sort_unstable();
         let per_shard = self.geometry.units_per_shard();
-        let units = self.geometry.num_units();
         shards.into_iter().flat_map(move |shard_idx| {
             let shard = &self.shards[&shard_idx];
-            (0..shard.alloc.units()).filter_map(move |in_shard| {
-                let unit = shard_idx * per_shard + in_shard;
-                (unit < units
-                    && !shard.alloc.get(in_shard)
+            let base = shard_idx * per_shard;
+            (0..addressable_units(&self.geometry, shard_idx)).filter_map(move |in_shard| {
+                (!shard.alloc.get(in_shard)
                     && !shard
                         .discard
                         .as_ref()
                         .is_some_and(|discard| discard.get(in_shard)))
-                .then_some(unit)
+                .then_some(base + in_shard)
             })
         })
     }
 
     /// Lowest allocated unit, if any slot has ever been checkpointed.
     pub fn first_allocated_unit(&self) -> Option<u64> {
-        let mut shards: Vec<u64> = self.shards.keys().copied().collect();
-        shards.sort_unstable();
-        for shard_idx in shards {
-            let shard = &self.shards[&shard_idx];
-            if shard.alloc.set_count() == 0 {
-                continue;
-            }
-            if let Some(in_shard) = (0..shard.alloc.units()).find(|u| {
-                shard.alloc.get(*u)
-                    && !shard
-                        .discard
-                        .as_ref()
-                        .is_some_and(|discard| discard.get(*u))
-            }) {
-                return Some(shard_idx * self.geometry.units_per_shard() + in_shard);
-            }
-        }
-        None
+        self.allocated_units().next()
     }
 
     fn ensure_shard(&mut self, shard_idx: u64) -> Result<(), CoreError> {
@@ -1013,6 +1032,7 @@ impl SlotStore {
             let shard = self.shards.get_mut(idx).unwrap();
             shard.map_stored = true;
             shard.dirty_alloc = false;
+            self.pending_allocations -= 1;
         }
         Ok(())
     }
@@ -1026,6 +1046,11 @@ impl SlotStore {
         ciphertext: &[u8],
     ) -> Result<(), CoreError> {
         self.validate_unit(unit)?;
+        if write_sequence == 0 {
+            return Err(CoreError::Corrupt(
+                "slot write sequence must be positive".into(),
+            ));
+        }
         if ciphertext.len() > self.geometry.max_ciphertext_size as usize {
             return Err(CoreError::Corrupt(format!(
                 "ciphertext {} exceeds max {}",
@@ -1057,6 +1082,9 @@ impl SlotStore {
         let shard = self.shards.get_mut(&shard_idx).unwrap();
         if !shard.alloc.get(in_shard) {
             shard.alloc.set(in_shard, true);
+            if !shard.dirty_alloc && shard.map_stored {
+                self.pending_allocations += 1;
+            }
             shard.dirty_alloc = true;
         }
         Ok(())
@@ -1109,6 +1137,7 @@ impl SlotStore {
                 let shard = self.shards.get_mut(idx).unwrap();
                 shard.dirty_alloc = false;
                 shard.map_stored = true;
+                self.pending_allocations -= 1;
             }
         }
         // The catalog commits an adopted shard only *after* its allocation
@@ -1156,6 +1185,9 @@ impl SlotStore {
         })?;
         if map.get(in_shard) != discarded {
             map.set(in_shard, discarded);
+            if !shard.dirty_discard {
+                self.pending_discards += 1;
+            }
             shard.dirty_discard = true;
         }
         Ok(())
@@ -1194,6 +1226,7 @@ impl SlotStore {
         self.backing.sync_dir(layout::DATA_DIR)?;
         for idx in dirty {
             self.shards.get_mut(&idx).unwrap().dirty_discard = false;
+            self.pending_discards -= 1;
         }
         Ok(())
     }
@@ -1214,8 +1247,8 @@ impl SlotStore {
             .discard
             .as_ref()
             .expect("reclaim cursor requires v3 map");
-        let map_units = map.units();
-        let end = start.saturating_add(4096).min(map_units);
+        let logical_end = addressable_units(&self.geometry, idx);
+        let end = start.saturating_add(4096).min(logical_end);
         let result = if shard.dirty_discard {
             Err(CoreError::Durability(
                 "reclamation requires durable discard metadata".into(),
@@ -1236,7 +1269,7 @@ impl SlotStore {
                     .map_or(failed, |old| old.min(failed)),
             );
         }
-        self.reclaim_cursor = if end < map_units {
+        self.reclaim_cursor = if end < logical_end {
             Some((idx, end))
         } else {
             self.catalog
@@ -1316,11 +1349,90 @@ impl SlotStore {
         Ok(self.slot_header(unit)?.map(|header| header.write_sequence))
     }
 
+    /// Compare slot metadata with the last surviving journal record for a
+    /// unit when no later record can account for a different value. The
+    /// deep check separately reads and verifies ciphertext.
+    pub(crate) fn verify_covered_slot(
+        &self,
+        unit: u64,
+        sequence: u64,
+        payload_len: u32,
+        payload_crc: u32,
+    ) -> Result<(), CoreError> {
+        self.validate_unit(unit)?;
+        if self.discard_enabled && payload_len == 0 {
+            let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
+            let discarded = self
+                .shards
+                .get(&shard_idx)
+                .and_then(|shard| shard.discard.as_ref())
+                .is_some_and(|map| map.get(in_shard));
+            return if discarded {
+                Ok(())
+            } else {
+                Err(CoreError::Corrupt(format!(
+                    "unit {unit}: covered journal discard at sequence {sequence} is missing from the discard map"
+                )))
+            };
+        }
+        let header = match self.slot_header(unit) {
+            Ok(header) => header,
+            // A damaged header already reads as EIO and is reported by the
+            // deep check. This comparison detects valid but stale state.
+            Err(CoreError::Corrupt(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(header) = header else {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: covered journal write at sequence {sequence} has no visible slot"
+            )));
+        };
+        if header.write_sequence != sequence {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: slot sequence {} does not match covered journal sequence {sequence}",
+                header.write_sequence
+            )));
+        }
+        if header.ciphertext_len != payload_len || header.ciphertext_crc != payload_crc {
+            return Err(CoreError::Corrupt(format!(
+                "unit {unit}: slot metadata does not match covered journal payload at sequence {sequence}"
+            )));
+        }
+        Ok(())
+    }
+
     /// SPEC §22 read classification, header part: which version the slot
     /// holds, or `None` for zeros. Refuses undecodable, foreign-unit and
     /// oversized headers and damaged unlisted slots exactly as a full read
     /// would.
-    fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
+    pub(crate) fn slot_header(&self, unit: u64) -> Result<Option<SlotHeader>, CoreError> {
+        self.slot_header_with_len(unit, |_, data| data.len())
+    }
+
+    /// Reuse one observed file length across consecutive probes under the volume lock.
+    pub(crate) fn scan_slot_header(
+        &self,
+        unit: u64,
+        previous: &mut Option<(u64, u64)>,
+    ) -> Result<Option<SlotHeader>, CoreError> {
+        self.slot_header_with_len(unit, |shard, data| {
+            if let Some((last_shard, len)) = *previous {
+                if last_shard == shard {
+                    return Ok(len);
+                }
+            }
+            let len = data.len()?;
+            *previous = Some((shard, len));
+            Ok(len)
+        })
+    }
+
+    fn slot_header_with_len(
+        &self,
+        unit: u64,
+        data_len: impl FnOnce(u64, &dyn BackingFile) -> std::io::Result<u64>,
+    ) -> Result<Option<SlotHeader>, CoreError> {
+        self.validate_unit(unit)?;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let Some(shard) = self.shards.get(&shard_idx) else {
             return Ok(None);
@@ -1354,7 +1466,7 @@ impl SlotStore {
         } else {
             // Bit clear: unwritten unless the slot itself says otherwise
             // (allocation copy behind the data, see module docs).
-            let len = shard.data.len()?;
+            let len = data_len(shard_idx, shard.data.as_ref())?;
             match probe_header(&self.geometry, shard, unit, in_shard, len)? {
                 Probe::Unwritten => return Ok(None),
                 Probe::Damaged => {
@@ -1387,30 +1499,157 @@ impl SlotStore {
         let Some(header) = self.slot_header(unit)? else {
             return Ok(SlotRead::Zero);
         };
+        Ok(SlotRead::Ciphertext {
+            write_sequence: header.write_sequence,
+            data: self.read_ciphertext(&header)?,
+        })
+    }
+
+    /// The offline caller holds the volume lock. Unlisted units arrive in
+    /// shard order so one observed length covers their whole header scan.
+    /// The result is true when the slot contains verified ciphertext.
+    pub(crate) fn checked_slots(
+        &self,
+    ) -> impl Iterator<Item = (u64, bool, Result<bool, CoreError>)> + '_ {
+        let listed = self.allocated_units().map(|unit| (unit, true));
+        let unlisted = self.unlisted_units().map(|unit| (unit, false));
+        let mut previous = None;
+        let mut scratch = None;
+        listed.chain(unlisted).map(move |(unit, allocated)| {
+            let header = self.scan_slot_header(unit, &mut previous);
+            let verified = header.and_then(|header| {
+                let Some(header) = header else {
+                    return Ok(false);
+                };
+                let buffer = scratch.get_or_insert_with(|| vec![0; 64 * 1024]);
+                self.read_and_verify_ciphertext(&header, buffer)?;
+                Ok(true)
+            });
+            (unit, allocated, verified)
+        })
+    }
+
+    /// Read the body corresponding to an already validated slot header.
+    pub(crate) fn read_ciphertext(&self, header: &SlotHeader) -> Result<Vec<u8>, CoreError> {
+        let mut data = vec![0; header.ciphertext_len as usize];
+        self.read_and_verify_ciphertext(header, &mut data)?;
+        Ok(data)
+    }
+
+    /// A full-size buffer retains the body. Offline verification reuses a
+    /// smaller buffer and feeds each consecutive chunk into the same CRC.
+    fn read_and_verify_ciphertext(
+        &self,
+        header: &SlotHeader,
+        buffer: &mut [u8],
+    ) -> Result<(), CoreError> {
+        let unit = header.unit_index;
         let (shard_idx, in_shard) = self.geometry.shard_of_unit(unit);
         let shard = self
             .shards
             .get(&shard_idx)
             .expect("slot_header found the shard");
         let offset = self.geometry.slot_offset(in_shard);
-        let mut data = vec![0u8; header.ciphertext_len as usize];
-        shard
-            .data
-            .read_at(offset + 64, &mut data)
-            .map_err(|error| slot_read_error(unit, "ciphertext", error))?;
-        if crc32fast::hash(&data) != header.ciphertext_crc {
+        let len = header.ciphertext_len as usize;
+        let mut crc = crc32fast::Hasher::new();
+        let mut read = 0;
+        loop {
+            let chunk_len = (len - read).min(buffer.len());
+            let chunk = &mut buffer[..chunk_len];
+            shard
+                .data
+                .read_at(offset + 64 + read as u64, chunk)
+                .map_err(|error| slot_read_error(unit, "ciphertext", error))?;
+            crc.update(chunk);
+            read += chunk_len;
+            if read == len {
+                break;
+            }
+        }
+        if crc.finalize() != header.ciphertext_crc {
             return Err(CoreError::Corrupt(format!(
                 "unit {unit}: ciphertext CRC mismatch"
             )));
         }
-        Ok(SlotRead::Ciphertext {
-            write_sequence: header.write_sequence,
-            data,
-        })
+        Ok(())
     }
 
     /// Shards touched by the given unit list (for checkpoint fdatasync).
     pub fn shards_of_units<'a>(&self, units: impl Iterator<Item = &'a u64>) -> BTreeSet<u64> {
         units.map(|u| self.geometry.shard_of_unit(*u).0).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_backing::MemBacking;
+    use maki_format::{init, superblock::Superblock};
+
+    fn open_store(geometry: Geometry) -> (Arc<MemBacking>, SlotStore) {
+        let backing = Arc::new(MemBacking::new());
+        init::create_volume(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "test".into(),
+                key_identity: "test".into(),
+                geometry: geometry.clone(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let store = SlotStore::open(backing.clone(), geometry).unwrap();
+        (backing, store)
+    }
+
+    #[test]
+    fn offline_slot_checks_verify_the_last_chunk_of_a_large_payload() {
+        let len = 128 * 1024 + 1;
+        let geometry = Geometry::compute(512, 512, 512, len, 512, 512).unwrap();
+        let (backing, mut store) = open_store(geometry);
+        let payload = vec![7; len as usize];
+        store.write_slot(0, 1, &payload).unwrap();
+        store.mark_allocated(0).unwrap();
+        assert!(store.checked_slots().next().unwrap().2.unwrap());
+
+        backing
+            .open(&layout::shard_data(0), false)
+            .unwrap()
+            .write_at(64 + u64::from(len) - 1, &[4])
+            .unwrap();
+        assert!(matches!(
+            store.checked_slots().next().unwrap().2,
+            Err(CoreError::Corrupt(reason)) if reason.contains("ciphertext CRC mismatch")
+        ));
+    }
+
+    #[test]
+    fn covered_slot_requires_matching_write_metadata() {
+        let geometry = Geometry::compute(512, 512, 512, 520, 512 * 64, 512 * 64).unwrap();
+        let (_, mut store) = open_store(geometry);
+        let payload = b"ciphertext";
+        let len = payload.len() as u32;
+        let crc = crc32fast::hash(payload);
+        store.write_slot(0, 1, payload).unwrap();
+        store.sync_shard_data(0).unwrap();
+        store.mark_allocated(0).unwrap();
+        store.persist_allocations().unwrap();
+
+        store.verify_covered_slot(0, 1, len, crc).unwrap();
+        for (unit, sequence, len, crc) in [
+            (0, 2, len, crc),
+            (0, 1, len + 1, crc),
+            (0, 1, len, crc ^ 1),
+            (1, 1, len, crc),
+        ] {
+            assert!(matches!(
+                store.verify_covered_slot(unit, sequence, len, crc),
+                Err(CoreError::Corrupt(_))
+            ));
+        }
     }
 }

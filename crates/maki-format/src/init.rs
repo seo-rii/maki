@@ -36,6 +36,10 @@ fn create_volume_with_metadata_version(
     mut superblock: Superblock,
     metadata_version: u32,
 ) -> Result<Superblock, FormatError> {
+    // Library callers can supply a model directly, including its derived
+    // geometry. Check the exact envelope with the reader before touching the
+    // backing, so every successful initialization yields a readable volume.
+    Superblock::decode(&superblock.encode_metadata_version(metadata_version)?)?;
     // Serialize the empty-root checks with initialization and attach. The
     // guard remains live through the final directory sync: a lock file's
     // presence alone does not prevent another creator from publishing a

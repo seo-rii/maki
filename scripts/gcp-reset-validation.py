@@ -22,6 +22,13 @@ import subprocess
 import time
 import uuid
 
+try:
+    from campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                             handle_termination, ledger_block_pattern, save_json)
+except ModuleNotFoundError:
+    from scripts.campaign_io import (CURRENT_BLOCK_PATTERN, DiagnosticLog, block_digest, check_termination,
+                                     handle_termination, ledger_block_pattern, save_json)
+
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
 MAX_FRAME = 16384
@@ -36,22 +43,22 @@ def mode_for_cycle(cycle):
     return "flush" if cycle % 2 == 0 else "fua"
 
 
-def expected_records(cycle):
+def expected_records(cycle, token=None, pattern=CURRENT_BLOCK_PATTERN):
     mode_for_cycle(cycle)
+    prefix = "maki-gcp-reset-v1" if token is None else f"maki-gcp-reset-v2:{token}"
     records = []
     for index in range(16):
         offset = (index % 8) * (16 << 20) + (index // 8) * 4096
-        block = hashlib.sha256(f"maki-gcp-reset-v1:{cycle}:{index}".encode()).digest() * 128
         records.append({"offset": offset, "length": 4096,
-                        "sha256": hashlib.sha256(block).hexdigest()})
+                        "sha256": block_digest(f"{prefix}:{cycle}:{index}", pattern)})
     return records
 
 
-def expected_discard_manifest(cycle):
-    writes = expected_records(cycle)
-    rewrite_block = hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+def expected_discard_manifest(cycle, token=None, pattern=CURRENT_BLOCK_PATTERN):
+    writes = expected_records(cycle, token, pattern)
+    prefix = "maki-gcp-reset-v3-rewrite" if token is None else f"maki-gcp-reset-v3-rewrite:{token}"
     rewrite = {"offset": 0, "length": 4096,
-               "sha256": hashlib.sha256(rewrite_block).hexdigest()}
+               "sha256": block_digest(f"{prefix}:{cycle}", pattern)}
     final = [dict(row) for row in writes]
     final[0] = rewrite
     final[8] = {"offset": 4096, "length": 4096, "sha256": ZERO_SHA256}
@@ -85,10 +92,11 @@ def require_unique_boot(seen, current):
 def validate_ready(ready, expected_fs_uuid, profile="v2"):
     if (not isinstance(ready, dict) or ready.get("event") != "ready"
             or ready.get("provider") != "local-aes-gcm-siv"
-            or ready.get("can_flush") is not True or ready.get("can_fua") is not True):
+            or ready.get("can_flush") is not True or ready.get("can_fua") is not True
+            or ready.get("native_fua") is not True):
         raise ValueError("guest did not prove native provider FLUSH and FUA support")
-    if profile == "v3-discard" and ready.get("can_trim") is not True:
-        raise ValueError("guest did not prove native TRIM support")
+    if ready.get("can_trim") is not (profile == "v3-discard"):
+        raise ValueError("guest TRIM capability does not match the qualification profile")
     if (ready.get("witness_service") != "active"
             or ready.get("graceful_stop_witness") != "absent"):
         raise ValueError("graceful shutdown witness invalidated hard-reset evidence")
@@ -124,9 +132,12 @@ def validate_records(records, expected):
         raise ValueError("record manifest mismatch, missing, reordered, or duplicated")
 
 
-def validate_ack(event, cycle, profile="v2"):
+def validate_ack(event, cycle, profile="v2", token=None, *, pattern=CURRENT_BLOCK_PATTERN):
     if not isinstance(event, dict):
         raise ValueError("ACK must be an object")
+    if event.get("token") != token or (token is not None and (
+            not isinstance(token, str) or not re.fullmatch("[0-9a-f]{32}", token))):
+        raise ValueError("ACK campaign identity mismatch")
     validate_boot_id(event.get("boot_id"))
     command = f"discard-{cycle}" if profile == "v3-discard" else f"write-{cycle}"
     if (event.get("event") != "ack" or event.get("command") != command
@@ -134,17 +145,20 @@ def validate_ack(event, cycle, profile="v2"):
             or event.get("mode") != mode_for_cycle(cycle)):
         raise ValueError("false, incomplete, or unexpected durable ACK")
     if profile == "v3-discard":
-        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle):
+        if event.get("profile") != profile or event.get("manifest") != expected_discard_manifest(cycle, token, pattern):
             raise ValueError("discard manifest mismatch, missing, reordered, or duplicated")
     else:
-        validate_records(event.get("records"), expected_records(cycle))
+        validate_records(event.get("records"), expected_records(cycle, token, pattern))
 
 
-def record_ack(ledger, event, cycle, profile="v2"):
-    validate_ack(event, cycle, profile)
+def record_ack(ledger, event, cycle, profile="v2", *, token):
+    if token is None:
+        raise ValueError("new ACKs require a campaign token")
+    validate_ack(event, cycle, profile, token)
     keys = ("event", "command", "cycle", "mode", "boot_id", "profile", "manifest") \
         if profile == "v3-discard" else ("event", "command", "cycle", "mode", "boot_id", "records")
-    record = {key: event[key] for key in keys}
+    record = {key: event[key] for key in (*keys, "token")}
+    record["block_pattern"] = CURRENT_BLOCK_PATTERN
     descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
@@ -157,7 +171,7 @@ def record_ack(ledger, event, cycle, profile="v2"):
         os.close(parent)
 
 
-def load_ledger(ledger, profile="v2"):
+def load_ledger(ledger, profile="v2", *, token=None, require_current=False):
     if ledger.stat().st_size > (1 << 20):
         raise ValueError("oversized ACK ledger")
     raw = ledger.read_text(encoding="utf-8")
@@ -165,12 +179,17 @@ def load_ledger(ledger, profile="v2"):
         raise ValueError("empty or truncated ACK ledger")
     latest = None
     seen_boots = set()
+    pattern = CURRENT_BLOCK_PATTERN if require_current else None
     for cycle, line in enumerate(raw.splitlines()):
         try:
             event = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError("invalid ACK ledger") from error
-        validate_ack(event, cycle, profile)
+        # Older archived ledgers have neither a token nor run-specific payloads.
+        if cycle == 0 and token is None and isinstance(event, dict):
+            token = event.get("token")
+        pattern = ledger_block_pattern(event, pattern)
+        validate_ack(event, cycle, profile, token, pattern=pattern)
         require_unique_boot(seen_boots, event["boot_id"])
         latest = event
     return latest
@@ -180,16 +199,8 @@ def verify_readbacks(expected, actual):
     validate_records(actual, expected)
 
 
-def save_json(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def bounded_run(command, timeout):
+def bounded_run(command, timeout, *, include_stdout_on_error=False):
+    check_termination()
     stdout, stderr = bytearray(), bytearray()
     total = 0
     leader_exited = False
@@ -201,6 +212,7 @@ def bounded_run(command, timeout):
             selector.register(child.stdout, selectors.EVENT_READ, stdout)
             selector.register(child.stderr, selectors.EVENT_READ, stderr)
             while True:
+                check_termination()
                 if not leader_exited:
                     # Do not reap (including via poll/communicate) before the
                     # final group signal: the retained leader pins its PGID.
@@ -213,12 +225,12 @@ def bounded_run(command, timeout):
                         except ProcessLookupError:
                             pass
                         leader_exited = True
-                if leader_exited and not selector.get_map():
-                    break
                 remaining = until - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout,
                                                     output=bytes(stdout), stderr=bytes(stderr))
+                if leader_exited and not selector.get_map():
+                    break
                 for key, _ in selector.select(min(.05, remaining)):
                     chunk = os.read(key.fd, 65536)
                     if not chunk:
@@ -244,6 +256,8 @@ def bounded_run(command, timeout):
     result = subprocess.CompletedProcess(command, child.returncode, bytes(stdout), bytes(stderr))
     if result.returncode != 0:
         detail = result.stderr[-4096:].decode(errors="replace")
+        if include_stdout_on_error:
+            detail = f"stdout: {result.stdout[-4096:].decode(errors='replace')}\nstderr: {detail}"
         raise RuntimeError(f"gcloud exited {result.returncode}: {detail}")
     return result
 
@@ -300,17 +314,25 @@ def resource_identity(args, timeout):
     attachments = instance.get("disks")
     if not isinstance(attachments, list):
         raise ValueError("instance disk attachments missing")
-    matches = [attachment for attachment in attachments
-               if isinstance(attachment, dict) and attachment.get("boot") is False
-               and (attachment.get("deviceName") == args.data_disk
-                    or (isinstance(attachment.get("source"), str)
-                        and attachment["source"].rsplit("/", 1)[-1] == args.data_disk))]
+    matches = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or attachment.get("boot") is not False:
+            continue
+        try:
+            source = canonical_disk_reference(attachment.get("source"))
+        except ValueError:
+            # Local SSDs and regional disks do not have a zonal persistent-disk URL.
+            continue
+        if source == expected_disk:
+            matches.append(attachment)
     if len(matches) != 1:
         raise ValueError("expected one attached persistent data disk")
     attachment = matches[0]
-    attached_disk = canonical_disk_reference(attachment.get("source"))
-    if attached_disk != expected_disk:
-        raise ValueError("attached data disk does not match requested project, zone and name")
+    device_name = attachment.get("deviceName")
+    if sum(isinstance(other, dict) and other.get("deviceName") == device_name
+           for other in attachments) != 1:
+        raise ValueError("ambiguous attachment device name")
+    attached_disk = expected_disk
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("resource identity deadline")
@@ -370,10 +392,11 @@ def reset_and_wait(args, command, baseline):
     return result
 
 
-def ssh_command(args, token, cycle, verify_only):
+def ssh_command(args, token, cycle, verify_only, device_name):
     guest = ["sudo", "-n", getattr(args, "guest_python", "python3"), args.guest_agent,
              "--token", token, "--cycle", str(cycle), "--config", args.guest_config,
-             "--plugin", args.guest_plugin]
+             "--plugin", args.guest_plugin, "--device-name", device_name,
+             "--ready-timeout", str(args.timeout)]
     profile = getattr(args, "profile", "v2")
     if profile != "v2":
         guest.extend(["--profile", profile])
@@ -402,10 +425,14 @@ def offline_check_command(args):
 
 
 def run_offline_check(args, timeout):
-    result = bounded_run(offline_check_command(args), timeout)
+    result = bounded_run(offline_check_command(args), timeout, include_stdout_on_error=True)
     return {"returncode": result.returncode,
             "stdout": result.stdout.decode(errors="replace"),
             "stderr": result.stderr.decode(errors="replace")}
+
+
+class SSHClosedError(RuntimeError):
+    """The transport ended before the guest produced a complete event."""
 
 
 class RemoteProcess:
@@ -419,10 +446,12 @@ class RemoteProcess:
         os.chmod(directory / "stderr.log", 0o600)
         self.selector = selectors.DefaultSelector()
         self.child = None
+        self.diagnostics_reader = None
         try:
             self.child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                          stdout=subprocess.PIPE, stderr=self.stderr_log,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           start_new_session=True, bufsize=0)
+            self.diagnostics_reader = DiagnosticLog(self.child.stderr, self.stderr_log, MAX_OUTPUT)
             self.selector.register(self.child.stdout, selectors.EVENT_READ)
         except BaseException:
             self.close()
@@ -437,29 +466,39 @@ class RemoteProcess:
     def event(self, timeout):
         until = time.monotonic() + timeout
         while True:
+            check_termination()
             newline = self.buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self.buffer[:newline]).rstrip(b"\r")
                 del self.buffer[:newline + 1]
                 frame = decode_frame(line, self.token, self.cycle)
                 if frame is not None:
+                    if time.monotonic() >= until:
+                        raise TimeoutError("guest SSH event deadline")
                     return frame
                 continue
             if len(self.buffer) > MAX_FRAME:
                 raise ValueError("unterminated oversized SSH control line")
             remaining = until - time.monotonic()
-            if remaining <= 0 or not self.selector.select(remaining):
+            if remaining <= 0:
                 raise TimeoutError("guest SSH event deadline")
-            chunk = os.read(self.child.stdout.fileno(), 4096)
+            if not self.selector.select(min(0.1, remaining)):
+                continue
+            chunk = self._read_stdout()
             if not chunk:
                 status = self.poll()
-                raise RuntimeError(f"guest SSH closed before expected event: {status}")
+                raise SSHClosedError(f"guest SSH closed before expected event: {status}")
+            self.buffer.extend(chunk)
+
+    def _read_stdout(self):
+        chunk = os.read(self.child.stdout.fileno(), 4096)
+        if chunk:
             self.total += len(chunk)
             if self.total > MAX_OUTPUT:
                 raise ValueError("SSH output limit exceeded")
             self.stdout_log.write(chunk)
             self.stdout_log.flush()
-            self.buffer.extend(chunk)
+        return chunk
 
     def expect(self, event, timeout):
         frame = self.event(timeout)
@@ -479,7 +518,7 @@ class RemoteProcess:
 
     def wait_clean(self, timeout):
         try:
-            status = self._wait_owned(timeout)
+            status = self._wait_owned(timeout, drain_stdout=True)
         except subprocess.TimeoutExpired as error:
             self._kill_owned()
             raise TimeoutError("verification SSH did not exit") from error
@@ -496,15 +535,27 @@ class RemoteProcess:
             return None
         return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
 
-    def _wait_owned(self, timeout):
+    def _wait_owned(self, timeout, *, drain_stdout=False):
         until = time.monotonic() + timeout
-        while self.poll() is None:
+        while True:
+            check_termination()
+            status = self.poll()
             remaining = until - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(self.child.args, timeout)
-            time.sleep(min(.05, remaining))
-        self._kill_owned()
-        return self.child.returncode
+            if status is not None:
+                # Stop inherited writers before draining the final pipe contents.
+                self._kill_owned()
+            if drain_stdout:
+                wait = 0 if status is not None else min(.05, remaining)
+                if self.selector.select(wait):
+                    if self._read_stdout():
+                        continue
+                    drain_stdout = False
+            elif status is None:
+                time.sleep(min(.05, remaining))
+            if status is not None:
+                return self.child.returncode
 
     def _kill_owned(self):
         if self.child is not None and self.child.returncode is None:
@@ -521,7 +572,13 @@ class RemoteProcess:
             self.child.stdout.close()
         self.selector.close()
         self.stdout_log.close()
-        self.stderr_log.close()
+        try:
+            if self.diagnostics_reader is not None:
+                self.diagnostics_reader.finish()
+            elif self.child is not None:
+                self.child.stderr.close()
+        finally:
+            self.stderr_log.close()
 
 
 def cut_instance(args, process, baseline=None):
@@ -536,20 +593,23 @@ def cut_instance(args, process, baseline=None):
             "post_reset_status": None if running is None else running["status"]}
 
 
-def launch_guest(args, token, cycle, verify_only, output):
+def launch_guest(args, token, cycle, verify_only, output, device_name):
     until = time.monotonic() + args.timeout
     attempt = 0
     errors = []
     while True:
+        check_termination()
         remaining = until - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("instance did not accept a guest qualification SSH session: " + "; ".join(errors[-3:]))
-        process = RemoteProcess(ssh_command(args, token, cycle, verify_only),
+        process = RemoteProcess(ssh_command(args, token, cycle, verify_only, device_name),
                                 output / f"attempt-{attempt}", token, cycle)
         try:
-            ready = process.expect("ready", min(remaining, args.connect_timeout + 30))
+            # SSH enforces ConnectTimeout itself; recovery after connection can
+            # legitimately consume the remaining guest startup budget.
+            ready = process.expect("ready", max(0, until - time.monotonic()))
             return process, ready
-        except (RuntimeError, TimeoutError) as error:
+        except (SSHClosedError, TimeoutError) as error:
             errors.append(str(error))
             process.close()
             attempt += 1
@@ -574,34 +634,37 @@ def campaign(args):
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
     token = uuid.uuid4().hex
     ledger = args.output / "host-acks.jsonl"
-    baseline = resource_identity(args, args.timeout)
-    validate_resource_identity(baseline, baseline)
     result = {"passed": False, "fault_scope": "whole GCE instance reset",
               "instance": args.instance, "project": args.project, "zone": args.zone,
-              "data_disk": args.data_disk, "resource_identity": baseline,
+              "data_disk": args.data_disk, "resource_identity": None,
               "cycles": args.cycles, "profile": args.profile, "token": token, "boots": []}
     seen_boots = set()
     fs_uuid = None
     try:
+        baseline = resource_identity(args, args.timeout)
+        result["resource_identity"] = baseline
+        validate_resource_identity(baseline, baseline)
         for cycle in range(args.cycles + 1):
             verify_only = cycle == args.cycles
             entry = {"cycle": cycle, "verify_only": verify_only}
             result["boots"].append(entry)
             process, ready = launch_guest(args, token, cycle, verify_only,
-                                          args.output / f"cycle-{cycle}")
+                                          args.output / f"cycle-{cycle}", baseline["attachment_device_name"])
             try:
                 entry["ready"] = ready
                 current_boot = ready["boot_id"]
                 require_unique_boot(seen_boots, current_boot)
                 fs_uuid = validate_ready(ready, fs_uuid, args.profile)
+                if ready.get("data_device") != baseline["attachment_device_name"]:
+                    raise ValueError("guest backing device differs from GCE attachment")
                 current_resources = resource_identity(args, args.timeout)
                 validate_resource_identity(baseline, current_resources)
                 if cycle:
                     readback = process.expect("readback", args.timeout)
                     if readback.get("generation") != cycle - 1:
                         raise ValueError("guest read back the wrong generation")
-                    expected = (expected_discard_manifest(cycle - 1)["final"]
-                                if args.profile == "v3-discard" else expected_records(cycle - 1))
+                    expected = (expected_discard_manifest(cycle - 1, token)["final"]
+                                if args.profile == "v3-discard" else expected_records(cycle - 1, token))
                     actual = readback.get("manifest") if args.profile == "v3-discard" else readback.get("records")
                     verify_readbacks(expected, actual)
                     verified = process.expect("verified", args.timeout)
@@ -615,20 +678,21 @@ def campaign(args):
                     ack = process.expect("ack", args.timeout)
                     if ack["boot_id"] != current_boot:
                         raise ValueError("ACK boot identity changed")
-                    record_ack(ledger, ack, cycle, args.profile)
+                    record_ack(ledger, ack, cycle, args.profile, token=token)
                     entry["acked_units"] = 16
                     entry["mode"] = mode_for_cycle(cycle)
                     entry["reset_ssh_status"] = cut_instance(args, process, baseline)
             finally:
                 process.close()
             save_json(args.output / "results.json", result)
-        latest = load_ledger(ledger, args.profile)
+        latest = load_ledger(ledger, args.profile, token=token, require_current=True)
         if latest["cycle"] != args.cycles - 1:
             raise ValueError("ACK ledger did not cover every reset cycle")
         result["offline_deep_check"] = run_offline_check(args, args.timeout)
         final_resources = resource_identity(args, args.timeout)
         validate_resource_identity(baseline, final_resources)
         result["fs_uuid"] = fs_uuid
+        check_termination()
         result["passed"] = True
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -655,7 +719,9 @@ def main():
     parser.add_argument("--guest-config", default="/mnt/maki-data/config.toml")
     parser.add_argument("--guest-plugin", default="/opt/maki/libmaki_nbdkit.so")
     parser.add_argument("--guest-maki", default="/opt/maki/maki")
-    campaign(parser.parse_args())
+    args = parser.parse_args()
+    with handle_termination():
+        campaign(args)
 
 
 if __name__ == "__main__":

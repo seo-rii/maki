@@ -222,9 +222,10 @@ fn not_retry_safe(peers: Vec<(&str, Arc<dyn CryptoProvider>)>) -> EndpointSet {
 
 #[tokio::test]
 async fn a_refused_connection_fails_a_non_retry_safe_request_over_to_a_peer() {
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Keep the port bound without listening throughout the request.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let down = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
     let good = Peer::start(Mode::Serve).await;
     let set = not_retry_safe(vec![
         ("down", provider(&down, None)),

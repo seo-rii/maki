@@ -56,11 +56,11 @@ fn options() -> VolumeOptions {
 
 fn new_volume(backing: &Arc<CrashableBacking>) -> Volume {
     init::create_volume(backing.as_ref(), superblock()).unwrap();
-    Volume::recover(backing.clone() as Arc<dyn Backing>, options()).unwrap()
+    Volume::recover(backing.process(), options()).unwrap()
 }
 
 fn recover(backing: &Arc<CrashableBacking>) -> Result<Volume, RecoveryError> {
-    Volume::recover(backing.clone() as Arc<dyn Backing>, options())
+    Volume::recover(backing.process(), options())
 }
 
 fn ct(stamp: u8) -> Vec<u8> {
@@ -137,6 +137,44 @@ fn resumed_segment_is_durable_before_a_successor_is_opened() {
 
 // ---------- K-02: covered segments are reclaimed even by an idle checkpoint ----------
 
+#[test]
+fn journal_byte_total_tracks_partial_reclaim_and_recovery() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let mut vol = new_volume(&backing);
+    let segment_bytes = 48 + RECORDS_PER_SEGMENT * RECORD;
+    for i in 0..3 * RECORDS_PER_SEGMENT {
+        vol.write_ct(i, &ct(1), false).unwrap();
+    }
+    vol.flush().unwrap();
+    assert_eq!(vol.journal_total_bytes(), 3 * segment_bytes);
+
+    let second_segment = layout::journal_segment(1);
+    backing.set_fault_hook(Some(Arc::new(move |op| match op {
+        maki_test_support::crash_backing::FaultOp::Remove { path } if *path == second_segment => {
+            Some(std::io::Error::other("second unlink failed"))
+        }
+        _ => None,
+    })));
+    assert!(vol.checkpoint().is_err());
+    assert_eq!(vol.journal_total_bytes(), 2 * segment_bytes);
+    backing.set_fault_hook(None);
+    vol.checkpoint().unwrap();
+    assert_eq!(vol.journal_total_bytes(), segment_bytes);
+    drop(vol);
+
+    backing.crash_all_lost();
+    let mut reopened = recover(&backing).unwrap();
+    // Recovery carries the previously active, already covered segment as
+    // sealed; the first new write opens its successor.
+    assert_eq!(reopened.journal_sealed_segment_count(), 1);
+    assert_eq!(reopened.journal_total_bytes(), segment_bytes);
+    reopened.write_ct(0, &ct(2), true).unwrap();
+    assert_eq!(reopened.journal_total_bytes(), segment_bytes + 48 + RECORD);
+    reopened.checkpoint().unwrap();
+    assert_eq!(reopened.journal_total_bytes(), 48 + RECORD);
+}
+
 /// A checkpoint that advanced its state but failed to delete the covered
 /// segments (transient unlink error, or the deletions lost in a crash)
 /// used to leave them on disk forever: every later checkpoint took the
@@ -153,6 +191,7 @@ fn idle_checkpoint_reclaims_covered_segments_left_by_a_failed_deletion() {
     vol.flush().unwrap();
     let before = vol.journal_segment_count();
     assert!(before >= 3);
+    assert_eq!(vol.journal_covered_segment_count(), 0);
 
     let fp = failpoints::fail_n_times(
         "checkpoint.segment_delete",
@@ -169,8 +208,14 @@ fn idle_checkpoint_reclaims_covered_segments_left_by_a_failed_deletion() {
     );
     assert_eq!(vol.journal_segment_count(), before, "nothing reclaimed yet");
 
+    assert_eq!(
+        vol.journal_covered_segment_count(),
+        vol.journal_sealed_segment_count()
+    );
+
     // Nothing new is durable: the "idle" path must still reclaim.
     vol.checkpoint().unwrap();
+    assert_eq!(vol.journal_covered_segment_count(), 0);
     assert!(
         vol.journal_segment_count() <= 1,
         "covered segments still on disk: {}",
@@ -241,7 +286,8 @@ fn record_with_out_of_range_unit_is_corruption_not_replay() {
         sequence: 2,
         unit_index: DEVICE_UNITS, // one past the end
         payload: ct(9),
-    });
+    })
+    .unwrap();
     let f = backing.open(&seg, false).unwrap();
     f.write_at(48 + RECORD, &forged).unwrap();
     f.sync_data().unwrap();
@@ -263,7 +309,8 @@ fn record_with_oversized_payload_is_corruption_not_replay() {
         sequence: 2,
         unit_index: 1,
         payload: vec![7u8; 600], // max_ciphertext_size is 544
-    });
+    })
+    .unwrap();
     let f = backing.open(&seg, false).unwrap();
     f.write_at(48 + RECORD, &forged).unwrap();
     f.sync_data().unwrap();
@@ -310,6 +357,7 @@ fn partially_resurrected_covered_prefix_is_accepted() {
     let vol =
         recover(&backing).unwrap_or_else(|e| panic!("resurrected covered segment refused: {e:?}"));
     assert_eq!(vol.read_ct(5).unwrap().unwrap().1, ct(100));
+    assert_eq!(vol.journal_covered_segment_count(), 2);
     // The genuine gap case still fails: an uncovered segment missing.
     let _ = StdRng::seed_from_u64(0);
 }
@@ -321,7 +369,6 @@ mod wrong_size {
 
     use async_trait::async_trait;
 
-    use maki_backing::Backing;
     use maki_core::engine::{Engine, EngineOptions};
     use maki_core::error::CoreError;
     use maki_crypto::{
@@ -387,7 +434,7 @@ mod wrong_size {
             armed: std::sync::atomic::AtomicBool::new(false),
         });
         let engine = Engine::attach(
-            backing.clone() as Arc<dyn Backing>,
+            backing.process(),
             provider.clone(),
             EngineOptions {
                 volume: options(),

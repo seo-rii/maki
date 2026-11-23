@@ -49,9 +49,13 @@ pub struct Superblock {
 impl Superblock {
     pub fn encode(&self) -> Vec<u8> {
         self.encode_metadata_version(SUPERBLOCK_VERSION)
+            .expect("validated superblock strings")
     }
 
-    fn encode_metadata_version(&self, metadata_version: u32) -> Vec<u8> {
+    pub(crate) fn encode_metadata_version(
+        &self,
+        metadata_version: u32,
+    ) -> Result<Vec<u8>, FormatError> {
         let g = &self.geometry;
         let mut w = Writer::new();
         w.bytes(SUPERBLOCK_MAGIC)
@@ -69,16 +73,13 @@ impl Superblock {
             .u32(self.format_version)
             .u64(self.created_unix)
             .u64(0); // flags
-        w.string(&self.provider_type, MAX_STR)
-            .expect("validated provider_type");
-        w.string(&self.crypto_compatibility_id, MAX_STR)
-            .expect("validated compat id");
-        w.string(&self.key_identity, MAX_STR)
-            .expect("validated key identity");
+        w.string(&self.provider_type, MAX_STR)?;
+        w.string(&self.crypto_compatibility_id, MAX_STR)?;
+        w.string(&self.key_identity, MAX_STR)?;
         w.pad_to(SUPERBLOCK_SIZE - 4);
         let out = w.finish_with_crc();
         debug_assert_eq!(out.len(), SUPERBLOCK_SIZE);
-        out
+        Ok(out)
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
@@ -181,6 +182,7 @@ impl VolumeSuperblock {
         );
         self.superblock
             .encode_metadata_version(self.metadata_version)
+            .expect("validated superblock strings")
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
@@ -316,11 +318,22 @@ fn select_volume_copy(copies: &VolumeCopies) -> Result<usize, FormatError> {
 pub fn load_volume_superblock(
     backing: &dyn maki_backing::Backing,
 ) -> Result<VolumeSuperblock, FormatError> {
+    Ok(load_volume_superblock_with_fallback(backing)?.0)
+}
+
+/// Select the volume superblock and identify an invalid partner, if any.
+/// When both copies decode, the selected generation is the maximum on disk.
+pub fn load_volume_superblock_with_fallback(
+    backing: &dyn maki_backing::Backing,
+) -> Result<(VolumeSuperblock, Option<&'static str>), FormatError> {
     let mut copies = read_volume_copies(backing)?;
     let selected = select_volume_copy(&copies)?;
+    let invalid = copies[1 - selected]
+        .is_none()
+        .then_some(SUPERBLOCK_PATHS[1 - selected]);
     copies[selected]
         .take()
-        .map(|(record, _)| record)
+        .map(|(record, _)| (record, invalid))
         .ok_or_else(|| FormatError::Invalid("no valid superblock".into()))
 }
 

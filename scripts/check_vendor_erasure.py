@@ -75,6 +75,13 @@ def check(root: Path, metadata: dict) -> list[str]:
             locked = [p for p in lock["package"] if p["name"] == name]
             if len(locked) != 1 or locked[0]["version"] != record["version"] or locked[0].get("source"):
                 errors.append(f"{name}: lockfile bypasses the pinned patch")
+        vendor = root / "vendor"
+        fixture_directories = ("test-ca", "rustls/src/testdata", "fuzz/corpus/message",
+                               "rustls-provider-test/tests")
+        fixture_paths = {path.relative_to(vendor).as_posix() for directory in fixture_directories
+                         for path in (vendor / directory).rglob("*") if path.is_file()}
+        for rel in sorted(fixture_paths - fixtures["files"].keys()):
+            errors.append(f"rustls: public test fixture missing from provenance: {rel}")
         for rel, record in fixtures["files"].items():
             path = root / "vendor" / rel
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:

@@ -62,7 +62,9 @@ refuse missing or changed volume/configuration. They never format, run repair
 tools or silently create replacement data.
 
 After nbdkit's startup recovery, provider checks and control bind send READY,
-the guest connects through libnbd and requires FLUSH and native FUA capability.
+the guest connects through libnbd. The historical run checked the FLUSH and
+FUA wire capabilities, which allow both native and emulated FUA. Current runs
+also require the nbdkit connection log to report native FUA before guest READY.
 Each write cycle changes sixteen 4 KiB units, two addresses in each of eight
 logical shard ranges. Payloads differ by cycle and address. FLUSH cycles write
 all sixteen units before a successful FLUSH; FUA cycles require every individual
@@ -144,8 +146,9 @@ Completed launcher evidence:
 
 Reproduction needs an explicitly provisioned disposable Linux host with KVM,
 the pinned Firecracker/kernel, Python 3 and a prepared rootfs. The rootfs needs
-nbdkit, `libnbd.so.0`, Python 3, `mount`, `blkid`, the normal release CLI/plugin,
-an executable agent at `/opt/maki/firecracker-guest-agent.py`, and a disposable
+nbdkit with the log filter, `libnbd.so.0`, Python 3, `mount`, `blkid`, the normal release CLI/plugin,
+an executable agent at `/opt/maki/firecracker-guest-agent.py`, the matching
+`scripts/campaign_io.py` alongside the agent, and a disposable
 32-byte `/opt/maki/key`. Prepare `/proc`, `/sys`, `/dev`, `/run`, `/data` and the
 initial console/null/ttyS0 device nodes before making the rootfs read-only.
 Check binary/runtime compatibility. The separate data file must already be a

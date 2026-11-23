@@ -82,3 +82,30 @@ fn is_path_or_query_byte(byte: u8) -> bool {
                 | b'?'
         )
 }
+
+/// A gateway may route by endpoint path or query in addition to the RPC method.
+pub fn grpc_request_path(url: &str, method: &str) -> Result<http::uri::PathAndQuery, &'static str> {
+    check_grpc_method_path(method)?;
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|_| "has an invalid endpoint URL")?;
+    let (method, query) = method
+        .split_once('?')
+        .map_or((method, None), |(p, q)| (p, Some(q)));
+    let mut path = format!("{}{method}", uri.path().trim_end_matches('/'));
+    if let Some(base_query) = uri.query() {
+        path.push('?');
+        path.push_str(base_query);
+        if let Some(method_query) = query.filter(|q| !q.is_empty()) {
+            if !base_query.is_empty() {
+                path.push('&');
+            }
+            path.push_str(method_query);
+        }
+    } else if let Some(method_query) = query {
+        path.push('?');
+        path.push_str(method_query);
+    }
+    check_grpc_method_path(&path)?;
+    path.parse().map_err(|_| "cannot be sent as a request path")
+}

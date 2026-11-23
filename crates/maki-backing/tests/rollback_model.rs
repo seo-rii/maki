@@ -50,14 +50,10 @@ impl Image {
             return;
         }
         self.bytes[offset..end].fill(0);
-        let mut at = offset;
-        while at < end {
-            let count = (PAGE - at % PAGE).min(end - at);
-            if at.is_multiple_of(PAGE) && count == PAGE {
-                self.reserved.remove(&(at / PAGE));
-            }
-            at += count;
-        }
+        self.reserved.retain(|page| {
+            let start = *page * PAGE;
+            offset > start || offset + len < start + PAGE
+        });
     }
 }
 

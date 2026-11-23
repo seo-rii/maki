@@ -78,9 +78,10 @@ pub fn parse(text: &str) -> Result<AttachConfig, ConfigError> {
     })
 }
 
-pub fn load(path: &str) -> Result<AttachConfig, ConfigError> {
+pub fn load(path: impl AsRef<std::path::Path>) -> Result<AttachConfig, ConfigError> {
+    let path = path.as_ref();
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_string(),
+        path: path.display().to_string(),
         source,
     })?;
     parse(&text)
@@ -110,6 +111,82 @@ impl AttachConfig {
         require_uuid: bool,
     ) -> Result<AttachRequest, ConfigError> {
         check_volume_name(volume)?;
+        let request = self.into_existing_request(volume, overrides, require_uuid)?;
+        // The canonical absolute path check also accepts the filesystem root.
+        if request.nbd_socket == "/" {
+            return Err(ConfigError::Invalid(
+                "nbd_socket must end with a socket filename".into(),
+            ));
+        }
+        // These paths describe the Linux host even when rendering a plan elsewhere.
+        if path_at_or_below(&request.mountpoint, &request.nbd_socket) {
+            return Err(ConfigError::Invalid(
+                "mountpoint cannot be the nbd_socket path or a directory beneath it".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        check_mountpoint_path(&request.mountpoint)?;
+        let vg = &request.vg_name;
+        check_vg_device(vg, &request.nbd_device)?;
+        #[cfg(target_os = "linux")]
+        if std::fs::metadata(std::path::Path::new("/dev").join(vg))
+            .is_ok_and(|entry| !entry.is_dir())
+        {
+            return Err(ConfigError::Invalid(
+                "vg_name conflicts with a non-directory entry under /dev".into(),
+            ));
+        }
+        let lv = &request.lv_name;
+        // Device mapper reserves one of its 128 name bytes for NUL. LVM joins
+        // the VG and LV with a hyphen and doubles every hyphen in either name.
+        let mapper_name = format!("{}-{}", vg.replace('-', "--"), lv.replace('-', "--"));
+        if mapper_name.len() > 127 {
+            return Err(ConfigError::Invalid(
+                "vg_name and lv_name exceed the 127-byte device-mapper name limit".into(),
+            ));
+        }
+        // Both names refer to the LV once the VG is activated. A mount or
+        // socket at an ancestor can also hide or prevent creation of the LV.
+        for device in [
+            format!("/dev/{vg}/{lv}"),
+            format!("/dev/mapper/{mapper_name}"),
+        ] {
+            for (field, path) in [
+                ("mountpoint", &request.mountpoint),
+                ("nbd_socket", &request.nbd_socket),
+            ] {
+                if path_at_or_below(path, &device) || path_at_or_below(&device, path) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{field} conflicts with the logical volume device path"
+                    )));
+                }
+            }
+        }
+        // LVM reserves these names and fragments for its internal LVs.
+        if lv.starts_with("snapshot")
+            || lv.starts_with("pvmove")
+            || [
+                "_cdata", "_cmeta", "_corig", "_cpool", "_cvol", "_imeta", "_iorig", "_mimage",
+                "_mlog", "_pmspare", "_rimage", "_rmeta", "_tdata", "_tmeta", "_vdata", "_vorigin",
+                "_wcorig",
+            ]
+            .iter()
+            .any(|reserved| lv.contains(reserved))
+        {
+            return Err(ConfigError::Invalid("lv_name is reserved by LVM".into()));
+        }
+        Ok(request)
+    }
+
+    /// Resolve a lifecycle operation for an existing attachment. Keep older
+    /// instance aliases reachable until their trusted devices are detached.
+    pub fn into_existing_request(
+        self,
+        volume: &str,
+        overrides: AttachOverrides,
+        require_uuid: bool,
+    ) -> Result<AttachRequest, ConfigError> {
+        check_instance_name(volume)?;
         let nbd_device = overrides
             .nbd_device
             .or(self.nbd_device)
@@ -127,6 +204,12 @@ impl AttachConfig {
             .or(self.nbd_socket)
             .unwrap_or_else(|| format!("/run/maki/{volume}/nbd.sock"));
         check_abs_path("nbd_socket", &nbd_socket)?;
+        #[cfg(unix)]
+        if std::os::unix::net::SocketAddr::from_pathname(&nbd_socket).is_err() {
+            return Err(ConfigError::Invalid(
+                "nbd_socket is not a usable Unix socket pathname".into(),
+            ));
+        }
         let vg_name = overrides
             .vg_name
             .or(self.vg_name)
@@ -152,10 +235,18 @@ impl AttachConfig {
             ));
         }
         let device_block_size = self.device_block_size.unwrap_or(4096);
-        if device_block_size == 0 || !device_block_size.is_power_of_two() {
-            return Err(ConfigError::Invalid(
-                "device_block_size must be a power of two".into(),
-            ));
+        // Linux BLKBSZSET accepts powers of two from 512 through PAGE_SIZE.
+        #[cfg(target_os = "linux")]
+        let maximum_block_size = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
+        #[cfg(not(target_os = "linux"))]
+        let maximum_block_size = 65536;
+        if !(512..=maximum_block_size).contains(&device_block_size)
+            || !device_block_size.is_power_of_two()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "device_block_size must be a power of two between 512 and {maximum_block_size}"
+            )));
         }
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
             Some(uuid) => {
@@ -189,6 +280,22 @@ impl AttachConfig {
             init_sentinel: overrides.init_sentinel || self.init_sentinel,
         })
     }
+}
+
+// NBD and the VG directory both live directly under /dev on the target host.
+pub(crate) fn check_vg_device(vg_name: &str, nbd_device: &str) -> Result<(), ConfigError> {
+    if nbd_device.strip_prefix("/dev/") == Some(vg_name) {
+        return Err(ConfigError::Invalid(
+            "vg_name would use the nbd_device path as a directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+// These canonical paths use Linux separators on every plan-rendering host.
+fn path_at_or_below(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 fn normalize_lvm_identity(mut pins: LvmIdentityPins) -> Result<LvmIdentityPins, ConfigError> {
@@ -237,6 +344,66 @@ pub fn check_argument(name: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Existing components must be directories, as required by the mount step.
+/// Missing components inherit the nearest existing parent's name limit.
+#[cfg(target_os = "linux")]
+fn check_mountpoint_path(mountpoint: &str) -> Result<(), ConfigError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    let mut parent = PathBuf::from("/");
+    let mut limit = None;
+    for name in Path::new(mountpoint).components().skip(1) {
+        let directory = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| ConfigError::Invalid("invalid mountpoint".into()))?;
+        // SAFETY: directory is a valid, NUL-terminated path for this call.
+        let result = unsafe {
+            // A -1 result with errno unchanged means an indeterminate limit.
+            *libc::__errno_location() = 0;
+            libc::pathconf(directory.as_ptr(), libc::_PC_NAME_MAX)
+        };
+        if let Ok(current) = usize::try_from(result) {
+            limit = Some(current);
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            // Some filesystems do not specify a fixed maximum.
+            limit = None;
+        }
+        if limit.is_some_and(|max| name.as_os_str().as_bytes().len() > max) {
+            return Err(ConfigError::Invalid(
+                "mountpoint component exceeds the filesystem name length limit".into(),
+            ));
+        }
+        parent.push(name);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must not contain a symlink".into(),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(ConfigError::Invalid(
+                    "mountpoint path must contain only directories".into(),
+                ));
+            }
+            Ok(_) => {}
+            // The directory may be provisioned later, or the plan rendered by
+            // a user who cannot search this part of the path.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(e) => {
+                return Err(ConfigError::Invalid(format!(
+                    "cannot resolve mountpoint: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An absolute, canonical path: no relative segments, no repeated slashes.
 pub fn check_abs_path(name: &str, value: &str) -> Result<(), ConfigError> {
     check_argument(name, value)?;
@@ -264,6 +431,17 @@ pub fn check_abs_path(name: &str, value: &str) -> Result<(), ConfigError> {
 }
 
 pub fn check_volume_name(value: &str) -> Result<(), ConfigError> {
+    // Match the format's MAX_VOLUME_NAME_BYTES without coupling the privileged helper to it.
+    if value.len() > 64 {
+        return Err(ConfigError::Invalid(
+            "volume name must be at most 64 ASCII bytes".into(),
+        ));
+    }
+    check_instance_name(value)
+}
+
+/// Validate the syntax used for stored instance aliases and cleanup paths.
+pub fn check_instance_name(value: &str) -> Result<(), ConfigError> {
     check_argument("volume", value)?;
     if !value
         .chars()

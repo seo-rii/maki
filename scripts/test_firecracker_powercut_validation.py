@@ -1,5 +1,8 @@
 """Host-oracle and guest-barrier contracts, without KVM or device operations."""
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 import pathlib
 import subprocess
@@ -35,6 +38,52 @@ class HostContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity"):
             self.host.decode_frame(self.frame(event="ack"), "a" * 32, 2)
 
+    def test_wire_fua_requires_a_native_default_export_in_the_server_log(self):
+        guest = load("fc_fua", "firecracker-guest-agent.py")
+        cgroup = load("cgroup_fua", "cgroup-validation.py")
+        socket = self.path / "nbd.sock"
+        connections = self.path / "connections.log"
+        for client in (guest, cgroup):
+            for fields in ('Connect export="" fua=2', 'Connect export="" fua=1',
+                           'Connect export="" fua=20', 'Connect export="other" fua=2', ''):
+                with self.subTest(client=client.__name__, fields=fields):
+                    # cgroup reuses its daemon for multiple connections.
+                    stale = 'old connection=1 Connect export="" fua=2\n' if client is cgroup else ''
+                    connections.write_text(stale)
+                    library = mock.Mock()
+                    library.nbd_create.return_value = 1
+                    library.nbd_can_fua.return_value = library.nbd_can_flush.return_value = 1
+
+                    def negotiate(_handle, _address):
+                        with connections.open("a") as log:
+                            log.write(f"new connection=2 {fields}\n")
+                        return 0
+
+                    library.nbd_connect_unix.side_effect = negotiate
+                    with mock.patch.object(client.ctypes, "CDLL", return_value=library):
+                        if fields == 'Connect export="" fua=2':
+                            handle = client.Nbd(socket)
+                            handle.lib.nbd_close(handle.handle)
+                        else:
+                            with self.assertRaisesRegex((ValueError, AssertionError), "native FUA"):
+                                client.Nbd(socket)
+                    library.nbd_close.assert_called_once_with(1)
+
+    def test_guest_mount_failure_reaches_host_before_ready(self):
+        guest = load("fc_mount_failure", "firecracker-guest-agent.py")
+        agent = guest.Agent()
+        with mock.patch.object(guest, "mount_guest", side_effect=OSError("data mount failed")), \
+                contextlib.redirect_stdout(io.StringIO()) as console:
+            try:
+                agent.startup()
+            except OSError as error:
+                agent.failure(error)
+        process = self.host.SerialProcess.__new__(self.host.SerialProcess)
+        process.token, process.boot = "a" * 32, 0
+        process.buffer = bytearray(console.getvalue().encode())
+        with self.assertRaisesRegex(RuntimeError, "data mount failed"):
+            process.expect("ready", 120)
+
     def test_truncated_or_oversized_control_frames_are_rejected(self):
         for raw in (b"MAKI_FC_V1 {", b"MAKI_FC_V1 " + b"x" * 65536):
             with self.assertRaises(ValueError):
@@ -54,18 +103,60 @@ class HostContracts(unittest.TestCase):
                 self.host.record_ack(self.ledger, ack, 0)
             self.assertFalse(self.ledger.exists())
 
+    def test_previous_ledgers_remain_readable_only_as_historical_evidence(self):
+        archived = self.ack()
+        for index, row in enumerate(archived["records"]):
+            seed = f"maki-firecracker-v1:0:{index}".encode()
+            row["sha256"] = hashlib.sha256(hashlib.sha256(seed).digest() * 128).hexdigest()
+        self.ledger.write_text(json.dumps(archived) + "\n")
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=1), archived["records"])
+        with self.assertRaises(ValueError):
+            self.host.load_ledger(self.ledger, expected_cycles=1, require_current=True)
+        with self.assertRaises(ValueError):
+            self.host.record_ack(self.ledger, archived, 0)
+        self.host.record_ack(self.ledger, self.ack(1), 1)
+        with self.assertRaises(ValueError):
+            self.host.load_ledger(self.ledger, expected_cycles=2)
+
     def test_correct_ack_is_fsynced_and_latest_generation_is_loaded(self):
         with mock.patch.object(self.host.os, "fsync", wraps=self.host.os.fsync) as sync:
             self.host.record_ack(self.ledger, self.ack(), 0)
             self.assertGreaterEqual(sync.call_count, 1)
         self.host.record_ack(self.ledger, self.ack(1), 1)
-        self.assertEqual(self.host.load_ledger(self.ledger), self.host.expected_records(1))
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=2), self.host.expected_records(1))
+
+    def test_each_boot_rechecks_prior_acks_without_rehashing_their_blocks(self):
+        events = [self.ack(cycle) for cycle in range(4)]
+        with mock.patch.object(self.host, "block_digest", wraps=self.host.block_digest) as digest:
+            for cycle, event in enumerate(events):
+                self.host.record_ack(self.ledger, event, cycle)
+                self.assertEqual(self.host.load_ledger(self.ledger, cycle + 1, require_current=True),
+                                 event["records"])
+            self.assertEqual(digest.call_count, sum(len(event["records"]) for event in events))
+
+            lines = self.ledger.read_text().splitlines()
+            earliest = json.loads(lines[0])
+            earliest["records"][0]["sha256"] = "0" * 64
+            lines[0] = json.dumps(earliest)
+            self.ledger.write_text("\n".join(lines) + "\n")
+            with self.assertRaisesRegex(ValueError, "unexpected durable ACK"):
+                self.host.load_ledger(self.ledger, len(events), require_current=True)
 
     def test_empty_truncated_or_duplicate_ledger_cannot_qualify(self):
         for text in ("", "{", json.dumps(self.ack()) + "\n" + json.dumps(self.ack()) + "\n"):
             self.ledger.write_text(text)
             with self.assertRaises(ValueError):
-                self.host.load_ledger(self.ledger)
+                self.host.load_ledger(self.ledger, expected_cycles=2)
+
+    def test_each_verification_boot_requires_exactly_its_preceding_ack_rows(self):
+        self.host.record_ack(self.ledger, self.ack(0), 0)
+        with self.assertRaisesRegex(ValueError, "ACK.*count"):
+            self.host.load_ledger(self.ledger, expected_cycles=2)
+        self.host.record_ack(self.ledger, self.ack(1), 1)
+        with self.assertRaisesRegex(ValueError, "ACK.*count"):
+            self.host.load_ledger(self.ledger, expected_cycles=1)
+        self.assertEqual(self.host.load_ledger(self.ledger, expected_cycles=2),
+                         self.host.expected_records(1))
 
     def test_missing_wrong_or_duplicate_readback_is_failure(self):
         expected = self.host.expected_records(0)
@@ -78,9 +169,10 @@ class HostContracts(unittest.TestCase):
 
     def test_every_boot_uses_same_data_image_with_explicit_flush_semantics(self):
         args = types.SimpleNamespace(kernel=self.path / "kernel", rootfs=self.path / "root",
-                                     data=self.path / "data", vcpus=2, memory_mib=512)
+                                     data=self.path / "data", vcpus=2, memory_mib=512, timeout=450)
         for boot in (0, 1):
             config = self.host.make_config(args, boot, "a" * 32)
+            self.assertIn("maki_ready_timeout=450", config["boot-source"]["boot_args"])
             root, data = config["drives"]
             self.assertTrue(root["is_read_only"])
             self.assertFalse(data["is_read_only"])
@@ -128,11 +220,65 @@ class GuestContracts(unittest.TestCase):
                 self.guest.barrier(client, 0, mode)
 
     def test_pid1_children_use_an_explicit_system_path(self):
-        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
-        with mock.patch.object(self.guest.subprocess, "run", return_value=completed) as invoked:
-            self.guest.run(["blkid"])
-        environment = invoked.call_args.kwargs["env"]
-        self.assertEqual(environment["PATH"], "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        with mock.patch.dict("os.environ", PATH="/unknown"):
+            child_path = self.guest.run([sys.executable, "-c", "import os; print(os.environ['PATH'])"])
+        self.assertEqual(child_path, self.guest.SYSTEM_PATH)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux guest")
+    def test_guest_setup_limits_combined_output_before_child_exit(self):
+        gce = load("gce_setup", "gcp-reset-guest.py")
+        for run in (self.guest.run, gce.run_output):
+            for fd in (1, 2):
+                with self.subTest(run=run, fd=fd), self.assertRaisesRegex(ValueError, "output limit"):
+                    run([sys.executable, "-c",
+                         f"import os,time; os.write({fd}, b'x' * 65537); time.sleep(10)"], timeout=1)
+            with self.subTest(run=run):
+                exact = "import os; os.write(1, b'a'*32768); os.write(2, b'b'*32768)"
+                self.assertEqual(run([sys.executable, "-c", exact]), "a" * 32768)
+                with self.assertRaisesRegex(ValueError, "output limit"):
+                    run([sys.executable, "-c", exact + "; os.write(2, b'!')"])
+                with self.assertRaisesRegex(RuntimeError, "exited 9: diagnostic"):
+                    run([sys.executable, "-c", "import sys; print('diagnostic', file=sys.stderr); sys.exit(9)"])
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux guest")
+    def test_guest_setup_rejects_exit_observed_after_deadline(self):
+        gce = load("gce_deadline", "gcp-reset-guest.py")
+        shared = sys.modules[self.guest.guest_command_output.__module__]
+        clock = mock.Mock(wraps=shared.time)
+        command = """import os, sys, time
+os.close(1)
+os.close(2)
+until = time.monotonic() + 5
+while not os.path.exists(sys.argv[1]):
+    if time.monotonic() >= until:
+        sys.exit(1)
+    time.sleep(0.001)
+"""
+
+        def release_child():
+            # The first clock sample after EOF is still within budget. Only
+            # then can the child exit, and the next observation is too late.
+            release.touch()
+            clock.monotonic.side_effect = None
+            clock.monotonic.return_value = 2
+            return 0
+
+        class DelayedEOF(shared.selectors.DefaultSelector):
+            def unregister(self, fileobj):
+                key = super().unregister(fileobj)
+                if not self.get_map():
+                    clock.monotonic.side_effect = release_child
+                return key
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(shared, "time", clock), \
+                mock.patch.object(shared.selectors, "DefaultSelector", DelayedEOF):
+            for run in (self.guest.run, gce.run_output):
+                release = pathlib.Path(directory) / run.__name__
+                clock.monotonic.return_value = 0
+                with self.subTest(run=run), self.assertRaises(subprocess.TimeoutExpired):
+                    run([sys.executable, "-c", command, str(release)], timeout=1)
 
     def test_real_payload_manifest_matches_host_and_barrier_calls(self):
         for cycle, mode in ((0, "flush"), (1, "fua")):
@@ -142,6 +288,8 @@ class GuestContracts(unittest.TestCase):
             self.assertEqual(client.write.call_count, 16)
             for call in client.write.call_args_list:
                 self.assertEqual(call.kwargs["fua"], mode == "fua")
+                block = call.args[1]
+                self.assertNotEqual(block, block[512:] + block[:512])
             self.assertEqual(client.flush.call_count, int(mode == "flush"))
 
 

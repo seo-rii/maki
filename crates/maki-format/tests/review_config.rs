@@ -338,6 +338,17 @@ fn endpoint_ports_preserve_valid_ipv4_ipv6_and_default_ports() {
 }
 
 #[test]
+fn remote_http_rejects_invalid_hosts_at_volume_validation() {
+    for host in ["[127.0.0.1]", "[localhost]", "192.168.1.999", "host name"] {
+        let raw = base().replace("https://crypto.internal", &format!("https://{host}"));
+        assert!(err(&raw).contains("invalid host"), "{host}");
+    }
+    for host in ["crypto.internal", "127.0.0.1", "[2001:db8::1]"] {
+        ok(&base().replace("https://crypto.internal", &format!("https://{host}")));
+    }
+}
+
+#[test]
 fn endpoint_ports_reject_invalid_syntax_and_overflow() {
     for scheme in ["http", "https", "ws", "wss"] {
         for host in ["localhost", "127.0.0.1", "[::1]"] {
@@ -435,7 +446,7 @@ fn keyring_credential_source_is_refused() {
 fn http_batch_layout_requires_unit_echo() {
     let batch_without_echo = base().replace(
         "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.response]\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
-        "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.body]\nitems_path = \"/items\"\n[crypto.http.encrypt.body.item_fields]\n\"/data\" = { source = \"payload\", encoding = \"base64\" }\n[crypto.http.encrypt.response]\nitems_path = \"/items\"\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
+        "[crypto.http.encrypt]\npath = \"/encrypt\"\n[crypto.http.encrypt.body]\nitems_path = \"/items\"\n[crypto.http.encrypt.body.item_fields]\n\"/unit\" = { source = \"unit_index\" }\n\"/data\" = { source = \"payload\", encoding = \"base64\" }\n[crypto.http.encrypt.response]\nitems_path = \"/items\"\ndata_path = \"/ct\"\nencoding = \"base64\"\n",
     );
     let msg = err(&batch_without_echo);
     assert!(msg.contains("item_index_path"), "{msg}");
@@ -571,7 +582,7 @@ fn defaults_still_validate() {
 
 #[test]
 fn journal_hard_limit_must_leave_room_for_a_reclaim_and_the_largest_request() {
-    // 4 KiB units, 1 MiB requests: a request journals 257 records of
+    // 4 KiB units, 1 MiB aligned requests: a request journals 256 records of
     // 32 + 4384 bytes; two 1 MiB segments alone are not enough.
     let too_small = base().replace(
         "[backing]\nroot = \"/x\"\n",
@@ -724,6 +735,37 @@ fn control_and_nbd_sockets_must_differ() {
     parse(&local()).validate().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn socket_aliases_use_the_actual_parent_directory_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("other/sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("other/sub"), root.join("link")).unwrap();
+    let check = |control: &str, nbd: &str| {
+        let raw = format!(
+            "{}[control]\nsocket = {:?}\n[nbd]\nsocket = {:?}\n",
+            local(),
+            root.join(control),
+            root.join(nbd)
+        );
+        parse(&raw).validate()
+    };
+    // systemd creates per-volume runtime directories on first start. An
+    // alias of an existing ancestor already identifies the same future file.
+    let check_runtime_paths = || {
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/a.sock").is_err());
+        assert!(check("link/new/volume/a.sock", "other/sub/new/volume/b.sock").is_ok());
+    };
+    check_runtime_paths();
+    std::fs::create_dir_all(root.join("other/sub/new/volume")).unwrap();
+    check_runtime_paths();
+    assert!(check("other/sub/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "other/shared.sock").is_err());
+    assert!(check("link/../shared.sock", "shared.sock").is_ok());
+    assert!(check("link/a.sock", "other/sub/b.sock").is_ok());
+}
+
 // ---------- transport limits carry ciphertext (BUG-092) ----------
 
 /// The default 128-item batch of 4096-byte units is 512 KiB of plaintext but
@@ -859,5 +901,218 @@ fn websocket_and_grpc_timeouts_must_be_positive() {
             provider,
             &format!("{section}\ntimeout = \"1s\""),
         ));
+    }
+}
+
+#[test]
+fn unix_socket_paths_must_end_in_a_filename() {
+    for section in ["nbd", "control"] {
+        for (path, valid) in [
+            ("/run/demo.sock", true),
+            ("/run/./demo.sock", true),
+            ("/", false),
+            ("/run/demo.sock/", false),
+            ("/run/demo.sock/.", false),
+            ("/run/demo.sock/..", false),
+        ] {
+            let cfg = parse(&format!("{}[{section}]\nsocket = {path:?}\n", local()));
+            assert_eq!(cfg.validate().is_ok(), valid, "{section}: {path}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unix_socket_path_lengths_are_checked_in_bytes() {
+    for section in ["nbd", "control"] {
+        for (suffix, valid) in [("", true), ("x", false)] {
+            let path = format!("/{}{suffix}", "é".repeat(53));
+            let cfg = parse(&format!("{}[{section}]\nsocket = {path:?}\n", local()));
+            assert_eq!(cfg.validate().is_ok(), valid, "{section}: {path}");
+        }
+    }
+}
+
+#[test]
+fn filesystem_paths_and_control_group_must_be_representable_by_the_os() {
+    let mut config = parse(&local());
+    config.backing.root = "/var/lib/ma\0ki".into();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("backing.root"));
+    config.backing.root = "/var/lib/maki".into();
+    config.control.group = Some("maki\0group".into());
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("control.group"));
+    config.control.group = Some("maki-admin".into());
+    config.validate().unwrap();
+}
+
+#[test]
+fn socket_filenames_cannot_be_backing_objects_or_socket_parent_directories() {
+    let mut config = parse(&local());
+    config.backing.root = "/runtime-checks/volume".into();
+    for conflicting in [
+        "/runtime-checks",
+        "/runtime-checks/volume",
+        "/runtime-checks/volume/superblock.a",
+        "/runtime-checks/volume/volume.lock/child",
+        "/runtime-checks/volume/data",
+        "/runtime-checks/volume/checkpoint/state.a",
+        "/runtime-checks/volume/data/shard-0000002a.alloc.b",
+        "/runtime-checks/volume/journal/seg-0000000000000001/nested",
+    ] {
+        config.control.socket = Some(conflicting.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+        config.control.socket = None;
+        config.nbd.socket = Some(conflicting.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+        config.nbd.socket = None;
+    }
+    config.control.socket = Some("/runtime-checks/volume/data/custom.sock".into());
+    config.nbd.socket = Some("/runtime-checks/volume-old/socket".into());
+    config.validate().unwrap();
+    for (parent, child) in [
+        ("/run/example.sock", "/run/example.sock/nested"),
+        ("/run/example.sock/nested", "/run/example.sock"),
+    ] {
+        config.control.socket = Some(parent.into());
+        config.nbd.socket = Some(child.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+    }
+}
+
+#[test]
+fn rollback_sockets_are_compared_to_the_physical_layout() {
+    let source = format!("{}[backing.rollback_protection]\nwitness_root = \"/other-witness\"\ncapacity = \"64MiB\"\n", local());
+    let mut config = parse(&source);
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    config.backing.root = "/runtime-checks/volume".into();
+    config.validate().unwrap();
+    for file in [
+        "rollback.format",
+        "rollback.arena",
+        "rollback.manifest.0",
+        "rollback.manifest.1",
+        "rollback.lock",
+    ] {
+        config.control.socket = Some(format!("/runtime-checks/volume/{file}"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+    }
+    config.control.socket = Some("/runtime-checks/volume/data/custom.sock".into());
+    config.validate().unwrap();
+}
+
+#[test]
+fn local_witness_directory_and_anchor_files_cannot_be_socket_paths() {
+    let mut config = parse(&format!("{}[backing.rollback_protection]\nwitness_root = \"/witness-store/volume\"\ncapacity = \"64MiB\"\n", local()));
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    for path in [
+        "/witness-store",
+        "/witness-store/volume",
+        "/witness-store/volume/anchor",
+        "/witness-store/volume/anchor.next",
+        "/witness-store/volume/witness.lock/child.sock",
+    ] {
+        config.control.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control.socket"));
+        config.control.socket = None;
+        config.nbd.socket = Some(path.into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nbd.socket"));
+        config.nbd.socket = None;
+    }
+    config.control.socket = Some("/witness-store/volume/anchor.sock".into());
+    config.nbd.socket = Some("/witness-store/volume-old/anchor".into());
+    config.validate().unwrap();
+}
+
+#[test]
+fn local_file_keys_require_a_filename_independent_of_the_runtime_layout() {
+    for provider in ["local-aes-gcm-siv", "local-aes-xts"] {
+        let raw = local().replace("local-aes-gcm-siv", provider);
+        let mut config = parse(&raw);
+        config.backing.root = "/runtime-checks/volume".into();
+        config.control.socket = Some("/runtime-checks/control.sock".into());
+        config.nbd.socket = Some("/runtime-checks/nbd.sock".into());
+        config.crypto.key.as_mut().unwrap().source = "file".into();
+        for path in [
+            "/runtime-checks",
+            "/runtime-checks/volume",
+            "/runtime-checks/volume/superblock.a",
+            "/runtime-checks/volume/superblock.a/key",
+            "/runtime-checks/volume/checkpoint/state.a",
+            "/runtime-checks/volume/data/shard-0000002a.alloc.b",
+            "/runtime-checks/control.sock/key",
+            "/runtime-checks/nbd.sock",
+        ] {
+            config.crypto.key.as_mut().unwrap().name = path.into();
+            let error = config.validate().expect_err(path).to_string();
+            assert!(
+                error.contains("crypto.key") && !error.contains(path),
+                "{error}"
+            );
+        }
+        for path in [
+            "/runtime-checks/volume/data/custom.key",
+            "/runtime-checks/volume-old/key",
+        ] {
+            config.crypto.key.as_mut().unwrap().name = path.into();
+            config.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn rollback_file_keys_use_the_physical_backing_and_witness_layouts() {
+    let mut config = parse(&format!("{}[backing.rollback_protection]\nwitness_root = \"/runtime-witness/volume\"\ncapacity = \"64MiB\"\n", local()));
+    config.backing.checkpoint_reserve_bytes.0 = 64 << 10;
+    config.backing.journal_emergency_reserve_bytes.0 = 64 << 10;
+    config.crypto.key.as_mut().unwrap().source = "file".into();
+    for path in [
+        "/x/rollback.arena",
+        "/runtime-witness",
+        "/runtime-witness/volume/anchor.next/key",
+    ] {
+        config.crypto.key.as_mut().unwrap().name = path.into();
+        assert!(config
+            .validate()
+            .expect_err(path)
+            .to_string()
+            .contains("crypto.key"));
+    }
+    for path in ["/x/superblock.a", "/runtime-witness/volume/anchor.key"] {
+        config.crypto.key.as_mut().unwrap().name = path.into();
+        config.validate().unwrap();
     }
 }

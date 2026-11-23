@@ -11,6 +11,23 @@ fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 #[test]
+fn partial_overwrite_preserves_mapped_edges_and_zeroes_sparse_edges() {
+    const PAGE: usize = 4096;
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 8 * PAGE as u64).unwrap();
+    let file = backing.open("data", true).unwrap();
+    file.write_at(0, &[0x41; 2 * PAGE]).unwrap();
+    file.set_len(3 * PAGE as u64).unwrap();
+    file.sync_data().unwrap();
+    file.write_at(1, &[0x42; 2 * PAGE]).unwrap();
+    let mut bytes = vec![0; 3 * PAGE];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes[0], 0x41);
+    assert!(bytes[1..=2 * PAGE].iter().all(|b| *b == 0x42));
+    assert!(bytes[2 * PAGE + 1..].iter().all(|b| *b == 0));
+}
+
+#[test]
 fn only_explicitly_synced_data_and_names_survive() {
     let (root, witness) = dirs();
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
@@ -157,4 +174,111 @@ fn witness_must_be_independent_and_existing_authority_is_never_reenrolled() {
     let absent = witness.path().join("absent");
     assert!(RollbackBacking::open(root.path(), &absent).is_err());
     assert!(!absent.exists());
+}
+
+#[test]
+fn full_page_punch_releases_a_short_final_page_only_after_sync() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    let file = backing.open("short", true).unwrap();
+    file.write_at(0, b"x").unwrap();
+    file.sync_data().unwrap();
+    file.read_at(u64::MAX, &mut []).unwrap();
+    assert_eq!(
+        file.read_at(1, &mut [0]).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+
+    // A partial punch preserves its reservation even if all visible bytes are zero.
+    file.punch_hole(0, 1).unwrap();
+    file.sync_data().unwrap();
+    assert_eq!(backing.free_bytes().unwrap(), Some(0));
+    file.punch_hole(0, 4096).unwrap();
+    assert_eq!(backing.free_bytes().unwrap(), Some(0));
+    file.sync_data().unwrap();
+    assert_eq!(file.len().unwrap(), 1);
+    let mut byte = [1];
+    file.read_at(0, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    assert_eq!(backing.free_bytes().unwrap(), Some(4096));
+    backing
+        .open("next", true)
+        .unwrap()
+        .allocate_range(0, 1)
+        .unwrap();
+}
+
+#[test]
+fn sparse_punch_visits_reservations_including_unwritten_pages() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 3 * 4096).unwrap();
+    let file = backing.open("sparse", true).unwrap();
+    let far = 1 << 30;
+    file.write_at(0, &[5, 6]).unwrap();
+    file.allocate_range(far / 2, 4096).unwrap();
+    file.write_at(far, &[7, 8]).unwrap();
+    file.sync_data().unwrap();
+    file.punch_hole(1, far).unwrap();
+    file.sync_data().unwrap();
+    let mut bytes = [0; 2];
+    file.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, [5, 0]);
+    file.read_at(far, &mut bytes).unwrap();
+    assert_eq!(bytes, [0, 8]);
+    assert_eq!(backing.free_bytes().unwrap(), Some(4096));
+}
+
+#[test]
+fn locking_requires_and_creates_a_file_in_the_rollback_namespace() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    assert_eq!(
+        backing.try_lock("sub/lock").err().unwrap().kind(),
+        io::ErrorKind::NotFound
+    );
+    backing.create_dir_all("sub").unwrap();
+    assert_eq!(
+        backing.try_lock("sub").err().unwrap().kind(),
+        io::ErrorKind::IsADirectory
+    );
+    let lock = backing.try_lock("sub/lock").unwrap();
+    assert_eq!(backing.list("sub").unwrap(), ["lock"]);
+    assert_eq!(backing.open("sub/lock", false).unwrap().len().unwrap(), 0);
+    assert_eq!(
+        backing.try_lock("sub/lock").err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(lock);
+    backing.try_lock("sub/lock").unwrap();
+}
+
+#[test]
+fn namespace_lookups_distinguish_files_from_missing_ancestors() {
+    let (root, witness) = dirs();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
+    backing.create_dir_all("dir").unwrap();
+    backing.open("dir/file", true).unwrap();
+    assert_eq!(
+        backing.list("dir/file").unwrap_err().kind(),
+        io::ErrorKind::NotADirectory
+    );
+    for path in ["dir/file/child", "dir/file/missing/child"] {
+        for error in [
+            backing.exists(path).unwrap_err(),
+            backing.list(path).unwrap_err(),
+            backing.open(path, false).err().unwrap(),
+            backing.open(path, true).err().unwrap(),
+            backing.remove(path).unwrap_err(),
+            backing.rename(path, "dir/target").unwrap_err(),
+            backing.create_dir_all(path).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{path}");
+        }
+    }
+    assert!(!backing.exists("dir/missing/child").unwrap());
+    assert_eq!(
+        backing.list("dir/missing/child").unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(backing.exists("dir/file").unwrap());
 }

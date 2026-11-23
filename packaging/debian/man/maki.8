@@ -1,0 +1,39 @@
+.TH MAKI 8
+.SH NAME
+maki \- administer Maki encrypted block volumes
+.SH SYNOPSIS
+.B maki volume
+.I action config.toml
+.RI [ arguments ]
+.br
+.B maki check
+.I config.toml
+.RB [ \-\-deep ]
+.br
+.B maki
+.I control-command config.toml
+.RI [ options ]
+.SH DESCRIPTION
+.B volume create
+initializes the backing described by the configuration.
+.B volume inspect
+reports the stored volume metadata.
+Pass
+.B \-\-discard
+at creation to select the discard-capable format.
+.B check
+performs an offline check. Detach the volume before a deep check.
+.PP
+An attached daemon exposes the
+.BR status ", " metrics ", " checkpoint ", " drain " and " reload
+control commands. Use a volume configuration or specify the control endpoint
+with
+.BI \-\-socket " path" .
+Draining closes I/O admission and checkpoints the volume.
+.PP
+Run
+.B maki \-\-help
+for the full command list and remote-volume operations.
+.SH SEE ALSO
+.BR maki-attach (8),
+.BR maki-check (8)

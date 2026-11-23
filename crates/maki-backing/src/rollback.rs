@@ -34,6 +34,8 @@ const MAX_CAPACITY: u64 = 1 << 30;
 const MAX_ENTRIES: usize = 4096;
 const MARKER: &str = "rollback.format";
 const MAGIC: &[u8] = b"MAKI-WITNESS-COW-V1\n";
+const LOCK: &str = "rollback.lock";
+const ENROLL_LOCK: &str = "remote.enroll.lock";
 const ARENA: &str = "rollback.arena";
 const MANIFESTS: [&str; 2] = ["rollback.manifest.0", "rollback.manifest.1"];
 
@@ -69,14 +71,14 @@ fn page_digest(identity: &[u8; 16], bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageRef {
     slot: u64,
     hash: [u8; 32],
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Node {
     len: u64,
@@ -104,6 +106,13 @@ struct Manifest {
 }
 
 impl Manifest {
+    fn reserved_pages(&self) -> u64 {
+        self.files
+            .values()
+            .map(|file| file.reserved.len() as u64)
+            .sum()
+    }
+
     fn encode(&self) -> io::Result<Vec<u8>> {
         let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
         if bytes.len() as u64 + 8 > manifest_bound(self.capacity) {
@@ -199,11 +208,19 @@ struct State {
     _disk_lock: Box<dyn VolumeLock>,
     committed: Manifest,
     manifest_slot: usize,
+    // Every working reservation is published before reserve() returns. A
+    // shrink/punch only releases committed capacity after its own sync.
+    reserved_pages: u64,
     entries: BTreeMap<String, Entry>,
     files: BTreeMap<u64, Node>,
+    // Only these working nodes can differ from an existing committed node.
+    possibly_dirty: BTreeSet<u64>,
     handles: BTreeMap<u64, usize>,
+    // Identities with neither a working nor a committed name. They become
+    // reclaimable at last close. Unlink or replacement can invalidate this set.
+    unlinked_files: Option<BTreeSet<u64>>,
     next_id: u64,
-    locks: BTreeSet<String>,
+    locks: BTreeSet<u64>,
     poisoned: bool,
     /// Arena slots the committed manifest references; recomputed only when
     /// a commit succeeds.
@@ -250,6 +267,19 @@ fn independent_paths(root: &Path, witness: &Path) -> io::Result<()> {
 }
 
 impl RollbackBacking {
+    /// Physical root entries occupied by a local or remote rollback backing.
+    /// The inner volume layout lives in the arena and owns no host pathnames.
+    pub fn owns_host_entry(name: &str, remote: bool) -> bool {
+        if remote {
+            matches!(
+                name,
+                MARKER | ENROLL_LOCK | gc::OPERATION_LOCK | enrollment::FILE
+            ) || gc::namespace_fence(name.strip_prefix(gc::TOMBSTONE).unwrap_or(name)).is_some()
+        } else {
+            matches!(name, MARKER | ARENA | LOCK) || MANIFESTS.contains(&name)
+        }
+    }
+
     /// The immutable logical-page capacity in the authenticated manifest.
     /// A revoked or uncertain session cannot supply usable format geometry.
     pub fn capacity(&self) -> io::Result<u64> {
@@ -272,10 +302,8 @@ impl RollbackBacking {
         // Creation of directories is authorized only on this explicit path.
         let witness_dir = FileBacking::new(witness)?;
         independent_paths(root, witness)?;
-        let disk_lock = disk.try_lock("rollback.lock")?;
-        if disk.list("")?.iter().any(|name| name != "rollback.lock")
-            || !witness_dir.list("")?.is_empty()
-        {
+        let disk_lock = disk.try_lock(LOCK)?;
+        if disk.list("")?.iter().any(|name| name != LOCK) || !witness_dir.list("")?.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "rollback enrollment requires empty backing and witness directories",
@@ -316,7 +344,7 @@ impl RollbackBacking {
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
-        let disk_lock = disk.try_lock("rollback.lock")?;
+        let disk_lock = disk.try_lock(LOCK)?;
         let marker = disk.open(MARKER, false)?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {
@@ -476,6 +504,7 @@ impl RollbackBacking {
         Self {
             state: Arc::new(Mutex::new(State {
                 committed_slots: slots_of(manifest.files.values()),
+                reserved_pages: manifest.reserved_pages(),
                 used_slots: None,
                 free_hint: 0,
                 entries: manifest.entries.clone(),
@@ -487,12 +516,37 @@ impl RollbackBacking {
                 arena,
                 witness,
                 _disk_lock: disk_lock,
+                possibly_dirty: BTreeSet::new(),
                 handles: BTreeMap::new(),
+                unlinked_files: None,
                 locks: BTreeSet::new(),
                 poisoned: false,
             })),
         }
     }
+
+    fn retain_file(&self, state: &mut State, id: u64) -> CowFile {
+        *state.handles.entry(id).or_default() += 1;
+        CowFile {
+            state: self.state.clone(),
+            id,
+        }
+    }
+}
+
+fn directory_entries<'a>(
+    entries: &'a BTreeMap<String, Entry>,
+    dir: &str,
+) -> impl Iterator<Item = (&'a str, &'a Entry)> {
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    entries
+        .range(prefix.clone()..)
+        .map_while(move |(name, entry)| name.strip_prefix(&prefix).map(|child| (child, entry)))
+        .filter(|(child, _)| !child.contains('/'))
 }
 
 fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -> io::Result<()> {
@@ -538,12 +592,55 @@ impl State {
 
     fn directory(&self, name: &str) -> io::Result<()> {
         if name.is_empty() || self.entries.get(name) == Some(&Entry::Directory) {
-            Ok(())
-        } else {
-            Err(missing())
+            return Ok(());
         }
+        let mut path = name;
+        while !path.is_empty() {
+            match self.entries.get(path) {
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        path.to_owned(),
+                    ))
+                }
+                Some(Entry::Directory) => break,
+                None => path = path::parent(path),
+            }
+        }
+        Err(missing())
     }
 
+    fn open_file(&mut self, name: &str, create: bool) -> io::Result<u64> {
+        self.directory(path::parent(name))?;
+        let id = match self.entries.get(name) {
+            Some(Entry::File(id)) => *id,
+            Some(Entry::Directory) => {
+                return Err(io::Error::new(io::ErrorKind::IsADirectory, name))
+            }
+            None if create => {
+                if self.entries.len() >= MAX_ENTRIES {
+                    return Err(no_space());
+                }
+                if self.files.len() >= MAX_ENTRIES {
+                    self.reclaim_closed_files()?;
+                }
+                if self.files.len() >= MAX_ENTRIES {
+                    return Err(no_space());
+                }
+                let id = self.next_id;
+                self.next_id = id
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("file identity exhausted"))?;
+                self.files.insert(id, Node::default());
+                self.entries.insert(name.to_owned(), Entry::File(id));
+                id
+            }
+            None => return Err(missing()),
+        };
+        Ok(id)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     fn coordinates(&self) -> BTreeSet<(u64, u64)> {
         self.committed
             .files
@@ -554,24 +651,16 @@ impl State {
     }
 
     fn reclaim_closed_files(&mut self) -> io::Result<()> {
-        let mut retained: BTreeSet<u64> = self
-            .committed
-            .entries
-            .values()
-            .chain(self.entries.values())
-            .filter_map(|entry| match entry {
-                Entry::File(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        retained.extend(self.handles.keys());
-        if self
-            .committed
-            .files
-            .keys()
-            .chain(self.files.keys())
-            .any(|id| !retained.contains(id))
-        {
+        let unlinked = self.unlinked_files.get_or_insert_with(|| {
+            let mut ids: BTreeSet<_> = self.files.keys().copied().collect();
+            for entry in self.committed.entries.values().chain(self.entries.values()) {
+                if let Entry::File(id) = entry {
+                    ids.remove(id);
+                }
+            }
+            ids
+        });
+        if unlinked.iter().any(|id| !self.handles.contains_key(id)) {
             // Last-close cannot report commit errors. Defer reclamation until
             // the next space query, reservation or identity-limited creation,
             // where errors can propagate.
@@ -600,7 +689,13 @@ impl State {
                 _ => None,
             })
             .collect();
-        retain.extend(self.handles.keys());
+        let mut unlinked = BTreeSet::new();
+        for id in self.handles.keys() {
+            if retain.insert(*id) {
+                // Only this handle keeps the identity in the new manifest.
+                unlinked.insert(*id);
+            }
+        }
         candidate.files.retain(|id, _| retain.contains(id));
         candidate.validate()?;
         let bytes = candidate.encode()?;
@@ -618,9 +713,12 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.unlinked_files = Some(unlinked);
+        self.reserved_pages = candidate.reserved_pages();
         self.committed = candidate;
         self.manifest_slot = slot;
         self.files.retain(|id, _| retain.contains(id));
+        self.possibly_dirty.retain(|id| retain.contains(id));
         self.committed_slots = slots_of(self.committed.files.values());
         self.used_slots = None;
         Ok(())
@@ -647,21 +745,24 @@ impl State {
         };
         if covered(self.committed.files.get(&id)) && covered(self.files.get(&id)) {
             let node = self.files.get_mut(&id).ok_or_else(missing)?;
-            node.len = node.len.max(end);
+            if node.len < end {
+                node.len = end;
+                self.possibly_dirty.insert(id);
+            }
             return Ok(());
         }
         self.reclaim_closed_files()?;
-        let mut coordinates = self.coordinates();
-        coordinates.extend(range.clone().map(|index| (id, index)));
-        if coordinates.len() as u64 > self.committed.capacity / PAGE {
+        let durable = self.committed.files.get(&id);
+        let additional = range
+            .clone()
+            .filter(|index| !durable.is_some_and(|file| file.reserved.contains(index)))
+            .count() as u64;
+        if additional > self.committed.capacity / PAGE - self.reserved_pages {
             return Err(no_space());
         }
-        let mut candidate = self.committed.clone();
-        let durable = candidate.files.entry(id).or_default();
-        let changed = range
-            .clone()
-            .any(|index| !durable.reserved.contains(&index));
-        if changed {
+        if additional != 0 {
+            let mut candidate = self.committed.clone();
+            let durable = candidate.files.entry(id).or_default();
             durable.reserved.extend(range.clone());
             // Allocation itself may persist EOF, but never unsynced bytes.
             durable.len = durable.len.max(end);
@@ -670,6 +771,7 @@ impl State {
         let node = self.files.get_mut(&id).ok_or_else(missing)?;
         node.reserved.extend(range);
         node.len = node.len.max(end);
+        self.possibly_dirty.insert(id);
         Ok(())
     }
 
@@ -687,28 +789,31 @@ impl State {
     fn page(&mut self, page: Option<PageRef>) -> io::Result<Vec<u8>> {
         let mut bytes = vec![0; PAGE as usize];
         if let Some(page) = page {
-            if let Err(error) = self.arena.read_at(page.slot * PAGE, &mut bytes) {
-                // No mutation or uncertain commit happened here. An ordinary
-                // I/O failure refuses this operation; the next one checks the
-                // witness and authenticates the page again. Missing, short or
-                // invalid referenced evidence still stops every handle, even
-                // if the original bytes are later restored.
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::InvalidData
-                ) {
-                    self.poisoned = true;
-                }
-                return Err(error);
-            }
-            if page_digest(&self.committed.identity, &bytes) != page.hash {
-                self.poisoned = true;
-                return Err(invalid("rollback arena page authentication failed"));
-            }
+            self.read_page(&page, &mut bytes)?;
         }
         Ok(bytes)
+    }
+
+    fn read_page(&mut self, page: &PageRef, bytes: &mut [u8]) -> io::Result<()> {
+        if let Err(error) = self.arena.read_at(page.slot * PAGE, bytes) {
+            // No mutation or uncertain commit happened here. An ordinary
+            // I/O failure refuses this operation; the next one checks the
+            // witness and authenticates the page again. Missing, short or
+            // invalid referenced evidence still stops every handle, even
+            // if the original bytes are later restored.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        if page_digest(&self.committed.identity, bytes) != page.hash {
+            self.poisoned = true;
+            return Err(invalid("rollback arena page authentication failed"));
+        }
+        Ok(())
     }
 
     /// A slot neither the committed manifest nor the working view uses.
@@ -742,6 +847,7 @@ impl State {
             self.poisoned = true;
             return Err(error);
         }
+        self.possibly_dirty.insert(id);
         self.files.get_mut(&id).ok_or_else(missing)?.pages.insert(
             index,
             PageRef {
@@ -774,6 +880,9 @@ impl BackingFile for CowFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
         let len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(buf.len() as u64)
@@ -784,10 +893,28 @@ impl BackingFile for CowFile {
                 "read beyond rollback file",
             ));
         }
+        // Authenticate into private scratch before exposing any bytes from
+        // this page. A hole-only read never needs to allocate it.
+        let mut bytes = Vec::new();
         let mut at = offset;
         while at < end {
-            let page = state.page_ref(self.id, at / PAGE)?;
-            let bytes = state.page(page)?;
+            let dest = (at - offset) as usize;
+            let Some((&index, page)) = state.files[&self.id]
+                .pages
+                .range(at / PAGE..=(end - 1) / PAGE)
+                .next()
+            else {
+                buf[dest..].fill(0);
+                break;
+            };
+            let page = page.clone();
+            let page_start = index * PAGE;
+            if at < page_start {
+                buf[dest..(page_start - offset) as usize].fill(0);
+                at = page_start;
+            }
+            bytes.resize(PAGE as usize, 0);
+            state.read_page(&page, &mut bytes)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
             let start = (at % PAGE) as usize;
             let dest = (at - offset) as usize;
@@ -804,14 +931,27 @@ impl BackingFile for CowFile {
             .checked_add(data.len() as u64)
             .ok_or_else(|| input("write overflow"))?;
         let mut at = offset;
+        let mut scratch = Vec::new();
         while at < end {
             let page = state.page_ref(self.id, at / PAGE)?;
-            let mut bytes = state.page(page)?;
             let count = (PAGE - at % PAGE).min(end - at) as usize;
-            let start = (at % PAGE) as usize;
             let src = (at - offset) as usize;
-            bytes[start..start + count].copy_from_slice(&data[src..src + count]);
-            state.write_page(self.id, at / PAGE, &bytes)?;
+            let fragment = &data[src..src + count];
+            if let Some(page) = page {
+                // Authenticate the old mapping even before a full overwrite.
+                scratch.resize(PAGE as usize, 0);
+                state.read_page(&page, &mut scratch)?;
+            } else if count < PAGE as usize {
+                scratch.clear();
+                scratch.resize(PAGE as usize, 0);
+            }
+            if count == PAGE as usize {
+                state.write_page(self.id, at / PAGE, fragment)?;
+            } else {
+                let start = (at % PAGE) as usize;
+                scratch[start..start + count].copy_from_slice(fragment);
+                state.write_page(self.id, at / PAGE, &scratch)?;
+            }
             at += count as u64;
         }
         Ok(())
@@ -819,9 +959,17 @@ impl BackingFile for CowFile {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
-        let current_len = state.files.get(&self.id).ok_or_else(missing)?.len;
+        let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
+        if len == node.len {
+            return Ok(());
+        }
+        if len > node.len {
+            node.len = len;
+            state.possibly_dirty.insert(self.id);
+            return Ok(());
+        }
         let tail = state.page_ref(self.id, len / PAGE)?;
-        if len < current_len && !len.is_multiple_of(PAGE) && tail.is_some() {
+        if !len.is_multiple_of(PAGE) && tail.is_some() {
             let mut bytes = state.page(tail)?;
             bytes[(len % PAGE) as usize..].fill(0);
             state.write_page(self.id, len / PAGE, &bytes)?;
@@ -830,6 +978,7 @@ impl BackingFile for CowFile {
         node.len = len;
         node.pages.retain(|index, _| *index < len.div_ceil(PAGE));
         node.reserved.retain(|index| *index < len.div_ceil(PAGE));
+        state.possibly_dirty.insert(self.id);
         // Dropped pages may free slots.
         state.used_slots = None;
         Ok(())
@@ -845,23 +994,40 @@ impl BackingFile for CowFile {
         let file_len = state.files.get(&self.id).ok_or_else(missing)?.len;
         let end = offset
             .checked_add(len)
-            .ok_or_else(|| input("hole range overflow"))?
-            .min(file_len);
-        let mut at = offset;
-        while at < end {
-            let count = (PAGE - at % PAGE).min(end - at);
-            if at.is_multiple_of(PAGE) && count == PAGE {
+            .ok_or_else(|| input("hole range overflow"))?;
+        let visible_end = end.min(file_len);
+        if offset >= visible_end {
+            return Ok(());
+        }
+
+        // Every mapped page has a reservation, including reserved zero pages.
+        // Visit only existing reservations, even for a very large sparse range.
+        let mut next = offset / PAGE;
+        let limit = visible_end.div_ceil(PAGE);
+        while let Some(index) = state.files[&self.id]
+            .reserved
+            .range(next..limit)
+            .next()
+            .copied()
+        {
+            let page_start = index * PAGE;
+            if offset <= page_start && index < end / PAGE {
+                // A whole-page request also releases a short final page.
                 let node = state.files.get_mut(&self.id).ok_or_else(missing)?;
-                node.pages.remove(&(at / PAGE));
-                node.reserved.remove(&(at / PAGE));
-                // A dropped page may free its slot.
+                node.pages.remove(&index);
+                node.reserved.remove(&index);
+                state.possibly_dirty.insert(self.id);
                 state.used_slots = None;
-            } else if let Some(page) = state.page_ref(self.id, at / PAGE)? {
+            } else if let Some(page) = state.page_ref(self.id, index)? {
                 let mut bytes = state.page(Some(page))?;
-                bytes[(at % PAGE) as usize..(at % PAGE + count) as usize].fill(0);
-                state.write_page(self.id, at / PAGE, &bytes)?;
+                let from = offset.saturating_sub(page_start) as usize;
+                let to = (visible_end - page_start).min(PAGE) as usize;
+                if bytes[from..to].iter().any(|&byte| byte != 0) {
+                    bytes[from..to].fill(0);
+                    state.write_page(self.id, index, &bytes)?;
+                }
             }
-            at += count;
+            next = index + 1;
         }
         Ok(())
     }
@@ -876,23 +1042,31 @@ impl BackingFile for CowFile {
     fn sync_data(&self) -> io::Result<()> {
         let mut state = self.state.lock();
         state.check()?;
+        let node = state.files.get(&self.id).ok_or_else(missing)?;
+        if state
+            .committed
+            .files
+            .get(&self.id)
+            .is_some_and(|durable| !state.possibly_dirty.contains(&self.id) || durable == node)
+        {
+            state.possibly_dirty.remove(&self.id);
+            return state.reclaim_closed_files();
+        }
         let mut candidate = state.committed.clone();
-        candidate.files.insert(
-            self.id,
-            state.files.get(&self.id).ok_or_else(missing)?.clone(),
-        );
-        state.commit(candidate)
+        candidate.files.insert(self.id, node.clone());
+        state.commit(candidate)?;
+        state.possibly_dirty.remove(&self.id);
+        Ok(())
     }
 }
 
 struct CowLock {
-    state: Arc<Mutex<State>>,
-    path: String,
+    file: CowFile,
 }
 impl VolumeLock for CowLock {}
 impl Drop for CowLock {
     fn drop(&mut self) {
-        self.state.lock().locks.remove(&self.path);
+        self.file.state.lock().locks.remove(&self.file.id);
     }
 }
 
@@ -904,50 +1078,29 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        state.directory(path::parent(name))?;
-        let id = match state.entries.get(name) {
-            Some(Entry::File(id)) => *id,
-            Some(Entry::Directory) => return Err(input("cannot open a directory as a file")),
-            None if create => {
-                if state.entries.len() >= MAX_ENTRIES {
-                    return Err(no_space());
-                }
-                if state.files.len() >= MAX_ENTRIES {
-                    state.reclaim_closed_files()?;
-                }
-                if state.files.len() >= MAX_ENTRIES {
-                    return Err(no_space());
-                }
-                let id = state.next_id;
-                state.next_id = id
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("file identity exhausted"))?;
-                state.files.insert(id, Node::default());
-                state.entries.insert(name.to_owned(), Entry::File(id));
-                id
-            }
-            None => return Err(missing()),
-        };
-        *state.handles.entry(id).or_default() += 1;
-        Ok(Arc::new(CowFile {
-            state: self.state.clone(),
-            id,
-        }))
+        let id = state.open_file(name, create)?;
+        Ok(Arc::new(self.retain_file(&mut state, id)))
     }
     fn exists(&self, name: &str) -> io::Result<bool> {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        Ok(state.entries.contains_key(name))
+        match state.directory(path::parent(name)) {
+            Ok(()) => Ok(state.entries.contains_key(name)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     fn remove(&self, name: &str) -> io::Result<()> {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(name))?;
         if state.entries.get(name) == Some(&Entry::Directory) {
             return Err(input("directory removal is unsupported"));
         }
         state.entries.remove(name).ok_or_else(missing)?;
+        state.unlinked_files = None;
         Ok(())
     }
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -955,6 +1108,7 @@ impl Backing for RollbackBacking {
         validate_name(to, false)?;
         let mut state = self.state.lock();
         state.check()?;
+        state.directory(path::parent(from))?;
         state.directory(path::parent(to))?;
         let entry = state.entries.get(from).ok_or_else(missing)?.clone();
         if entry == Entry::Directory || state.entries.get(to) == Some(&Entry::Directory) {
@@ -967,7 +1121,9 @@ impl Backing for RollbackBacking {
             ));
         }
         state.entries.remove(from);
-        state.entries.insert(to.to_owned(), entry);
+        if state.entries.insert(to.to_owned(), entry).is_some() {
+            state.unlinked_files = None;
+        }
         Ok(())
     }
     fn create_dir_all(&self, name: &str) -> io::Result<()> {
@@ -981,7 +1137,9 @@ impl Backing for RollbackBacking {
             }
             prefix.push_str(part);
             match state.entries.get(&prefix) {
-                Some(Entry::File(_)) => return Err(input("parent is a file")),
+                Some(Entry::File(_)) => {
+                    return Err(io::Error::new(io::ErrorKind::NotADirectory, prefix))
+                }
                 Some(Entry::Directory) => (),
                 None => {
                     if state.entries.len() >= MAX_ENTRIES {
@@ -998,11 +1156,8 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
-        Ok(state
-            .entries
-            .keys()
-            .filter(|name| path::parent(name) == dir)
-            .map(|name| path::file_name(name).to_owned())
+        Ok(directory_entries(&state.entries, dir)
+            .map(|(child, _)| child.to_owned())
             .collect())
     }
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -1010,6 +1165,14 @@ impl Backing for RollbackBacking {
         let mut state = self.state.lock();
         state.check()?;
         state.directory(dir)?;
+        // Syncing a child also publishes any missing ancestors. Once the
+        // directory is durable, only changes to its immediate names matter.
+        if (dir.is_empty() || state.committed.entries.get(dir) == Some(&Entry::Directory))
+            && directory_entries(&state.entries, dir)
+                .eq(directory_entries(&state.committed.entries, dir))
+        {
+            return state.reclaim_closed_files();
+        }
         let mut candidate = state.committed.clone();
         candidate
             .entries
@@ -1037,30 +1200,120 @@ impl Backing for RollbackBacking {
         validate_name(name, false)?;
         let mut state = self.state.lock();
         state.check()?;
-        if !state.locks.insert(name.to_owned()) {
+        let id = state.open_file(name, true)?;
+        if !state.locks.insert(id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "volume already attached",
             ));
         }
         Ok(Box::new(CowLock {
-            state: self.state.clone(),
-            path: name.to_owned(),
+            file: self.retain_file(&mut state, id),
         }))
     }
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         let mut state = self.state.lock();
         state.check()?;
         state.reclaim_closed_files()?;
-        Ok(Some(
-            state.committed.capacity - state.coordinates().len() as u64 * PAGE,
-        ))
+        Ok(Some(state.committed.capacity - state.reserved_pages * PAGE))
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punching_an_already_zero_part_of_a_mapped_page_is_idle() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
+        let file = backing.open("file", true).unwrap();
+        file.write_at(0, &[1, 0, 2]).unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("").unwrap();
+        let generation = backing.state.lock().committed.generation;
+        file.punch_hole(1, 1).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(backing.state.lock().committed.generation, generation);
+        file.punch_hole(0, 1).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(backing.state.lock().committed.generation, generation + 1);
+        let mut bytes = [0; 3];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0, 2]);
+    }
+
+    #[test]
+    fn clean_file_and_directory_barriers_leave_the_witness_generation_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 4 * PAGE).unwrap();
+        backing.create_dir_all("data/sub").unwrap();
+        let file = backing.open("data/file", true).unwrap();
+        file.write_at(0, b"first").unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("data").unwrap();
+        let generation = || backing.state.lock().committed.generation;
+        let clean = generation();
+        for _ in 0..3 {
+            file.sync_data().unwrap();
+            backing.sync_dir("data").unwrap();
+        }
+        assert_eq!(generation(), clean);
+        file.write_at(0, b"other").unwrap();
+        backing.sync_dir("data").unwrap();
+        assert_eq!(generation(), clean);
+        file.sync_data().unwrap();
+        assert_eq!(generation(), clean + 1);
+        backing.open("data/sub/pending", true).unwrap();
+        backing.sync_dir("data").unwrap();
+        assert_eq!(generation(), clean + 1);
+        backing.sync_dir("data/sub").unwrap();
+        assert_eq!(generation(), clean + 2);
+        drop((file, backing));
+        let reopened = RollbackBacking::open(root.path(), witness.path()).unwrap();
+        let mut bytes = [0; 5];
+        reopened
+            .open("data/file", false)
+            .unwrap()
+            .read_at(0, &mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"other");
+        assert!(reopened.exists("data/sub/pending").unwrap());
+    }
+
+    #[test]
+    fn listing_only_returns_direct_children_of_the_exact_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+        backing.create_dir_all("data/nested").unwrap();
+        backing.create_dir_all("database").unwrap();
+        backing.open("data/a", true).unwrap();
+        backing.open("data/nested/hidden", true).unwrap();
+        backing.open("database/other", true).unwrap();
+        assert_eq!(backing.list("").unwrap(), ["data", "database"]);
+        assert_eq!(backing.list("data").unwrap(), ["a", "nested"]);
+        assert_eq!(backing.list("data/nested").unwrap(), ["hidden"]);
+    }
+
+    #[test]
+    fn retaining_or_extending_file_length_keeps_the_arena_slot_index() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
+        let file = backing.open("pages", true).unwrap();
+        file.write_at(0, b"x").unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        file.set_len(file.len().unwrap()).unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        file.set_len(PAGE + 1).unwrap();
+        assert!(backing.state.lock().used_slots.is_some());
+        let mut bytes = [1; 2];
+        file.read_at(PAGE - 1, &mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0]);
+    }
 
     #[test]
     fn manifest_and_page_domains_have_fixed_vectors() {

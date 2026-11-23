@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Repeat existing Linux storage regressions using frozen source and binaries."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import ExitStack
 import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -36,17 +40,29 @@ def suite_groups(config):
     return PROFILES[profile]
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(128 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def save_json(path, value, before_publish=None):
-    temporary = path.with_name(path.name + ".tmp")
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
-        json.dump(value, out, indent=2, sort_keys=True)
-        out.write("\n")
-        out.flush()
-        os.fsync(out.fileno())
-    if before_publish is not None and not before_publish():
-        return False
-    os.replace(temporary, path)
-    return True
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(value, out, indent=2, sort_keys=True)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        if before_publish is not None and not before_publish():
+            return False
+        os.replace(temporary, path)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def process_identity(pid):
@@ -63,12 +79,48 @@ def alive(controller):
     return bool(controller.get("identity")) and process_identity(controller["pid"]) == controller["identity"]
 
 
-def passed_count(text):
-    matches = re.findall(
-        r"test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;", text)
-    if len(matches) != 1 or int(matches[0]) < 1:
+RESULT_PREFIX = "test result: ok. "
+RESULT_SUFFIX = " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+RESULT_PATTERN = re.compile(re.escape(RESULT_PREFIX) + r"(\d+)" + re.escape(RESULT_SUFFIX))
+RESULT_DIGITS = re.compile(r"\d*")
+
+
+def passed_count(stream):
+    # Retain only an unfinished summary, including a partial prefix at a chunk
+    # boundary. Even a diagnostic line without newlines can span the entire log.
+    if isinstance(stream, str):
+        stream = io.StringIO(stream)
+    count = None
+    carry = ""
+    # Libtest's count fits usize. Preserve Python's normal decimal conversion
+    # limit as well, and retain one extra digit to reject an oversized match.
+    digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)() or 4300
+    while chunk := stream.read(64 * 1024):
+        window = carry + chunk
+        end = 0
+        for match in RESULT_PATTERN.finditer(window):
+            if count is not None or len(match[1]) > digit_limit:
+                raise ValueError("duplicate or oversized test result")
+            count = int(match[1])
+            end = match.end()
+        start = window.rfind(RESULT_PREFIX, end)
+        if start >= 0:
+            digits = RESULT_DIGITS.match(window, start + len(RESULT_PREFIX))
+            rest = window[digits.end():]
+            if RESULT_SUFFIX.startswith(rest):
+                keep = min(digits.end(), digits.start() + digit_limit + 1)
+                carry = window[start:keep] + rest
+                continue
+        carry = window[max(end, len(window) - len(RESULT_PREFIX) + 1):]
+    if not count:
         raise ValueError("missing, empty, filtered or incomplete test result")
-    return int(matches[0])
+    return count
+
+
+def observe_exit(pid):
+    # Leave the leader waitable: its PID anchors the process group until cleanup.
+    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    return time.monotonic()
 
 
 def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
@@ -89,29 +141,31 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         for number in previous:
             signal.signal(number, request_stop)
         with os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
-            child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-            reason = "exited"
-            try:
-                # Keep the leader unreaped until group cleanup, so its PID
-                # cannot be reused for an unrelated process group.
-                while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                    if received_signal is not None or stop.exists():
-                        reason = "cancelled"
-                    elif time.monotonic() - began >= timeout:
-                        reason = "timeout"
-                    elif log.stat().st_size > max_bytes:
-                        reason = "output_limit"
-                    if reason != "exited":
-                        break
-                    time.sleep(.1)
-            finally:
-                # Kill descendants also after an early leader exit.
+            with subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=output, stderr=subprocess.STDOUT,
+                                  start_new_session=True) as child, ThreadPoolExecutor(max_workers=1) as observer:
+                reason = "exited"
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
+                    exit_time = observer.submit(observe_exit, child.pid)
+                    while not exit_time.done():
+                        remaining = timeout - (time.monotonic() - began)
+                        if received_signal is not None or stop.exists():
+                            reason = "cancelled"
+                            break
+                        if remaining <= 0:
+                            reason = "timeout"
+                            break
+                        if log.stat().st_size > max_bytes:
+                            reason = "output_limit"
+                            break
+                        # Wake on exit immediately, even between stop/size checks.
+                        wait((exit_time,), timeout=min(.1, remaining))
+                finally:
+                    # Kill descendants before joining the observer and reaping the leader.
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
@@ -119,21 +173,61 @@ def run_child(command, cwd, log, stop, timeout, max_bytes=64 << 20, env=None):
         # Reuse the cancellation marker so build-time interruption also
         # reaches worker() as cancellation rather than a build failure.
         stop.touch(mode=0o600)
-    # The leader can exit during the polling interval, skipping the loop's
-    # limit checks. Cancellation also takes precedence during group cleanup;
-    # otherwise retain any limit reason already observed while it was alive.
+    # Cleanup can outlast the deadline. Use the observed leader exit for the
+    # verdict, but report the total elapsed time and honour late cancellation.
     if received_signal is not None or stop.exists():
         reason = "cancelled"
-    elif reason == "exited":
-        if time.monotonic() - began >= timeout:
+    elif reason in ("exited", "timeout"):
+        if exit_time.result() - began >= timeout:
             reason = "timeout"
         elif log.stat().st_size > max_bytes:
             reason = "output_limit"
+        else:
+            reason = "exited"
     result = {"exit_code": child.returncode, "reason": reason,
               "seconds": round(time.monotonic() - began, 3)}
     if received_signal is not None:
         result["signal"] = received_signal
     return result
+
+
+def cargo_compiler(source, directory, environment, remaining):
+    # Cargo gives build scripts its resolved compiler and both wrapper paths.
+    # Run from the same cwd as the campaign so Cargo and rustup load its configuration.
+    with tempfile.TemporaryDirectory(dir=directory, prefix="toolchain-") as temporary:
+        probe = Path(temporary)
+        (probe / "Cargo.toml").write_text(
+            '[workspace]\n[package]\nname = "maki-toolchain-probe"\nversion = "0.0.0"\n'
+            'edition = "2021"\n[lib]\npath = "lib.rs"\n')
+        (probe / "lib.rs").touch()
+        (probe / "build.rs").write_text("""
+use std::{env, fs, process::Command};
+
+fn main() {
+    let compiler = env::var_os("RUSTC").unwrap();
+    let mut command = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"].iter()
+        .filter_map(env::var_os)
+        .filter(|path| !path.is_empty())
+        .chain(std::iter::once(compiler.clone()));
+    let version = Command::new(command.next().unwrap()).args(command).arg("-vV")
+        .current_dir(env::var_os("MAKI_PROBE_SOURCE").unwrap()).output().unwrap();
+    assert!(version.status.success(), "{}", String::from_utf8_lossy(&version.stderr));
+    fs::write("rustc-path", compiler.as_encoded_bytes()).unwrap();
+    fs::write("rustc-version", version.stdout).unwrap();
+    fs::write("rust-target", env::var("TARGET").unwrap()).unwrap();
+}
+""")
+        environment = dict(environment, CARGO_TARGET_DIR=str(probe / "target"),
+                           CARGO_BUILD_BUILD_DIR=str(probe / "build"), MAKI_PROBE_SOURCE=str(source))
+        command = ["cargo", "check", "--quiet", "--offline", "--manifest-path", str(probe / "Cargo.toml")]
+        result = run_child(command, source, directory / "toolchain.log", directory / "STOP",
+                           remaining(1800), env=environment)
+        if result["reason"] == "timeout":
+            raise TimeoutError(f"compiler probe timed out: {result}")
+        if result["exit_code"] != 0 or result["reason"] != "exited":
+            raise RuntimeError(f"compiler probe did not complete (see toolchain.log): {result}")
+        return (os.fsdecode((probe / "rustc-path").read_bytes()), (probe / "rustc-version").read_text(),
+                (probe / "rust-target").read_text())
 
 
 def prepare(directory, config, deadline):
@@ -154,13 +248,29 @@ def prepare(directory, config, deadline):
     # when the shell or Cargo configuration supplies a shared build directory.
     environment.update(CARGO_TARGET_DIR=config["target_dir"],
                        CARGO_BUILD_BUILD_DIR=str(directory / "build"), CARGO_BUILD_JOBS="2")
+    config["rustc_executable"], config["rustc"], target = cargo_compiler(source, directory, environment, remaining)
+    save_json(directory / "config.json", config)
+    # Cargo sets a package-specific loader path for each test invocation,
+    # including its sysroot and dynamic dependencies in the isolated build.
+    # Capture that path without executing the test before it has been frozen.
+    remaining(1800)
+    runner = directory / "maki-capture-test-environment"
+    runner.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "print(json.dumps({'reason': 'maki-test-runtime', 'executable': sys.argv[1], "
+        "'library_path': os.environ['LD_LIBRARY_PATH']}))\n")
+    runner.chmod(0o500)
+    environment["PATH"] = str(runner.parent) + os.pathsep + environment.get("PATH", os.defpath)
+    environment["CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUNNER"] = runner.name
+    library_paths = {}
     executables = {}
     suites = [suite for group in groups.values() for suite in group]
     for package, selected in groups.items():
         command = ["cargo", "test", "--offline", "--locked", "-p", package,
-                   "--no-run", "--message-format=json"]
+                   "--message-format=json"]
         for suite in selected:
             command.extend(["--test", suite])
+        command.extend(["--", "--list"])
         log = directory / ("build.log" if len(groups) == 1 else f"build-{package}.log")
         result = run_child(command, source, log, stop, remaining(1800), env=environment)
         if result["reason"] == "timeout":
@@ -168,14 +278,18 @@ def prepare(directory, config, deadline):
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"{package} build did not complete: {result}")
         remaining(1800)
-        for line in log.read_text(errors="replace").splitlines():
-            if not line.startswith("{"):
-                continue
-            event = json.loads(line)
-            name = event.get("target", {}).get("name")
-            if (event.get("reason") == "compiler-artifact" and name in selected
-                    and event.get("executable")):
-                executables[name] = Path(event["executable"])
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.startswith("{"):
+                    continue
+                event = json.loads(line)
+                if event.get("reason") == "maki-test-runtime":
+                    library_paths[Path(event["executable"])] = event["library_path"]
+                    continue
+                name = event.get("target", {}).get("name")
+                if (event.get("reason") == "compiler-artifact" and name in selected
+                        and event.get("executable")):
+                    executables[name] = Path(event["executable"])
     if set(executables) != set(suites):
         raise RuntimeError("build did not produce every requested test binary")
     binary_dir = directory / "bin"
@@ -183,19 +297,24 @@ def prepare(directory, config, deadline):
     manifest = {}
     for name, original in executables.items():
         remaining(30)
+        if original not in library_paths:
+            raise RuntimeError(f"Cargo did not report a runtime environment for {name}")
+        library_path = library_paths[original]
         frozen = binary_dir / name
         shutil.copyfile(original, frozen)
         frozen.chmod(0o500)
         executables[name] = frozen
-        manifest[name] = {"sha256": hashlib.sha256(frozen.read_bytes()).hexdigest()}
+        manifest[name] = {"sha256": sha256_file(frozen),
+                          "library_path": library_path}
         result = run_child([str(frozen), "--list", "--include-ignored"], source,
-                           directory / f"list-{name}.log", stop, remaining(30))
+                           directory / f"list-{name}.log", stop, remaining(30),
+                           env=dict(os.environ, LD_LIBRARY_PATH=library_path))
         if result["reason"] == "timeout":
             raise TimeoutError(f"cannot enumerate {name}: {result}")
         if result["exit_code"] != 0 or result["reason"] != "exited":
             raise RuntimeError(f"cannot enumerate {name}: {result}")
-        count = sum(line.endswith(": test") for line in
-                    (directory / f"list-{name}.log").read_text().splitlines())
+        with (directory / f"list-{name}.log").open(encoding="utf-8") as stream:
+            count = sum(line.removesuffix("\n").endswith(": test") for line in stream)
         if count < 1:
             raise RuntimeError(f"empty suite: {name}")
         manifest[name]["expected_tests"] = count
@@ -232,15 +351,19 @@ def worker(directory):
                               elapsed_seconds=round(time.monotonic() - began, 1))
                 save_json(directory / "status.json", status)
                 log = directory / f"round-{round_number:04d}-{name}.log"
+                environment = os.environ.copy()
+                if name in manifest:
+                    environment["LD_LIBRARY_PATH"] = manifest[name]["library_path"]
                 result = run_child([str(binary), "--include-ignored", "--test-threads=1", "--color=never"],
                                    Path(config["source"]), log, directory / "STOP",
-                                   min(config["suite_timeout"], deadline - time.monotonic()))
+                                   min(config["suite_timeout"], deadline - time.monotonic()), env=environment)
                 status["last_result"] = {"suite": name, "round": round_number, "log": str(log), **result}
                 if result["reason"] != "exited" or result["exit_code"] != 0:
                     status["state"] = {"cancelled": "cancelled", "timeout": "incomplete"}.get(
                         result["reason"], "failed")
                     raise RuntimeError(f"suite did not complete: {status['last_result']}")
-                count = passed_count(log.read_text(errors="replace"))
+                with log.open(errors="replace") as output:
+                    count = passed_count(output)
                 if name in manifest and count != manifest[name]["expected_tests"]:
                     raise ValueError(f"{name}: passed test count changed")
                 status["passed_tests"] += count
@@ -289,12 +412,21 @@ def worker(directory):
     return exit_code
 
 
+def qualification_source():
+    # The detached worker is a standalone copy; only the launcher needs this module.
+    try:
+        import qualification_source as snapshot
+    except ModuleNotFoundError:
+        from scripts import qualification_source as snapshot
+    return snapshot
+
+
 def start(args):
     profile = getattr(args, "profile", "storage")
     groups = suite_groups({"profile": profile})
     repo = Path(__file__).resolve().parents[1]
-    subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    snapshot = qualification_source()
+    revision = snapshot.clean_revision(repo)
     logs = Path.home() / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     logs.chmod(0o700)
@@ -302,41 +434,52 @@ def start(args):
         raise RuntimeError("at least 2 GiB of free space is required before building")
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = logs / f"maki-storage-{stamp}-{uuid.uuid4().hex[:6]}"
-    directory.mkdir(mode=0o700)
-    source = directory / "source"
-    source.mkdir(mode=0o700)
-    target = directory / "target"
-    target.mkdir(mode=0o700)
-    archive = directory / "source.tar"
-    subprocess.run(["git", "archive", "--format=tar", f"--output={archive}", revision], cwd=repo, check=True)
-    subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
-    runner = directory / "runner.py"
-    shutil.copyfile(__file__, runner)
-    runner.chmod(0o400)
-    save_json(directory / "config.json", {
-        "revision": revision, "source": str(source), "target_dir": str(target),
-        "build_dir": str(directory / "build"),
-        "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
-        "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-        "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
-        "profile": profile,
-        "suites": [suite for group in groups.values() for suite in group],
-        "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
-        "cargo": subprocess.check_output(["cargo", "-V"], text=True).strip(),
-    })
-    with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
-        process = subprocess.Popen([sys.executable, "-B", str(runner), "_worker", "--run-dir", str(directory)],
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-    controller = {"run_dir": str(directory), "pid": process.pid, "identity": process_identity(process.pid)}
-    save_json(directory / "controller.json", controller)
-    save_json(logs / "maki-storage-latest.json", controller)
+    with ExitStack() as preparation:
+        directory.mkdir(mode=0o700)
+        preparation.callback(shutil.rmtree, directory)
+        source = directory / "source"
+        source.mkdir(mode=0o700)
+        target = directory / "target"
+        target.mkdir(mode=0o700)
+        archive = directory / "source.tar"
+        snapshot.extract_revision(repo, revision, archive, source)
+        runner = directory / "runner.py"
+        shutil.copyfile(source / "scripts/storage-repeat-validation.py", runner)
+        runner.chmod(0o400)
+        save_json(directory / "config.json", {
+            "revision": revision, "source": str(source), "target_dir": str(target),
+            "build_dir": str(directory / "build"),
+            "rounds": args.rounds, "max_seconds": args.max_seconds, "suite_timeout": args.suite_timeout,
+            "source_sha256": sha256_file(archive),
+            "runner_sha256": sha256_file(runner),
+            "profile": profile,
+            "suites": [suite for group in groups.values() for suite in group],
+            "cargo": subprocess.check_output(["cargo", "-V"], cwd=source, text=True).strip(),
+        })
+        with os.fdopen(os.open(directory / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as log:
+            process = subprocess.Popen([sys.executable, "-B", str(runner), "_published_worker", "--run-dir", str(directory)],
+                                       stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        # Once the worker exists, preserve its directory and let the
+        # publication gate below manage its lifetime.
+        preparation.pop_all()
+    # The worker waits for this byte before spawning any build. A publication
+    # failure or a controller crash closes the pipe without starting a campaign.
+    try:
+        with process.stdin as gate:
+            controller = {"run_dir": str(directory), "pid": process.pid, "identity": process_identity(process.pid)}
+            save_json(directory / "controller.json", controller)
+            save_json(logs / "maki-storage-latest.json", controller)
+            gate.write(b"1")
+    except BaseException:
+        process.wait()
+        raise
     print(json.dumps(controller, indent=2))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "status", "cancel", "_worker"))
+    parser.add_argument("action", choices=("start", "status", "cancel", "_worker", "_published_worker"))
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--profile", choices=tuple(PROFILES), default="storage")
     parser.add_argument("--rounds", type=int, default=100)
@@ -352,14 +495,21 @@ def main():
         start(args)
         return 0
     directory = args.run_dir or Path(json.loads((Path.home() / "logs/maki-storage-latest.json").read_text())["run_dir"])
+    if args.action == "_published_worker":
+        if sys.stdin.buffer.read(1) != b"1":
+            return 1
+        return worker(directory)
     if args.action == "_worker":
         return worker(directory)
-    if args.action == "cancel":
-        (directory / "STOP").touch(mode=0o600)
     controller = json.loads((directory / "controller.json").read_text())
     status_path = directory / "status.json"
     status = json.loads(status_path.read_text()) if status_path.exists() else {"state": "starting"}
     status.update(run_dir=str(directory), controller_alive=alive(controller))
+    if args.action == "cancel":
+        if Path(controller["run_dir"]).resolve() != directory.resolve():
+            parser.error("controller does not belong to this campaign directory")
+        if status["state"] not in TERMINAL and status["controller_alive"]:
+            (directory / "STOP").touch(mode=0o600)
     if status["state"] not in TERMINAL and not status["controller_alive"]:
         status.update(state="interrupted", detail="controller exited without a terminal report; this is not a pass")
     print(json.dumps(status, indent=2))

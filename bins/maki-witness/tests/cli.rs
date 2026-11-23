@@ -50,6 +50,7 @@ fn init_is_explicit_durable_and_refuses_reinitialization() {
         String::from_utf8_lossy(&first.stderr)
     );
     let record: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first.stdout.ends_with(b"\n"));
     assert_eq!(record["phase"], "released");
     assert!(record["current"].is_null());
     assert!(!command(&args).status.success());
@@ -67,6 +68,54 @@ fn init_is_explicit_durable_and_refuses_reinitialization() {
         )
         .unwrap();
     assert_eq!(serde_json::to_value(current).unwrap(), record);
+}
+
+fn init_with_stdout(stdout: std::process::Stdio) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let args = [
+        "init",
+        state.to_str().unwrap(),
+        "01234567-89ab-cdef-0123-456789abcdef",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_maki-witness"))
+        .args(args)
+        .stdout(stdout)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let retry = command(&args);
+    assert!(!retry.status.success());
+    let retry_stderr = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        retry_stderr.contains("remote witness already enrolled"),
+        "{retry_stderr}"
+    );
+
+    // Open the store after the last CLI call. A child forked by another
+    // test can inherit the harness's lock and hold it until exec.
+    maki_backing::remote_witness::StateStore::open(&state).expect("reopen initialized witness");
+    stderr
+}
+
+#[test]
+fn init_succeeds_quietly_when_the_stdout_reader_closes() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let stderr = init_with_stdout(writer.into());
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn init_reports_completed_enrollment_when_stdout_is_full() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let stderr = init_with_stdout(full.into());
+    assert!(stderr.contains("witness was initialized"), "{stderr}");
 }
 
 #[test]

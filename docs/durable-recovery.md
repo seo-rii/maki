@@ -175,6 +175,25 @@ against the journal, but when newer records survive, the record end recovery
 publishes for them must lie after the proof's stored location; a proof naming
 a later segment or record end is refused the same way.
 
+If a contiguous run of surviving journal records reaches the checkpoint,
+recovery and the deep check compare the last covered record for each unit
+with its slot metadata. A valid newer record for the same unit takes
+precedence because replay can install it, including after a checkpoint that
+was interrupted before publication. For a covered write, the slot sequence,
+ciphertext length and checksum must agree. For a v3 discard, the discard map
+must record the logical zero. A v2 empty write still requires a slot. The
+comparison refuses missing or stale slot metadata before publishing
+metadata or removing journal segments. Slot headers that are already
+unreadable as corruption keep their existing read-error path. The deep
+check reports them and also verifies slot ciphertext separately.
+
+The comparison keeps at most 65,536 units' record metadata in memory at a
+time. Larger surviving ranges require additional read-only scans of the
+validated journal prefixes that can affect those units. Pruning can remove
+the records needed for this comparison. Older records across a gap can have
+been superseded by pruned records and provide no independent evidence of
+what their slots should hold.
+
 Unproven final-tail bytes may be discarded after a crash. Intact later records
 do not prove that earlier damaged bytes were durable: unsynced sectors may
 persist out of order. Recovery rewrites, verifies, and synchronizes every

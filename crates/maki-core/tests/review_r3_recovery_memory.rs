@@ -159,7 +159,8 @@ fn distinct_recovery_allocations(records: u64) -> Allocations {
             sequence,
             unit_index: sequence - 1,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &bytes).unwrap();
         position += bytes.len() as u64;
     }
@@ -264,7 +265,8 @@ fn covered_scan_allocations(records: u64) -> Allocations {
             sequence,
             unit_index: 0,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &record).unwrap();
         position += record.len() as u64;
     }
@@ -310,7 +312,8 @@ fn overwrite_fixture(records: u64) -> Fixture {
             sequence,
             unit_index: (sequence - 1) % 4,
             payload: vec![sequence as u8; 4096],
-        });
+        })
+        .unwrap();
         file.write_at(position, &bytes).unwrap();
         position += bytes.len() as u64;
     }
@@ -396,22 +399,32 @@ fn deep_check_preserves_checkpoint_counts_tail_repairs_and_read_only_state() {
     use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
 
     for checkpoint in [0, 5, 12] {
-        let fixture = overwrite_fixture(12);
+        let fixture = Fixture::new();
         bind_key_canary(fixture.backing.as_ref(), fixture.superblock.volume_uuid);
+        let mut volume =
+            Volume::recover(fixture.backing.clone(), VolumeOptions::default()).unwrap();
+        // Publish covered writes to their slots through a normal checkpoint.
+        // The active segment retains the covered and uncovered records.
+        for sequence in 1..=12 {
+            assert_eq!(
+                volume
+                    .write_ct((sequence - 1) % 4, &[sequence as u8; 4096], true)
+                    .unwrap(),
+                sequence
+            );
+            if sequence == checkpoint {
+                assert_eq!(volume.checkpoint().unwrap(), checkpoint);
+            }
+        }
+        assert_eq!(volume.checkpoint_sequence(), checkpoint);
+        assert_eq!(volume.journal_segment_count(), 1);
+        let active = volume.journal_active_segment_path().unwrap();
+        drop(volume);
         let store = AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B);
-        let mut state = store
-            .load::<CheckpointState>(fixture.backing.as_ref())
-            .unwrap()
-            .unwrap();
-        state.checkpoint_sequence = checkpoint;
-        store.store(fixture.backing.as_ref(), &mut state).unwrap();
         let before = store
             .side_generations::<CheckpointState>(fixture.backing.as_ref())
             .unwrap();
-        let file = fixture
-            .backing
-            .open(&layout::journal_segment(0), false)
-            .unwrap();
+        let file = fixture.backing.open(&active, false).unwrap();
         let valid_end = file.len().unwrap();
         file.write_at(valid_end, &record(13)[..47]).unwrap();
         let report = maki_core::check::deep_check(fixture.backing.clone(), 256 << 20).unwrap();
@@ -541,7 +554,8 @@ fn a_geometry_oversized_record_is_checked_without_allocating_its_payload() {
             sequence: 1,
             unit_index: 0,
             payload: vec![5; 1 << 20],
-        });
+        })
+        .unwrap();
         if !intact {
             *body.last_mut().unwrap() ^= 1;
         }
@@ -570,6 +584,7 @@ fn record(sequence: u64) -> Vec<u8> {
         unit_index: 0,
         payload: vec![sequence as u8; 512],
     })
+    .unwrap()
 }
 
 #[test]
@@ -609,11 +624,14 @@ fn streaming_scan_matches_the_format_scanner_at_tail_and_durability_boundaries()
     let header_crc = crc32fast::hash(&impossible_length[..28]);
     impossible_length[28..32].copy_from_slice(&header_crc.to_le_bytes());
     cases.push(impossible_length);
-    cases.push(encode_record(&JournalRecord {
-        sequence: 1,
-        unit_index: 0,
-        payload: Vec::new(),
-    }));
+    cases.push(
+        encode_record(&JournalRecord {
+            sequence: 1,
+            unit_index: 0,
+            payload: Vec::new(),
+        })
+        .unwrap(),
+    );
 
     for (case, body) in cases.iter().enumerate() {
         for durable in [None, Some(0), Some(body.len() / 2), Some(body.len())] {

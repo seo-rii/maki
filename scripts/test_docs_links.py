@@ -1,13 +1,27 @@
 """Project links remain checked without rewriting preserved crate documents."""
 
+import codecs
 import hashlib
+import os
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from scripts.check_docs_links import broken_links
+from scripts.check_docs_links import block_lines, broken_links, table_cells
+
+
+class ShippedDocumentationTables(unittest.TestCase):
+    def test_benchmark_and_review_tables_do_not_drop_cells(self):
+        docs = Path(__file__).resolve().parents[1] / "docs"
+        for name in ("benchmark.md", "review-remediation.md"):
+            with self.subTest(document=name):
+                for line, rendered in block_lines((docs / name).read_text(encoding="utf-8")):
+                    if rendered is not None:
+                        self.assertEqual(len(table_cells(line.content)), len(rendered),
+                                         f"{name}:{line.number}: extra table cells are discarded")
 
 
 class DocumentationLinks(unittest.TestCase):
@@ -26,6 +40,572 @@ class DocumentationLinks(unittest.TestCase):
                 ["git", "-C", str(self.root), "add", "--", name], check=True
             )
         return path
+
+    def test_emphasis_delimiters_cannot_cross_inline_boundaries(self):
+        self.write("guide.md", "# [Read _config](file) after_\n# *inside _text* and_\n")
+        self.write("file", "")
+        self.write("README.md", "[a](guide.md#read-_config-after_) [b](guide.md#inside-_text-and_)\n"
+                   "[c](guide.md#read-config-after) [d](guide.md#inside-text-and)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#read-config-after (missing anchor)",
+            "README.md:2: guide.md#inside-text-and (missing anchor)"])
+
+    def test_emphasis_flanking_uses_source_characters_at_link_boundaries(self):
+        self.write("guide.md", "# [X](file)_word_\n# _word_[X](file)\n")
+        self.write("file", "")
+        self.write("README.md", "[first](guide.md#xword) [second](guide.md#wordx)\n"
+                   "[a](guide.md#x_word_) [b](guide.md#_word_x)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:2: guide.md#x_word_ (missing anchor)",
+            "README.md:2: guide.md#_word_x (missing anchor)",
+        ])
+
+    def test_emphasis_flanking_uses_gfm_unicode_whitespace(self):
+        for char in ("\v", "\x1c", "\u0085", "\u2028", "\u2029"):
+            with self.subTest(char=repr(char)):
+                self.write("guide.md", f"# a{char}_inside_\n# _inside_{char}b\n"
+                           "# c\u2003_yes_\n# _yes_ d\n")
+                self.write("README.md", "[open](guide.md#a_inside_) [close](guide.md#_inside_b)\n"
+                           "[em space](guide.md#cyes) [space](guide.md#yes-d)\n"
+                           "[absent](guide.md#ainside) [absent](guide.md#insideb)\n")
+                self.assertCountEqual(broken_links(self.root), [
+                    "README.md:3: guide.md#ainside (missing anchor)",
+                    "README.md:3: guide.md#insideb (missing anchor)",
+                ])
+
+    def test_heading_entities_are_decoded_only_when_contiguous_in_source(self):
+        self.write("file", "")
+        self.write("guide.md", "# &am*p*;\n# &co[py](file);\n# real &#95; and &amp;copy;\n")
+        self.write("README.md", "[a](guide.md#amp) [b](guide.md#copy) "
+                   "[c](guide.md#real-_-and-copy) [bad](guide.md#real-_-and-)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#real-_-and- (missing anchor)"])
+
+    def test_non_ascii_spaces_do_not_end_markdown_or_html_blocks(self):
+        for space in ("\u00a0", "\u2003"):
+            self.write("README.md", f"Prose\n{space}\n    [a](missing.md)\n\n"
+                       f"<div>hello</div>\n{space}\n[b](literal.md)\n")
+            self.assertEqual(broken_links(self.root), ["README.md:3: missing.md"])
+
+    def test_numeric_references_in_markdown_destinations_use_unicode_scalars(self):
+        self.write("README.md", "[a](&#128;.txt) [b](&#x85;.txt) [c](&#8364;.txt)\n")
+        self.write("€.txt", "")
+        self.assertCountEqual(broken_links(self.root), ["README.md:1: \x80.txt", "README.md:1: \x85.txt"])
+
+    def test_image_description_does_not_report_a_reference_from_alt_text(self):
+        self.write("plot.png", "")
+        self.write("README.md", "[![Grid[row][column]](plot.png)](absent.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: absent.md"])
+
+    def test_sparse_checkout_validates_omitted_documents_and_destinations(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
+        self.write("docs/start.md", "[example](../examples/data) [anchor](../examples/guide.md#known)\n")
+        self.write("examples/data", "data")
+        self.write("examples/guide.md", "# Known\n[missing](absent.md)\n")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture")
+        expected = ["examples/guide.md:2: absent.md"]
+        self.assertEqual(broken_links(self.root), expected)
+        git("sparse-checkout", "set", "docs")
+        self.assertFalse((self.root / "examples/guide.md").exists())
+        self.assertEqual(broken_links(self.root), expected)
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_sparse_checkout_resolves_inventory_and_dangling_archive_links(self):
+        self.archive(content="[included](alias) [outside](escape/missing) [omitted](docs/missing)\n",
+                     extra_files={"missing-license": "0" * 64})
+        inventory = self.root / "vendor/upstream.json"
+        inventory.rename(inventory.with_name("packages.json"))
+        inventory.symlink_to("packages.json")
+        (self.root / "vendor/hyper/alias").symlink_to("missing-license")
+        (self.root / "vendor/hyper/escape").symlink_to("../../elsewhere")
+        self.write("docs/index.md", "[readme](../vendor/hyper/README.md)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        expected = ["vendor/hyper/README.md:1: alias", "vendor/hyper/README.md:1: escape/missing"]
+        self.assertEqual(broken_links(self.root), expected)
+        subprocess.run([*git, "sparse-checkout", "set", "docs"], check=True)
+        self.assertEqual(broken_links(self.root), expected)
+
+    def test_sparse_checkout_keeps_deleted_gitlink_missing(self):
+        self.write("docs/index.md", "[component](../modules/component) [directory](../modules/component/)\n")
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "fixture"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), ["docs/index.md:1: ../modules/component",
+                                                  "docs/index.md:1: ../modules/component/"])
+        subprocess.run([*git, "update-index", "--skip-worktree", "modules/component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_markdown_line_endings_and_bom(self):
+        self.write("guide.md", "\ufeff# Start\rIntro\u2028# Phantom\r\n# Two\n")
+        self.write("README.md", "[start](guide.md#start) [two](guide.md#two) [absent](guide.md#phantom)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#phantom (missing anchor)"])
+
+    def test_utf16_sources_targets_and_plain_lines(self):
+        for name, bom, encoding in [("le.md", codecs.BOM_UTF16_LE, "utf-16-le"),
+                                    ("be.md", codecs.BOM_UTF16_BE, "utf-16-be")]:
+            self.write(name, "").write_bytes(bom + "# Guide\n[bad](absent.md)\n".encode(encoding))
+        self.write("README.md", "[le](le.md#guide) [be](be.md#guide) [ok](be.md?plain=1#L2) "
+                   "[bad line](le.md?plain=1#L3) [bad link](missing.md)\n")
+        self.assertCountEqual(broken_links(self.root), [
+            "README.md:1: le.md?plain=1#L3 (missing line)", "README.md:1: missing.md",
+            "be.md:2: absent.md", "le.md:2: absent.md",
+        ])
+
+    def test_overlong_target_preserves_other_documents_diagnostics(self):
+        target = "x" * 512 + ".md"
+        self.write("a.md", f"[too long]({target})\n")
+        self.write("b.md", "[absent](other.md)\n")
+        self.assertEqual(broken_links(self.root), [f"a.md:1: {target}", "b.md:1: other.md"])
+
+    def test_malformed_document_does_not_interrupt_other_diagnostics(self):
+        self.write("docs/invalid.md", "").write_bytes(b"\xffx")
+        self.write("odd.md", "").write_bytes(codecs.BOM_UTF16_LE + b"x")
+        self.write("README.md", "[a](docs/invalid.md#one) [b](odd.md?plain=1#L2) [c](missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: missing.md", "docs/invalid.md: invalid utf-8 at byte 0",
+            "odd.md: invalid utf-16 at byte 2",
+        ])
+
+    def test_repeated_links_decode_a_malformed_target_once(self):
+        target = self.write("invalid.md", "")
+        target.write_bytes(b"\xffx")
+        self.write("a.md", "[one](invalid.md#x) [two](invalid.md?plain=1#L2) [three](invalid.md#y)")
+        read_bytes = Path.read_bytes
+        reads = []
+
+        def read_document(path):
+            if path == target:
+                reads.append(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", read_document):
+            self.assertEqual(broken_links(self.root), ["invalid.md: invalid utf-8 at byte 0"])
+        self.assertEqual(reads, [target])
+
+    def test_only_ascii_digits_start_ordered_list_items(self):
+        self.write("guide.md", "１. Setup\n   ===\n\n١. Setup\n   ===\n\n1. Item\n   ===\n")
+        self.write("README.md", "[one](guide.md#１-setup) [two](guide.md#١-setup) "
+                   "[list](guide.md#item) [absent](guide.md#setup)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#setup (missing anchor)"])
+
+    def test_hashtag_can_begin_a_setext_heading(self):
+        self.write("README.md", "#hashtag guide\n====\n\n[section](#hashtag-guide)\n")
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_multiline_code_in_a_heading_keeps_its_rendered_spaces(self):
+        self.write("guide.md", "`hello\nworld`\n===\n\n"
+                   "Two `hello   \n   world` words\n===\n\n"
+                   "Normal   \nbreak\n===\n\n"
+                   "With <i></i>  \ntag\n===\n")
+        self.write("README.md", "[code](guide.md#hello-world) [missing](guide.md#helloworld)\n"
+                   "[padding](guide.md#two-hello----world-words) [normal](guide.md#normalbreak)\n"
+                   "[tag](guide.md#with-tag)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#helloworld (missing anchor)"])
+
+    def test_indented_continuations_in_setext_headings(self):
+        self.write("guide.md", "First `hello\n    world` second\n===\n\n"
+                   "Alpha `begin\n\tmiddle\nend`\n===\n\n"
+                   "> Quote `a\n>     b`\n> ===\n\n"
+                   "- Item `a\n      b`\n  ===\n")
+        self.write("README.md", "[first](guide.md#first-hello-world-second)\n"
+                   "[middle](guide.md#alpha-begin-middle-end) [tail](guide.md#end)\n"
+                   "[quoted](guide.md#quote-a-b) [listed](guide.md#item-a-b)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:2: guide.md#end (missing anchor)"])
+
+    def test_indented_code_after_block_boundary_is_literal(self):
+        self.write("guide.md", "Before\n***\n    [code](missing.md)\n    Code heading\n===\n\n"
+                   "After\n\n\t[example](absent.md)\nReal title\n---\n")
+        self.write("README.md", "[real](guide.md#real-title) [literal](guide.md#code-heading)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: guide.md#code-heading (missing anchor)"])
+
+    def test_blank_after_empty_list_item_ends_its_margin(self):
+        for marker in ("-", "+   ", "1.", "42)"):
+            with self.subTest(marker=marker):
+                self.write("README.md", f"{marker}\n \n\t[code](literal.md)\n\n"
+                           f"{marker}\n    [immediate](missing.md)\n\n"
+                           f"{marker.rstrip()} body\n\n    [continued](also-missing.md)\n")
+                self.assertEqual(broken_links(self.root), [
+                    "README.md:6: missing.md", "README.md:10: also-missing.md",
+                ])
+
+    def test_empty_item_needs_its_full_margin_on_each_blank(self):
+        self.write("README.md", "1.\n\t\n   \n    [continued](missing.md)\n\n"
+                   "1.\n\t\n  \n    [code](literal.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: missing.md"])
+
+    def test_blank_closes_only_the_empty_item_inside_outer_containers(self):
+        self.write("README.md", "> - outer\n>\n>   -\n>\n>       [code](literal.md)\n\n"
+                   "> - outer\n>\n>   -\n>\n>   [continued](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:11: missing.md"])
+
+    def test_footnote_paragraph_links_and_literal_blocks(self):
+        self.write("guide.md", "# Setup\n")
+        self.write("README.md", "Notes[^wide-label] and [^two].\n\n"
+                   "   [^wide-label]:[first](missing-first.md)\n\n"
+                   "    [ok](guide.md#setup) and [bad](guide.md#absent)\n\n"
+                   "\t\t[code](ignored.md)\n\n"
+                   "    ~~~\n    [fenced](ignored.md)\n    ~~~\n\n"
+                   "[^two]:\n\n\t[second](missing-second.md)\n\n"
+                   "Outside.\n\n    [code](ignored.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing-first.md", "README.md:5: guide.md#absent (missing anchor)",
+            "README.md:15: missing-second.md",
+        ])
+
+    def test_footnote_continuation_inside_a_list_and_block_quote(self):
+        self.write("README.md", "Notes[^listed] and [^quoted].\n\n"
+                   "- [^listed]: first paragraph\n\n      [nested](missing.md)\n\n"
+                   "> [^quoted]: [first](quoted.md)\n>\n>     [code](ignored.md)\n\n"
+                   "[outside](also-missing.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:5: missing.md", "README.md:7: quoted.md", "README.md:11: also-missing.md",
+        ])
+
+    def test_table_cells_cannot_hide_a_link_in_another_cell_or_row(self):
+        self.write("README.md", "| Token | Link | Token |\n| --- | --- | --- |\n"
+                   "| ` | [one](missing.md) | ` |\n\n"
+                   "Name | Link\n--- | ---\nfirst ` | [two](also-missing.md)\n"
+                   "last ` | `[code](ignored.md)` | [extra](dropped.md)\n"
+                   "escaped \\| pipe | [three](gone.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing.md", "README.md:7: also-missing.md", "README.md:9: gone.md",
+        ])
+
+    def test_indented_code_after_a_table_is_literal(self):
+        self.write("README.md", "A | B\n---\t|\t---\nrow | [one](missing.md) | [dropped](ignored.md)\n"
+                   "    [code](ignored.md)\n\n\t[more code](ignored.md)\n"
+                   "next [link](another.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:3: missing.md", "README.md:7: another.md"])
+
+    def test_inline_pipe_in_prose_does_not_start_a_table(self):
+        self.write("README.md", "A | B\njust `code\n[example](ignored.md)`\n"
+                   "and [real](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: missing.md"])
+
+    def test_heading_links_use_the_rendered_label(self):
+        self.write("ok.md", "# Guide\n")
+        self.write("README.md", "# [Handling `]`](ok.md)\n\n"
+                   "# [How [install](ok.md)](obsolete.md)\n\n"
+                   "[one](#handling-) [two](#how-installobsoletemd) [wrong](#handling-okmd)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:5: #handling-okmd (missing anchor)"])
+
+    def test_html_attribute_entities_and_duplicate_names(self):
+        self.write("README.md", '<a name="sign&copyx"></a>\n<a id="first" ID="second"></a>\n'
+                   '<a name="a&copy="></a>\n<a name="a&copy!"></a>\n\n'
+                   '[one](#sign%26copyx) [two](#first) [three](#a%26copy=) [four](#a%C2%A9!) '
+                   '[absent](#second)\n')
+        self.assertEqual(broken_links(self.root), ["README.md:6: #second (missing anchor)"])
+
+    def test_inline_processing_instructions_and_cdata_mask_their_contents(self):
+        self.write("README.md", "Here <?example [fake](inside.md)?> and <![CDATA[ [x](other.md) ]]> "
+                   "followed by [real](missing.md).\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
+    def test_plain_markdown_links_address_source_lines(self):
+        self.write("guide.md", "# Guide\n\nLast line")
+        self.write("README.md", "[one](guide.md?plain=1#L3) [range](guide.md?a=b&plain=1#L1-L3)\n"
+                   "[next](guide.md?plain=1#L4) [backwards](guide.md?plain=1#L3-L2)\n"
+                   "[rendered](guide.md?plain=0#guide) [wrong view](guide.md?plain=0#L1)\n"
+                   "[heading in source](guide.md?plain=1#guide) [empty](guide.md?plain=1)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: guide.md?plain=1#L4 (missing line)",
+            "README.md:2: guide.md?plain=1#L3-L2 (missing line)",
+            "README.md:3: guide.md?plain=0#L1 (missing anchor)",
+        ])
+
+    def test_uri_autolinks_hide_link_shapes_inside_the_url(self):
+        self.write("README.md", "See <https://example.org/[a](example.pdf)/[b][unused]> "
+                   "and [guide](missing.md).\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing.md"])
+
+    def test_gfm_bare_urls_hide_only_their_own_markdown(self):
+        self.write("README.md",
+                   "https://example.org/a/[label](inside.md)/[ref][unknown] [next](one.md)\n"
+                   "(*www.example.org/[label](example.pdf)*) [next](two.md)\n"
+                   "FTP://localhost/[x](example.pdf)<kbd>[next](three.md)</kbd>\n"
+                   "[https://example.org/[nested](four.md)](outer.md)\n"
+                   "prefixhttps://example.org/[plain](five.md) wordwww.example.org/[x](six.md)\n"
+                   "https://invalid_host.example/[plain](seven.md)\n"
+                   "# https://example.org/_path_/[x](file.md)\n"
+                   "[heading](#httpsexampleorg_path_xfilemd)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: one.md", "README.md:2: two.md", "README.md:3: three.md",
+            "README.md:4: four.md", "README.md:5: five.md", "README.md:5: six.md",
+            "README.md:6: seven.md",
+        ])
+
+    def test_bare_url_unicode_hosts_follow_gfm_character_classes(self):
+        self.write("README.md",
+                   "https://🌍.example/[x](url-path.md)\n"
+                   "https://he\u0301llo.example/[x](url-path.md)\n"
+                   "https://🌍_invalid.example/[x](bad-name.md)\n"
+                   "https://—example.org/[x](bad-start.md)\n"
+                   "https://abc.example/ [x](separate.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: bad-name.md", "README.md:4: bad-start.md", "README.md:5: separate.md",
+        ])
+
+    def test_inline_markup_can_start_a_setext_heading(self):
+        self.write("README.md", "<https://example.org>\n===\n\n<kbd>Enter</kbd> key\n---\n\n"
+                   "<div>Hidden</div>\n===\n\n"
+                   "[url](#httpsexampleorg) [key](#enter-key) [absent](#hidden)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:10: #hidden (missing anchor)"])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_direct_links_through_a_tracked_directory_alias(self):
+        self.write("docs/guide.md", "# Setup\n")
+        self.write(".gitignore", "/local/\n")
+        self.write("README.md", "[valid](manual/guide.md#setup) [broken](manual/guide.md#absent)\n"
+                   "[ignored](local/guide.md) [missing](manual/absent.md)\n")
+        (self.root / "manual").symlink_to("docs", target_is_directory=True)
+        (self.root / "local").mkdir()
+        (self.root / "local/guide.md").symlink_to("../docs/guide.md")
+        git = ["git", "-C", self.root]
+        subprocess.run([*git, "add", "manual"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "tracked directory alias"], check=True)
+        with tempfile.TemporaryDirectory() as temp:
+            clone = Path(temp) / "clone"
+            subprocess.run(["git", "clone", "--quiet", self.root, clone], check=True)
+            for checkout in [self.root, clone]:
+                self.assertEqual(broken_links(checkout), [
+                    "README.md:1: manual/guide.md#absent (missing anchor)",
+                    "README.md:2: local/guide.md", "README.md:2: manual/absent.md",
+                ])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte filenames")
+    def test_percent_encoded_filenames_keep_the_original_bytes(self):
+        self.write(os.fsdecode(b"notes\xff.txt"), "notes")
+        self.write("notes�.txt", "replacement")
+        self.write("README.md", "[bytes](notes%FF.txt) [utf8](notes%EF%BF%BD.txt) "
+                   "[missing](notes%FE.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: notes%FE.txt"])
+
+    def test_rooted_links_and_external_scheme_case(self):
+        self.write("GUIDE.MD", "# Welcome\n")
+        self.write("docs/sub/page.md", "[guide](/GUIDE.MD#welcome) [web](HtTpS://example.org/a)\n"
+                   "[absent](/not-a-repository-path)\n")
+        self.assertEqual(broken_links(self.root), ["docs/sub/page.md:2: /not-a-repository-path"])
+
+    def test_comments_and_quoted_headings(self):
+        self.write("README.md", "<!--\n# Draft\n```\n[example](hidden)\n-->\n"
+                   "> ## Backup\n\n[visible](#backup) [invisible](#draft)\n"
+                   "text <!-- [scratch](hidden) --> [real](missing.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:8: #draft (missing anchor)", "README.md:9: missing.md"])
+
+    def test_block_comments_end_with_their_list_or_quote_container(self):
+        cases = {
+            "list": "- <!-- draft\n\n[real](gone.md)\n",
+            "sibling": "- <!-- draft\n- [real](gone.md)\n",
+            "quoted list": "> 1. <!-- draft\n>    [draft](hidden.md)\n> [real](gone.md)\n",
+            "list of quotes": "- > <!-- draft\n  > [draft](hidden.md)\n  [real](gone.md)\n",
+            "nested list": "- outer\n  - <!-- draft\n    [draft](hidden.md)\n  [real](gone.md)\n",
+            "inline close": "- > <!-- [draft](hidden.md) -->\n  > [real](gone.md)\n",
+            "closing line": "- > <!-- draft\n  > --> [draft](hidden.md)\n  > [real](gone.md)\n",
+            "fenced sibling block": "-   <!-- note -->\n\n    ```markdown\n\n"
+                                    "    [example](hidden.md)\n    ```\n\n[real](gone.md)\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                self.write("README.md", content)
+                self.assertEqual(broken_links(self.root),
+                                 [f"README.md:{len(content.splitlines())}: gone.md"])
+
+    def test_mixed_case_markdown_extensions(self):
+        self.write("README.Md", "[broken](absent)\n", tracked=False)
+        self.assertEqual(broken_links(self.root), ["README.Md:1: absent"])
+
+    def test_multiline_destinations_use_their_source_lines(self):
+        self.write("README.md", "[a](\n  missing.md\n) ![b](also-missing.md)\n\n"
+                   "> [nested](\n> <missing file.md>\n> )\n\n"
+                   "[no](\n\nafter-blank.md)\n\n[broken](<spans\nlines.md>)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: missing.md", "README.md:3: also-missing.md",
+            "README.md:6: missing file.md"])
+
+    def test_network_path_references_are_external(self):
+        self.write("README.md", "[manual](//docs.example.org/manual#topic)\n"
+                   "[other]: //cdn.example.org/sample\n\n[local](/missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: /missing.md"])
+
+    def test_only_publishable_files_and_directories_are_link_targets(self):
+        self.write(".gitignore", "ignored/\n")
+        self.write("ignored/notes.txt", "local", tracked=False)
+        self.write("draft/file.txt", "new", tracked=False)
+        sibling = tempfile.NamedTemporaryFile(dir=self.root.parent)
+        self.addCleanup(sibling.close)
+        outside = Path(sibling.name)
+        self.write("README.md", "[root](/) [draft](draft) [new](draft/file.txt)\n"
+                   f"[ignored](ignored/notes.txt) [dir](ignored/) [external](../{outside.name})\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: ignored/notes.txt", "README.md:2: ignored/", f"README.md:2: ../{outside.name}"])
+
+    def test_url_dot_segments_are_removed_before_checking_files_and_anchors(self):
+        self.write("docs/guide.md", "# Guide\n")
+        self.write("docs/readme.md", "[direct](guide.md#guide) [gone](old/../guide.md#guide)\n"
+                   "[file](guide.md/../guide.md#guide) [encoded](/old/%2e%2E/docs/guide.md#guide)\n"
+                   "[bad](old/../guide.md#absent) [missing](old/../missing.md)\n"
+                   "[directory](guide.md/old/..) [above](../../docs/guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "docs/readme.md:3: old/../guide.md#absent (missing anchor)", "docs/readme.md:3: old/../missing.md",
+            "docs/readme.md:4: guide.md/old/..", "docs/readme.md:4: ../../docs/guide.md",
+        ])
+
+    def test_dot_segments_count_empty_url_segments(self):
+        self.write("guide.md", "# Root\n")
+        self.write("live/guide.md", "# Nested\n")
+        self.write("README.md", "[missing](missing//../guide.md#root) [nested](live//%2e./guide.md#nested)\n"
+                   "[wrong](live//../guide.md#root) [root](.//../guide.md#root)\n"
+                   "[dir](live//..) [file](guide.md//..) [escape](.//../../guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:1: missing//../guide.md#root", "README.md:2: live//../guide.md#root (missing anchor)",
+            "README.md:3: guide.md//..", "README.md:3: .//../../guide.md",
+        ])
+
+    def test_encoded_slash_does_not_split_a_url_segment(self):
+        self.write("guide.md", "# Root\n")
+        self.write("live/guide.md", "# Nested\n")
+        self.write("live/%2f.md", "# Percent\n")
+        self.write("README.md", "[root](live%2Fchild/../guide.md#root) [nested](live/%2f/../guide.md#nested)\n"
+                   "[split](live%2fguide.md#nested) [literal](live/%252f.md#percent)\n"
+                   "[escape](%2f../guide.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: live%2fguide.md#nested", "README.md:3: %2f../guide.md",
+        ])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_removed_url_segment_is_not_resolved_as_a_checkout_symlink(self):
+        self.write("guide.md", "# Root\n")
+        self.write("deep/guide.md", "# Deep\n")
+        self.write("deep/sub/file", "")
+        (self.root / "alias").symlink_to("deep/sub", target_is_directory=True)
+        self.write("README.md", "[root](alias/../guide.md#root) [wrong](alias/../guide.md#deep)\n"
+                   "[through alias](alias/file)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: alias/../guide.md#deep (missing anchor)"])
+
+    def test_a_tracked_submodule_directory_is_publishable(self):
+        self.write("README.md", "[component](component)\n")
+        (self.root / "component").mkdir()
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture commit"], check=True)
+        oid = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run([*git, "update-index", "--add", "--cacheinfo", f"160000,{oid},component"], check=True)
+        self.assertEqual(broken_links(self.root), [])
+
+    @unittest.skipUnless(os.name == "posix", "Git symlink checkout")
+    def test_every_link_in_a_document_symlink_chain_must_be_publishable(self):
+        self.write("docs/guide.md", "# Guide\n")
+        self.write("README.md", "[file](alias.md#guide) [directory](via-dir.md) [ok](good.md#guide)\n")
+        self.write(".gitignore", "/local-file\n/local-dir\n")
+        for name, target in (("alias.md", "local-file"), ("local-file", "docs/guide.md"),
+                             ("via-dir.md", "local-dir/guide.md"), ("local-dir", "docs"),
+                             ("good.md", "published-dir/guide.md"), ("published-dir", "docs")):
+            (self.root / name).symlink_to(target)
+        git = ["git", "-C", str(self.root)]
+        subprocess.run([*git, "add", "--all"], check=True)
+        subprocess.run([*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "-qm", "fixture links"], check=True)
+        with tempfile.TemporaryDirectory() as directory:
+            clone = Path(directory) / "clone"
+            subprocess.run(["git", "clone", "--quiet", str(self.root), str(clone)], check=True)
+            expected = ["README.md:1: alias.md#guide", "README.md:1: via-dir.md",
+                        "alias.md: invalid Markdown symlink target", "via-dir.md: invalid Markdown symlink target"]
+            self.assertEqual(broken_links(clone), expected)
+            self.assertEqual(broken_links(self.root), expected)
+
+    def test_inner_links_deactivate_outer_links_but_images_remain_linkable(self):
+        self.write("guide.md", "# Guide\n")
+        self.write("README.md", "[[inner](guide.md)](literal.md)\n\n"
+                   "[![badge](missing.png)](outer.md)\n\n"
+                   "[[inner][guide]](literal2.md)\n\n[guide]: guide.md\n\n"
+                   "[![alt [inner](alt-text)](absent.png)](outside.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: missing.png", "README.md:3: outer.md",
+            "README.md:9: absent.png"])
+
+    def test_inline_html_attributes_do_not_create_links_or_references(self):
+        self.write("README.md", 'See <a id="here" title="[x](example) [y][unused]">here</a> '
+                   '[anchor](#here) [real](missing).\n')
+        self.assertEqual(broken_links(self.root), ["README.md:1: missing"])
+
+    def test_unmatched_underscores_are_literal_in_heading_slugs(self):
+        self.write("README.md", "# _draft\n# build_\n# _both_\n# __before_\n\n"
+                   "[a](#_draft) [b](#build_) [c](#both) [d](#_before)\n")
+        self.assertEqual(broken_links(self.root), [])
+
+    def test_absolute_uri_schemes_are_external(self):
+        self.write("README.md", "[mirror](FTP://example.org/pub/) [phone](tel:+1234)\n\n"
+                   "[ref]: urn:example:manual\n\n[local](file.txt)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:5: file.txt"])
+
+    def test_only_complete_markdown_entities_change_a_link_destination(self):
+        self.write("copy&copy.txt", "")
+        self.write("copy©.txt", "")
+        self.write("README.md", "[literal](copy&copy.txt) [entity](copy&copy;.txt)\n\n"
+                   "[ref]: copy&copy.txt\n")
+        (self.root / "copy©.txt").unlink()
+        self.assertEqual(broken_links(self.root), ["README.md:1: copy©.txt"])
+
+    def test_headings_inside_nested_list_and_quote_containers(self):
+        self.write("README.md", "- ## Install\n- > Release\n  > =======\n- Help\n- -----\n\n"
+                   "[one](#install) [two](#release) [separate item](#help)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: #help (missing anchor)"])
+
+    def test_lazy_continuations_keep_paragraph_links_and_definitions(self):
+        self.write("README.md", "- [Release\nnotes](missing.md)\n\n"
+                   "> prose\n[ref]: ignored.md\n\n[go][ref]\n\n"
+                   "- Item\n===\n\n[not a heading](#item)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:2: missing.md", "README.md:7: [go][ref] (undefined reference)",
+            "README.md:12: #item (missing anchor)"])
+
+    def test_ordered_list_interrupts_a_paragraph_only_when_it_starts_at_one(self):
+        self.write("README.md", "Paragraph\n2. ## Fake\n\n"
+                   "Paragraph\n1. ## Real\n2. ## Second\n\n"
+                   "[a](#fake) [b](#real) [c](#second)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:8: #fake (missing anchor)"])
+
+    def test_unquoted_and_entity_encoded_html_anchor_values(self):
+        self.write("README.md", "<a name=install></a> <A ID='a&amp;b' name=another></A>\n"
+                   "<span title=\"<a id=pretend>\">example</span>\n\n"
+                   "[a](#install) [b](#a%26b) [c](#another) [d](#pretend)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:4: #pretend (missing anchor)"])
+
+    def test_raw_html_blocks_keep_html_anchors_and_hide_markdown_examples(self):
+        self.write("README.md", "<pre>\n\n[code](missing.md)\n# Code title\n</PRE>\n"
+                   "- <div>\n  <a name=actual></a>\n  [example](hidden.md)\n"
+                   "- [real](missing-real.md)\n\n[ok](#actual) [absent](#code-title)\n"
+                   "<script>\n<a name=script-text>\n</script>\n\n[script](#script-text)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:9: missing-real.md", "README.md:11: #code-title (missing anchor)",
+            "README.md:16: #script-text (missing anchor)"])
+
+    def test_raw_html_blocks_end_at_any_type_one_closing_tag(self):
+        self.write("README.md", "<pre>\n[example](hidden.md)\n</STYLE>\n"
+                   "[real](missing.md)\n\n<script>sample('</textarea>')\n"
+                   "# Visible\n\n[anchor](#visible) [real](absent.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:4: missing.md", "README.md:9: absent.md"])
+
+    def test_github_html_block_tags_interrupt_paragraphs(self):
+        self.write("README.md", "Text\n<source src=demo>\n[example](hidden.md)\n\n"
+                   "Text\n<search>\n[real](missing.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: missing.md"])
+
+    @unittest.skipUnless(os.name == "posix", "Unix byte filenames")
+    def test_byte_filename_keeps_other_diagnostics(self):
+        name = os.fsdecode(b"notes-\xff.md")
+        self.write(name, "[broken](gone)\n")
+        self.write("a.md", "[broken](also-gone)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["a.md:1: also-gone", f"{name}:1: gone"])
 
     def archive(self, document="README.md", content="[Contributing](CONTRIBUTING.md)\n",
                 extra_files=None):
@@ -107,6 +687,80 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root), [
             "vendor/hyper/README.md:1: ../missing.md",
         ])
+
+    def test_fence_closer_must_match_marker_length_and_have_no_info(self):
+        self.write("README.md", "````md\n```\n~~~\n````example\n"
+                   "[sample](inside.md)\n`````\n[real](outside.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:7: outside.md"])
+
+    def test_fences_end_at_the_list_item_or_quote_boundary(self):
+        self.write("README.md", "10. example\n    ````md\n    [sample](inside.md)\n"
+                   "    ```\n    ````\n[outside](one.md)\n\n"
+                   "> - ~~~\n>   [sample](inside.md)\n> [outside](two.md)\n\n"
+                   "- example\n  ```\n  [sample](inside.md)\n> [outside](three.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:6: one.md", "README.md:10: two.md", "README.md:15: three.md"])
+
+    def test_list_fences_count_tab_stops_in_the_container_indent(self):
+        self.write("README.md", "- Docs\n  ```md\n\t[example](inside.md)\n  ```\n"
+                   "[broken](outside.md)\n\n"
+                   "1.\tExample\n\t~~~\n\t[sample](nested.md)\n\t~~~\n"
+                   "[next](after.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:5: outside.md", "README.md:11: after.md"])
+
+    def test_multiline_code_masks_links_references_and_anchors_only_in_its_paragraph(self):
+        self.write("README.md", 'Text ``example `\n[shown](inside.md) [x][label] <a id="inside">\n'
+                   'end`` [real](outside.md)\n\n[anchor](#inside)\n'
+                   'Unmatched `tick\n\n[another](after.md) `literal\n')
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:3: outside.md", "README.md:5: #inside (missing anchor)",
+                          "README.md:8: after.md"])
+
+    def test_backticks_and_brackets_in_a_destination_or_title_do_not_change_later_links(self):
+        self.write("file`with).md", "# OK\n")
+        self.write("README.md", """[ok](<file`with).md> 'title [x][label] <a id="hidden">') [bad](lost.md) `code`
+[query](<file%60with%29.md?plain=1#ok>) [anchor](#hidden)
+""")
+        self.assertEqual(broken_links(self.root), ["README.md:1: lost.md",
+                                                   "README.md:2: #hidden (missing anchor)"])
+
+    def test_inline_code_is_not_a_link_or_an_html_anchor(self):
+        self.write("README.md", '`<a id="sample"> [sample](inside.md)`\n[real](#sample)\n')
+        self.assertEqual(broken_links(self.root), ["README.md:2: #sample (missing anchor)"])
+
+    def test_inline_destinations_with_spaces_parentheses_and_titles(self):
+        self.write("User Guide.md", "## here\n")
+        self.write("right(one).md", "# yes\n")
+        self.write("README.md", "[guide](User%20Guide.md#here)\n[guide](<User Guide.md>)\n"
+                   "[guide](right(one).md 'title')\n[item](<Missing Guide.md>)\n"
+                   "[![image](missing.png)](right(one).md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:4: Missing Guide.md", "README.md:5: missing.png"])
+
+    def test_wrapped_label_retains_its_destination_and_report_line(self):
+        self.write("guide#one%.md", "# Start\n")
+        self.write("README.md", "[a wrapped\nlabel](guide%23one%25.md#start) and [a second\n"
+                   "label](missing.md)\n\n[unmatched\n\nclosing](not-a-link.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:3: missing.md"])
+
+    def test_unstaged_deletion_still_reports_links_to_the_removed_document(self):
+        self.write("old.md", "# Old\n").unlink()
+        self.write("README.md", "[old](old.md)\n")
+        self.assertEqual(broken_links(self.root), ["README.md:1: old.md"])
+
+    def test_dangling_markdown_symlink_is_reported_even_without_inbound_links(self):
+        self.write("missing.md", "# Former file\n").unlink()
+        (self.root / "guide.md").symlink_to("missing.md")
+        self.write("README.md", "[other](no.md)\n")
+        self.assertEqual(broken_links(self.root),
+                         ["README.md:1: no.md", "guide.md: invalid Markdown symlink target"])
+
+    def test_replacing_a_tracked_file_with_a_directory_checks_its_new_documents(self):
+        old = self.write("old.md", "# Former file\n")
+        old.unlink()
+        self.write("old.md/new.md", "[missing](target.md)\n", tracked=False)
+        self.assertEqual(broken_links(self.root), ["old.md/new.md:1: target.md"])
 
     def test_regular_link_filtering_and_locations_are_preserved(self):
         self.write("target.md", "# Present\n\n## Heading\n")

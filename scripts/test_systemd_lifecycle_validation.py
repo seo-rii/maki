@@ -5,13 +5,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SCRIPT = Path(__file__).with_name("systemd-lifecycle-validation.py")
 SPEC = importlib.util.spec_from_file_location("maki_systemd_fixture", SCRIPT)
 fixture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fixture)
+READY_DAEMON = ("daemon-start", "daemon-ready")
 
 
 class SystemdLifecycleFixtureTests(unittest.TestCase):
@@ -30,48 +31,173 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                   patch.object(fixture.time, "sleep")):
                 case.verify(mode)
 
+    def test_recovered_workload_requires_a_live_ready_daemon(self):
+        events = (*READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
+                  "daemon-stop", *READY_DAEMON, "attach-start", "attach-ready")
+        for mode in ("exit-once", "timeout-once", "kill-once"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(AssertionError, "daemon"):
+                self.verify_events(mode, (*events, "daemon-stop", "workload-start"), "active")
+            with self.subTest(mode=mode), self.assertRaisesRegex(AssertionError, "daemon|timed out"):
+                self.verify_events(mode, (*events, "workload-start"), "active", states={"daemon": "inactive"})
+
+    def test_failed_recovery_requires_its_specific_cleanup_event(self):
+        for mode, refusal in (("foreign-resource", "foreign-resource-preserved"),
+                              ("cleanup-failure", "cleanup-refused")):
+            base = (*READY_DAEMON, "attach-start")
+            self.verify_events(mode, (*base, "cleanup-recover", refusal), "inactive",
+                               states={"recovery": "failed"}, resource=True)
+            for suffix in ((), ("cleanup-recover",), (refusal, "cleanup-recover")):
+                with self.subTest(mode=mode, suffix=suffix), self.assertRaises(AssertionError):
+                    self.verify_events(mode, (*base, *suffix), "inactive",
+                                       states={"recovery": "failed"}, resource=True)
+
+    def test_command_name_preserves_dollar_while_arguments_are_escaped(self):
+        volume = "mkci_dollar"
+        with patch.object(fixture.sys, "executable", "/tmp/python$build"):
+            units = fixture.fixture_units(volume, Path("/tmp/dir$build"), Path("/tmp/helper$build"))
+        attach = units[fixture.names(volume)["attach"]]
+        self.assertIn('ExecStopPost="/tmp/helper$build"', attach)
+        self.assertIn('ExecStart="/tmp/python$build"', attach)
+        self.assertIn('"/tmp/dir$$build" attach', attach)
+
+    def test_partial_event_fails_both_the_writer_and_final_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
+            fixture.event(case.directory, "started")
+            write = fixture.os.write
+            with patch.object(fixture.os, "write", side_effect=lambda fd, line: write(fd, line[:11])):
+                with self.assertRaisesRegex(OSError, "short write"):
+                    fixture.event(case.directory, "finished")
+            self.assertEqual([record["event"] for record in case.events()], ["started"])
+            with self.assertRaisesRegex(ValueError, "incomplete final record"):
+                case.events(final=True)
+
     def test_failed_cleanup_trace_requires_live_daemon(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("failed-stop", (
-                "daemon-start", "attach-start", "attach-ready", "workload-start",
+                *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                 "workload-stop", "cleanup-stop", "cleanup-refused", "daemon-stop",
             ), "inactive", states={"attach": "failed"}, resource=True)
 
     def test_cancelled_start_cannot_stop_daemon_with_resource(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("cancel-start", (
-                "daemon-start", "attach-start", "daemon-stop",
+                *READY_DAEMON, "attach-start", "daemon-stop",
             ), "inactive", resource=True)
 
     def test_failed_or_interrupted_cleanup_preserves_live_daemon(self):
         for mode in ("failed-stop", "timeout-stop", "kill-stop"):
             with self.subTest(mode=mode):
                 self.verify_events(mode, (
-                    "daemon-start", "attach-start", "attach-ready", "workload-start",
+                    *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                     "workload-stop", "cleanup-stop", "cleanup-refused",
                 ), "inactive", states={"attach": "failed", "daemon": "active"}, resource=True)
 
+    def test_wait_rejects_a_late_success_and_bounds_each_systemctl_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "normal-stop")
+            now = [0.0]
+            budgets = []
+
+            def slow_show(command, **kwargs):
+                budgets.append(kwargs["timeout"])
+                now[0] += 10
+                return subprocess.CompletedProcess(command, 0, "ActiveState=active", "")
+
+            with patch.object(fixture.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(subprocess, "run", side_effect=slow_show):
+                with self.assertRaisesRegex(AssertionError, "timed out"):
+                    case.wait(lambda: all(case.state(unit) == "active" for unit in ("target", "workload")),
+                              "both units active", timeout=18)
+                case.state("daemon")
+            self.assertEqual(budgets, [18, 8, 20])
+
+    def test_fixture_construction_failure_preserves_completed_case_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+            output = root / "results"
+            first = Mock(volume="mkci_first", events=Mock(return_value=[]))
+            with (patch.object(fixture.sys, "argv", ["fixture", "--disposable-host", "--helper-binary",
+                                                     str(helper), "--output", str(output)]),
+                  patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                  patch.object(fixture.sys, "platform", "linux"),
+                  patch.object(fixture, "CASES", ("first", "second")),
+                  patch.object(fixture, "Fixture", side_effect=[first, ValueError("unit contract changed")])):
+                self.assertEqual(fixture.main(), 1)
+            previous, failed = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual(previous["status"], "passed")
+            self.assertEqual(failed, {"case": "second", "status": "failed", "error": "unit contract changed"})
+
+    def test_corrupt_events_are_reported_even_if_verification_already_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+
+            def install(case):
+                (case.directory / "events.jsonl").write_text('{"event":\n')
+
+            with (patch.object(fixture.sys, "argv", ["fixture", "--disposable-host", "--helper-binary",
+                                                      str(helper), "--output", str(output)]),
+                  patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                  patch.object(fixture.sys, "platform", "linux"),
+                  patch.object(fixture, "CASES", ("normal-stop",)),
+                  patch.object(fixture.Fixture, "install", install),
+                  patch.object(fixture.Fixture, "verify", side_effect=RuntimeError("verification failed")),
+                  patch.object(fixture.Fixture, "diagnostics")):
+                self.assertEqual(fixture.main(), 1)
+            result, = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error"], "verification failed")
+            self.assertIn("Expecting value", result["events_error"])
+
     def test_normal_stop_requires_cleanup_before_daemon_stop(self):
-        prefix = ("daemon-start", "attach-start", "attach-ready", "workload-start",
+        prefix = (*READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                   "workload-stop", "cleanup-stop")
         self.verify_events("normal-stop", (*prefix, "cleanup-complete", "daemon-stop"), "inactive")
         with self.assertRaisesRegex(AssertionError, "daemon stopped before"):
             self.verify_events("normal-stop", (*prefix, "daemon-stop", "cleanup-complete"), "inactive")
 
+    def test_attach_requires_readiness_from_the_running_daemon(self):
+        tail = ("attach-ready", "workload-start", "workload-stop", "cleanup-stop", "cleanup-complete", "daemon-stop")
+        for prefix in (("attach-start", *READY_DAEMON), ("daemon-start", "attach-start", "daemon-ready"),
+                       ("daemon-ready", "attach-start"), (*READY_DAEMON, "daemon-stop", "attach-start")):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(AssertionError, "daemon"):
+                self.verify_events("normal-stop", (*prefix, *tail), "inactive")
+
+        first = (*READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete", "daemon-stop", "daemon-start")
+        retry = ("attach-start", "attach-ready", "workload-start")
+        with self.assertRaisesRegex(AssertionError, "daemon"):
+            self.verify_events("exit-once", (*first, *retry), "active")
+        self.verify_events("exit-once", (*first, "daemon-ready", *retry), "active")
+
+    def test_workload_requires_readiness_from_its_own_attachment(self):
+        for trace in (
+            ("attach-start", "cleanup-recover", "cleanup-complete",
+             "attach-start", "workload-start", "attach-ready"),
+            ("attach-start", "attach-ready", "cleanup-recover", "cleanup-complete",
+             "attach-start", "workload-start"),
+        ):
+            with self.subTest(trace=trace), self.assertRaisesRegex(AssertionError, "workload.*ready"):
+                self.verify_events("exit-once", (*READY_DAEMON, *trace), "active")
+
     def test_normal_stop_waits_for_the_actual_daemon_shutdown(self):
         with self.assertRaisesRegex(AssertionError, "daemon"):
             self.verify_events("normal-stop", (
-                "daemon-start", "attach-start", "attach-ready", "workload-start",
+                *READY_DAEMON, "attach-start", "attach-ready", "workload-start",
                 "workload-stop", "cleanup-stop", "cleanup-complete",
             ), "inactive", states={"daemon": "active"})
 
     def test_recovery_oracle_accepts_cleanup_before_each_reattach(self):
         self.verify_events("exit-once", (
-            "attach-start", "cleanup-recover", "cleanup-complete",
+            *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "attach-ready", "workload-start",
         ), "active")
         self.verify_events("repeated-failure", (
-            "attach-start", "cleanup-recover", "cleanup-complete",
+            *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "cleanup-recover", "cleanup-complete",
             "attach-start", "cleanup-recover", "cleanup-complete",
         ), "failed")
@@ -81,7 +207,7 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             with self.subTest(completion=completion):
                 with self.assertRaisesRegex(AssertionError, "reattach"):
                     self.verify_events("exit-once", (
-                        "attach-start", "cleanup-recover",
+                        *READY_DAEMON, "attach-start", "cleanup-recover",
                         "attach-start", "attach-ready", "workload-start",
                         *completion,
                     ), "active")
@@ -89,26 +215,50 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
     def test_recovery_oracle_rejects_stale_cleanup_completion(self):
         with self.assertRaisesRegex(AssertionError, "reattach"):
             self.verify_events("repeated-failure", (
-                "attach-start", "cleanup-recover", "cleanup-complete",
+                *READY_DAEMON, "attach-start", "cleanup-recover", "cleanup-complete",
                 "attach-start", "cleanup-recover",
                 "attach-start", "cleanup-complete",
             ), "failed")
 
     def test_cancellation_oracle_rejects_unsafe_events(self):
-        self.verify_events("cancel-start", ("attach-start",), "inactive",
+        self.verify_events("cancel-start", (*READY_DAEMON, "attach-start"), "inactive",
                            states={"daemon": "active"}, resource=True)
         for event in ("unsafe-workload-start", "unsafe-cleanup-before-workload-stop"):
             with self.subTest(event=event):
                 with self.assertRaisesRegex(AssertionError, "unsafe"):
-                    self.verify_events("cancel-start", ("attach-start", event), "inactive",
+                    self.verify_events("cancel-start", (*READY_DAEMON, "attach-start", event), "inactive",
                                        states={"daemon": "active"}, resource=True)
+
+    def test_cancellation_waits_for_the_partial_attachment_before_stop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
+            for event in (*READY_DAEMON, "attach-start"):
+                fixture.event(case.directory, event)
+            resource = case.directory / "resource"
+
+            def wait(condition, label):
+                if label == "partial attachment created":
+                    self.assertFalse(condition())
+                    resource.touch()
+                    self.assertFalse(condition())
+                    resource.write_bytes(b"owned")
+                self.assertTrue(condition())
+
+            def ctl(action, *_args):
+                if action == "stop":
+                    self.assertEqual(resource.read_bytes(), b"owned")
+
+            with (patch.object(case, "wait", side_effect=wait), patch.object(case, "ctl", side_effect=ctl),
+                  patch.object(case, "state", side_effect=lambda unit: "active" if unit == "daemon" else "inactive"),
+                  patch.object(fixture.time, "sleep")):
+                case.verify("cancel-start")
 
     def test_cancellation_waits_for_service_stop_jobs_before_checking_safety(self):
         for terminal_state in ("inactive", "failed"):
             with self.subTest(terminal_state=terminal_state), tempfile.TemporaryDirectory() as temporary:
                 case = fixture.Fixture(Path(temporary), Path("/tmp/helper"), "cancel-start")
                 (case.directory / "resource").write_text("owned")
-                records = [{"event": "attach-start"}]
+                records = [{"event": name} for name in (*READY_DAEMON, "attach-start")]
                 stopping = iter(("deactivating", terminal_state))
 
                 def state(which):
@@ -145,6 +295,10 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
         units = fixture.names(volume)
         files = fixture.fixture_units(volume, Path("/tmp/private fixture"), Path("/tmp/real helper"))
         self.assertEqual(set(files), set(units.values()))
+        daemon = files[units["daemon"]].splitlines()
+        self.assertIn("Type=notify", daemon)
+        start = next(line for line in daemon if line.startswith("ExecStart="))
+        self.assertIn(start.replace("ExecStart=", "ExecStartPost=") + "-ready", daemon)
         for content in files.values():
             self.assertNotIn("%i", content)
             self.assertNotIn("AssertPathExists=", content)
@@ -165,6 +319,12 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
         self.assertIn(f"OnSuccess={units['target']}", recovery)
         self.assertIn(f"After={units['target']} {units['attach']} {units['daemon']}", recovery)
         self.assertIn("StartLimitBurst=3", recovery)
+
+    def test_instance_substitution_preserves_literal_helper_path(self):
+        volume = "mkci_fixture"
+        units = fixture.fixture_units(volume, Path("/tmp/private"), Path("/tmp/%images/helper"))
+        self.assertIn('ExecStopPost="/tmp/%%images/helper" recover-failed-start --volume mkci_fixture',
+                      units[fixture.names(volume)["attach"]].splitlines())
 
     def test_unexpected_hook_or_external_dependency_is_refused(self):
         read_text = Path.read_text
@@ -231,6 +391,158 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                     self.assertNotEqual(fixture.actor(directory, "cleanup-recover"), 0)
                     self.assertTrue((directory / "resource").exists())
 
+    def test_cleanup_preserves_the_units_as_executed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            runtime = root / "systemd"
+            runtime.mkdir()
+
+            def systemctl(action, *args, **_kwargs):
+                if action == "link":
+                    source = Path(args[-1])
+                    (runtime / source.name).symlink_to(source)
+                return subprocess.CompletedProcess([], 0, "ActiveState=inactive", "")
+
+            with patch.object(fixture, "Path", return_value=runtime), patch.object(case, "ctl", systemctl):
+                case.install()
+                for installed, source in case.linked:
+                    self.assertEqual(installed.read_text(), case.files[installed.name])
+                case.cleanup()
+            for name, original in case.files.items():
+                self.assertEqual((case.directory / name).read_text(), original)
+                self.assertFalse((runtime / name).is_symlink())
+            rewritten = case.directory / "runtime-units" / case.units["attach"]
+            self.assertNotIn("ExecStop=", rewritten.read_text())
+
+    def test_install_remembers_link_created_before_systemctl_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            runtime = root / "runtime"
+            runtime.mkdir()
+
+            def partially_link(_verb, _runtime, filename):
+                source = Path(filename)
+                (runtime / source.name).symlink_to(source)
+                raise TimeoutError("reload timed out")
+
+            with patch.object(fixture, "Path", return_value=runtime), patch.object(case, "ctl", partially_link):
+                with self.assertRaises(TimeoutError):
+                    case.install()
+            self.assertEqual(len(case.linked), 1)
+            destination, source = case.linked[0]
+            self.assertEqual(destination.resolve(), source.resolve())
+
+    def test_cleanup_retries_after_a_partial_unlink_and_failed_final_reload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = fixture.Fixture(root, Path("/tmp/helper"), "normal-stop")
+            for name in (case.units["attach"], case.units["recovery"]):
+                source = case.directory / name
+                source.write_text(case.files[name])
+                link = root / name
+                link.symlink_to(source)
+                case.linked.append((link, source))
+            remaining = case.linked[1]
+            unlink = Path.unlink
+
+            def fail_second(link):
+                if link == remaining[0]:
+                    raise PermissionError("interrupted unlink")
+                unlink(link)
+
+            ctl = Mock(return_value=subprocess.CompletedProcess([], 0, "ActiveState=inactive", ""))
+            with patch.object(case, "ctl", ctl), patch.object(Path, "unlink", fail_second):
+                with self.assertRaisesRegex(PermissionError, "interrupted"):
+                    case.cleanup()
+            self.assertEqual(case.linked, [remaining])
+
+            def fail_reload(*args, **kwargs):
+                if not case.linked:
+                    raise RuntimeError("reload failed")
+                return ctl.return_value
+
+            with patch.object(case, "ctl", fail_reload):
+                with self.assertRaisesRegex(RuntimeError, "reload failed"):
+                    case.cleanup()
+            self.assertFalse(remaining[0].is_symlink())
+            ctl.reset_mock()
+            with patch.object(case, "ctl", ctl):
+                case.cleanup()
+                case.cleanup()
+            ctl.assert_called_once_with("daemon-reload")
+
+    def test_failed_report_replacement_preserves_completed_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "evidence"
+            helper = root / "helper"
+            helper.touch(mode=0o700)
+            replacement = fixture.os.replace
+            case = Mock(volume="fixture")
+            case.events.return_value = []
+
+            def publish(source, destination):
+                if destination.exists():
+                    raise OSError("publication failed")
+                replacement(source, destination)
+
+            with patch.object(fixture.sys, "argv", ["validation", "--disposable-host", "--helper-binary", str(helper),
+                                                    "--output", str(output)]), \
+                    patch.object(fixture.os, "geteuid", return_value=0, create=True), \
+                    patch.object(fixture.sys, "platform", "linux"), \
+                    patch.object(fixture, "CASES", ("first", "second")), \
+                    patch.object(fixture, "Fixture", return_value=case), \
+                    patch.object(fixture.os, "replace", publish):
+                with self.assertRaisesRegex(OSError, "publication failed"):
+                    fixture.main()
+            results = fixture.json.loads((output / "results.json").read_text())
+            self.assertEqual([row["case"] for row in results], ["first"])
+
+    def test_cli_retries_partial_cleanup_before_discarding_fixture(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "evidence"
+                helper = root / "helper"
+                helper.touch(mode=0o700)
+                case = fixture.Fixture(root, helper, "normal-stop")
+                for name in (case.units["attach"], case.units["recovery"]):
+                    source = case.directory / name
+                    source.write_text(case.files[name])
+                    link = root / name
+                    link.symlink_to(source)
+                    case.linked.append((link, source))
+                last = case.linked[-1][0]
+                attempts = []
+                unlink = Path.unlink
+
+                def fail_unlink(path, *args, **kwargs):
+                    if path == last:
+                        attempts.append(path)
+                        if persistent or len(attempts) == 1:
+                            raise PermissionError("unit link busy")
+                    return unlink(path, *args, **kwargs)
+
+                with (patch.object(fixture.sys, "argv", ["validation", "--disposable-host",
+                                  "--helper-binary", str(helper), "--output", str(output)]),
+                      patch.object(fixture.sys, "platform", "linux"),
+                      patch.object(fixture.os, "geteuid", return_value=0, create=True),
+                      patch.object(fixture, "CASES", ("normal-stop",)),
+                      patch.object(fixture, "Fixture", return_value=case),
+                      patch.object(case, "install"), patch.object(case, "verify"),
+                      patch.object(case, "ctl", return_value=subprocess.CompletedProcess(
+                          [], 0, "ActiveState=inactive", "")) as ctl,
+                      patch.object(Path, "unlink", fail_unlink)):
+                    self.assertEqual(fixture.main(), 1)
+                result, = fixture.json.loads((output / "results.json").read_text())
+                self.assertEqual(result["cleanup_error"], "unit link busy")
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(last.is_symlink(), persistent)
+                self.assertEqual(result.get("cleanup_retry_error"), "unit link busy" if persistent else None)
+                self.assertEqual(sum(call.args[0] == "stop" for call in ctl.call_args_list), 1)
+
     def test_cleanup_disables_hooks_and_removes_only_its_recorded_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -251,12 +563,14 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
                 commands.append(arguments)
                 return subprocess.CompletedProcess(arguments, 0, "ActiveState=inactive\n", "")
 
+            owned = case.linked.copy()
             with patch.object(case, "ctl", control):
                 case.cleanup()
             self.assertEqual(unrelated.read_text(), "preserve")
-            expected = tuple(destination.name for destination, _ in case.linked)
+            expected = tuple(destination.name for destination, _ in owned)
             self.assertIn(("stop", *expected), commands)
-            for destination, source in case.linked:
+            self.assertFalse(case.linked)
+            for destination, source in owned:
                 self.assertFalse(destination.exists())
                 text = source.read_text()
                 self.assertNotIn("OnFailure=", text)

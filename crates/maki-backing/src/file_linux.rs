@@ -163,6 +163,33 @@ impl Directory {
         Ok(Self(root))
     }
 
+    /// Pin an existing root for reading only: each component is opened
+    /// without following a symlink, and nothing is created, probed for write
+    /// access or synced (an immutable directory answers that probe EPERM).
+    pub(super) fn existing(root: &Path) -> io::Result<Self> {
+        let mut directory = File::open(if root.is_absolute() { "/" } else { "." })?;
+        for component in root.components() {
+            match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(_) | Component::ParentDir => {
+                    let child = name(component.as_os_str())?;
+                    directory = open_at(&directory, &child, libc::O_PATH | libc::O_DIRECTORY)?;
+                }
+                Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid Linux root",
+                    ))
+                }
+            }
+        }
+        Ok(Self(open_at(
+            &directory,
+            c".",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?))
+    }
+
     pub(super) fn root_metadata(&self) -> io::Result<std::fs::Metadata> {
         self.0.metadata()
     }
@@ -191,12 +218,17 @@ impl Directory {
         Ok((self.directory(parent, false)?, name(OsStr::new(child))?))
     }
 
-    fn open_file(&self, path: &str, create: bool) -> io::Result<File> {
+    fn open_file(&self, path: &str, create: bool, read_only: bool) -> io::Result<File> {
         let (parent, child) = self.parent(path)?;
         let file = open_at(
             &parent,
             &child,
-            libc::O_RDWR | libc::O_NONBLOCK | if create { libc::O_CREAT } else { 0 },
+            if read_only {
+                libc::O_RDONLY
+            } else {
+                libc::O_RDWR
+            } | libc::O_NONBLOCK
+                | if create { libc::O_CREAT } else { 0 },
         )?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -215,6 +247,16 @@ impl Directory {
             ));
         }
         Ok(file)
+    }
+
+    /// A lock file opened read-only, created first only if it is missing.
+    pub(super) fn lock_file(&self, path: &str) -> io::Result<File> {
+        match self.open_file(path, false, true) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.open_file(path, true, true)
+            }
+            file => file,
+        }
     }
 }
 
@@ -596,8 +638,11 @@ impl Directory {
 
 impl Backing for FileBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+        if create {
+            self.writable()?;
+        }
         Ok(Arc::new(RealFile {
-            file: self.directory.open_file(path, create)?,
+            file: self.directory.open_file(path, create, self.read_only)?,
         }))
     }
 
@@ -610,6 +655,7 @@ impl Backing for FileBacking {
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
+        self.writable()?;
         let (parent, child) = self.directory.parent(path)?;
         entry_exists(&parent, &child)?;
         // SAFETY: unlinkat removes the named entry, never follows a final link.
@@ -620,6 +666,7 @@ impl Backing for FileBacking {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.writable()?;
         let (source, from) = self.directory.parent(from)?;
         let (target, to) = self.directory.parent(to)?;
         entry_exists(&source, &from)?;
@@ -641,6 +688,7 @@ impl Backing for FileBacking {
     }
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
+        self.writable()?;
         validate(path, false)?;
         self.directory.directory(path, true).map(|_| ())
     }
@@ -672,7 +720,13 @@ impl Backing for FileBacking {
             }
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
             if name != c"." && name != c".." {
-                names.push(name.to_string_lossy().into_owned());
+                let name = name.to_str().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory entry name is not UTF-8",
+                    )
+                })?;
+                names.push(name.to_owned());
             }
         }
         names.sort();
@@ -680,12 +734,14 @@ impl Backing for FileBacking {
     }
 
     fn sync_dir(&self, path: &str) -> io::Result<()> {
+        self.writable()?;
         let directory = self.directory.directory(path, false)?;
         open_at(&directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.sync_all()
     }
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
-        let file = self.directory.open_file(path, true)?;
+        self.writable()?;
+        let file = self.directory.open_file(path, true, false)?;
         match file.try_lock() {
             Ok(()) => Ok(Box::new(FileLock { _file: file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(

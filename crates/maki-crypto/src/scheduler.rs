@@ -36,12 +36,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 use crate::clock::Clock;
 use crate::error::CryptoError;
 use crate::flow::{DualPermit, DualSemaphore};
-use crate::provider::CryptoProvider;
+use crate::provider::{private::ValidationCaller, CryptoProvider};
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
 #[derive(Debug, Clone)]
@@ -146,13 +146,6 @@ impl UnitIndexed for CiphertextUnit {
     }
 }
 
-fn units_of<I: UnitIndexed, O>(groups: &[Group<I, O>]) -> HashSet<u64> {
-    groups
-        .iter()
-        .flat_map(|g| g.items.iter().map(UnitIndexed::unit_index))
-        .collect()
-}
-
 struct Group<I, O> {
     context: CryptoContext,
     items: Vec<I>,
@@ -217,16 +210,20 @@ async fn all_replies_closed<'a, O: 'a>(replies: impl Iterator<Item = &'a mut Rep
     }
 }
 
-async fn queued_caller_closed<I, O>(batch: &mut [Group<I, O>], queued: &mut VecDeque<Group<I, O>>) {
-    std::future::poll_fn(|cx| {
-        for group in batch.iter_mut().chain(queued.iter_mut()) {
-            if group.reply.poll_closed(cx).is_ready() {
-                return std::task::Poll::Ready(());
-            }
+/// A dropped submit future wakes its lane to release cancelled groups. Close
+/// the receiver first so a concurrently running lane sees the cancellation.
+struct PendingReply<'a, O> {
+    receiver: oneshot::Receiver<Result<Vec<O>, CryptoError>>,
+    cancelled: &'a Notify,
+}
+
+impl<O> Drop for PendingReply<'_, O> {
+    fn drop(&mut self) {
+        if !self.receiver.is_terminated() {
+            self.receiver.close();
+            self.cancelled.notify_one();
         }
-        std::task::Poll::Pending
-    })
-    .await;
+    }
 }
 
 /// A provider call hands its items back with the result, so a batch whose
@@ -353,7 +350,13 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
     }
 }
 
+struct LaneInbox<I, O> {
+    requests: mpsc::Receiver<Group<I, O>>,
+    cancelled: Arc<Notify>,
+}
+
 struct Lane<I, O> {
+    cancelled: Arc<Notify>,
     tx: mpsc::Sender<Group<I, O>>,
     clock: Arc<dyn Clock>,
     admission: DualSemaphore,
@@ -375,15 +378,21 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
         call: LaneCall<I, O>,
         resend_safe: ResendSafe,
     ) -> Self {
-        let max_pending_items = config.max_pending_items.max(1);
-        let (tx, rx) = mpsc::channel::<Group<I, O>>(max_pending_items as usize);
+        let admission = DualSemaphore::new(config.max_pending_items.max(1), max_pending_bytes);
+        // Tokio's channel also uses a semaphore, so its capacity must agree
+        // with the effective admission limit, including on 32-bit targets.
+        let (tx, rx) = mpsc::channel::<Group<I, O>>(admission.max_items());
         let inflight = Arc::new(tokio::sync::Semaphore::new(
-            config.max_inflight_batches.max(1) as usize,
+            (config.max_inflight_batches.max(1) as usize).min(tokio::sync::Semaphore::MAX_PERMITS),
         ));
-        let max_admit_items = config.max_items.min(max_pending_items as usize).max(1);
+        let max_admit_items = config.max_items.min(admission.max_items()).max(1);
         let max_admit_logical_bytes = config.max_bytes;
+        let cancelled = Arc::new(Notify::new());
         tokio::spawn(run_lane(
-            rx,
+            LaneInbox {
+                requests: rx,
+                cancelled: cancelled.clone(),
+            },
             config,
             clock.clone(),
             stats,
@@ -392,9 +401,10 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
             inflight,
         ));
         Self {
+            cancelled,
             tx,
             clock,
-            admission: DualSemaphore::new(max_pending_items, max_pending_bytes),
+            admission,
             max_admit_items,
             max_admit_logical_bytes,
         }
@@ -407,10 +417,11 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
     /// the old clamp-and-serialize path let a group exceed the budget (R04).
     fn check_admissible(
         &self,
-        items: usize,
+        group: &[I],
         logical_bytes: u64,
         resident_bytes: u64,
     ) -> Result<(), CryptoError> {
+        let items = group.len();
         if items > self.max_admit_items
             || logical_bytes > self.max_admit_logical_bytes
             || resident_bytes > self.admission.max_bytes()
@@ -423,6 +434,19 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
                 self.max_admit_logical_bytes,
                 self.admission.max_bytes()
             )));
+        }
+        // Engine groups are in ascending order, so validating the common
+        // case needs no allocation. A library caller may use any order.
+        if group
+            .windows(2)
+            .any(|pair| pair[0].unit_index() >= pair[1].unit_index())
+        {
+            let mut seen = HashSet::with_capacity(items);
+            if group.iter().any(|item| !seen.insert(item.unit_index())) {
+                return Err(CryptoError::NonRetryableRequest(
+                    "a scheduler request contains a repeated unit index".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -461,7 +485,11 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
                 "crypto batch scheduler has stopped".to_string(),
             ));
         }
-        reply_rx.await.unwrap_or_else(|_| {
+        let mut reply = PendingReply {
+            receiver: reply_rx,
+            cancelled: &self.cancelled,
+        };
+        (&mut reply.receiver).await.unwrap_or_else(|_| {
             Err(CryptoError::Retryable(
                 "crypto batch scheduler dropped the request".to_string(),
             ))
@@ -472,7 +500,7 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
 /// One lane's aggregation loop: form batches of whole groups, dispatch,
 /// route results back. Exits when every sender is gone.
 async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
-    mut rx: mpsc::Receiver<Group<I, O>>,
+    mut inbox: LaneInbox<I, O>,
     config: SchedulerConfig,
     clock: Arc<dyn Clock>,
     stats: Arc<SchedulerStats>,
@@ -483,12 +511,14 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
     // Groups received while a full lane waits keep their payload and queue
     // admission together. Unlike an unread mpsc tail, this FIFO can observe
     // and remove cancelled callers even while an earlier live RPC stalls.
+    // Arrivals only append. A cancellation notification can cover multiple
+    // callers, so sweep all the groups we own when consuming it.
     let mut queued = VecDeque::new();
     let mut receiver_closed = false;
     'lane: loop {
         let first = match queued.pop_front() {
             Some(g) => g,
-            None => match rx.recv().await {
+            None => match inbox.requests.recv().await {
                 Some(g) => g,
                 None => return,
             },
@@ -500,7 +530,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let mut batch: Vec<Group<I, O>> = vec![first];
         let mut items: usize = batch[0].items.len();
         let mut bytes: u64 = batch[0].logical_bytes;
-        let mut units = units_of(&batch);
+        let mut units = HashSet::new();
 
         while items < config.target_items && bytes < config.target_bytes {
             let remaining = deadline.saturating_sub(clock.now());
@@ -511,17 +541,17 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                 Some(group)
             } else {
                 tokio::select! {
-                    _ = queued_caller_closed(&mut batch, &mut queued) => {
+                    _ = inbox.cancelled.notified() => {
                         batch.retain(|g| !g.reply.is_closed());
                         if batch.is_empty() { continue 'lane; }
                         deadline = batch.iter().map(|g| g.enqueued_at).min()
                             .expect("live batch").saturating_add(config.max_wait);
                         items = batch.iter().map(|g| g.items.len()).sum();
                         bytes = batch.iter().map(|g| g.logical_bytes).sum();
-                        units = units_of(&batch);
+                        units.clear();
                         continue;
                     },
-                    g = rx.recv() => g,
+                    g = inbox.requests.recv() => g,
                     _ = clock.sleep(remaining) => None,
                 }
             };
@@ -537,10 +567,21 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
             let fits = items + group.items.len() <= config.max_items
                 && bytes + group.logical_bytes <= config.max_bytes
                 && group.context == batch[0].context
-                && group
-                    .items
-                    .iter()
-                    .all(|item| !units.contains(&item.unit_index()));
+                && {
+                    // Every group is nonempty. Build the index on the first
+                    // eligible merge, or rebuild it after a cancellation.
+                    if units.is_empty() {
+                        units.extend(
+                            batch
+                                .iter()
+                                .flat_map(|g| g.items.iter().map(UnitIndexed::unit_index)),
+                        );
+                    }
+                    group
+                        .items
+                        .iter()
+                        .all(|item| !units.contains(&item.unit_index()))
+                };
             if !fits {
                 queued.push_front(group);
                 break;
@@ -558,13 +599,13 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let slot = loop {
             tokio::select! {
                 biased;
-                _ = queued_caller_closed(&mut batch, &mut queued) => {
+                _ = inbox.cancelled.notified() => {
                     batch.retain(|g| !g.reply.is_closed());
                     queued.retain(|g| !g.reply.is_closed());
                     if batch.is_empty() { continue 'lane; }
                 },
                 slot = inflight.clone().acquire_owned() => break slot.expect("semaphore closed"),
-                group = rx.recv(), if !receiver_closed => {
+                group = inbox.requests.recv(), if !receiver_closed => {
                     match group {
                         Some(group) if !group.reply.is_closed() => queued.push_back(group),
                         Some(_) => {},
@@ -660,9 +701,10 @@ fn deliver<O>(
     replies: Vec<oneshot::Sender<Result<Vec<O>, CryptoError>>>,
 ) {
     match result {
-        Ok(mut out) if out.len() == items => {
+        Ok(out) if out.len() == items => {
+            let mut out = out.into_iter();
             for (len, reply) in lengths.into_iter().zip(replies) {
-                let part: Vec<O> = out.drain(..len).collect();
+                let part: Vec<O> = out.by_ref().take(len).collect();
                 let _ = reply.send(Ok(part));
             }
         }
@@ -774,6 +816,15 @@ impl BatchScheduler {
         self.stats.clone()
     }
 
+    fn decrypt_unit_size(&self, caps: &CryptoCapabilities) -> Result<u32, CryptoError> {
+        self.unit_size
+            .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
+            .filter(|size| *size > 0 && caps.supported_plaintext_sizes.contains(size))
+            .ok_or_else(|| {
+                CryptoError::Contract("provider has no compatible plaintext unit size".into())
+            })
+    }
+
     /// Start the caller's budget before its first queue-admission wait.
     /// Expiry drops the submit future; the lane then removes that group or
     /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
@@ -782,11 +833,27 @@ impl BatchScheduler {
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
         let result = match self.max_operation_time() {
-            Some(limit) => tokio::select! {
-                biased;
-                _ = self.clock.sleep(limit) => Err(crate::endpoint::deadline_error()),
-                result = operation => result,
-            },
+            Some(limit) => {
+                let deadline = self.clock.now().saturating_add(limit);
+                let remaining = deadline.saturating_sub(self.clock.now());
+                if remaining.is_zero() {
+                    Err(crate::endpoint::deadline_error())
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = self.clock.sleep(remaining) => Err(crate::endpoint::deadline_error()),
+                        result = operation => {
+                            // The timer may wake on a later tick. Check the clock
+                            // after the operation's final poll, as the dispatcher does.
+                            if self.clock.now() < deadline {
+                                result
+                            } else {
+                                Err(crate::endpoint::deadline_error())
+                            }
+                        }
+                    }
+                }
+            }
             None => operation.await,
         };
         // The caller owns this outcome, whether its queue timer or the inner
@@ -805,12 +872,43 @@ impl BatchScheduler {
 
 #[async_trait]
 impl CryptoProvider for BatchScheduler {
+    fn checks_plaintext_echo(&self, caller: ValidationCaller) -> bool {
+        // The lane copies input bytes unchanged, then gives each caller its
+        // original consecutive slice of the provider's ordered output.
+        self.inner.checks_plaintext_echo(caller)
+    }
+
     fn max_operation_time(&self) -> Option<Duration> {
         self.inner.max_operation_time()
     }
 
     async fn capabilities(&self) -> Result<CryptoCapabilities, CryptoError> {
-        self.inner.capabilities().await
+        let mut caps = self.inner.capabilities().await?;
+        let decrypt_unit = u64::from(self.decrypt_unit_size(&caps)?);
+        // Both lanes admit whole groups. The decrypt lane charges a fixed
+        // logical size and must hold each unit's worst-case ciphertext.
+        let max_items = (self.encrypt.max_admit_items as u64)
+            .min(self.decrypt.max_admit_logical_bytes / decrypt_unit)
+            .min(self.decrypt.admission.max_bytes() / u64::from(caps.max_ciphertext_size.max(1)));
+        caps.batch.max_items = u64::from(caps.batch.max_items).min(max_items) as u32;
+        caps.batch.max_bytes = caps
+            .batch
+            .max_bytes
+            .min(self.encrypt.max_admit_logical_bytes)
+            .min(self.encrypt.admission.max_bytes());
+        caps.supported_plaintext_sizes
+            .retain(|size| *size > 0 && u64::from(*size) <= caps.batch.max_bytes);
+        if caps.batch.max_items == 0
+            || caps.supported_plaintext_sizes.is_empty()
+            || self
+                .unit_size
+                .is_some_and(|size| !caps.supported_plaintext_sizes.contains(&size))
+        {
+            return Err(CryptoError::Contract(
+                "scheduler budgets cannot admit a supported unit".into(),
+            ));
+        }
+        Ok(caps)
     }
 
     async fn encrypt_batch(
@@ -822,7 +920,7 @@ impl CryptoProvider for BatchScheduler {
             let bytes: u64 = items.iter().map(|i| i.data.len() as u64).sum();
             // Validate before duplicating the plaintext: an inadmissible
             // request must not copy secrets or charge pending capacity (R04).
-            self.encrypt.check_admissible(items.len(), bytes, bytes)?;
+            self.encrypt.check_admissible(items, bytes, bytes)?;
             if items.is_empty() {
                 return Ok(Vec::new());
             }
@@ -861,13 +959,7 @@ impl CryptoProvider for BatchScheduler {
                 .caps
                 .get_or_try_init(|| self.inner.capabilities())
                 .await?;
-            let unit_size = self
-                .unit_size
-                .or_else(|| caps.supported_plaintext_sizes.iter().copied().max())
-                .filter(|size| *size > 0 && caps.supported_plaintext_sizes.contains(size))
-                .ok_or_else(|| {
-                    CryptoError::Contract("provider has no compatible plaintext unit size".into())
-                })?;
+            let unit_size = self.decrypt_unit_size(caps)?;
             let logical_bytes = (items.len() as u64)
                 .checked_mul(u64::from(unit_size))
                 .ok_or_else(|| {
@@ -883,8 +975,7 @@ impl CryptoProvider for BatchScheduler {
             }
             // Check logical batching independently of resident ciphertext,
             // then reserve its full resident cost before cloning (R3-003).
-            self.decrypt
-                .check_admissible(items.len(), logical_bytes, bytes)?;
+            self.decrypt.check_admissible(items, logical_bytes, bytes)?;
             let permit = self
                 .decrypt
                 .admission
@@ -902,5 +993,58 @@ impl CryptoProvider for BatchScheduler {
                 .await
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CountedUnit(Arc<AtomicU64>);
+
+    impl UnitIndexed for CountedUnit {
+        fn unit_index(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            7
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_batches_skip_the_coalescing_unit_index() {
+        let context = CryptoContext {
+            volume_uuid: uuid::Uuid::nil(),
+            format_version: 1,
+            crypto_compatibility_id: "test".into(),
+        };
+        for (target_items, max_wait) in [(1, Duration::from_secs(1)), (4, Duration::ZERO)] {
+            let stats = Arc::new(SchedulerStats::default());
+            let lane = Lane::spawn(
+                SchedulerConfig {
+                    target_items,
+                    max_wait,
+                    ..SchedulerConfig::default()
+                },
+                64,
+                Arc::new(crate::SystemClock::new()),
+                stats.clone(),
+                Arc::new(|_, items| Box::pin(async move { (items, Ok(vec![()])) })),
+                Arc::new(|| Box::pin(async { false })),
+            );
+            let lookups = Arc::new(AtomicU64::new(0));
+            let permit = lane.admission.acquire(64).await.unwrap();
+            let reply = lane
+                .submit(
+                    &context,
+                    vec![CountedUnit(lookups.clone())],
+                    64,
+                    64,
+                    permit,
+                    &stats,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.len(), 1);
+            assert_eq!(lookups.load(Ordering::Relaxed), 0);
+        }
     }
 }

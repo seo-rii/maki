@@ -52,9 +52,8 @@ fn zero_disables_an_overlay_limit_explicitly() {
 
 #[test]
 fn overlay_byte_limit_must_hold_the_largest_request_twice() {
-    // The largest request is nbd.maximum_io (1 MiB) plus one unit of
-    // misalignment: 257 units of 4384 ciphertext bytes, charged twice
-    // (latest and durable copy) = 2,253,376 bytes.
+    // With 4 KiB alignment a 1 MiB request touches exactly 256 units.
+    // Latest and durable copies of 256 * 4384 bytes require 2,244,608.
     let cfg = config("max_overlay_bytes = \"2MiB\"");
     let err = cfg
         .validate()
@@ -63,15 +62,15 @@ fn overlay_byte_limit_must_hold_the_largest_request_twice() {
         err.to_string().contains("limits.max_overlay_bytes"),
         "{err}"
     );
-    config("max_overlay_bytes = 2253376").validate().unwrap();
-    config("max_overlay_bytes = 2253375")
+    config("max_overlay_bytes = 2244608").validate().unwrap();
+    config("max_overlay_bytes = 2244607")
         .validate()
         .expect_err("one byte short");
 }
 
 #[test]
 fn overlay_entry_limit_must_hold_the_largest_request() {
-    let cfg = config("max_overlay_entries = 256");
+    let cfg = config("max_overlay_entries = 255");
     let err = cfg
         .validate()
         .expect_err("too few entries for the largest request");
@@ -79,7 +78,7 @@ fn overlay_entry_limit_must_hold_the_largest_request() {
         err.to_string().contains("limits.max_overlay_entries"),
         "{err}"
     );
-    config("max_overlay_entries = 257").validate().unwrap();
+    config("max_overlay_entries = 256").validate().unwrap();
 }
 
 #[test]
@@ -87,7 +86,18 @@ fn the_overlay_bound_does_not_constrain_the_admission_budget() {
     // The admission budget may be far larger than the overlay bound: the
     // largest single request, not the budget, is what must fit.
     let mut cfg = config("");
-    cfg.limits.max_plaintext_bytes.0 = (u32::MAX >> 1) as u64;
-    cfg.limits.max_ciphertext_bytes.0 = (u32::MAX >> 1) as u64;
+    cfg.limits.max_plaintext_bytes.0 =
+        u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+    cfg.limits.max_ciphertext_bytes.0 =
+        u64::from(u32::MAX >> 1).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn a_single_unit_export_only_needs_room_for_one_request_unit() {
+    let mut cfg = config("max_overlay_entries = 1\nmax_overlay_bytes = 8768");
+    cfg.volume.max_virtual_size.0 = 4096;
+    cfg.backing.journal_segment_size.0 = 16384;
+    cfg.backing.journal_max_bytes.0 = 65536;
     cfg.validate().unwrap();
 }

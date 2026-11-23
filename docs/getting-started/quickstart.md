@@ -115,14 +115,15 @@ without being written; the production profile additionally sets
 The backing tree must be owned by the daemon user, so create it as `maki`:
 
 ```bash
-install -d -o maki -g maki -m 0700 /var/lib/maki/demo
-sudo -u maki maki volume create /etc/maki/volumes/demo.toml
-maki volume inspect /etc/maki/volumes/demo.toml
-maki check /etc/maki/volumes/demo.toml
+install -d -o maki -g maki -m 0700 /var/lib/maki/demo &&
+    sudo -u maki maki volume create /etc/maki/volumes/demo.toml &&
+    maki volume inspect /etc/maki/volumes/demo.toml &&
+    maki check /etc/maki/volumes/demo.toml
 ```
 
 `inspect` prints the volume UUID the bootstrap will pin and the format-file
-sizes at full allocation.
+sizes at full allocation. Continue to provisioning only if the entire block
+succeeds.
 
 ## 4. Provision LVM and XFS on the export
 
@@ -187,15 +188,23 @@ If cleanup fails, the daemon stays running for the remaining mount; follow the
 # Succeeds once every named unit is inactive; fails at once if one failed
 # (inspect it before continuing) or after WAIT_SECONDS (default 600).
 wait_stopped() {
-    local unit state deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
-    for unit in "$@"; do
-        while state=$(systemctl show -P ActiveState "$unit"); [ "$state" != inactive ]; do
-            if [ "$state" = failed ] || [ "$SECONDS" -ge "$deadline" ]; then
-                echo "$unit is $state: preserve the host state and inspect it" >&2
+    local unit state pending deadline=$((SECONDS + ${WAIT_SECONDS:-600}))
+    while :; do
+        pending=
+        for unit in "$@"; do
+            state=$(systemctl show -P ActiveState "$unit") || return 1
+            if [ "$state" = failed ]; then
+                echo "$unit failed: preserve the host state and inspect it" >&2
                 return 1
             fi
-            sleep 1
+            if [ "$state" != inactive ]; then pending="$unit ($state)"; fi
         done
+        [ -n "$pending" ] || return 0
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Still waiting for $pending" >&2
+            return 1
+        fi
+        sleep 1
     done
 }
 maki-attach verify --volume demo &&
@@ -213,9 +222,9 @@ wait_stopped maki-attach@demo.service maki@demo.service &&
 ## 8. Start again and read the data back
 
 ```bash
-systemctl start maki-workload@demo.target
-maki-attach verify --volume demo
-cat /srv/demo/hello.txt
+systemctl start maki-workload@demo.target &&
+    maki-attach verify --volume demo &&
+    cat /srv/demo/hello.txt
 ```
 
 The same commands work after a reboot once the target is enabled:
@@ -233,9 +242,15 @@ the target owns their ordering and the recovery unit
 ```bash
 systemctl disable --now maki-workload@demo.target &&
 wait_stopped maki-attach@demo.service maki@demo.service &&
+    rmdir /srv/demo &&
     rm -rf /var/lib/maki/demo /etc/maki/attach/demo.toml /etc/maki/volumes/demo.toml &&
     shred -u /etc/maki/secrets/demo.token
 ```
+
+`rmdir` removes the empty mountpoint the bootstrap created, so this guide can
+run again: the bootstrap refuses an existing mountpoint. It refuses a
+directory that is still a mountpoint or not empty, which stops the cleanup
+before any volume file is deleted.
 
 ## What you have and have not seen
 

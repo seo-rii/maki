@@ -15,6 +15,7 @@ use std::{
     },
 };
 
+#[derive(Default)]
 struct ReadFailure {
     backing: MemBacking,
     fault: Arc<ReadFault>,
@@ -23,6 +24,7 @@ struct ReadFailure {
 struct ReadFault {
     offset: AtomicU64,
     errno: AtomicI32,
+    shard_len_queries: AtomicU64,
 }
 
 struct ReadFailureFile {
@@ -45,6 +47,9 @@ impl BackingFile for ReadFailureFile {
         self.inner.set_len(len)
     }
     fn len(&self) -> io::Result<u64> {
+        if self.shard {
+            self.fault.shard_len_queries.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.len()
     }
     fn sync_data(&self) -> io::Result<()> {
@@ -81,25 +86,22 @@ impl Backing for ReadFailure {
         self.backing.try_lock(p)
     }
 }
+fn superblock() -> Superblock {
+    Superblock {
+        generation: 0,
+        volume_uuid: uuid::Uuid::from_u128(0xa011),
+        provider_type: "fake".into(),
+        crypto_compatibility_id: "test-profile-v1".into(),
+        key_identity: "k".into(),
+        geometry: Geometry::compute(512, 512, 512, 544, 8192, 4096).unwrap(),
+        format_version: 1,
+        created_unix: 0,
+    }
+}
+
 fn fixture(journaled_overwrite: bool) -> Arc<ReadFailure> {
-    let backing = Arc::new(ReadFailure {
-        backing: MemBacking::new(),
-        fault: Arc::new(ReadFault::default()),
-    });
-    init::create_volume(
-        backing.as_ref(),
-        Superblock {
-            generation: 0,
-            volume_uuid: uuid::Uuid::from_u128(0xa011),
-            provider_type: "fake".into(),
-            crypto_compatibility_id: "test-profile-v1".into(),
-            key_identity: "k".into(),
-            geometry: Geometry::compute(512, 512, 512, 544, 8192, 4096).unwrap(),
-            format_version: 1,
-            created_unix: 0,
-        },
-    )
-    .unwrap();
+    let backing = Arc::new(ReadFailure::default());
+    init::create_volume(backing.as_ref(), superblock()).unwrap();
     let mut volume = Volume::recover(
         backing.clone(),
         VolumeOptions {
@@ -234,4 +236,66 @@ fn validated_journal_still_classifies_actual_slot_damage_as_recoverable() {
     )
     .unwrap();
     assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![8; 540]);
+}
+
+#[test]
+fn deep_check_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
+    let backing = fixture(false);
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    assert!(deep_check(backing.clone(), 4096).unwrap().ok());
+    // One query at store open and one for the offline unlisted-slot scan.
+    assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn key_probe_reads_a_sparse_shards_length_once_for_all_unlisted_slots() {
+    let backing = Arc::new(ReadFailure::default());
+    init::create_volume_with_discard(backing.as_ref(), superblock()).unwrap();
+    let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+    volume.write_ct(0, &[7; 540], true).unwrap();
+    volume.checkpoint().unwrap();
+    volume.discard_ct(0, true).unwrap();
+    volume.checkpoint().unwrap();
+
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    assert_eq!(volume.first_ciphertext_unit().unwrap(), None);
+    assert_eq!(backing.fault.shard_len_queries.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn engine_read_reuses_sparse_shard_length_within_each_request() {
+    use maki_core::engine::{CheckpointPolicy, Engine, EngineOptions};
+    use maki_test_support::FakeCryptoProvider;
+
+    let backing = Arc::new(ReadFailure::default());
+    let sb = superblock();
+    init::create_volume(backing.as_ref(), sb).unwrap();
+    let engine = Engine::attach(
+        backing.clone(),
+        Arc::new(FakeCryptoProvider::new(512).with_overhead(32)),
+        EngineOptions {
+            checkpoint: CheckpointPolicy {
+                emergency_reserve_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.stop_checkpoint_worker().await;
+    engine.write(0, &[5; 512], true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    backing.fault.shard_len_queries.store(0, Ordering::Relaxed);
+    for requests in 1..=2 {
+        assert_eq!(engine.read(512, 3 * 512).await.unwrap(), vec![0; 3 * 512]);
+        assert_eq!(
+            backing.fault.shard_len_queries.load(Ordering::Relaxed),
+            requests
+        );
+    }
+    backing.fault.offset.store(2 * 1024, Ordering::SeqCst);
+    backing.fault.errno.store(5, Ordering::SeqCst);
+    assert_io(engine.read(512, 3 * 512).await, 5);
 }

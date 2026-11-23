@@ -1,6 +1,7 @@
 """Candidate bundles bind packaged native artifacts to committed source."""
 
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -10,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -32,6 +34,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertTrue(SCRIPT.is_file(), "a release-candidate preparation command is required")
         shutil.copyfile(SCRIPT, self.repo / "scripts/prepare_release.py")
         shutil.copytree(ROOT / "packaging", self.repo / "packaging")
+        shutil.copyfile(ROOT / "CHANGELOG.md", self.repo / "CHANGELOG.md")
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "0.1.0"\n')
         (self.repo / "Cargo.lock").write_text("# locked fixture\nversion = 3\n")
         self.git("init", "-q")
@@ -142,8 +145,10 @@ class ReleasePreparationTests(unittest.TestCase):
     def test_bundle_has_committed_source_dependencies_and_verifiable_manifest(self):
         # Untracked files must neither enter the archive nor affect the build.
         (self.repo / "local-secret").write_text("do not package me")
+        self.environment["DPKG_DEB_COMPRESSOR_TYPE"] = "gzip"
         output, _ = self.prepare()
         manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["package_environment"], {"DPKG_DEB_COMPRESSOR_TYPE": "gzip"})
         self.assertEqual(manifest["source"]["commit"], self.commit)
         self.assertEqual(manifest["source"]["tree"], self.git("rev-parse", "HEAD^{tree}"))
         self.assertEqual(manifest["workspace_version"], "0.1.0")
@@ -173,6 +178,118 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertNotIn("--features", invocation["args"])
         self.assertNotEqual(pathlib.Path(invocation["cwd"]), self.repo)
         self.assertEqual(invocation["epoch"], self.git("show", "-s", "--format=%ct", "HEAD"))
+
+    def test_candidate_hashes_each_published_artifact_once(self):
+        spec = importlib.util.spec_from_file_location("prepare", self.repo / "scripts/prepare_release.py")
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(
+                builder, "digest", wraps=builder.digest) as trace:
+            builder.prepare(self.work / "result")
+        names = [call.args[0].name for call in trace.call_args_list]
+        self.assertCountEqual(names, [p.name for p in (self.work / "result").iterdir() if p.name != "SHA256SUMS"])
+
+    def test_closed_output_after_build_banner_preserves_success(self):
+        output = self.work / "candidate"
+        with subprocess.Popen([sys.executable, "-B", self.repo / "scripts/prepare_release.py",
+                               "--output", output], env=self.environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            self.assertIn(b"Building candidate", child.stdout.readline())
+            child.stdout.close()
+            self.assertEqual(child.wait(timeout=30), 0, child.stderr.read())
+        self.assertTrue((output / "SHA256SUMS").is_file())
+
+    def test_documented_background_build_preserves_status_with_and_without_errexit(self):
+        guide = (ROOT / "docs/releasing.md").read_text().split("## Prepare and inspect", 1)[1]
+        block = guide.split("```bash\n", 1)[1].split("\n```", 1)[0]
+        for strict in (False, True):
+            for status in (0, 7):
+                with self.subTest(strict=strict, status=status), tempfile.TemporaryDirectory() as work:
+                    script = ("set -e\n" if strict else "") + f"rustup() {{ return {status}; }}\n" + block
+                    result = subprocess.run(["bash", "-c", script], cwd=self.repo, capture_output=True,
+                                            env={**self.environment, "HOME": work})
+                    self.assertEqual(result.returncode, status)
+                    self.assertEqual([f.read_text().strip() for f in (pathlib.Path(work) / "logs").glob("*.status")],
+                                     [str(status)])
+
+    def test_source_bytes_and_modes_are_independent_of_archive_attributes(self):
+        contents = b"#!/bin/sh\n# revision: $Format:%H$\n"
+        note = self.repo / "release notes"
+        note.write_bytes(contents)
+        note.chmod(0o755)
+        self.git("add", note.name)
+        self.git("commit", "-qm", "test: include release notes")
+        attrs = self.repo / ".git/info/attributes"
+        archives = []
+        for setting in ("export-ignore", "export-subst"):
+            with self.subTest(setting=setting):
+                attrs.write_text(f'"release notes" {setting}\n')
+                output, _ = self.prepare(setting)
+                manifest = json.loads((output / "manifest.json").read_text())
+                archive = output / manifest["source"]["filename"]
+                with tarfile.open(archive) as tar:
+                    member = tar.getmember("maki-0.1.0/release notes")
+                    self.assertEqual(tar.extractfile(member).read(), contents)
+                    self.assertEqual(member.mode, 0o755)
+                archives.append(manifest["source"]["sha256"])
+        self.assertEqual(archives[0], archives[1])
+
+    def test_source_names_and_bytes_are_reproducible_across_filesystem_encodings(self):
+        names = [b"release-\xc3\xa9.md", b"release-\xff.md"]
+        for name in names:
+            (self.repo / os.fsdecode(name)).write_bytes(name)
+        self.git("add", ".")
+        self.git("commit", "-qm", "test: non-ASCII archive members")
+        digests = []
+        for mode in ("0", "1"):
+            with self.subTest(utf8_mode=mode):
+                self.environment.update(LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8=mode)
+                bundle, _ = self.prepare(f"locale-{mode}")
+                archive = next(bundle.glob("*-source.tar.gz"))
+                digests.append(hashlib.sha256(archive.read_bytes()).hexdigest())
+                with tarfile.open(archive, encoding="utf-8") as source:
+                    for name in names:
+                        path = "maki-0.1.0/" + name.decode("utf-8", "surrogateescape")
+                        self.assertEqual(source.extractfile(path).read(), name)
+        self.assertEqual(digests[0], digests[1])
+
+    def test_source_archive_uses_original_git_objects_with_local_replacements(self):
+        (self.repo / "notes.txt").write_text("committed contents\n")
+        (self.repo / "other.txt").write_text("different contents\n")
+        self.git("add", "notes.txt", "other.txt")
+        self.git("commit", "-qm", "test: add release notes")
+        self.git("replace", self.git("rev-parse", "HEAD:notes.txt"), self.git("rev-parse", "HEAD:other.txt"))
+
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        with tarfile.open(output / manifest["source"]["filename"]) as archive:
+            self.assertEqual(archive.extractfile("maki-0.1.0/notes.txt").read(), b"committed contents\n")
+
+    def test_filemode_false_does_not_hide_executable_changes_on_posix(self):
+        tracked = self.repo / "Cargo.toml"
+        self.git("config", "core.fileMode", "false")
+        mode = tracked.stat().st_mode
+        tracked.chmod(mode | 0o100)
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertFalse(self.cargo_trace.exists())
+        tracked.chmod(mode)
+        self.print_version()
+        executable = self.repo / "packaging/debian/build-deb.py"
+        executable_mode = executable.stat().st_mode
+        self.assertTrue(executable_mode & 0o100)
+        executable.chmod(executable_mode & ~0o100)
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        executable.chmod(executable_mode)
+        self.print_version()
+        self.assertEqual(self.git("config", "--bool", "core.fileMode"), "false")
+
+    def test_filemode_false_is_preserved_on_a_fixed_mode_filesystem(self):
+        from scripts import prepare_release
+        self.git("config", "core.fileMode", "false")
+        tracked = self.repo / "Cargo.toml"
+        tracked.chmod(tracked.stat().st_mode | 0o100)
+        with mock.patch.object(prepare_release.os, "fchmod", return_value=None):
+            self.assertFalse(prepare_release.tracked_changes(repo=self.repo))
 
     def test_print_version_needs_no_build_tools_or_output_directory(self):
         # Only Git is needed: neither dpkg nor the selected compiler is usable.
@@ -242,6 +359,16 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assert_version_order("0.1.0", next_candidate)
         self.assert_version_order(next_candidate, "0.1.1")
 
+    def test_candidate_version_ignores_checkout_local_grafts(self):
+        self.git("commit", "--allow-empty", "-qm", "test: second commit")
+        head = self.git("rev-parse", "HEAD")
+        expected = f"0.1.0~rc+rev2.git{head[:12]}"
+        self.assertEqual(self.print_version().stdout.strip(), expected)
+        (self.repo / ".git/info/grafts").write_text(head + "\n")
+        self.assertEqual(self.print_version().stdout.strip(), expected)
+        output, _ = self.prepare()
+        self.assertEqual(json.loads((output / "manifest.json").read_text())["package"]["version"], expected)
+
     def test_shallow_history_is_refused_before_output_or_building(self):
         self.git("commit", "--allow-empty", "-qm", "test: complete history has two commits")
         complete_version = self.print_version().stdout.strip()
@@ -259,6 +386,60 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertFalse(self.cargo_trace.exists())
         self.git("fetch", "--quiet", "--unshallow")
         self.assertEqual(self.print_version().stdout.strip(), complete_version)
+
+    def test_unchanged_hint_preserves_the_index_but_does_not_hide_local_edits(self):
+        self.git("update-index", "--assume-unchanged", "Cargo.toml")
+        self.print_version()
+        with (self.repo / "Cargo.toml").open("a") as source:
+            source.write("# worktree edit\n")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "h Cargo.toml")
+
+    def test_release_checks_contents_when_git_stat_information_is_unchanged(self):
+        tracked = self.repo / "Cargo.lock"
+        original = tracked.read_bytes()
+        self.git("config", "core.trustctime", "false")
+        self.git("config", "core.checkStat", "minimal")
+        before = 1_700_000_000_000_000_000
+        os.utime(tracked, ns=(before, before))
+        self.git("update-index", "--refresh")
+        tracked.write_bytes(original.replace(b"version = 3", b"version = 4"))
+        os.utime(tracked, ns=(before, before))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        tracked.write_bytes(original)
+        self.print_version()
+
+    def test_present_skipped_file_is_checked_but_absent_sparse_file_is_supported(self):
+        self.git("update-index", "--split-index")
+        self.git("update-index", "--skip-worktree", "Cargo.lock", "Cargo.toml")
+        self.git("update-index", "--assume-unchanged", "Cargo.toml")
+        (self.repo / "Cargo.lock").unlink()
+        self.print_version()
+        with (self.repo / "Cargo.toml").open("a") as source:
+            source.write("# worktree edit\n")
+        self.assertIn("tracked changes", self.print_version(succeeds=False).stderr)
+        self.assertEqual(self.git("ls-files", "-v", "Cargo.toml"), "s Cargo.toml")
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "signed commit fixture requires SSH signing")
+    def test_signature_display_does_not_change_the_source_timestamp(self):
+        from scripts.qualification_source import extract_revision
+        key = self.work / "fixture-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        self.git("config", "gpg.format", "ssh")
+        self.git("config", "user.signingkey", str(key))
+        self.git("commit", "-qS", "--allow-empty", "-m", "test: signed fixture")
+        allowed = self.work / "allowed-signers"
+        allowed.write_text("fixture@example.invalid " + key.with_suffix(".pub").read_text())
+        self.git("config", "gpg.ssh.allowedSignersFile", str(allowed))
+        self.git("config", "log.showSignature", "true")
+        commit = self.git("rev-parse", "HEAD")
+        directory, _ = self.prepare()
+        self.assertEqual(json.loads((directory / "manifest.json").read_text())["source"]["commit"], commit)
+        source = self.work / "qualification"
+        source.mkdir()
+        extract_revision(self.repo, commit, self.work / "qualification.tar", source)
+        self.assertEqual((source / "Cargo.toml").read_bytes(), (self.repo / "Cargo.toml").read_bytes())
 
     def test_tracked_worktree_changes_are_refused_before_building(self):
         with (self.repo / "Cargo.toml").open("a") as handle:
@@ -294,6 +475,40 @@ class ReleasePreparationTests(unittest.TestCase):
                 self.assertFalse(build.exists(), "temporary intermediates must be cleaned")
                 self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
                 self.assertEqual((outside / "sentinel").read_text(), "preserve")
+
+    def test_manifest_records_rustflags_and_the_selected_target_linker(self):
+        target_key = "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_RUSTFLAGS"
+        linker_key = "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_LINKER"
+        self.environment.update({
+            target_key: "--cfg target_marker",
+            linker_key: "native-linker",
+            "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
+            "CARGO_TARGET_OTHER_LINUX_GNU_RUSTFLAGS": "--cfg other_marker",
+            "CARGO_TARGET_OTHER_LINUX_GNU_LINKER": "other-linker",
+            "CARGO_TARGET_FIXTURE_NATIVE_LINUX_GNU_UNRELATED": "unrelated",
+        })
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["compiler_environment"], {
+            "RUSTC": str(self.tools / "rustc"),
+            target_key: "--cfg target_marker",
+            linker_key: "native-linker",
+            "CARGO_BUILD_RUSTFLAGS": "--cfg fallback_marker",
+        })
+
+    def test_manifest_records_cargo_and_environment_wrapper_inputs(self):
+        wrappers = {
+            "CARGO_BUILD_RUSTC_WRAPPER": "build-wrapper",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "workspace-build-wrapper",
+            "RUSTC_WRAPPER": "override-wrapper",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+        }
+        self.environment.update(wrappers)
+        self.environment["CARGO_BUILD_UNRELATED"] = "unrelated"
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["build"]["compiler_environment"],
+                         {"RUSTC": str(self.tools / "rustc"), **wrappers})
 
     def test_compiler_overrides_match_the_recorded_toolchain_and_target(self):
         alternate = self.tools / "alternate-rustc"
@@ -353,11 +568,54 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual((output / "sentinel").read_text(), "preserve")
         self.assertFalse(self.cargo_trace.exists())
 
+    def test_head_change_during_cleanliness_check_stops_candidate(self):
+        from scripts import prepare_release
+
+        (self.repo / "notes.txt").write_text("release notes\n")
+        self.git("add", "notes.txt")
+        self.git("commit", "-qm", "fixture: add release notes")
+        tracked_changes = prepare_release.tracked_changes
+
+        def change_checked_head():
+            dirty = tracked_changes()
+            self.assertFalse(dirty)
+            self.git("reset", "--soft", self.commit)
+            return dirty
+
+        output = self.work / "candidate"
+        with mock.patch.object(prepare_release, "ROOT", self.repo), \
+                mock.patch.object(prepare_release, "tracked_changes", change_checked_head):
+            with self.assertRaisesRegex(SystemExit, "HEAD changed"):
+                prepare_release.prepare(output)
+        self.assertFalse(output.exists())
+        self.assertFalse(self.cargo_trace.exists())
+
     def test_failed_build_leaves_no_partial_candidate(self):
         self.environment["CANDIDATE_FIXTURE_BUILD_FAIL"] = "1"
         output, result = self.prepare(succeeds=False)
         self.assertIn("fixture build failed", result.stderr)
         self.assertFalse(output.exists())
+
+    def test_concurrently_reserved_empty_output_is_preserved(self):
+        from scripts import prepare_release
+        output = self.work / "candidate"
+        output.mkdir()
+        reserved_inode = output.stat().st_ino
+        exists = pathlib.Path.exists
+
+        # Both callers can observe an absent destination before one creates it.
+        # The filesystem already contains that caller's empty directory at rename.
+        def observed_exists(path):
+            return path != output and exists(path)
+
+        with mock.patch.object(prepare_release, "ROOT", self.repo), \
+                mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(pathlib.Path, "exists", observed_exists):
+            with self.assertRaisesRegex(SystemExit, "output already exists"):
+                prepare_release.prepare(output)
+        self.assertTrue(self.cargo_trace.exists())
+        self.assertEqual(output.stat().st_ino, reserved_inode)
+        self.assertEqual(list(output.iterdir()), [])
 
     def test_failed_native_dependency_scan_leaves_no_candidate(self):
         shlibdeps = self.tools / "dpkg-shlibdeps"

@@ -632,6 +632,20 @@ mod mount_root_hygiene {
 fn pinned_nbd_devices_must_be_canonical() {
     assert_eq!(nbd_index("/dev/nbd0"), Some(0));
     assert_eq!(nbd_index("/dev/nbd15"), Some(15));
+    assert_eq!(nbd_index("/dev/nbd1048575"), Some(1048575));
+    for device in ["/dev/nbd1048576", "/dev/nbd4294967295"] {
+        assert_eq!(nbd_index(device), None);
+        assert!(AttachConfig::default()
+            .into_request(
+                "audit",
+                AttachOverrides {
+                    nbd_device: Some(device.into()),
+                    ..Default::default()
+                },
+                false
+            )
+            .is_err());
+    }
     for device in [
         "/dev/nbd01",
         "/dev/nbd+1",
@@ -653,4 +667,145 @@ fn pinned_nbd_devices_must_be_canonical() {
         );
         assert!(result.is_err(), "{device} must be refused");
     }
+}
+
+#[test]
+fn a_pinned_nbd_device_cannot_also_be_the_volume_group_directory() {
+    let cfg = AttachConfig {
+        vg_name: Some("nbd1048575".into()),
+        ..Default::default()
+    };
+    let error = cfg
+        .clone()
+        .into_request(
+            "audit",
+            AttachOverrides {
+                nbd_device: Some("/dev/nbd1048575".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("nbd_device"));
+    cfg.into_request(
+        "audit",
+        AttachOverrides {
+            nbd_device: Some("/dev/nbd1048575".into()),
+            vg_name: Some("nbd1048575_vg".into()),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+}
+
+#[test]
+fn attach_socket_must_end_in_a_filename() {
+    for (path, valid) in [
+        ("/run/nbd.sock", true),
+        ("/", false),
+        ("/run/nbd.sock/", false),
+        ("/run/nbd.sock/.", false),
+        ("/run/nbd.sock/..", false),
+    ] {
+        let cfg = AttachConfig {
+            nbd_socket: Some(path.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_the_socket_path_byte_limit() {
+    for (suffix, valid) in [("", true), ("x", false)] {
+        let cfg = AttachConfig {
+            nbd_socket: Some(format!("/{}{suffix}", "é".repeat(53))),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid
+        );
+    }
+}
+
+#[test]
+fn attach_checks_device_block_size_before_planning() {
+    for (size, valid) in [
+        (256, false),
+        (512, true),
+        (768, false),
+        (4096, true),
+        (1 << 30, false),
+    ] {
+        let cfg = AttachConfig {
+            device_block_size: Some(size),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.into_request("pg", AttachOverrides::default(), false)
+                .is_ok(),
+            valid,
+            "{size}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_checks_mount_components_in_bytes_against_the_host_filesystem() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = std::env::temp_dir();
+    let path = std::ffi::CString::new(base.as_os_str().as_bytes()).unwrap();
+    let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+    if limit < 1 {
+        return;
+    }
+    let limit = usize::try_from(limit).unwrap();
+    for (length, ok) in [(limit, true), (limit + 1, false)] {
+        let name = "é".repeat(length / 2) + &"a".repeat(length % 2);
+        let mount = base.join("maki-uncreated-mount-parent").join(name);
+        let result = AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                mountpoint: Some(mount.to_str().unwrap().to_owned()),
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(result.is_ok(), ok, "{result:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn attach_refuses_volume_groups_that_name_device_nodes() {
+    let request = |vg: &str| {
+        AttachConfig::default().into_request(
+            "audit",
+            AttachOverrides {
+                vg_name: Some(vg.into()),
+                ..Default::default()
+            },
+            false,
+        )
+    };
+    for vg in ["null", "zero"] {
+        assert!(request(vg).unwrap_err().to_string().contains("vg_name"));
+    }
+    if std::path::Path::new("/dev/shm").is_dir() {
+        assert!(
+            request("shm").is_ok(),
+            "existing directories can be active VGs"
+        );
+    }
+    assert!(request("vg_maki_new_group").is_ok());
 }

@@ -11,6 +11,60 @@ documents.
 
 ### Breaking changes
 
+- **The `maki-witness` configuration, state directory and state files must be
+  owned by root or by the user that runs the command** (AUD-075, AUD-076,
+  2026-11-17; [#170](https://github.com/seo-rii/maki/pull/170)). `serve`,
+  `init-etcd` and `inspect` refuse a configuration owned by another user, and
+  `init` and `serve` refuse a state directory or `remote.state`, `remote.next`
+  or `remote.lock` owned by another user or writable by group or others, before
+  writing anything or binding the listener. A command run as root therefore
+  refuses a configuration or state directory the service account owns:
+  `chown -R` the state directory to the account that runs `serve` and
+  `chmod go-w` it and its files, or use a root-owned configuration ([witness
+  service](docs/remote-witness-service.md#credential-and-configuration-files)).
+- **A witness frontend whose allow-list does not name a trusted client
+  certificate answers with a final denial** (AUD-077,
+  [#179](https://github.com/seo-rii/maki/pull/179)). Failover no longer tries
+  another frontend, a mutation is not retried, and a remote rollback session
+  stops until it is reopened; before, the dropped connection looked like an
+  unavailable witness and another frontend could answer. List every client on
+  every frontend ([frontend
+  failover](docs/remote-witness-service.md#configure-frontend-failover)).
+- **`MAKI_LOG` directives need a level, and `maki` refuses `--timeout` on
+  commands without a control round trip** (AUD-094, AUD-095,
+  [#188](https://github.com/seo-rii/maki/pull/188)). A directive that is
+  neither a level nor `<target>=<level>`, such as a misspelt `warning` (which
+  silenced every Maki event, ERROR included) or a bare `maki_core` (which meant
+  that target at trace and every other target off), now falls back to `info`
+  and logs one `MAKI_LOG is not a valid filter` warning; write
+  `maki_core=trace` for one target. Only `status`, `metrics`, `checkpoint`,
+  `drain` and `reload` take `--timeout`; `maki volume` and `maki check` refuse
+  it with the usage and exit status 2 instead of ignoring it
+  ([logging](docs/operations.md#logging)).
+- **gRPC method paths, HTTP item fields and `env` credential names are
+  validated as the providers send them** (AUD-072 to AUD-074,
+  [#172](https://github.com/seo-rii/maki/pull/172)). `encrypt_path` and
+  `decrypt_path` must be an absolute path with an optional query and no
+  fragment, with characters outside RFC 3986's path and query sets
+  percent-encoded. A batch body's top-level `fields` may not use the `payload`,
+  `unit_index` or `batch_index` source (map it in `item_fields`), and a
+  per-item body may not have `item_fields`. An `env` name may not contain `=`
+  or NUL. These configurations used to fail every attach or send empty values
+  ([HTTP mapping](docs/configuration.md#remote-http-mapping)).
+- **Recovery and `maki check --deep` refuse inconsistent metadata they used to
+  disagree on** (AUD-055 to AUD-059,
+  [#185](https://github.com/seo-rii/maki/pull/185)). Both refuse a checkpoint
+  above the durable proof's horizon, whose acknowledged writes then read zeros;
+  a v2/v3 durable sequence or segment index that leaves no room for one more
+  record or segment, or a metadata generation in the top quarter of its range,
+  after which every write or a later checkpoint failed; and a covered proof
+  that names a location past the newer records. Only damage or a foreign writer
+  produces these states ([durable
+  recovery](docs/durable-recovery.md#cost-and-verification-limits)). The deep
+  check reports a lost key canary as an `ERROR` only when the volume has
+  history but no ciphertext left, which every attach refuses, and as a warning
+  otherwise ([operations](docs/operations.md#volume-lifecycle)).
+
 - **Credential and witness key files must be owned by root or by the user that
   loads them** (AUD-029, AUD-031, 2026-11-16;
   [#158](https://github.com/seo-rii/maki/pull/158),
@@ -247,6 +301,63 @@ documents.
   checker in CI (2026-09-23).
 
 ### Fixed
+
+- **2026-11-17 audit: durability and recovery** (AUD-052 to AUD-062, AUD-091).
+  A worker pass started by the interval, the overlay bound or a write refused
+  for space now checkpoints the records already durable when its journal sync
+  fails, as watermark and low-space passes did, and a watermark at or below the
+  segment size no longer costs a sync and a checkpoint per write
+  ([#176](https://github.com/seo-rii/maki/pull/176)). A final journal segment
+  exactly one header long whose header fails its checksum, left by an older
+  binary's torn header write, no longer blocks attach when the durable proof
+  and mark name earlier segments
+  ([#177](https://github.com/seo-rii/maki/pull/177)). Allocation map padding
+  bits, and positions past the device's end in a partial last shard, no longer
+  make a never-written short shard read EIO
+  ([#184](https://github.com/seo-rii/maki/pull/184),
+  [#186](https://github.com/seo-rii/maki/pull/186)). See the remediation log's
+  [second](docs/review-remediation.md#internal-audit-second-round-2026-11-17-aud-052aud-090)
+  and
+  [third](docs/review-remediation.md#internal-audit-third-round-2026-11-17-aud-091aud-097)
+  rounds.
+- **2026-11-17 audit: remote providers** (AUD-066 to AUD-071). WebSocket and
+  gRPC responses no longer take about 43 and 49 times their size in memory
+  while they are parsed ([#173](https://github.com/seo-rii/maki/pull/173)). A
+  request of a provider that is not retry-safe now fails over when its attempt
+  failed before any request byte was sent (a refused connection, a failed TLS
+  handshake, a refused WebSocket upgrade); under `stall` it stays pending while
+  its only endpoint refuses connections, instead of failing at once. An
+  operation whose deadline expires while it waits for endpoint admission
+  reports the last endpoint error, as the other deadline exits do
+  ([#174](https://github.com/seo-rii/maki/pull/174)). The patched serde_json
+  builds error messages in linear time and erases the owned raw text a
+  `&RawValue` rejects ([#183](https://github.com/seo-rii/maki/pull/183)).
+- **2026-11-17 audit: witness, rollback protection and admission** (AUD-078 to
+  AUD-080, AUD-082, AUD-092, AUD-093). One name that is not UTF-8 in a remote
+  rollback backing root no longer makes every GC pass fail (which left
+  predecessor namespaces on disk until the filesystem filled), and a damaged
+  manifest length no longer allocates about 72 MiB per open
+  ([#181](https://github.com/seo-rii/maki/pull/181)). A root
+  `maki check --deep`, `maki volume inspect` or other open of a local rollback
+  witness keeps the anchor's owner, so the daemon can still attach, and a root
+  `maki volume create` names the witness directory in its `chown` warning
+  ([#182](https://github.com/seo-rii/maki/pull/182)). Memory-budget admission
+  reads the mount table as bytes, so one non-UTF-8, newline or very deep mount
+  path elsewhere no longer stops every memory-budgeted volume from starting
+  ([#180](https://github.com/seo-rii/maki/pull/180)). A failure before a local
+  witness authority renames its new state now fails only that request, instead
+  of making `serve` answer every later request as unavailable until a restart,
+  and `maki volume restore` reads a snapshot it may not write, such as one on a
+  read-only mount or with immutable files
+  ([#189](https://github.com/seo-rii/maki/pull/189); [witness
+  service](docs/remote-witness-service.md#initialize-a-local-authority)).
+- **2026-11-17 audit: tooling and tests** (AUD-063 to AUD-065, AUD-083). The
+  vendor erasure contract resolves every workspace feature
+  ([#183](https://github.com/seo-rii/maki/pull/183)). `CrashableBacking` and
+  `MemBacking` refuse directory names as locks and in `remove` as `FileBacking`
+  does, three recovery and journal regressions that could not fail now fail
+  without the rewrite they are named after, and MAKI-011 has a dedicated test
+  ([#175](https://github.com/seo-rii/maki/pull/175)).
 
 - **2026-11-16 audit: durability and recovery** (AUD-001 to AUD-007). Recovery
   rewrites both superblock copies from their exact bytes and completes a
@@ -590,6 +701,31 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-11-17 audit** (AUD-081, AUD-084 to AUD-090, AUD-096, AUD-097): the
+  link checker verifies reference-style link definitions and references
+  ([#171](https://github.com/seo-rii/maki/pull/171)). A copy-on-write backing
+  filesystem (btrfs with copy-on-write data, ZFS) is unsupported and btrfs
+  NOCOW backing files are not qualified, because there an overwrite needs new
+  space despite the reservation ([status](docs/status.md#known-limitations),
+  [#171](https://github.com/seo-rii/maki/pull/171)). The workload verify gate
+  needs CAP_DAC_READ_SEARCH or CAP_DAC_OVERRIDE in the unit's bounding set, or
+  a volume root others can read and search
+  ([#171](https://github.com/seo-rii/maki/pull/171),
+  [#187](https://github.com/seo-rii/maki/pull/187)). Inside the checkpoint
+  headroom raw discards are admitted, but a filesystem's deletes and XFS
+  `fstrim` are refused; the key-rotation procedure masks `maki-recover@` while
+  it starts units by hand; SPEC §9 lists only the implemented key sources
+  ([#178](https://github.com/seo-rii/maki/pull/178)). `maki volume witness`,
+  `snapshot` and `gc` run as the daemon user with the writer configuration, and
+  enrollment recovery hands the paths back to it
+  ([#182](https://github.com/seo-rii/maki/pull/182)). A remote restore's
+  automatic GC deletes the newer state it replaces from the backing root;
+  snapshot that state first if it may be needed ([witness
+  service](docs/remote-witness-service.md#snapshot-takeover-and-restore),
+  [#187](https://github.com/seo-rii/maki/pull/187)). The
+  `systemd-analyze verify`, `BindsTo=` and quick-start cleanup statements were
+  corrected ([#187](https://github.com/seo-rii/maki/pull/187)).
 
 - **2026-11-16 audit** (AUD-047 to AUD-051): the link checker verifies in-page
   and cross-file anchors against GitHub heading slugs

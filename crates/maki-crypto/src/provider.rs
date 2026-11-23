@@ -6,6 +6,12 @@ use std::time::Duration;
 use crate::error::CryptoError;
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
+// A private argument seals just the validation hook. Third-party providers
+// can implement CryptoProvider, but cannot exempt their output from scanning.
+pub(crate) mod private {
+    pub struct ValidationCaller;
+}
+
 /// A local or remote cryptographic provider.
 ///
 /// Contract (validated by the caller — see `validate_encrypt_result` and
@@ -17,6 +23,13 @@ use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextU
 ///   (or another error) — never fabricated plaintext.
 #[async_trait]
 pub trait CryptoProvider: Send + Sync {
+    /// Only report a completed scan when each returned ciphertext was checked
+    /// against these exact plaintext bytes. Transforming wrappers need a new scan.
+    #[doc(hidden)]
+    fn checks_plaintext_echo(&self, _: private::ValidationCaller) -> bool {
+        false
+    }
+
     /// Maximum elapsed time for one caller operation, including admission
     /// and batching in outer wrappers. `None` keeps stall semantics.
     fn max_operation_time(&self) -> Option<Duration> {

@@ -340,6 +340,11 @@ A `credential` name, and the file name that ends a `file` path, may contain
 only ASCII letters, digits, `.`, `_` and `-` and must not start with `.`;
 the loaders refuse any other name, so validation refuses it before a volume is
 created (a key's name is stored as the volume's immutable key identity).
+A file credential path must end in the file name. If an older volume was
+created with a key path such as `/etc/maki/key/` or `/etc/maki/key/.`, remove
+the trailing directory suffix from the configuration before reattaching.
+The old loader opened `/etc/maki/key` in both cases. Maki recognizes that
+stored spelling for the corrected file path and verifies the key as usual.
 An `env` name is upper-cased, with `-` and `.` replaced by `_`, to form the
 variable name. It must not contain `=` or a NUL character, which no
 environment variable name can hold (a lookup of `A=B` would even return part
@@ -394,6 +399,8 @@ sources:
 | `format_version` | the on-disk format version, an unsigned JSON integer |
 | `batch_index` | the item's position in its request, an unsigned JSON integer |
 
+Every JSON request maps a per-item `payload`. Batch requests also map the volume
+`unit_index` so the server can echo it, including when context binding is disabled.
 Only `payload` takes an `encoding`. A per-item body sends `fields` once per
 item and takes no `item_fields`. A batch body sends `fields` once per request,
 so they may carry only `volume_id`, `compatibility_id` and `format_version`
@@ -529,6 +536,12 @@ when its final caller leaves. Other callers in that batch can still complete.
 
 The gRPC transport uses the message shape in
 [`packaging/examples/maki-crypto.proto`](../packaging/examples/maki-crypto.proto).
+A gateway endpoint path prefixes the method path. Endpoint query parameters precede
+method query parameters on the request. ASCII metadata names are case-insensitive
+and unique. Binary keys ending in `-bin` and the protocol fields `te`,
+`content-type`, `user-agent`, `grpc-message`, `grpc-message-type`, and
+`grpc-status` are rejected in configured metadata.
+
 Service method paths are configurable (`encrypt_path` and `decrypt_path`,
 default `/maki.CryptoService/EncryptBatch` and `/maki.CryptoService/DecryptBatch`;
 a gateway prefix or a query is sent unchanged), but request and response
@@ -667,7 +680,7 @@ times; it does not refresh them.
 | `backing.journal_emergency_reserve_bytes` | Enables write-admission free-space checks; writes fail with ENOSPC unless a fresh sample covers this reserve, checkpoint headroom, and the projected record/segment-header footprint |
 | `backing.checkpoint_reserve_bytes` | Headroom preserved by write admission while the emergency reserve is enabled; the worker also checkpoints eagerly below this value |
 | `limits.max_journal_pending_bytes` | Appended-but-unsynced journal bytes; checked before every record, including inside one request. Must hold a maximum ciphertext plus its 32-byte record header |
-| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when that reclaim cannot make room; the worker checkpoints at half of it. Must hold the largest request (`nbd.maximum_io` plus one unit, as ciphertext) twice, or be `0` to disable |
+| `limits.max_overlay_bytes` (default 256 MiB) | Ciphertext held in memory by the overlay (journaled, not yet checkpointed records; each unit's latest and durable copy). A write whose projected charge would exceed it syncs and checkpoints inline first, and fails with ENOSPC only when that reclaim cannot make room; the worker checkpoints at half of it. Must hold twice the ciphertext for the greatest number of crypto units a legal request can touch, respecting export size and minimum I/O alignment, or be `0` to disable |
 | `limits.max_overlay_entries` (default 262144) | Units the overlay may hold, whatever their payload (a v3 discard tombstone has none but still costs an entry). Same inline-checkpoint and ENOSPC behaviour; must hold the largest request in crypto units, or be `0` to disable |
 
 An inline reclaim keeps what it frees for the write that ran it. From the
@@ -781,7 +794,8 @@ window, while time waiting for queue admission does not. A full lane can delay
 dispatch beyond that deadline; available capacity does not start a new window.
 A request's items are never split and keep
 their order. Requests that touch the same unit are never coalesced: one
-provider call never carries a unit twice. Each lane keeps up to `limits.max_crypto_inflight_batches`
+provider call never carries a unit twice. A single request with a repeated unit
+number is rejected before queue admission. Each lane keeps up to `limits.max_crypto_inflight_batches`
 batches in flight at once (the dispatcher's own limits bound what reaches the
 endpoints), so one slow batch does not serialize the requests behind it.
 `limits.max_pending_crypto_items` bounds queued items per lane (one permit per

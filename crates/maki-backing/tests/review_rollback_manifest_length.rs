@@ -20,11 +20,15 @@ use maki_backing::{Backing, MemBacking, RollbackBacking};
 struct Counting;
 
 thread_local! {
+    static PAGE_ALLOCS: Cell<usize> = const { Cell::new(0) };
     static LIVE: Cell<usize> = const { Cell::new(0) };
     static PEAK: Cell<usize> = const { Cell::new(0) };
 }
 
 fn grew(size: usize) {
+    if size == PAGE as usize {
+        let _ = PAGE_ALLOCS.try_with(|n| n.set(n.get() + 1));
+    }
     let _ = LIVE.try_with(|live| {
         let now = live.get() + size;
         live.set(now);
@@ -182,4 +186,35 @@ fn remote_manifest_length_beyond_its_slot_is_refused_before_allocating() {
         (peak as u64) < slot_len,
         "open_remote allocated {peak} bytes for a {slot_len}-byte manifest slot"
     );
+}
+
+#[test]
+fn sparse_reads_do_not_allocate_zero_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let backing = RollbackBacking::create(root.path(), witness.path(), PAGE).unwrap();
+    let file = backing.open("sparse", true).unwrap();
+    let mut out = vec![0x55; 64 * PAGE as usize];
+    file.set_len(out.len() as u64).unwrap();
+    let before = PAGE_ALLOCS.with(Cell::get);
+    file.read_at(0, &mut out).unwrap();
+    assert_eq!(PAGE_ALLOCS.with(Cell::get), before);
+    assert!(out.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn aligned_writes_to_fresh_pages_do_not_allocate_a_scratch_page_per_page() {
+    let root = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let backing = RollbackBacking::create(root.path(), witness.path(), 32 * PAGE).unwrap();
+    let file = backing.open("fresh", true).unwrap();
+    let data: Vec<u8> = (0..32 * PAGE).map(|offset| (offset % 251) as u8).collect();
+    file.allocate_range(0, data.len() as u64).unwrap();
+    let before = PAGE_ALLOCS.with(Cell::get);
+    file.write_at(0, &data).unwrap();
+    assert_eq!(PAGE_ALLOCS.with(Cell::get), before);
+    file.sync_data().unwrap();
+    let mut read = vec![0; data.len()];
+    file.read_at(0, &mut read).unwrap();
+    assert_eq!(read, data);
 }

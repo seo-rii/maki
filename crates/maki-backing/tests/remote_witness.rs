@@ -1,4 +1,5 @@
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use maki_backing::remote_witness::{
@@ -392,6 +393,9 @@ enum Fault {
     StateOpen,
     /// Reading the published state fails (a transient EIO).
     StateRead,
+    /// Opening `remote.next` fails (EMFILE from a connection flood).
+    TempOpen,
+    /// Writing `remote.next` fails after half of the bytes reached it.
     TempWrite,
     TempSync,
     Rename,
@@ -425,7 +429,11 @@ impl BackingFile for FaultFile {
     }
     fn write_at(&self, o: u64, b: &[u8]) -> io::Result<()> {
         if self.temporary {
-            fail(&self.fault, Fault::TempWrite)?;
+            if let Err(error) = fail(&self.fault, Fault::TempWrite) {
+                // A failed write can still leave a prefix in the file.
+                self.inner.write_at(o, &b[..b.len() / 2])?;
+                return Err(error);
+            }
         }
         self.inner.write_at(o, b)
     }
@@ -446,6 +454,9 @@ impl Backing for FaultBacking {
     fn open(&self, p: &str, c: bool) -> io::Result<Arc<dyn BackingFile>> {
         if p == "remote.state" && !c {
             fail(&self.fault, Fault::StateOpen)?;
+        }
+        if p == "remote.next" {
+            fail(&self.fault, Fault::TempOpen)?;
         }
         Ok(Arc::new(FaultFile {
             inner: self.inner.open(p, c)?,
@@ -479,37 +490,53 @@ impl Backing for FaultBacking {
     }
 }
 
+/// The pre-rename steps of a publication: each leaves `remote.state` as it
+/// was published.
+const BEFORE_RENAME: [Fault; 3] = [Fault::TempOpen, Fault::TempWrite, Fault::TempSync];
+
+/// Open an enrolled authority through `FaultBacking`, returning its
+/// published state's bytes and record.
+fn faulty_store(dir: &Path) -> (Arc<FaultBacking>, StateStore, Vec<u8>, Record) {
+    drop(StateStore::create(dir, ID).unwrap());
+    let backing = Arc::new(FaultBacking {
+        inner: FileBacking::new(dir).unwrap(),
+        fault: Arc::new(Mutex::new(None)),
+    });
+    let mut store = StateStore::open_backing(backing.clone()).unwrap();
+    let before = inspect(&mut store);
+    let published = std::fs::read(dir.join("remote.state")).unwrap();
+    (backing, store, published, before)
+}
+
+/// Once the rename of `remote.next` over `remote.state` has been attempted,
+/// the published state may be either one: a failed rename can still have
+/// happened, and after a failed directory sync the new name is visible but
+/// may not survive a power loss. The handle refuses every request until a
+/// reopen re-publishes whichever state it reads. A failure before the
+/// rename leaves the published state unchanged and refuses only its request
+/// (`a_publication_failure_before_the_rename_refuses_only_that_request`).
 #[test]
-fn every_publication_failure_poisons_and_reopen_resolves_exact_old_or_new() {
+fn an_uncertain_publication_poisons_and_reopen_resolves_exact_old_or_new() {
     let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    for point in [
-        Fault::TempWrite,
-        Fault::TempSync,
-        Fault::Rename,
-        Fault::DirectorySync,
-    ] {
+    for point in [Fault::Rename, Fault::DirectorySync] {
         let dir = tempdir().unwrap();
-        drop(StateStore::create(dir.path(), ID).unwrap());
-        let backing = Arc::new(FaultBacking {
-            inner: FileBacking::new(dir.path()).unwrap(),
-            fault: Arc::new(Mutex::new(None)),
-        });
-        let mut store = StateStore::open_backing(backing.clone()).unwrap();
-        let before = inspect(&mut store);
+        let (backing, mut store, _, before) = faulty_store(dir.path());
         let request = op(1, &before, Action::Claim);
         *backing.fault.lock().unwrap() = Some(point);
         assert!(store.handle(Role::Writer, &request).is_err(), "{point:?}");
-        assert!(store
-            .handle(
-                Role::Writer,
-                &Request {
-                    authorization: None,
-                    operation_id: [0; 16],
-                    expected: None,
-                    action: Action::Inspect
-                }
-            )
-            .is_err());
+        for _ in 0..2 {
+            assert!(store
+                .handle(
+                    Role::Writer,
+                    &Request {
+                        authorization: None,
+                        operation_id: [0; 16],
+                        expected: None,
+                        action: Action::Inspect
+                    }
+                )
+                .is_err());
+        }
         drop(store);
         let mut reopened = StateStore::open(dir.path()).unwrap();
         let observed = inspect(&mut reopened);
@@ -523,10 +550,72 @@ fn every_publication_failure_poisons_and_reopen_resolves_exact_old_or_new() {
     }
 }
 
+/// A publication that fails before the rename (opening, writing or syncing
+/// `remote.next`) leaves `remote.state` byte for byte as published, and the
+/// next publication truncates and rewrites `remote.next` through a new
+/// descriptor. Poisoning on such a failure (EMFILE from a connection flood,
+/// a transient ENOSPC or EIO) made every later request, Inspect included,
+/// answer "reopen required" until the witness was restarted, so every
+/// volume using it refused all I/O long after the cause was gone. Only that
+/// request fails; its exact retry applies once and is durable.
+#[test]
+fn a_publication_failure_before_the_rename_refuses_only_that_request() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for point in BEFORE_RENAME {
+        let dir = tempdir().unwrap();
+        let (backing, mut store, published, before) = faulty_store(dir.path());
+        let request = op(1, &before, Action::Claim);
+        *backing.fault.lock().unwrap() = Some(point);
+        assert!(store.handle(Role::Writer, &request).is_err(), "{point:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join("remote.state")).unwrap(),
+            published,
+            "{point:?}: the failure preceded the rename"
+        );
+        assert_eq!(inspect(&mut store), before, "{point:?}");
+        let claimed = store.handle(Role::Writer, &request).unwrap();
+        assert_eq!(claimed.phase, Phase::Claimed, "{point:?}");
+        assert_eq!(claimed.fence, 1, "{point:?}");
+        assert_eq!(store.handle(Role::Writer, &request).unwrap(), claimed);
+        drop(store);
+        let mut reopened = StateStore::open(dir.path()).unwrap();
+        assert_eq!(inspect(&mut reopened), claimed, "{point:?}");
+    }
+}
+
+/// Whatever such a failure left in `remote.next`, even the complete next
+/// state whose sync failed, is never taken for state: a reopen serves the
+/// published `remote.state`, and the request then applies afresh.
+#[test]
+fn a_reopen_after_a_failure_before_the_rename_serves_the_published_state() {
+    let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for point in BEFORE_RENAME {
+        let dir = tempdir().unwrap();
+        let (backing, mut store, published, before) = faulty_store(dir.path());
+        let request = op(1, &before, Action::Claim);
+        *backing.fault.lock().unwrap() = Some(point);
+        assert!(store.handle(Role::Writer, &request).is_err(), "{point:?}");
+        drop(store);
+        let mut reopened = StateStore::open(dir.path()).unwrap();
+        assert_eq!(inspect(&mut reopened), before, "{point:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join("remote.state")).unwrap(),
+            published,
+            "{point:?}"
+        );
+        assert_eq!(
+            reopened.handle(Role::Writer, &request).unwrap().fence,
+            1,
+            "{point:?}"
+        );
+    }
+}
+
 #[test]
 fn reopen_must_republish_before_serving_any_response() {
     let _fixture_guard = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for point in [
+        Fault::TempOpen,
         Fault::TempWrite,
         Fault::TempSync,
         Fault::Rename,

@@ -53,8 +53,10 @@ Rules the test infrastructure imposes:
   (failpoints are process-global).
 - Time-dependent code uses the injectable `Clock` (`ManualClock` in tests);
   never real sleeps.
-- Crash tests use `CrashableBacking::with_tearing`, and distinguish a restart
-  (`drop` + `recover`, page cache survives) from a power loss (`crash*`).
+- Crash tests use `CrashableBacking::with_tearing`, distinguish a restart
+  (`drop` + `recover`, page cache survives) from a power loss (`crash*`), and
+  start each process of the code under test on `backing.process()`, which a
+  power loss kills.
 - Debug builds run `check_invariants()` after every mutation; a sanitizer
   panic is a real bug, not flakiness.
 
@@ -94,7 +96,9 @@ missing files or directories included in the archive remain errors.
 
 A fragment on a Markdown link, in-page (`#anchor`) or cross-file
 (`other.md#anchor`), must name a heading of that document as GitHub slugs it,
-or an explicit `<a id>`/`<a name>` anchor there. The slug is the heading's
+or an explicit `<a id>`/`<a name>` anchor there. In GitHub source view, use
+`?plain=1#L3` or `?plain=1#L3-L8` for existing lines of the file.
+The slug is the heading's
 text (inline code and links reduced to their text) in lower case, with
 punctuation removed and each space turned into a hyphen, so
 `Review — 2026-10-12` becomes `review--2026-10-12`; a repeated heading gets

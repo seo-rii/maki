@@ -10,7 +10,7 @@
 //! is also how a test waits for a wake-up from outside the scheduler (for
 //! example `ManualClock::advance`) before running again.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,10 +23,10 @@ use rand_chacha::ChaCha8Rng;
 
 /// Ids of the tasks whose waker fired since they were last polled. Ordered,
 /// so the seeded choice among them is reproducible.
-type ReadySet = Arc<Mutex<BTreeSet<usize>>>;
+type ReadySet = Arc<Mutex<BTreeSet<u64>>>;
 
 struct TaskWaker {
-    id: usize,
+    id: u64,
     ready: ReadySet,
 }
 
@@ -52,7 +52,8 @@ enum Outcome {
 }
 
 pub struct DeterministicScheduler {
-    tasks: Vec<Option<Task>>,
+    tasks: BTreeMap<u64, Task>,
+    next_id: u64,
     ready: ReadySet,
     rng: ChaCha8Rng,
 }
@@ -60,7 +61,8 @@ pub struct DeterministicScheduler {
 impl DeterministicScheduler {
     pub fn new(seed: u64) -> Self {
         Self {
-            tasks: Vec::new(),
+            tasks: BTreeMap::new(),
+            next_id: 0,
             ready: ReadySet::default(),
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
@@ -68,21 +70,26 @@ impl DeterministicScheduler {
 
     /// Add a task; it is runnable until its first poll.
     pub fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
-        let id = self.tasks.len();
+        // Wakers can outlive their tasks, so an ID must never be reassigned.
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).expect("scheduler task ID exhausted");
         let waker = Waker::from(Arc::new(TaskWaker {
             id,
             ready: self.ready.clone(),
         }));
-        self.tasks.push(Some(Task {
-            future: Box::pin(fut),
-            waker,
-        }));
+        self.tasks.insert(
+            id,
+            Task {
+                future: Box::pin(fut),
+                waker,
+            },
+        );
         self.ready.lock().insert(id);
     }
 
     /// Unfinished tasks, runnable or parked.
     pub fn pending(&self) -> usize {
-        self.tasks.iter().filter(|task| task.is_some()).count()
+        self.tasks.len()
     }
 
     /// Run until all tasks complete. Panics if the tasks stall (unfinished,
@@ -115,10 +122,10 @@ impl DeterministicScheduler {
 
     fn drive(&mut self, max_polls: usize) -> Outcome {
         for _ in 0..max_polls {
-            let runnable: Vec<usize> = {
+            let runnable: Vec<u64> = {
                 let mut ready = self.ready.lock();
                 // A finished task can still be woken by a stale waker clone.
-                ready.retain(|id| self.tasks[*id].is_some());
+                ready.retain(|id| self.tasks.contains_key(id));
                 ready.iter().copied().collect()
             };
             if runnable.is_empty() {
@@ -132,15 +139,16 @@ impl DeterministicScheduler {
             // Clear the flag before polling: a wake during the poll (such as
             // `yield_now`) makes the task runnable again.
             self.ready.lock().remove(&pick);
-            let Task { future, waker } = self.tasks[pick]
-                .as_mut()
+            let Task { future, waker } = self
+                .tasks
+                .get_mut(&pick)
                 .expect("a runnable task is unfinished");
             if future
                 .as_mut()
                 .poll(&mut Context::from_waker(waker))
                 .is_ready()
             {
-                self.tasks[pick] = None;
+                self.tasks.remove(&pick);
             }
         }
         if self.pending() == 0 {

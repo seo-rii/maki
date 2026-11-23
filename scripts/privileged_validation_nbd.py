@@ -110,6 +110,13 @@ def execute(args):
         if command is None:
             return 0
         result = subprocess.run(command)
+        if result.returncode and args.action == "remove-lv":
+            # lvcreate or lvremove can fail with the validation VG already empty.
+            # Confirm that state under the ownership lock before releasing lower layers.
+            count = subprocess.run(["vgs", "--noheadings", "-o", "lv_count", args.vg],
+                                   stdout=subprocess.PIPE, text=True)
+            if count.returncode == 0 and count.stdout.strip() == "0":
+                return 0
         if result.returncode == 0 and args.action == "disconnect" and backend(target) is not None:
             raise RuntimeError("NBD disconnect left a live backend; preserving cleanup identity")
         return result.returncode

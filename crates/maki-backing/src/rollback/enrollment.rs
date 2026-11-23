@@ -4,7 +4,7 @@
 //! that the root holds no other volume's state (a legacy root has no binding).
 use super::*;
 
-const FILE: &str = "remote.enrollment";
+pub(super) const FILE: &str = "remote.enrollment";
 const MAGIC: &[u8; 8] = b"MAKIRE01";
 const DOMAIN: &[u8] = b"maki.remote.enrollment.v1\0";
 const LENGTH: usize = 64;

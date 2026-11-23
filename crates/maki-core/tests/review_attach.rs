@@ -13,7 +13,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use maki_backing::Backing;
 use maki_core::engine::{AttachError, AttachIdentity, CheckpointPolicy, Engine, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_crypto::{
@@ -21,6 +20,7 @@ use maki_crypto::{
     SecretBuffer,
 };
 use maki_format::ab::AbStore;
+use maki_format::allocation::AllocationMap;
 use maki_format::canary::{KeyCanary, CANARY_UNIT_INDEX};
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
@@ -89,7 +89,7 @@ async fn attach(
     backing: &Arc<CrashableBacking>,
     provider: Arc<dyn CryptoProvider>,
 ) -> Result<Engine, AttachError> {
-    Engine::attach(backing.clone() as Arc<dyn Backing>, provider, options(None)).await
+    Engine::attach(backing.process(), provider, options(None)).await
 }
 
 async fn attach_as(
@@ -99,7 +99,7 @@ async fn attach_as(
     key_identity: &str,
 ) -> Result<Engine, AttachError> {
     Engine::attach(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         provider,
         options(Some(AttachIdentity {
             provider_type: provider_type.into(),
@@ -224,7 +224,7 @@ async fn write_legacy_unit(backing: &Arc<CrashableBacking>, provider: &dyn Crypt
         .await
         .unwrap();
     let mut vol = Volume::recover(
-        backing.clone() as Arc<dyn Backing>,
+        backing.process(),
         VolumeOptions {
             journal_segment_size: 1 << 20,
         },
@@ -257,6 +257,32 @@ async fn legacy_volume_is_probed_with_integrity_provider_then_canaried() {
         attach(&backing, key(KEY_B)).await,
         Err(AttachError::KeyMismatch(_))
     ));
+}
+
+#[tokio::test]
+async fn canary_probe_uses_readable_ciphertext_missing_from_both_allocation_maps() {
+    let backing = fresh();
+    write_legacy_unit(&backing, key(KEY_A).as_ref()).await;
+    let alloc = AbStore::new(layout::shard_alloc_a(0), layout::shard_alloc_b(0));
+    let mut empty = AllocationMap::new(geometry().units_per_shard());
+    for _ in 0..2 {
+        alloc.store(backing.as_ref(), &mut empty).unwrap();
+    }
+
+    let report = maki_core::check::deep_check(backing.process(), 1 << 20).unwrap();
+    assert!(report.ok(), "{:?}", report.errors);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("integrity-capable")));
+    assert!(matches!(
+        attach(&backing, key(KEY_B)).await,
+        Err(AttachError::KeyMismatch(_))
+    ));
+    assert!(!canary_present(&backing));
+    let engine = attach(&backing, key(KEY_A)).await.unwrap();
+    assert_eq!(engine.read(0, UNIT as usize).await.unwrap(), data(0x33));
+    assert!(canary_present(&backing));
 }
 
 #[tokio::test]

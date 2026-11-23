@@ -51,7 +51,9 @@ maximum_io = "{REQUEST}B"
 
 fn minimum(unit: u32) -> u64 {
     let record = max_record_len(unit + 8);
-    let count = REQUEST.div_ceil(u64::from(unit)) + 1;
+    // With 512-byte aligned offsets a 512-byte unit never straddles the
+    // adjacent unit. Larger units can begin one block into the unit.
+    let count = REQUEST / u64::from(unit) + u64::from(unit > 512);
     let header = SEGMENT_HEADER_SIZE as u64;
     let records_per_segment = ((SEGMENT - header) / record).max(1);
     let append = count * record + count.div_ceil(records_per_segment) * header;

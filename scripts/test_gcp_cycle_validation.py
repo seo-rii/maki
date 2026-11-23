@@ -59,8 +59,10 @@ class CycleBoundaryContracts(unittest.TestCase):
 
     def cli_error(self, argv):
         # Run the original argparse and validation; stop before any VM lookup.
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(
-                pathlib.Path, "resolve", side_effect=ReachedFilesystemSetup):
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(pathlib.Path, "read_text", return_value="12345678-1234-1234-1234-123456789abc"), \
+                mock.patch.object(pathlib.Path, "resolve", side_effect=ReachedFilesystemSetup), \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
             try:
                 self.guest.main()
             except ReachedFilesystemSetup:
@@ -70,7 +72,7 @@ class CycleBoundaryContracts(unittest.TestCase):
         self.fail("guest main did not reach its filesystem setup boundary")
 
     def cli(self, cycle, profile, verify_only=False):
-        argv = ["gcp-reset-guest.py", "--token", "a" * 32,
+        argv = ["gcp-reset-guest.py", "--token", "a" * 32, "--device-name", "data",
                 "--cycle", str(cycle), "--profile", profile]
         if verify_only:
             argv.append("--verify-only")
@@ -114,9 +116,9 @@ class CycleBoundaryContracts(unittest.TestCase):
         client = MemoryNbd()
         launches, resets = [], []
 
-        def launch(args, token, cycle, verify_only, output):
+        def launch(args, token, cycle, verify_only, output, device_name):
             # Preserve the original host-generated CLI, including verify-only.
-            command = self.host.ssh_command(args, token, cycle, verify_only)
+            command = self.host.ssh_command(args, token, cycle, verify_only, device_name)
             argv = shlex.split(command[command.index("--command") + 1])[3:]
             self.assertIsNone(self.cli_error(argv), f"guest CLI rejected cycle {cycle}, verify-only={verify_only}")
             events = []
@@ -125,15 +127,16 @@ class CycleBoundaryContracts(unittest.TestCase):
                 events.append(dict(event=event, token=token, cycle=cycle,
                                    boot_id=f"00000000-0000-0000-0000-{cycle + 1:012x}", **fields))
 
-            emit("ready", provider="local-aes-gcm-siv", can_flush=True,
-                 can_fua=True, can_trim=True,
+            emit("ready", data_device=device_name, provider="local-aes-gcm-siv", can_flush=True,
+                 can_fua=True, native_fua=True, can_trim=profile == "v3-discard",
                  fs_uuid="10000000-0000-0000-0000-000000000001",
                  witness_service="active", graceful_stop_witness="absent")
             before = (client.writes, client.trims, client.flushes)
             with mock.patch.object(self.guest, "wait_for_reset") as wait_for_reset:
-                self.guest.execute_cycle(argparse.Namespace(
-                    cycle=cycle, profile=profile, verify_only=verify_only), client, emit)
+                final = self.guest.execute_cycle(argparse.Namespace(
+                    cycle=cycle, profile=profile, verify_only=verify_only, token=token), client, emit)
             if verify_only:
+                emit("verified", **final)  # This fixture completes the guest's final shutdown.
                 self.assertEqual((client.writes, client.trims, client.flushes), before)
                 wait_for_reset.assert_not_called()
             else:
@@ -182,11 +185,45 @@ class CycleBoundaryContracts(unittest.TestCase):
         self.assertEqual(len(ledger.read_text().splitlines()), cycles)
         self.assertEqual(self.host.load_ledger(ledger, profile)["cycle"], cycles - 1)
 
+    def test_prior_campaign_blocks_cannot_verify_an_ack_from_this_run(self):
+        for profile in ("v2", "v3-discard"):
+            with self.subTest(profile=profile):
+                disk = MemoryNbd()
+                events = []
+                def cycle(token, generation, verify_only):
+                    events.clear()
+                    args = argparse.Namespace(profile=profile, token=token, cycle=generation,
+                                              verify_only=verify_only)
+                    self.guest.execute_cycle(args, disk, lambda name, **data: events.append(data))
+                with mock.patch.object(self.guest, "wait_for_reset"):
+                    cycle("a" * 32, 0, False)
+                    with mock.patch.object(disk, "write"), mock.patch.object(disk, "trim"):
+                        cycle("b" * 32, 0, False)
+                    cycle("b" * 32, 1, True)
+                key = "manifest" if profile == "v3-discard" else "records"
+                expected = (self.host.expected_discard_manifest(0, "b" * 32)["final"]
+                            if profile == "v3-discard" else self.host.expected_records(0, "b" * 32))
+                with self.assertRaisesRegex(ValueError, "manifest mismatch"):
+                    self.host.verify_readbacks(expected, events[0][key])
+
     def test_campaign_63_and_64_reach_final_readback_and_offline_check(self):
         for profile in ("v2", "v3-discard"):
             for cycles in (63, 64):
                 with self.subTest(profile=profile, cycles=cycles):
                     self.run_local_campaign(cycles, profile)
+
+    def test_initial_resource_failure_leaves_private_error_report(self):
+        args = self.campaign_args(2, "v2")
+        with mock.patch.object(self.host, "resource_identity", side_effect=RuntimeError("describe failed")):
+            with self.assertRaisesRegex(RuntimeError, "describe failed"):
+                self.host.campaign(args)
+        report = args.output / "results.json"
+        result = json.loads(report.read_text())
+        self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(result["passed"])
+        self.assertIsNone(result["resource_identity"])
+        self.assertIn("describe failed", result["error"])
+        self.assertEqual(result["boots"], [])
 
     def test_campaign_65_is_rejected_before_resource_lookup(self):
         for profile in ("v2", "v3-discard"):

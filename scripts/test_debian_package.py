@@ -1,6 +1,9 @@
+import gzip
 import hashlib
 import os
 import pathlib
+import re
+import runpy
 import shutil
 import stat
 import struct
@@ -40,11 +43,12 @@ def elf_stub(machine, e_type, elf_class=64, endian="little", e_flags=0):
     return ident + header
 
 
-def elf_with_segments(machine, elf_class=64, endian="little", *, interpreter=False, flags_1=None):
+def elf_with_segments(machine, elf_class=64, endian="little", *, interpreter=False, flags_1=None,
+                      extra_segments=(), e_type=ET_DYN):
     """ET_DYN fixture with program headers, deliberately without section headers."""
     order = "<" if endian == "little" else ">"
-    header = bytearray(elf_stub(machine, ET_DYN, elf_class, endian))
-    segments = []
+    header = bytearray(elf_stub(machine, e_type, elf_class, endian))
+    segments = list(extra_segments)
     if interpreter:
         segments.append((3, b"/fixture/ld.so\0"))  # PT_INTERP
     if flags_1 is not None:
@@ -83,6 +87,7 @@ class DebianPackageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.work = pathlib.Path(self.temp.name)
+        self.builder = BUILDER
         self.release = self.work / "release"
         self.release.mkdir()
         self.write_release_files()
@@ -102,7 +107,7 @@ class DebianPackageTests(unittest.TestCase):
         output = self.work / name
         return output, [
             "python3",
-            str(BUILDER),
+            str(self.builder),
             "--release-dir",
             str(self.release),
             "--version",
@@ -166,6 +171,51 @@ class DebianPackageTests(unittest.TestCase):
         subprocess.run(["dpkg-deb", "--control", package, control], check=True)
         return root, control
 
+    def test_checkout_extras_do_not_change_the_packaged_units_or_examples(self):
+        checkout = self.work / "checkout"
+        shutil.copytree(ROOT / "packaging", checkout / "packaging")
+        shutil.copyfile(ROOT / "CHANGELOG.md", checkout / "CHANGELOG.md")
+        self.builder = checkout / "packaging/debian/build-deb.py"
+        clean = self.build("clean.deb")
+        (checkout / "packaging/systemd/maki@.service~").write_text("editor backup")
+        examples = checkout / "packaging/examples"
+        (examples / "maki@.service.d/local.conf").write_text("local example")
+        with_extras = self.build("extras.deb")
+        self.assertEqual(hashlib.sha256(clean.read_bytes()).digest(),
+                         hashlib.sha256(with_extras.read_bytes()).digest())
+        root, _ = self.extract(with_extras)
+        drop_in = pathlib.Path("maki@.service.d/20-memory-budget.conf")
+        self.assertEqual((root / "usr/share/doc/maki/examples" / drop_in).read_bytes(),
+                         (examples / drop_in).read_bytes())
+
+    def test_vendored_license_inventory_uses_tracked_paths(self):
+        repo = self.work / "checkout"
+        source = repo / "vendor" / "example"
+        source.mkdir(parents=True)
+        script = repo / "packaging/debian/update-copyright.py"
+        script.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / "packaging/debian/update-copyright.py", script)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (source / "LICENSE").write_text("published")
+        subprocess.run(["git", "-C", source, "add", "LICENSE"], check=True)
+        (source / "LICENSE.bak").write_text("local backup")
+        inventory = runpy.run_path(str(script))["notice_files"]
+        self.assertEqual(inventory(source, "LICENSE", tracked=True), {source / "LICENSE"})
+        with self.assertRaisesRegex(ValueError, "not tracked"):
+            inventory(source, "LICENSE.bak", tracked=True)
+
+    def test_installed_maintenance_contact_history_and_manuals(self):
+        package = self.build()
+        self.assertRegex(self.field(package, "Maintainer"), r".+ <[^@<> ]+@[^@<> ]+>$")
+        root, _ = self.extract(package)
+        docs = root / "usr/share/doc/maki"
+        changelog = gzip.decompress((docs / "changelog.Debian.gz").read_bytes())
+        self.assertIn(b"maki (0.1.0+test1)", changelog)
+        self.assertEqual(gzip.decompress((docs / "NEWS.gz").read_bytes()), (ROOT / "CHANGELOG.md").read_bytes())
+        for binary in ("maki", "maki-attach", "maki-check"):
+            page = root / "usr/share/man/man8" / f"{binary}.8.gz"
+            self.assertIn(f".TH {binary.upper()} 8".encode(), gzip.decompress(page.read_bytes()))
+
     def test_package_owns_runtime_artifacts_but_not_live_configuration(self):
         package = self.build()
         self.assertEqual(self.field(package, "Package"), "maki")
@@ -173,7 +223,7 @@ class DebianPackageTests(unittest.TestCase):
         self.assertEqual(self.field(package, "Architecture"), "amd64")
         dependencies = self.field(package, "Depends")
         self.assertIn("nbd-client (>= 1:3.27.0)", dependencies)
-        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd"):
+        for dependency in ("nbdkit", "lvm2", "xfsprogs", "systemd (>= 249)", "kmod"):
             self.assertIn(dependency, dependencies)
 
         root, control = self.extract(package)
@@ -217,6 +267,21 @@ class DebianPackageTests(unittest.TestCase):
                 )
 
     # --- R4-003: removal must not orphan a live attachment -----------------
+
+    def test_installs_the_project_and_dependency_copyright_notice(self):
+        root, _ = self.extract(self.build())
+        notice = root / "usr/share/doc/maki/copyright"
+        self.assertTrue(notice.is_file())
+        self.assertFalse(notice.is_symlink())
+        self.assertEqual(stat.S_IMODE(notice.stat().st_mode), 0o644)
+        self.assertEqual(notice.read_bytes(), (ROOT / "packaging/debian/copyright").read_bytes())
+        text = notice.read_text(encoding="utf-8")
+        generator = ROOT / "packaging/debian/update-copyright.py"
+        self.assertEqual(text, runpy.run_path(str(generator))["render"](),
+                         "Regenerate packaging/debian/copyright with update-copyright.py")
+        self.assertIn("https://github.com/seo-rii/maki", text)
+        self.assertIn("/usr/share/common-licenses/Apache-2.0", text)
+        self.assertIn((ROOT / "vendor/bytes/LICENSE").read_text().strip(), text)
 
     def test_prerm_refuses_removal_while_a_volume_is_attached(self):
         package = self.build()
@@ -339,6 +404,92 @@ class DebianPackageTests(unittest.TestCase):
         i386 = self.build("i386.deb", architecture="i386")
         self.assertEqual(self.field(i386, "Architecture"), "i386")
 
+    def test_foreign_os_abi_is_rejected_for_each_release_file(self):
+        for name in RELEASE_NAMES:
+            with self.subTest(name=name):
+                self.write_release_files()
+                path = self.release / name
+                image = bytearray(path.read_bytes())
+                image[7] = 9  # ELFOSABI_FREEBSD
+                path.write_bytes(image)
+                error = self.build_failure("freebsd.deb")
+                self.assertIn(name, error)
+                self.assertIn("OS ABI", error)
+        self.write_release_files()
+        for path in self.release.iterdir():
+            image = bytearray(path.read_bytes())
+            image[7] = 3  # ELFOSABI_GNU
+            path.write_bytes(image)
+        self.build("gnu.deb")
+
+    def test_mips64el_checks_the_float_abi_in_each_program_header_table(self):
+        def flags(fp_abi, version=0):
+            return struct.pack("<H6B4I", version, 64, 2, 2, 2, 0, fp_abi, 0, 0, 0, 0)
+
+        def image(name, *records):
+            return elf_with_segments(8, extra_segments=[(0x70000003, record) for record in records],
+                                     e_type=ET_DYN if name.endswith(".so") else ET_EXEC)
+
+        for name in RELEASE_NAMES:
+            (self.release / name).write_bytes(image(name, flags(1)))
+        self.build("hard.deb", architecture="mips64el")
+        (self.release / "maki").write_bytes(image("maki", flags(0)))
+        self.build("abi-independent.deb", architecture="mips64el")
+        for name in RELEASE_NAMES:
+            with self.subTest(name=name):
+                (self.release / name).write_bytes(image(name, flags(3)))
+                error = self.build_failure("soft.deb", architecture="mips64el")
+                self.assertIn(name, error)
+                self.assertIn("mips64el", error)
+                (self.release / name).write_bytes(image(name, flags(1)))
+        for records in ([], [flags(1)[:-1]], [flags(1, version=1)], [flags(1), flags(1)]):
+            with self.subTest(records=records):
+                (self.release / "maki").write_bytes(image("maki", *records))
+                self.assertIn("mips64el", self.build_failure("invalid.deb", architecture="mips64el"))
+
+    def test_riscv64_requires_lp64d_for_every_artifact(self):
+        machine = 0xF3
+        self.write_release_files(machine, e_flags=0x5)
+        self.build("lp64d.deb", architecture="riscv64")
+        for name in RELEASE_NAMES:
+            for flags in (0x1, 0x2, 0x6):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(machine, e_flags=0x4)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(machine, kind, e_flags=flags))
+                    error = self.build_failure("invalid.deb", architecture="riscv64")
+                    self.assertIn(name, error)
+                    self.assertIn("LP64D", error)
+
+    def test_ppc64el_rejects_incompatible_abi_markers_on_every_artifact(self):
+        # 0 is ABI-neutral; 2 denotes ELFv2. Higher flag bits are independent.
+        for flags in (0, 2, 0x12):
+            self.write_release_files(0x15, e_flags=flags)
+            self.build(f"ppc64el-{flags}.deb", architecture="ppc64el")
+        for name in RELEASE_NAMES:
+            for flags in (1, 3):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(0x15, e_flags=2)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(0x15, kind, e_flags=flags))
+                    error = self.build_failure("bad-ppc.deb", architecture="ppc64el")
+                    self.assertIn(name, error)
+                    self.assertIn("ELFv2", error)
+
+    def test_loong64_requires_lp64d_for_every_artifact(self):
+        machine = 0x102
+        self.write_release_files(machine, e_flags=0x43)
+        self.build("lp64d.deb", architecture="loong64")
+        for name in RELEASE_NAMES:
+            for flags in (0x40, 0x41, 0x42):
+                with self.subTest(artifact=name, flags=flags):
+                    self.write_release_files(machine, e_flags=0x43)
+                    kind = ET_DYN if name.endswith(".so") else ET_EXEC
+                    (self.release / name).write_bytes(elf_stub(machine, kind, e_flags=flags))
+                    error = self.build_failure("invalid.deb", architecture="loong64")
+                    self.assertIn(name, error)
+                    self.assertIn("LP64D", error)
+
     def test_arm_packages_accept_matching_float_abi(self):
         # AAELF32: absent float flags imply the base PCS, just like FLOAT_SOFT.
         for architecture, flags in (("armhf", 0x05000400),
@@ -452,6 +603,48 @@ class DebianPackageTests(unittest.TestCase):
                     (self.release / name).write_bytes(elf_with_segments(EM_X86_64, **markers))
                 self.build("pie-cli.deb")
 
+    def test_interpreter_segment_must_hold_one_complete_absolute_path(self):
+        good = b"/lib64/ld-linux-x86-64.so.2\0"
+        for records in ([good, good], [b"ld.so\0"], [good[:-1]], [good + b"extra\0"], [b""]):
+            with self.subTest(records=records):
+                (self.release / "maki").write_bytes(elf_with_segments(
+                    EM_X86_64, extra_segments=[(3, record) for record in records]))
+                self.assertIn("PT_INTERP", self.build_failure("bad-interpreter.deb"))
+
+    @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
+                         "native Debian build tools required")
+    def test_native_package_requires_the_declared_elf_interpreter_on_the_target(self):
+        architecture = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
+        source = self.work / "fixture.c"
+        source.write_text("int main(void) { return 0; }\n")
+        for name in RELEASE_NAMES:
+            options = ["-shared", "-fPIC"] if name.endswith(".so") else []
+            subprocess.run(["cc", *options, str(source), "-o", self.release / name], check=True)
+        good, command = self.builder_command("native.deb", "1", architecture)
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertTrue(good.is_file())
+
+        headers = subprocess.check_output(["readelf", "-lW", self.release / "maki"], text=True,
+                                          env={**os.environ, "LC_ALL": "C"})
+        loader = re.search(r"\[Requesting program interpreter: (.+?)\]", headers)[1]
+        for suffix in ("/", "/."):
+            with self.subTest(directory_only_suffix=suffix):
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{loader}{suffix}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("directory-interpreter.deb", architecture=architecture, opt_out=False)
+                self.assertIn("interpreter", error)
+
+        private = self.work / "ld-private.so.2"
+        for installed in (False, True):
+            with self.subTest(private_loader_exists=installed):
+                if installed:
+                    private.symlink_to("/bin/true")
+                subprocess.run(["cc", str(source), f"-Wl,--dynamic-linker,{private}",
+                                "-o", self.release / "maki-check"], check=True)
+                error = self.build_failure("build-host-only.deb", architecture=architecture, opt_out=False)
+                self.assertIn("maki-check", error)
+                self.assertIn("interpreter", error)
+
     @unittest.skipUnless(shutil.which("cc") and shutil.which("dpkg-shlibdeps"),
                          "native C compiler and dpkg-shlibdeps required")
     def test_native_shared_library_cli_is_rejected_before_packaging(self):
@@ -534,8 +727,19 @@ class DebianPackageTests(unittest.TestCase):
         self.assertIn("native library dependencies", result.stderr)
         self.assertEqual(
             self.field(output, "Depends"),
-            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd",
+            "nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod",
         )
+
+    def test_unspecified_epoch_also_applies_to_archive_headers(self):
+        output, command = self.builder_command("default-epoch.deb", "0.1.0+test1",
+                                               extra=["--no-shlibdeps"])
+        environment = os.environ.copy()
+        environment.pop("SOURCE_DATE_EPOCH", None)
+        subprocess.run(command, cwd=ROOT, env=environment, check=True, capture_output=True)
+        with output.open("rb") as stream:
+            self.assertEqual(stream.read(8), b"!<arch>\n")
+            header = stream.read(60)
+        self.assertEqual(int(header[16:28]), 0)
 
     def test_build_is_reproducible_and_rejects_invalid_inputs(self):
         first = self.build("first.deb")
@@ -546,6 +750,68 @@ class DebianPackageTests(unittest.TestCase):
         (self.release / "maki-check").unlink()
         stderr = self.build_failure("invalid.deb")
         self.assertIn("maki-check", stderr)
+
+    def test_installed_size_accounts_for_staged_files_in_kib(self):
+        package = self.build()
+        size = int(self.field(package, "Installed-Size"))
+        self.assertGreater(size, 0)
+        with (self.release / "maki").open("ab") as executable:
+            executable.write(b"x" * 2048)
+        self.assertEqual(int(self.field(self.build(), "Installed-Size")), size + 2)
+
+    def test_output_cannot_replace_a_required_release_input(self):
+        alias = self.work / "release-alias"
+        alias.symlink_to(self.release, target_is_directory=True)
+        for name in RELEASE_NAMES:
+            source = self.release / name
+            original = source.read_bytes()
+            for directory in (self.release, alias):
+                with self.subTest(name=name, directory=directory):
+                    _, command = self.builder_command(directory / name, "0.1.0", extra=["--no-shlibdeps"])
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("overwrite a release input", result.stderr)
+                    self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(self.field(self.build("release/maki.deb"), "Package"), "maki")
+
+    @unittest.skipUnless(shutil.which("unshare") and shutil.which("mount"), "needs Linux mount namespaces")
+    def test_output_cannot_replace_input_through_a_bind_mount(self):
+        namespace = ["unshare", "--map-root-user", "--mount", "--propagation", "private", "--"]
+        if subprocess.run([*namespace, "true"], capture_output=True).returncode:
+            self.skipTest("unprivileged mount namespace unavailable")
+        alias = self.work / "bind"
+        alias.mkdir()
+        source = self.release / "maki"
+        original = source.read_bytes()
+        _, command = self.builder_command(alias / "maki", "0.1.0", extra=["--no-shlibdeps"])
+        result = subprocess.run(
+            [*namespace, "sh", "-c", 'mount --bind "$1" "$2" || exit 77; shift 2; exec "$@"',
+             "fixture", self.release, alias, *command], capture_output=True, text=True,
+        )
+        if result.returncode == 77:
+            self.skipTest("bind mounts unavailable in this namespace")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("overwrite a release input", result.stderr)
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_safe_output_entries_can_be_replaced_or_created(self):
+        source = self.release / "maki"
+        original = source.read_bytes()
+        os.link(source, self.release / "hardlink")
+        (self.release / "symlink").symlink_to(source)
+        for name in ("release/hardlink", "release/symlink", "new/maki"):
+            with self.subTest(name=name):
+                self.assertEqual(self.field(self.build(name), "Package"), "maki")
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_rebuild_replaces_the_directory_entry_after_output_is_complete(self):
+        output = self.work / "maki.deb"
+        output.write_bytes(b"previous package")
+        previous = self.work / "previous.deb"
+        os.link(output, previous)
+        self.build()
+        self.assertEqual(previous.read_bytes(), b"previous package")
+        self.assertEqual(self.field(output, "Package"), "maki")
 
     def test_build_succeeds_with_restrictive_caller_umask(self):
         package = self.build(umask=0o077)

@@ -338,3 +338,29 @@ async fn dispatcher_reports_latency_budget_and_inflight() {
     assert_eq!(tokens[0].0, "a");
     assert!(tokens[0].1 >= 0.0);
 }
+
+#[tokio::test]
+async fn cumulative_rpc_seconds_can_exceed_u64_nanoseconds() {
+    let provider = fake();
+    let clock = Arc::new(ManualClock::new());
+    let elapsed = Duration::from_secs(10_000_000_000);
+    provider.set_latency(clock.clone(), elapsed);
+    let set = Arc::new(EndpointSet::new(
+        vec![("a".into(), provider.clone())],
+        cfg(true, None),
+        clock.clone(),
+    ));
+    for count in 1..=2 {
+        let dispatcher = set.clone();
+        let call =
+            tokio::spawn(async move { dispatcher.encrypt_batch(&ctx(), &[pt(count)]).await });
+        settle().await;
+        assert_eq!(provider.encrypt_calls(), count as usize);
+        clock.advance(elapsed);
+        call.await.unwrap().unwrap();
+        assert_eq!(
+            set.metrics().rpc_latency(),
+            (count, count as f64 * elapsed.as_secs_f64())
+        );
+    }
+}

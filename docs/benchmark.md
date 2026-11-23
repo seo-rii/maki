@@ -35,7 +35,7 @@ maki-benchmark --json --concurrency 32 --access random --read-percent 70 \
 | Option | Behavior |
 | --- | --- |
 | `--concurrency N` | At most N submitted I/O jobs and their completion results; 1–256, default 1. Compare 1, 2, 8 and 32 with the same configuration. |
-| `--access sequential|random` | Sequential wrapped addresses or reproducible independent random addresses; default sequential. |
+| `--access sequential\|random` | Sequential wrapped addresses or reproducible independent random addresses; default sequential. |
 | `--seed N` | Nonnegative seed for random addresses; default 1. |
 | `--read-percent N` | Mixed workload with N percent reads, 0–100. `ops` becomes the total measured read/write count; reads number `floor(ops × N / 100)`. Omit to retain two phases. |
 | `--working-set SIZE` | Positive multiple of I/O size within the volume, accepting bytes or KiB/MiB/GiB suffixes. Default is `min(ops, volume I/O slots) × io-size`. |
@@ -43,15 +43,18 @@ maki-benchmark --json --concurrency 32 --access random --read-percent 70 \
 | `--flush-every N` | Drain each cohort of N measured operations, then FLUSH; requires N > 0. Phased reads do not issue FLUSH. The last cohort always has a final FLUSH. |
 
 I/O size must fit the device and configured maximum request size and be a
-multiple of its device block size. `ops` must be in 1–1,000,000,000. Unknown,
+multiple of its device block size. Before opening a volume, the benchmark checks
+that a request at any slot in the working set fits the plaintext, overlay, and
+journal budgets, including slots that span crypto-unit boundaries. `ops` must be in 1–1,000,000,000. Unknown,
 duplicate, missing, malformed and out-of-range workload arguments fail before
 backing creation.
 
 Mixed workloads initialize the complete working set and FLUSH it before
 measurement; `setup.writes`, `setup.flushes` and `setup.elapsed_seconds` report
 that cost separately. Each address starts at generation zero; every successful
-measured write advances its generation and repeats the address and generation
-throughout the payload. Reads compare against the latest successful write, so
+measured write advances its generation. Each 32-byte payload segment carries
+its absolute byte position, the generation and a fresh per-run identifier.
+Repeating the address seed reproduces the access pattern across runs. Reads compare against the latest successful write, so
 returning an earlier value at the correct address fails verification.
 Reads and writes sharing an address execute in submission order. A busy address
 delays submission until its preceding operation finishes, so hot addresses can
@@ -74,7 +77,14 @@ The sweep uses live reads through the same engine and cache. It does not close
 and reopen the volume, bypass the cache, or qualify persistence after a crash or
 power loss. Those guarantees require separate recovery and durability campaigns.
 
-The oracle stores eight bytes per I/O slot, capped at 64 MiB (8,388,608 slots,
+Sequential phased runs allocate eight oracle bytes per reachable slot, up to
+the smaller of the working-set slot count and the operations per phase. For a
+phased random run with at most one operation per four working-set slots, the
+oracle indexes the distinct seeded addresses before measurement. Its index
+reserves eight bytes per planned write, and each distinct address needs one
+eight-byte generation. Denser random runs and mixed workloads use a direct
+generation array for the full working set. The working-set limit remains
+8,388,608 slots (64 MiB for a full oracle,
 or a 32 GiB working set for 4 KiB I/O). Larger working sets are rejected before
 backing creation. Only addresses with an outstanding job/result retain a lock,
 so lock metadata is bounded by concurrency (at most 256 entries).
@@ -113,14 +123,20 @@ and sweeps the complete initialized working set.
 
 `resources` distinguishes exact and sampled values:
 
-- `peak_pending_operations` counts submitted, unfinished engine calls and
-  returns to `pending_operations_at_exit = 0` on success.
+- `peak_pending_operations` is the largest number of measured engine reads and
+  writes in progress at once. Counting starts when a worker polls the engine
+  call and ends when the call completes. `pending_operations_at_exit` is zero
+  on success.
 - `oracle_generation_bytes` reports eight bytes per tracked slot, excluding
   allocator overhead and the at-most-256 sequencing locks.
+- `oracle_slot_index_bytes` reports the reserved address-index storage for
+  sparse phased random runs. Directly indexed workloads report zero.
 - `observed_peak_active_callbacks`, `observed_peak_plaintext_bytes`,
   `observed_peak_overlay_bytes` and `observed_peak_journal_pending_bytes` come
-  from nonblocking engine snapshots sampled every 1ms. Short peaks can fall
-  between samples; snapshots can use the latest observation while the volume
+  from nonblocking engine snapshots. The monitor samples at most once per
+  millisecond, skips missed samples when delayed, and takes a final snapshot
+  on shutdown. Short peaks can fall between samples. Snapshots can use the
+  latest observation while the volume
   lock is busy. `monitor_samples` and `monitor_interval_ms` describe that
   sampling cost.
 - `process_peak_rss_bytes` reads Linux `/proc/self/status` `VmHWM`, the

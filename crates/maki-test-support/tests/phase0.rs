@@ -361,6 +361,41 @@ fn manual_clock_sleep_requires_advance() {
     assert!(fired.get());
 }
 
+#[test]
+fn manual_clock_saturates_time_and_wakes_sleepers_at_the_horizon() {
+    let clock = ManualClock::new();
+    clock.set(Duration::from_nanos(1));
+    let sleeper = clock.sleep(Duration::MAX);
+    let mut scheduler = DeterministicScheduler::new(1);
+    scheduler.spawn(sleeper);
+    clock.set(Duration::MAX - Duration::from_nanos(1));
+    assert!(!scheduler.run_bounded(1));
+    clock.advance(Duration::MAX);
+    assert_eq!(clock.now(), Duration::MAX);
+    assert!(scheduler.run_bounded(1));
+    assert_eq!(clock.sleeper_count(), 0);
+}
+
+#[tokio::test]
+async fn fake_provider_rejects_unrepresentable_ciphertext_geometry() {
+    let largest = FakeCryptoProvider::new(u32::MAX - 8);
+    assert_eq!(
+        largest.capabilities().await.unwrap().max_ciphertext_size,
+        u32::MAX
+    );
+    let provider = FakeCryptoProvider::new(u32::MAX - 7);
+    for result in [
+        provider.capabilities().await.map(|_| ()),
+        provider.encrypt_batch(&ctx(), &[]).await.map(|_| ()),
+        provider.decrypt_batch(&ctx(), &[]).await.map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(maki_crypto::CryptoError::ProviderFatal(_))
+        ));
+    }
+}
+
 /// FakeCryptoProvider: round-trips, binds context, and never returns
 /// plaintext from corrupted ciphertext.
 #[test]

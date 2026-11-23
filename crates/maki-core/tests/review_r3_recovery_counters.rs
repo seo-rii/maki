@@ -75,11 +75,14 @@ impl Fixture {
         };
         let mut bytes = header.encode();
         for &sequence in sequences {
-            bytes.extend(encode_record(&JournalRecord {
-                sequence,
-                unit_index: 0,
-                payload: vec![42; 540],
-            }));
+            bytes.extend(
+                encode_record(&JournalRecord {
+                    sequence,
+                    unit_index: 0,
+                    payload: vec![42; 540],
+                })
+                .unwrap(),
+            );
         }
         self.backing
             .open(&layout::journal_segment(index), true)

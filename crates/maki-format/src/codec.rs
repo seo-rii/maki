@@ -80,6 +80,12 @@ impl Writer {
         Self::default()
     }
 
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.buf.len()
     }
@@ -115,6 +121,7 @@ impl Writer {
     }
 
     pub fn string(&mut self, s: &str, max: usize) -> Result<&mut Self, FormatError> {
+        let max = max.min(usize::from(u16::MAX));
         if s.len() > max {
             return Err(FormatError::Invalid(format!(
                 "string length {} exceeds max {max}",
@@ -155,4 +162,26 @@ pub fn strip_verify_crc<'a>(buf: &'a [u8], what: &str) -> Result<&'a [u8], Forma
         return Err(FormatError::BadChecksum(what.to_string()));
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_length_must_fit_its_prefix_before_writing() {
+        let mut writer = Writer::new();
+        let boundary = "x".repeat(usize::from(u16::MAX));
+        writer.string(&boundary, usize::MAX).unwrap();
+        let len = writer.len();
+        assert!(writer
+            .string(&(boundary.clone() + "x"), usize::MAX)
+            .is_err());
+        assert_eq!(writer.len(), len);
+        writer.u8(7);
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.string(usize::MAX).unwrap(), boundary);
+        assert_eq!(reader.u8().unwrap(), 7);
+    }
 }

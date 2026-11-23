@@ -158,7 +158,7 @@ fn provider_at(
         // Connect to the exact address the fixture bound. On Windows,
         // localhost may resolve to ::1 first while this listener is IPv4,
         // consuming the whole request timeout before trying 127.0.0.1.
-        url: format!("wss://{addr}{path}"),
+        url: format!("WsS://{addr}{path}"),
         capabilities: caps(),
         timeout: Duration::from_secs(2),
         max_frame_bytes: 64 * 1024,

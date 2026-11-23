@@ -11,7 +11,7 @@ mod grpc_method_path;
 mod http_mapping;
 mod transport_size;
 
-pub use grpc_method_path::{check_grpc_method_path, MAX_GRPC_METHOD_PATH_BYTES};
+pub use grpc_method_path::{check_grpc_method_path, grpc_request_path, MAX_GRPC_METHOD_PATH_BYTES};
 pub use http_mapping::{
     decode_pointer_token, HttpFieldSource, HttpPayloadEncoding, HttpRequestMapping,
 };
@@ -410,6 +410,48 @@ pub struct GrpcSection {
     pub decrypt_path: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, HeaderValue>,
+}
+
+fn checked_wire_limit(
+    value: Option<ByteSize>,
+    default: u64,
+    field: &str,
+) -> Result<usize, ConfigError> {
+    let bytes = value.map_or(default, |size| size.0);
+    if bytes == 0 {
+        return Err(invalid(format!("{field} must be positive")));
+    }
+    usize::try_from(bytes).map_err(|_| invalid(format!("{field} exceeds the platform byte limit")))
+}
+
+impl HttpSection {
+    pub fn response_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_response_bytes,
+            DEFAULT_HTTP_MAX_RESPONSE_BYTES,
+            "[crypto.http] max_response_bytes",
+        )
+    }
+}
+
+impl TransportSection {
+    pub fn frame_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_frame_bytes,
+            DEFAULT_WS_MAX_FRAME_BYTES,
+            "[crypto.websocket] max_frame_bytes",
+        )
+    }
+}
+
+impl GrpcSection {
+    pub fn message_byte_limit(&self) -> Result<usize, ConfigError> {
+        checked_wire_limit(
+            self.max_message_bytes,
+            DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+            "[crypto.grpc] max_message_bytes",
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1068,11 +1110,9 @@ impl VolumeConfig {
         // relative path would land wherever nbdkit's working directory is
         // (SPEC §8 places volumes under /var/lib/maki/<volume>).
         let root = self.backing.root.as_str();
-        if root.trim().is_empty()
-            || !(root.starts_with('/') || std::path::Path::new(root).is_absolute())
-        {
+        if !is_absolute_path(root) || root.contains('\0') {
             return Err(ConfigError::Invalid(format!(
-                "backing.root {root:?} must be an absolute path"
+                "backing.root {root:?} must be an absolute path without NUL"
             )));
         }
         if let Some(rollback) = &self.backing.rollback_protection {
@@ -1099,12 +1139,9 @@ impl VolumeConfig {
                             .parse::<std::net::SocketAddr>()
                             .map_or(true, |a| a.port() == 0 || !unique.insert(a))
                     })
-                    || remote.server_name.is_empty()
+                    || remote.server_name.contains('_')
                     || remote.server_name.len() > 253
-                    || remote
-                        .server_name
-                        .bytes()
-                        .any(|b| !b.is_ascii_alphanumeric() && !b".-:".contains(&b))
+                    || rustls_pki_types::ServerName::try_from(remote.server_name.as_str()).is_err()
                     || !(1..=60_000).contains(&remote.timeout_ms)
                 {
                     return Err(ConfigError::Invalid(
@@ -1124,21 +1161,19 @@ impl VolumeConfig {
                 }
             } else {
                 let witness = rollback.witness_root.as_str();
-                if witness.trim().is_empty()
-                    || !(witness.starts_with('/') || std::path::Path::new(witness).is_absolute())
-                {
+                if !is_absolute_path(witness) || witness.contains('\0') {
                     return Err(ConfigError::Invalid(format!(
-                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path"
+                        "backing.rollback_protection.witness_root {witness:?} must be an absolute path without NUL"
                     )));
                 }
-                let root_path = std::path::Path::new(root);
-                let witness_path = std::path::Path::new(witness);
+                let root_path = resolved_config_path(std::path::Path::new(root));
+                let witness_path = resolved_config_path(std::path::Path::new(witness));
                 if root_path == witness_path {
                     return Err(ConfigError::Invalid(
                         "rollback witness and backing root must be distinct".to_string(),
                     ));
                 }
-                if root_path.starts_with(witness_path) || witness_path.starts_with(root_path) {
+                if root_path.starts_with(&witness_path) || witness_path.starts_with(&root_path) {
                     return Err(ConfigError::Invalid(
                         "rollback witness and backing root must not be nested".to_string(),
                     ));
@@ -1209,11 +1244,9 @@ impl VolumeConfig {
         }
         self.geometry()
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        self.validate_journal_bounds()?;
-        self.validate_settings()?;
-        // Name conflicts first: they say more than a per-credential error
-        // about the same name.
+        // Validate credential names before using file references in layout checks.
         self.validate_credential_sources()?;
+        self.validate_settings()?;
         self.validate_provider_sections()?;
         if !self
             .crypto
@@ -1325,8 +1358,10 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
     // A `file` credential names a path. A relative one resolves against the
     // working directory of whichever process reads it, which is not the one
     // that validated it (BUG-122).
-    if c.source == "file" && !is_absolute_path(&c.name) {
-        return Err(invalid("file credential name must be an absolute path"));
+    if c.source == "file" && (!is_absolute_path(&c.name) || c.name.contains('\0')) {
+        return Err(invalid(
+            "file credential name must be an absolute path without NUL",
+        ));
     }
     // The loaders look up a `credential` name, and the file name of a
     // `file` path, in a directory and refuse any other name. `volume create`
@@ -1344,7 +1379,11 @@ fn validate_credential(c: &CredentialRef) -> Result<(), ConfigError> {
             if !std::path::Path::new(&c.name)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(is_loadable_credential_name) =>
+                // Path::file_name strips trailing separators and `/.`. The
+                // original spelling must actually end with this file name.
+                .is_some_and(|name| {
+                    is_loadable_credential_name(name) && c.name.ends_with(name)
+                }) =>
         {
             return Err(invalid(
                 "file credential name must end in a file name of ASCII letters, digits, \
@@ -1400,10 +1439,6 @@ fn is_absolute_path(path: &str) -> bool {
 }
 
 impl VolumeConfig {
-    /// Cross-field checks for the journal bound settings the engine enforces
-    /// (review M-004/M-013): every bound must be positive, and the hard
-    /// journal limit must leave room for at least one sealed segment plus
-    /// the active one, or the limit could never be honoured.
     /// The preferred I/O size advertised to NBD: `nbd.preferred_io` when
     /// set, otherwise the crypto unit (SPEC §13), never below
     /// `nbd.minimum_io`.
@@ -1413,7 +1448,102 @@ impl VolumeConfig {
             .unwrap_or_else(|| self.volume.crypto_unit_size.max(self.nbd.minimum_io))
     }
 
-    fn validate_journal_bounds(&self) -> Result<(), ConfigError> {
+    /// Check the largest request cost for a fixed-size workload whose offsets
+    /// are multiples of the request size, including direct engine workloads
+    /// with finer alignment than the exported NBD device.
+    pub fn validate_fixed_io_working_set(
+        &self,
+        io_size: u64,
+        working_set: u64,
+    ) -> Result<(), ConfigError> {
+        let block = u64::from(self.volume.device_block_size);
+        if block == 0
+            || self.volume.crypto_unit_size == 0
+            || io_size == 0
+            || io_size > self.nbd.maximum_io.0.min(u64::from(u32::MAX))
+            || io_size > self.volume.max_virtual_size.0
+            || !io_size.is_multiple_of(block)
+        {
+            return Err(invalid(format!("io-size {io_size} must be a positive multiple of {block} no larger than the configured device and maximum request size")));
+        }
+        if working_set == 0
+            || working_set > self.volume.max_virtual_size.0
+            || !working_set.is_multiple_of(io_size)
+        {
+            return Err(invalid(
+                "working-set must be a positive multiple of io-size no larger than the volume",
+            ));
+        }
+        self.validate_request_bounds(io_size, io_size, working_set)
+    }
+
+    fn validate_request_bounds(
+        &self,
+        request_len: u64,
+        minimum: u64,
+        span: u64,
+    ) -> Result<(), ConfigError> {
+        // The engine charges every touched crypto unit in full (F07). Adding
+        // one unit to the byte length undercounts a sub-unit request that
+        // crosses a unit boundary (BUG-084). Consider only permitted offsets
+        // and requests that fit the working range. Shorter requests cannot
+        // cost more: each can be extended to this length within the export.
+        let unit = u64::from(self.volume.crypto_unit_size);
+        // Units need not be powers of two. Offset phases repeat after
+        // unit/gcd(unit, minimum) steps; validated geometry bounds this to
+        // 32768 (16 MiB / 512), without allocating or scanning the export.
+        let (mut gcd, mut remainder) = (unit, minimum);
+        while remainder != 0 {
+            (gcd, remainder) = (remainder, gcd % remainder);
+        }
+        let offset_count = (unit / gcd).min((span - request_len) / minimum + 1);
+        let maximal_units = (0..offset_count)
+            .map(|step| {
+                let offset = step * minimum;
+                (offset + request_len - 1) / unit - offset / unit + 1
+            })
+            .max()
+            .unwrap(); // A validated nonempty export always permits offset 0.
+                       // The offsets above span at most one phase cycle and maximum_io
+                       // fits u32; their sum and full-unit charge are representable in u64.
+        let maximal_request = maximal_units * unit;
+        if self.limits.max_plaintext_bytes.0 < maximal_request {
+            return Err(invalid(format!(
+                "limits.max_plaintext_bytes {} must be at least {maximal_request}: one maximal \
+                 request can touch {maximal_units} crypto units of {unit} bytes each \
+                 (offset alignment {minimum}, I/O size {request_len}, span {span})",
+                self.limits.max_plaintext_bytes.0
+            )));
+        }
+        // After an inline checkpoint the overlay must fit both the latest and
+        // the durable copy of each unit in the largest request.
+        let l = &self.limits;
+        let overlay_needed = maximal_units
+            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
+            .saturating_mul(2);
+        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
+            return Err(invalid(format!(
+                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
+                 largest request ({maximal_units} units of {} ciphertext bytes) so it can \
+                 always be admitted after an inline checkpoint, or 0 to disable the bound",
+                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
+            )));
+        }
+        if l.max_overlay_entries != 0 && l.max_overlay_entries < maximal_units {
+            return Err(invalid(format!(
+                "limits.max_overlay_entries {} must be at least {maximal_units} (the largest \
+                 request in crypto units) or 0 to disable the bound",
+                l.max_overlay_entries
+            )));
+        }
+        self.validate_journal_bounds(maximal_units)
+    }
+
+    /// Cross-field checks for the journal bound settings the engine enforces
+    /// (review M-004/M-013): every bound must be positive, and the hard
+    /// journal limit must leave room for at least one sealed segment plus
+    /// the active one, or the limit could never be honoured.
+    fn validate_journal_bounds(&self, units_per_request: u64) -> Result<(), ConfigError> {
         let seg = self.backing.journal_segment_size.0;
         let max = self.backing.journal_max_bytes.0;
         if seg < 4096 {
@@ -1439,13 +1569,6 @@ impl VolumeConfig {
         let progress_overflow = || {
             ConfigError::Invalid("journal progress bound exceeds u64 byte accounting range".into())
         };
-        let units_per_request = self
-            .nbd
-            .maximum_io
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            .checked_add(1)
-            .ok_or_else(progress_overflow)?;
         let needed = crate::journal::minimum_journal_limit(seg, record, units_per_request)
             .ok_or_else(progress_overflow)?;
         if max < needed {
@@ -1468,6 +1591,80 @@ impl VolumeConfig {
 
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
+}
+
+/// Resolve existing aliases before comparing paths whose runtime directories
+/// may still need to be created. Preserve the lexical path on lookup failure.
+fn resolved_config_path(path: &std::path::Path) -> std::path::PathBuf {
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in path.strip_prefix(ancestor).unwrap().components() {
+                    if component == std::path::Component::ParentDir {
+                        resolved.pop();
+                    } else {
+                        resolved.push(component);
+                    }
+                }
+                return resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => break,
+        }
+    }
+    path.to_owned()
+}
+
+fn file_conflicts_with_backing(
+    file: &std::path::Path,
+    root: &std::path::Path,
+    rollback: Option<&RollbackProtectionSection>,
+) -> bool {
+    use crate::{checkpoint, durable_proof, layout};
+    if root.starts_with(file) {
+        return true; // The backing needs this pathname to be a directory.
+    }
+    let Ok(relative) = file.strip_prefix(root) else {
+        return false;
+    };
+    let mut entries = relative.iter();
+    let Some(entry) = entries.next().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if let Some(rollback) = rollback {
+        return maki_backing::RollbackBacking::owns_host_entry(entry, rollback.remote.is_some());
+    }
+    if layout::ROOT_METADATA.contains(&entry) || entry == layout::VOLUME_LOCK {
+        return true;
+    }
+    let Some(child) = entries.next().and_then(|s| s.to_str()) else {
+        return matches!(
+            entry,
+            layout::CHECKPOINT_DIR | layout::JOURNAL_DIR | layout::DATA_DIR
+        );
+    };
+    if [
+        checkpoint::CHECKPOINT_STATE_A,
+        checkpoint::CHECKPOINT_STATE_B,
+        durable_proof::DURABLE_PROOF_A,
+        durable_proof::DURABLE_PROOF_B,
+        layout::JOURNAL_DURABLE_MARK,
+    ]
+    .iter()
+    .any(|file| relative.starts_with(file))
+    {
+        return true;
+    }
+    match entry {
+        layout::JOURNAL_DIR => layout::parse_journal_segment(child).is_some(),
+        layout::DATA_DIR => child.split_once('.').is_some_and(|(stem, suffix)| {
+            matches!(
+                suffix,
+                "dat" | "alloc.a" | "alloc.b" | "discard.a" | "discard.b"
+            ) && layout::parse_shard_data(&format!("{stem}.dat")).is_some()
+        }),
+        _ => false,
+    }
 }
 
 /// Scheme and host of an endpoint URL. Rejects userinfo (credentials in a
@@ -1520,6 +1717,16 @@ pub fn parse_endpoint_url(url: &str) -> Result<(String, String), ConfigError> {
             redacted_url(url)
         )));
     }
+    // The transport URL grammar requires brackets to contain an IPv6
+    // address and applies the URL host parser to DNS names and IPv4.
+    let valid_host = if authority.starts_with('[') {
+        host.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        url::Host::parse(host).is_ok()
+    };
+    if !valid_host {
+        return Err(invalid("endpoint url has an invalid host"));
+    }
     // An empty port means the scheme's default, as in the transport URL
     // parsers. Do not silently accept a nonnumeric or out-of-range port
     // and defer a permanent configuration error until the first request.
@@ -1543,6 +1750,41 @@ pub fn is_loopback_host(host: &str) -> bool {
             .map(|ip| ip.is_loopback())
             .unwrap_or(false)
 }
+
+/// Validate the ASCII metadata keys sent through tonic's unary client.
+pub fn check_grpc_metadata_keys<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let key = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid("bad metadata key: invalid HTTP field name"))?;
+        if key.as_str().ends_with("-bin") {
+            return Err(invalid(
+                "bad metadata key: binary metadata requires a binary encoding",
+            ));
+        }
+        if matches!(
+            key.as_str(),
+            "te" | "user-agent"
+                | "content-type"
+                | "grpc-message"
+                | "grpc-message-type"
+                | "grpc-status"
+        ) {
+            return Err(invalid("bad metadata key: reserved by the gRPC transport"));
+        }
+        if !seen.insert(key) {
+            return Err(invalid(
+                "duplicate gRPC metadata key after case normalization",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub const DEFAULT_GRPC_ENCRYPT_PATH: &str = "/maki.CryptoService/EncryptBatch";
+pub const DEFAULT_GRPC_DECRYPT_PATH: &str = "/maki.CryptoService/DecryptBatch";
 
 fn validate_endpoints(
     transport: &str,
@@ -1659,6 +1901,21 @@ fn validate_tls(section: &str, tls: &TlsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Check field names before resolving credentials or constructing the request.
+pub fn check_http_header_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let field = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid("invalid HTTP header name"))?;
+        if !seen.insert(field) {
+            return Err(invalid("duplicate HTTP header name"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
     if !["POST", "PUT"].contains(&op.method.to_ascii_uppercase().as_str()) {
         return Err(invalid(format!(
@@ -1673,10 +1930,8 @@ fn validate_http_op(name: &str, op: &HttpOpConfig) -> Result<(), ConfigError> {
             "[crypto.http.{name}] path must start with a slash"
         )));
     }
-    for (header, value) in &op.headers {
-        if header.trim().is_empty() {
-            return Err(invalid(format!("[crypto.http.{name}] empty header name")));
-        }
+    check_http_header_names(op.headers.keys().map(String::as_str))?;
+    for value in op.headers.values() {
         if let HeaderValue::Credential(c) = value {
             validate_credential(c)?;
         }
@@ -1763,12 +2018,17 @@ impl VolumeConfig {
             if value == 0 {
                 return Err(invalid(format!("{name} must be positive")));
             }
-            // Match DualSemaphore's supported byte capacity. A larger TOML
-            // budget would be silently truncated before runtime admission.
-            if name.contains("_bytes") && value > (u32::MAX as u64 >> 1) {
+            // Keep both budgets representable by Tokio on this target. Byte
+            // budgets also retain DualSemaphore's per-acquire ceiling.
+            let max_permits = tokio::sync::Semaphore::MAX_PERMITS as u64;
+            let capacity = if name.contains("_bytes") {
+                max_permits.min(u64::from(u32::MAX >> 1))
+            } else {
+                max_permits
+            };
+            if value > capacity {
                 return Err(invalid(format!(
-                    "{name} ({value}) exceeds the admission capacity of {} bytes",
-                    u32::MAX as u64 >> 1
+                    "{name} ({value}) exceeds the admission capacity of {capacity}"
                 )));
             }
         }
@@ -1978,71 +2238,11 @@ impl VolumeConfig {
                 self.volume.max_virtual_size.0, n.minimum_io
             )));
         }
-        // The engine charges every touched crypto unit in full (F07). Adding
-        // one unit to the byte length undercounts a sub-unit request that
-        // crosses a unit boundary (BUG-084). Consider only offsets permitted
-        // by NBD and requests that fit the export. Shorter requests cannot
-        // cost more: each can be extended to this length within the export.
-        let unit = u64::from(self.volume.crypto_unit_size);
-        let minimum = u64::from(n.minimum_io);
-        let request_len = n.maximum_io.0.min(self.volume.max_virtual_size.0);
-        // Units need not be powers of two. Offset phases repeat after
-        // unit/gcd(unit, minimum) steps; validated geometry bounds this to
-        // 32768 (16 MiB / 512), without allocating or scanning the export.
-        let (mut gcd, mut remainder) = (unit, minimum);
-        while remainder != 0 {
-            (gcd, remainder) = (remainder, gcd % remainder);
-        }
-        let offset_count =
-            (unit / gcd).min((self.volume.max_virtual_size.0 - request_len) / minimum + 1);
-        let maximal_units = (0..offset_count)
-            .map(|step| {
-                let offset = step * minimum;
-                (offset + request_len - 1) / unit - offset / unit + 1
-            })
-            .max()
-            .unwrap(); // A validated nonempty export always permits offset 0.
-                       // The offsets above span at most one phase cycle and maximum_io
-                       // fits u32; their sum and full-unit charge are representable in u64.
-        let maximal_request = maximal_units * unit;
-        if self.limits.max_plaintext_bytes.0 < maximal_request {
-            return Err(invalid(format!(
-                "limits.max_plaintext_bytes {} must be at least {maximal_request}: one maximal \
-                 NBD request can touch {maximal_units} crypto units of {unit} bytes each \
-                 (minimum_io {minimum}, maximum_io {}, export size {})",
-                self.limits.max_plaintext_bytes.0, n.maximum_io.0, self.volume.max_virtual_size.0
-            )));
-        }
-        // Progress guarantee for the overlay bound (R4-005): after an inline
-        // checkpoint the overlay is empty, and the largest single request
-        // (nbd.maximum_io plus one unit of misalignment, as ciphertext) is
-        // charged twice (latest plus durable copy), so it must fit twice.
-        // Checked after nbd.maximum_io itself so an unrepresentable maximum
-        // is reported as such.
-        let l = &self.limits;
-        let overlay_units = n
-            .maximum_io
-            .0
-            .div_ceil(self.volume.crypto_unit_size.max(1) as u64)
-            + 1;
-        let overlay_needed = overlay_units
-            .saturating_mul(self.crypto.capabilities.max_ciphertext_size as u64)
-            .saturating_mul(2);
-        if l.max_overlay_bytes.0 != 0 && l.max_overlay_bytes.0 < overlay_needed {
-            return Err(invalid(format!(
-                "limits.max_overlay_bytes {} must be at least {overlay_needed}: twice the \
-                 largest request ({overlay_units} units of {} ciphertext bytes) so it can \
-                 always be admitted after an inline checkpoint, or 0 to disable the bound",
-                l.max_overlay_bytes.0, self.crypto.capabilities.max_ciphertext_size
-            )));
-        }
-        if l.max_overlay_entries != 0 && l.max_overlay_entries < overlay_units {
-            return Err(invalid(format!(
-                "limits.max_overlay_entries {} must be at least {overlay_units} (the largest \
-                 request in crypto units) or 0 to disable the bound",
-                l.max_overlay_entries
-            )));
-        }
+        self.validate_request_bounds(
+            n.maximum_io.0.min(self.volume.max_virtual_size.0),
+            u64::from(n.minimum_io),
+            self.volume.max_virtual_size.0,
+        )?;
 
         // Socket paths are resolved by nbdkit and the helper against *their*
         // working directories: only an absolute path names one place.
@@ -2056,6 +2256,22 @@ impl VolumeConfig {
                 {
                     return Err(invalid(format!(
                         "{name} {socket:?} must be an absolute path"
+                    )));
+                }
+                // Path::file_name normalizes trailing slashes and "/.", but a
+                // socket cannot bind to a path that requires a directory.
+                if matches!(
+                    socket.rsplit(std::path::is_separator).next(),
+                    Some("" | "." | "..")
+                ) {
+                    return Err(invalid(format!("{name} must end with a socket filename")));
+                }
+                #[cfg(unix)]
+                if socket.contains('\0')
+                    || std::os::unix::net::SocketAddr::from_pathname(socket).is_err()
+                {
+                    return Err(invalid(format!(
+                        "{name} is not a usable Unix socket pathname"
                     )));
                 }
             }
@@ -2074,17 +2290,67 @@ impl VolumeConfig {
             .socket
             .clone()
             .unwrap_or_else(|| format!("/run/maki/{}/nbd.sock", self.volume.name));
-        if std::path::Path::new(&control_socket)
-            .components()
-            .eq(std::path::Path::new(&nbd_socket).components())
-        {
+        let control = resolved_config_path(control_socket.as_ref());
+        let nbd = resolved_config_path(nbd_socket.as_ref());
+        if control.starts_with(&nbd) || nbd.starts_with(&control) {
             return Err(invalid(format!(
-                "control.socket {control_socket:?} must differ from nbd.socket {nbd_socket:?}"
+                "control.socket {control_socket:?} and nbd.socket {nbd_socket:?} require separate socket filenames"
             )));
         }
+        let root = resolved_config_path(self.backing.root.as_ref());
+        let witness = self
+            .backing
+            .rollback_protection
+            .as_ref()
+            .filter(|rollback| rollback.remote.is_none())
+            .map(|rollback| resolved_config_path(rollback.witness_root.as_ref()));
+        // Creation records the local AES key identity before the daemon reads
+        // the file. Its path must remain available after backing initialization.
+        let key = self
+            .crypto
+            .key
+            .as_ref()
+            .filter(|key| {
+                key.source == "file"
+                    && matches!(
+                        self.crypto.provider.as_str(),
+                        "local-aes-gcm-siv" | "local-aes-xts"
+                    )
+            })
+            .map(|key| resolved_config_path(key.name.as_ref()));
+        if key.as_ref().is_some_and(|key| {
+            [&control, &nbd]
+                .iter()
+                .any(|socket| key.starts_with(socket) || socket.starts_with(key))
+        }) {
+            return Err(invalid(
+                "crypto.key conflicts with a configured socket path",
+            ));
+        }
+        for (name, file) in [("control.socket", control), ("nbd.socket", nbd)]
+            .into_iter()
+            .chain(key.map(|file| ("crypto.key", file)))
+        {
+            if file_conflicts_with_backing(&file, &root, self.backing.rollback_protection.as_ref())
+            {
+                return Err(invalid(format!(
+                    "{name} conflicts with the backing.root layout"
+                )));
+            }
+            if witness.as_ref().is_some_and(|dir| {
+                dir.starts_with(&file)
+                    || file
+                        .strip_prefix(dir)
+                        .is_ok_and(maki_backing::witness::FileWitness::reserves_path)
+            }) {
+                return Err(invalid(format!(
+                    "{name} conflicts with the local witness layout"
+                )));
+            }
+        }
         if let Some(group) = &self.control.group {
-            if group.trim().is_empty() {
-                return Err(invalid("control.group must not be empty"));
+            if group.trim().is_empty() || group.contains('\0') {
+                return Err(invalid("control.group must not be empty or contain NUL"));
             }
         }
 
@@ -2236,15 +2502,7 @@ impl VolumeConfig {
                         return Err(invalid("[crypto.http] timeout must be positive"));
                     }
                 }
-                if let Some(b) = &http.max_response_bytes {
-                    if b.0 == 0 {
-                        return Err(invalid("[crypto.http] max_response_bytes must be positive"));
-                    }
-                }
-                let limit = http
-                    .max_response_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES);
+                let limit = http.response_byte_limit()? as u64;
                 for (name, op, is_encrypt) in
                     [("encrypt", encrypt, true), ("decrypt", decrypt, false)]
                 {
@@ -2274,15 +2532,7 @@ impl VolumeConfig {
                 if ws.timeout.is_some_and(|t| t.0.is_zero()) {
                     return Err(invalid("[crypto.websocket] timeout must be positive"));
                 }
-                let frame = ws
-                    .max_frame_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_WS_MAX_FRAME_BYTES);
-                if frame == 0 {
-                    return Err(invalid(
-                        "[crypto.websocket] max_frame_bytes must be positive",
-                    ));
-                }
+                let frame = ws.frame_byte_limit()? as u64;
                 let encoded = self.websocket_frame_bound()?;
                 if encoded > frame {
                     return Err(invalid(format!(
@@ -2307,37 +2557,35 @@ impl VolumeConfig {
                     validate_tls("grpc", tls)?;
                 }
                 validate_endpoints("grpc", &grpc.endpoint, "http", "https", grpc.tls.is_some())?;
-                // The provider checks the method paths with this same rule
-                // when it is built (attach); unset paths take the reference
-                // contract's methods. Never quote a path: like an endpoint
-                // URL it can carry a token.
                 for (field, path) in [
-                    ("encrypt_path", &grpc.encrypt_path),
-                    ("decrypt_path", &grpc.decrypt_path),
+                    (
+                        "encrypt_path",
+                        grpc.encrypt_path
+                            .as_deref()
+                            .unwrap_or(DEFAULT_GRPC_ENCRYPT_PATH),
+                    ),
+                    (
+                        "decrypt_path",
+                        grpc.decrypt_path
+                            .as_deref()
+                            .unwrap_or(DEFAULT_GRPC_DECRYPT_PATH),
+                    ),
                 ] {
-                    if let Some(path) = path {
-                        check_grpc_method_path(path)
+                    for endpoint in &grpc.endpoint {
+                        grpc_request_path(&endpoint.url, path)
                             .map_err(|reason| invalid(format!("[crypto.grpc] {field} {reason}")))?;
                     }
                 }
                 if grpc.timeout.is_some_and(|t| t.0.is_zero()) {
                     return Err(invalid("[crypto.grpc] timeout must be positive"));
                 }
-                for (name, value) in &grpc.metadata {
-                    if name.trim().is_empty() {
-                        return Err(invalid("[crypto.grpc.metadata] empty key"));
-                    }
+                check_grpc_metadata_keys(grpc.metadata.keys().map(String::as_str))?;
+                for value in grpc.metadata.values() {
                     if let HeaderValue::Credential(c) = value {
                         validate_credential(c)?;
                     }
                 }
-                let message = grpc
-                    .max_message_bytes
-                    .map(|b| b.0)
-                    .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
-                if message == 0 {
-                    return Err(invalid("[crypto.grpc] max_message_bytes must be positive"));
-                }
+                let message = grpc.message_byte_limit()? as u64;
                 let wire = self.grpc_message_bound()?;
                 if wire > message {
                     return Err(invalid(format!(

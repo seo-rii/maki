@@ -1,5 +1,8 @@
 //! R3-004: ciphertext/key interchangeability does not imply equal RPC limits.
 
+#[path = "common/compact_provider.rs"]
+mod compact;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +111,115 @@ fn config() -> DispatchConfig {
     }
 }
 
+#[tokio::test]
+async fn endpoint_batches_fit_both_rpc_byte_budgets() {
+    for pinned in [false, true] {
+        for limit_global in [false, true] {
+            let peer = Arc::new(Peer::new(4, 4 * UNIT as u64).await);
+            let budget = 2 * u64::from(peer.caps.max_ciphertext_size);
+            let mut cfg = config();
+            if limit_global {
+                cfg.global_max_inflight_bytes = budget;
+            } else {
+                cfg.per_endpoint_max_bytes = budget;
+            }
+            let mut set = EndpointSet::new(
+                vec![("peer".into(), peer.clone())],
+                cfg,
+                Arc::new(SystemClock::new()),
+            );
+            if pinned {
+                set = set.with_plaintext_size(UNIT as u32);
+            }
+            let caps = set.capabilities().await.unwrap();
+            assert_eq!((caps.batch.max_items, caps.batch.max_bytes), (2, budget));
+            assert!(set.encrypt_batch(&context(), &[]).await.unwrap().is_empty());
+            assert!(set.decrypt_batch(&context(), &[]).await.unwrap().is_empty());
+            let plain = items();
+            let ciphertext = set.encrypt_batch(&context(), &plain).await.unwrap();
+            let output = set.decrypt_batch(&context(), &ciphertext).await.unwrap();
+            assert_eq!(peer.inner.encrypt_calls(), 2);
+            assert_eq!(peer.inner.decrypt_calls(), 2);
+            for (result, expected) in output.iter().zip(&plain) {
+                assert_eq!(result.unit_index, expected.unit_index);
+                assert_eq!(result.data, expected.data);
+            }
+            assert_eq!(output.len(), plain.len());
+        }
+    }
+}
+
+#[tokio::test]
+async fn decrypt_checks_actual_resident_sizes_before_sending_any_chunk() {
+    let mut peer = Peer::new(4, 4 * UNIT as u64).await;
+    let budget = 2 * (UNIT + 8);
+    peer.caps.max_ciphertext_size = (budget + 1) as u32;
+    let peer = Arc::new(peer);
+    let mut cfg = config();
+    cfg.global_max_inflight_bytes = budget as u64;
+    let set = EndpointSet::new(
+        vec![("peer".into(), peer.clone())],
+        cfg,
+        Arc::new(SystemClock::new()),
+    );
+    let mut ciphertext = peer
+        .inner
+        .encrypt_batch(&context(), &items())
+        .await
+        .unwrap();
+    assert!(set.decrypt_batch(&context(), &ciphertext).await.is_ok());
+    assert_eq!(peer.inner.decrypt_calls(), 2);
+    ciphertext.last_mut().unwrap().data.resize(budget + 1, 0);
+    assert!(matches!(
+        set.decrypt_batch(&context(), &ciphertext).await,
+        Err(CryptoError::NonRetryableRequest(_))
+    ));
+    assert_eq!(peer.inner.decrypt_calls(), 2);
+    assert!(
+        set.capabilities().await.is_err(),
+        "the maximum ciphertext cannot fit"
+    );
+}
+
+#[tokio::test]
+async fn decrypt_groups_mixed_ciphertext_lengths_by_actual_byte_cost() {
+    let peer = Arc::new(compact::CompactProvider::new(
+        8,
+        8 * u64::from(compact::UNIT),
+        true,
+    ));
+    let mut cfg = config();
+    cfg.per_endpoint_max_bytes = 5000;
+    let set = EndpointSet::new(
+        vec![("peer".into(), peer.clone())],
+        cfg,
+        Arc::new(SystemClock::new()),
+    )
+    .with_plaintext_size(compact::UNIT);
+    let plain: Vec<_> = (0..4)
+        .map(|unit_index| {
+            let mut data = SecretBuffer::zeroed(compact::UNIT as usize);
+            if unit_index % 2 == 1 {
+                data.expose_mut()[0] = 1;
+            }
+            PlaintextUnit { unit_index, data }
+        })
+        .collect();
+    let ciphertext = set.encrypt_batch(&context(), &plain).await.unwrap();
+    assert_eq!(peer.encrypt_groups(), [1, 1, 1, 1]);
+    assert_eq!(
+        ciphertext.iter().map(|c| c.data.len()).collect::<Vec<_>>(),
+        [520, 4104, 520, 4104]
+    );
+    let decoded = set.decrypt_batch(&context(), &ciphertext).await.unwrap();
+    assert_eq!(peer.decrypt_groups(), [2, 2]);
+    assert_eq!(decoded.len(), plain.len());
+    for (result, expected) in decoded.iter().zip(&plain) {
+        assert_eq!(result.unit_index, expected.unit_index);
+        assert_eq!(result.data, expected.data);
+    }
+}
+
 fn set(a: Arc<Peer>, b: Arc<Peer>) -> EndpointSet {
     EndpointSet::new(
         vec![("large".into(), a), ("small".into(), b)],
@@ -199,6 +311,44 @@ async fn a_recovered_small_peer_does_not_change_the_serving_contract() {
         .fail_next([CryptoError::Retryable("unavailable".into())]);
     set.encrypt_batch(&context(), &items()).await.unwrap();
     assert_eq!(b.largest_request.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn nested_dispatchers_honor_the_inner_no_resend_policy() {
+    for inner_retry_safe in [false, true] {
+        let peer = Arc::new(Peer::new(4, 4 * UNIT as u64).await);
+        let mut inner_config = config();
+        inner_config.retry_safe = inner_retry_safe;
+        let inner = Arc::new(EndpointSet::new(
+            vec![("inner".into(), peer.clone())],
+            inner_config,
+            Arc::new(SystemClock::new()),
+        ));
+        let advertised = inner.capabilities().await.unwrap();
+        let fallback = Arc::new(Peer::new(4, 4 * UNIT as u64).await);
+        let outer = EndpointSet::new(
+            vec![
+                ("first".into(), inner),
+                ("fallback".into(), fallback.clone()),
+            ],
+            config(),
+            Arc::new(SystemClock::new()),
+        );
+        peer.inner
+            .fail_next([CryptoError::Retryable("uncertain completion".into())]);
+        let result = outer.encrypt_batch(&context(), &items()[..1]).await;
+        assert_eq!(peer.inner.encrypt_calls(), 1);
+        assert_eq!(
+            fallback.inner.encrypt_calls(),
+            usize::from(inner_retry_safe)
+        );
+        assert_eq!(result.is_ok(), inner_retry_safe);
+        assert_eq!(advertised.retry_safe, inner_retry_safe);
+        assert_eq!(
+            outer.capabilities().await.unwrap().retry_safe,
+            inner_retry_safe
+        );
+    }
 }
 
 #[tokio::test]

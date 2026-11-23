@@ -25,7 +25,8 @@ device_block_size = 4096
 # fs_uuid = "11111111-2222-3333-4444-555555555555"
 
 # First boot only: create the sentinel on an empty filesystem. Remove after
-# the first successful attach; an existing sentinel is never overwritten.
+# the first successful attach. A matching UUID is rewritten and synced on retry.
+# A different UUID is refused.
 init_sentinel = false
 
 # Production profile: pin the complete PV set, VG and configured target LV

@@ -118,9 +118,15 @@ async fn a_cache_hit_reads_only_the_slot_header_from_the_backing() {
     engine.write(off(3), &data(0x33), true).await.unwrap();
     engine.checkpoint().await.unwrap(); // unit 3 lives in a slot now
 
+    let before = backing.read_bytes();
     assert_eq!(
         engine.read(off(3), UNIT as usize).await.unwrap(),
         data(0x33)
+    );
+    assert_eq!(
+        backing.read_bytes() - before,
+        64 + CT,
+        "the first read must reuse the header on a cache miss"
     );
     let decrypts = provider.decrypt_calls();
     let before = backing.read_bytes();
@@ -364,4 +370,23 @@ async fn verify_on_hit_rereads_the_payload_but_skips_decryption() {
         "payload damage is EIO immediately, cached plaintext or not: {result:?}"
     );
     assert_eq!(provider.decrypt_calls(), decrypts);
+}
+
+#[tokio::test]
+async fn cache_smaller_than_a_unit_skips_the_extra_header_probe() {
+    let _guard = failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    let provider = Arc::new(FakeCryptoProvider::new(UNIT));
+    let engine = engine(&backing, provider, true).await;
+    engine.write(off(3), &data(0x33), true).await.unwrap();
+    engine.checkpoint().await.unwrap();
+    for limit in [0, u64::from(UNIT) - 1] {
+        assert!(engine.resize_cache(limit));
+        let before = backing.read_bytes();
+        assert_eq!(
+            engine.read(off(3), UNIT as usize).await.unwrap(),
+            data(0x33)
+        );
+        assert_eq!(backing.read_bytes() - before, 64 + CT);
+    }
 }

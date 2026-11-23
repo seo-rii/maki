@@ -16,11 +16,17 @@ import pathlib
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+
+try:
+    from campaign_io import guest_command_output
+except ModuleNotFoundError:
+    from scripts.campaign_io import guest_command_output
 
 
 PREFIX = b"MAKI_GCP_RESET_V1 "
@@ -49,30 +55,30 @@ def index_for_offset(offset):
     return offsets.index(offset)
 
 
-def payload(cycle, index):
+def payload(cycle, index, token):
     mode_for_cycle(cycle)
     offset_for_index(index)
-    return hashlib.sha256(f"maki-gcp-reset-v1:{cycle}:{index}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v2:{token}:{cycle}:{index}".encode()).digest(4096)
 
 
-def rewrite_payload(cycle):
+def rewrite_payload(cycle, token):
     mode_for_cycle(cycle)
-    return hashlib.sha256(f"maki-gcp-reset-v3-rewrite:{cycle}".encode()).digest() * 128
+    return hashlib.shake_256(f"maki-gcp-reset-v3-rewrite:{token}:{cycle}".encode()).digest(4096)
 
 
-def discard_final_block(cycle, offset):
+def discard_final_block(cycle, offset, token):
     index = index_for_offset(offset)
     if offset == 0:
-        return rewrite_payload(cycle)
+        return rewrite_payload(cycle, token)
     if offset == 4096:
         return bytes(4096)
-    return payload(cycle, index)
+    return payload(cycle, index, token)
 
 
-def manifest(cycle, blocks=None):
+def manifest(cycle, blocks):
     rows = []
     for index in range(16):
-        block = payload(cycle, index) if blocks is None else blocks[index]
+        block = blocks[index]
         ensure(isinstance(block, bytes) and len(block) == 4096, "invalid read block")
         rows.append({"offset": offset_for_index(index), "length": 4096,
                      "sha256": hashlib.sha256(block).hexdigest()})
@@ -103,8 +109,10 @@ class Nbd:
         self.check(self.lib.nbd_connect_unix(self.handle, os.fsencode(socket_path)))
         self.can_fua = self.lib.nbd_can_fua(self.handle) == 1
         self.can_flush = self.lib.nbd_can_flush(self.handle) == 1
-        self.can_trim = self.lib.nbd_can_trim(self.handle) == 1
-        ensure(self.can_fua, "native FUA unavailable")
+        trim = self.lib.nbd_can_trim(self.handle)
+        self.check(trim)
+        self.can_trim = trim == 1
+        ensure(self.can_fua, "FUA unavailable on the NBD connection")
         ensure(self.can_flush, "FLUSH unavailable")
 
     def check(self, result):
@@ -132,11 +140,11 @@ class Nbd:
             self.handle = None
 
 
-def barrier(client, cycle, mode):
+def barrier(client, cycle, mode, token):
     ensure(mode == mode_for_cycle(cycle), "wrong durability barrier")
     records = []
     for index in range(16):
-        block = payload(cycle, index)
+        block = payload(cycle, index, token)
         offset = offset_for_index(index)
         client.write(offset, block, fua=mode == "fua")
         records.append({"offset": offset, "length": 4096,
@@ -146,33 +154,32 @@ def barrier(client, cycle, mode):
     return records
 
 
-def discard_barrier(client, cycle, mode):
+def discard_barrier(client, cycle, mode, token):
     ensure(mode == mode_for_cycle(cycle), "wrong durability barrier")
-    writes = barrier(client, cycle, mode)
+    writes = barrier(client, cycle, mode, token)
     trims = [{"offset": 0, "length": 4096}, {"offset": 4096, "length": 4096}]
     for row in trims:
         client.trim(row["offset"], row["length"], fua=mode == "fua")
     if mode == "flush":
         client.flush()
-    block = rewrite_payload(cycle)
+    block = rewrite_payload(cycle, token)
     client.write(0, block, fua=mode == "fua")
     if mode == "flush":
         client.flush()
     rewrite = {"offset": 0, "length": 4096,
                "sha256": hashlib.sha256(block).hexdigest()}
-    final = manifest(cycle, [discard_final_block(cycle, offset_for_index(index))
+    final = manifest(cycle, [discard_final_block(cycle, offset_for_index(index), token)
                              for index in range(16)])
     return {"write": writes, "trim": trims, "rewrite": rewrite, "final": final}
 
 
 def capabilities(client, profile="v2"):
-    result = {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True}
-    if profile == "v3-discard":
-        result["can_trim"] = client.can_trim is True
-    return result
+    ensure(client.can_trim is (profile == "v3-discard"), "native TRIM capability does not match the qualification profile")
+    return {"can_flush": client.can_flush is True, "can_fua": client.can_fua is True,
+            "can_trim": client.can_trim}
 
 
-def configured_provider(path):
+def configured_backing(path):
     """Validate the campaign's provider before launching its data plane."""
     try:
         with path.open("rb") as stream:
@@ -187,23 +194,41 @@ def configured_provider(path):
     provider = crypto.get("provider") if isinstance(crypto, dict) else None
     ensure(provider == "local-aes-gcm-siv",
            'qualification requires crypto.provider = "local-aes-gcm-siv"')
-    return provider
+    backing = config.get("backing")
+    root = backing.get("root") if isinstance(backing, dict) else None
+    ensure(isinstance(root, str) and pathlib.Path(root).is_absolute(),
+           "qualification requires an absolute backing.root")
+    return provider, pathlib.Path(root).resolve(strict=True)
 
 
 def run_output(command, timeout=10):
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            timeout=timeout, env=dict(os.environ, PATH=SYSTEM_PATH), check=False)
-    ensure(len(result.stdout) + len(result.stderr) <= 65536, "setup output limit exceeded")
-    if result.returncode != 0:
-        raise RuntimeError(f"{command[0]} exited {result.returncode}: "
-                           + result.stderr[-2048:].decode(errors="replace"))
-    return result.stdout.decode(errors="strict").strip()
+    return guest_command_output(command, timeout=timeout, search_path=SYSTEM_PATH)
 
 
 def filesystem_uuid(path):
     value = run_output(["findmnt", "-n", "-o", "UUID", "--target", str(path)])
     ensure(BOOT_ID.fullmatch(value) is not None, "persistent filesystem UUID unavailable")
     return value
+
+
+def validate_disk(mount, config, backing, device_name):
+    """Bind the mounted filesystem to the exact GCE attachment before opening NBD."""
+    ensure(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,126}", device_name) is not None,
+           "invalid GCE attachment device name")
+    disk = (pathlib.Path("/dev/disk/by-id") / ("google-" + device_name)).stat()
+    ensure(stat.S_ISBLK(disk.st_mode), "GCE attachment is not a block device")
+    mounted = mount.stat().st_dev
+    ensure(backing.is_dir() and config.stat().st_dev == mounted and backing.stat().st_dev == mounted,
+           "config and backing.root must reside on the qualified filesystem")
+    if mounted != disk.st_rdev:
+        # A mounted partition must be an immediate child of the pinned disk.
+        dev = pathlib.Path("/sys/dev/block") / f"{os.major(mounted)}:{os.minor(mounted)}"
+        entry = dev.resolve(strict=True)
+        ensure((entry / "partition").is_file()
+               and (entry.parent / "dev").read_text().strip()
+               == f"{os.major(disk.st_rdev)}:{os.minor(disk.st_rdev)}",
+               "mounted filesystem does not belong to the GCE attachment")
+    return filesystem_uuid(mount)
 
 
 def shutdown_witness(path):
@@ -220,25 +245,39 @@ def wait_for_reset():
 
 def execute_cycle(args, client, emit):
     profile = getattr(args, "profile", "v2")
+    if args.verify_only:
+        ensure(args.cycle > 0, "verify-only requires a prior generation")
     if args.cycle:
         generation = args.cycle - 1
         blocks = [client.read(offset_for_index(index)) for index in range(16)]
         field = {"manifest": manifest(generation, blocks)} if profile == "v3-discard" \
             else {"records": manifest(generation, blocks)}
         emit("readback", generation=generation, **field)
-        emit("verified", generation=generation, count=16)
-    if args.verify_only:
-        ensure(args.cycle > 0, "verify-only requires a prior generation")
-        return
+        verification = {"generation": generation, "count": len(blocks)}
+        if args.verify_only:
+            return verification  # Published after the final daemon shutdown.
+        emit("verified", **verification)
     mode = mode_for_cycle(args.cycle)
     if profile == "v3-discard":
-        result = discard_barrier(client, args.cycle, mode)
+        result = discard_barrier(client, args.cycle, mode, args.token)
         emit("ack", command=f"discard-{args.cycle}", mode=mode,
              profile=profile, manifest=result)
     else:
-        records = barrier(client, args.cycle, mode)
+        records = barrier(client, args.cycle, mode, args.token)
         emit("ack", command=f"write-{args.cycle}", mode=mode, records=records)
     wait_for_reset()
+
+
+def require_native_fua(runtime):
+    # The NBD handshake advertises one FUA bit for both emulated and native
+    # operation. The log filter records the plugin's nbdkit capability value
+    # during negotiation, before this client can finish connecting.
+    with (runtime / "connections.log").open() as log:
+        for line in log:
+            if re.search(r' connection=\d+ Connect export="" ', line):
+                ensure("fua=2" in line.split(), "plugin does not provide native FUA")
+                return
+    raise ValueError("no nbdkit connection record for native FUA")
 
 
 def run_nbdkit(args, runtime):
@@ -249,9 +288,10 @@ def run_nbdkit(args, runtime):
     notify.bind(str(notify_path))
     notify.settimeout(0.2)
     environment = dict(os.environ, PATH=SYSTEM_PATH, NOTIFY_SOCKET=str(notify_path))
-    log = open(log_path, "xb")
-    child = subprocess.Popen([args.nbdkit, "--foreground", "--threads", "4", "-U",
-                              str(socket_path), args.plugin, "config=" + args.config],
+    log = open(log_path, "x+b")
+    child = subprocess.Popen([args.nbdkit, "--exit-with-parent", "--threads", "4", "-U",
+                              str(socket_path), "--filter=log", args.plugin, "config=" + args.config,
+                              "logfile=" + str(runtime / "connections.log")],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              env=environment, start_new_session=True)
     until = time.monotonic() + args.ready_timeout
@@ -262,7 +302,7 @@ def run_nbdkit(args, runtime):
             if time.monotonic() >= until:
                 raise TimeoutError("nbdkit READY deadline")
             try:
-                if b"READY=1" in notify.recv(4096).splitlines():
+                if b"READY=1" in notify.recv(4096).splitlines() and time.monotonic() < until:
                     return child, log, socket_path
             except socket.timeout:
                 pass
@@ -276,17 +316,30 @@ def run_nbdkit(args, runtime):
         notify.close()
 
 
-def cleanup(child, log, client):
-    if client is not None:
-        client.close()
-    if child is not None and child.poll() is None:
-        child.terminate()
+def cleanup(child, log, client, *, require_clean=False):
+    try:
         try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
-    if log is not None:
+            if client is not None:
+                client.close()
+        finally:
+            status = child.poll()
+            if status is None:
+                child.terminate()
+                try:
+                    status = child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    status = child.wait(timeout=5)
+                    if require_clean:
+                        raise RuntimeError("nbdkit shutdown required SIGKILL")
+        if require_clean:
+            ensure(status == 0, f"nbdkit exited {status} during final verification")
+            # The nbdkit unload callback is void. The plugin also reports a
+            # failed final drain to stderr when the process itself exits zero.
+            log.seek(0)
+            ensure(not any(b"maki-nbdkit: shutdown during unload failed" in line for line in log),
+                   "maki-nbdkit reported a shutdown failure during final verification")
+    finally:
         log.close()
 
 
@@ -294,6 +347,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token", required=True)
     parser.add_argument("--cycle", type=int, required=True)
+    parser.add_argument("--device-name", required=True)
     parser.add_argument("--config", default="/mnt/maki-data/config.toml")
     parser.add_argument("--plugin", default="/opt/maki/libmaki_nbdkit.so")
     parser.add_argument("--nbdkit", default="nbdkit")
@@ -304,21 +358,9 @@ def main():
     ensure(re.fullmatch(r"[0-9a-f]{32}", args.token) is not None, "invalid token")
     # A verify-only boot reads the preceding write generation; boot 64 reads 63.
     mode_for_cycle(args.cycle - 1 if args.verify_only else args.cycle)
-    ensure(1 <= args.ready_timeout <= 300, "invalid READY timeout")
-    config = pathlib.Path(args.config).resolve(strict=True)
-    plugin = pathlib.Path(args.plugin).resolve(strict=True)
-    ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
-    mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
-    ensure(config == mount / "config.toml", "qualification config must be on the persistent data mount")
-    provider = configured_provider(config)
-    args.config = str(config)
-    fs_uuid = filesystem_uuid(mount)
-    witness = shutdown_witness(mount / "graceful-stop.jsonl")
+    ensure(1 <= args.ready_timeout <= 900, "invalid READY timeout")
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     ensure(BOOT_ID.fullmatch(boot_id) is not None, "invalid boot identity")
-    os.umask(0o077)
-    runtime = pathlib.Path(tempfile.mkdtemp(prefix="maki-gcp-reset-", dir="/run"))
-    child = log = client = None
 
     def emit(event, **fields):
         frame = {"token": args.token, "cycle": args.cycle, "boot_id": boot_id,
@@ -329,23 +371,38 @@ def main():
         sys.stdout.buffer.flush()
 
     try:
+        config = pathlib.Path(args.config).resolve(strict=True)
+        plugin = pathlib.Path(args.plugin).resolve(strict=True)
+        ensure(config.is_file() and plugin.is_file(), "config and plugin must be regular files")
+        mount = pathlib.Path("/mnt/maki-data").resolve(strict=True)
+        ensure(config.is_relative_to(mount), "qualification config must be on the persistent data mount")
+        provider, backing = configured_backing(config)
+        args.config = str(config)
+        fs_uuid = validate_disk(mount, config, backing, args.device_name)
+        witness = shutdown_witness(mount / "graceful-stop.jsonl")
+        os.umask(0o077)
+        runtime = pathlib.Path(tempfile.mkdtemp(prefix="maki-gcp-reset-", dir="/run"))
         child, log, socket_path = run_nbdkit(args, runtime)
-        client = Nbd(socket_path)
-        features = capabilities(client, args.profile)
-        emit("ready", provider=provider, config=str(config),
-             kernel=os.uname().release, fs_uuid=fs_uuid, **features, **witness)
-        execute_cycle(args, client, emit)
+        client = None
+        completed = False
+        try:
+            client = Nbd(socket_path)
+            features = capabilities(client, args.profile)
+            require_native_fua(runtime)
+            emit("ready", provider=provider, config=str(config), native_fua=True,
+                 kernel=os.uname().release, fs_uuid=fs_uuid, data_device=args.device_name, **features, **witness)
+            final = execute_cycle(args, client, emit)
+            completed = True
+        finally:
+            cleanup(child, log, client, require_clean=completed and args.verify_only)
+        if args.verify_only:
+            emit("verified", **final)
     except BaseException as error:
         try:
             emit("error", message=f"{type(error).__name__}: {error}"[:2048])
         except BaseException:
             pass
         raise
-    finally:
-        # A successful write cycle never reaches here: only the external reset
-        # ends wait_for_reset. Final verify-only and pre-ACK failures clean up
-        # their process-local resources without touching the data mount.
-        cleanup(child, log, client)
 
 
 if __name__ == "__main__":

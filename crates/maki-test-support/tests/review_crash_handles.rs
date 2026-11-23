@@ -1,8 +1,9 @@
 //! A power loss kills every process. No file or lock handle opened before a
-//! `crash*()` may work afterwards or change the recovered state; a test that
-//! crashes while something still holds a handle would otherwise observe a
-//! state no power loss can produce. A process restart (`drop` + reopen) is
-//! not a crash and invalidates nothing.
+//! `crash*()` may work afterwards or change the recovered state, and neither
+//! may a process view (`CrashableBacking::process`) started before it; a test
+//! that crashes while something still holds a handle or a view would
+//! otherwise observe a state no power loss can produce. A process restart
+//! (`drop` + reopen, or a new view) is not a crash and invalidates nothing.
 
 use std::io::{self, ErrorKind};
 use std::sync::Arc;
@@ -17,6 +18,23 @@ fn read_all(backing: &CrashableBacking, path: &str) -> Vec<u8> {
     let mut bytes = vec![0; file.len().unwrap() as usize];
     file.read_at(0, &mut bytes).unwrap();
     bytes
+}
+
+/// The root's names and the bytes of every file in it.
+fn root_state(backing: &CrashableBacking) -> Vec<(String, Option<Vec<u8>>)> {
+    backing
+        .list("")
+        .unwrap()
+        .into_iter()
+        .map(|name| match backing.open(&name, false) {
+            Ok(_) => {
+                let bytes = read_all(backing, &name);
+                (name, Some(bytes))
+            }
+            Err(error) if error.kind() == ErrorKind::IsADirectory => (name, None),
+            Err(error) => panic!("{name}: {error}"),
+        })
+        .collect()
 }
 
 fn assert_dead(result: io::Result<impl std::fmt::Debug>, op: &str, crash: &str) {
@@ -101,6 +119,42 @@ fn dropping_a_pre_crash_handle_leaves_post_crash_handles_alone() {
     }
 }
 
+#[test]
+fn a_lock_follows_the_original_inode_when_its_name_is_reused() {
+    let backing = CrashableBacking::new();
+    let original = backing.try_lock("original").unwrap();
+    backing.rename("original", "moved").unwrap();
+    assert_eq!(
+        backing.try_lock("moved").err().map(|error| error.kind()),
+        Some(ErrorKind::WouldBlock)
+    );
+    let replacement = backing.try_lock("original").unwrap();
+    drop(original);
+    let moved = backing.try_lock("moved").unwrap();
+
+    backing
+        .open("original", false)
+        .unwrap()
+        .write_at(0, b"x")
+        .unwrap();
+    backing.remove("original").unwrap();
+    backing.sync_dir("").unwrap();
+    assert_eq!(backing.pending_write_count(), 1);
+    let newest = backing.try_lock("original").unwrap();
+    drop(replacement);
+    assert_eq!(backing.pending_write_count(), 0);
+    for path in ["original", "moved"] {
+        assert_eq!(
+            backing.try_lock(path).err().map(|error| error.kind()),
+            Some(ErrorKind::WouldBlock),
+            "{path}"
+        );
+    }
+    drop((newest, moved));
+    drop(backing.try_lock("original").unwrap());
+    drop(backing.try_lock("moved").unwrap());
+}
+
 /// A power loss releases every lock its processes held; the dead holder's
 /// handle cannot release a lock taken after the crash.
 #[test]
@@ -110,6 +164,7 @@ fn a_power_loss_releases_the_volume_lock_of_the_dead_process() {
         drop(backing.open("f", true).unwrap());
         backing.sync_dir("").unwrap();
         let stale = backing.try_lock("volume.lock").unwrap();
+        backing.sync_dir("").unwrap();
 
         power_loss(&backing);
         let live = backing
@@ -139,4 +194,72 @@ fn a_restart_invalidates_no_handle() {
     second.read_at(0, &mut buf).unwrap();
     assert_eq!(&buf, b"cached");
     second.sync_data().unwrap();
+
+    // Neither does starting another process.
+    let earlier = backing.process();
+    let later = backing.process();
+    drop(later.open("g", true).unwrap());
+    assert!(earlier.exists("g").unwrap());
+    earlier.sync_dir("").unwrap();
+}
+
+/// Every namespace operation of a process started before a power loss
+/// fails afterwards and changes nothing: the process is dead, even if the
+/// test still holds its view (an undropped volume or engine, a worker in
+/// the middle of a pass). The backing the test created, and processes
+/// started after the crash, keep working.
+#[test]
+fn a_process_started_before_a_power_loss_is_dead_afterwards() {
+    for (crash, power_loss) in CRASHES {
+        let backing = CrashableBacking::new();
+        let dead = backing.process();
+        dead.create_dir_all("d").unwrap();
+        let file = dead.open("f", true).unwrap();
+        file.write_at(0, b"old").unwrap();
+        file.sync_data().unwrap();
+        dead.sync_dir("").unwrap();
+        drop(file);
+        let file = dead.open("f", false).unwrap();
+        file.write_at(3, b" pending").unwrap();
+        drop(file);
+        let lock = dead.try_lock("volume.lock").unwrap();
+        let same_process = dead.clone();
+
+        power_loss(&backing);
+        let recovered = root_state(&backing);
+
+        for view in [&dead, &same_process] {
+            assert_dead(view.open("f", false).map(drop), "open", crash);
+            assert_dead(view.open("new", true).map(drop), "open (create)", crash);
+            assert_dead(view.exists("f"), "exists", crash);
+            assert_dead(view.remove("f"), "remove", crash);
+            assert_dead(view.rename("f", "g"), "rename", crash);
+            assert_dead(view.create_dir_all("e"), "create_dir_all", crash);
+            assert_dead(view.list(""), "list", crash);
+            assert_dead(view.sync_dir(""), "sync_dir", crash);
+            assert_dead(view.sync_dir("d"), "sync_dir (subdirectory)", crash);
+            assert_dead(view.try_lock("other.lock").map(drop), "try_lock", crash);
+            assert_dead(view.free_bytes(), "free_bytes", crash);
+            assert_dead(view.check_freshness(), "check_freshness", crash);
+        }
+        drop((dead, same_process, lock));
+        backing.crash_all_lost();
+        assert_eq!(
+            root_state(&backing),
+            recovered,
+            "{crash}: a dead process changed the recovered state"
+        );
+
+        // A process started after the crash works, and so does the backing.
+        let live = backing.process();
+        let file = live.open("g", true).unwrap();
+        file.write_at(0, b"new").unwrap();
+        file.sync_data().unwrap();
+        live.sync_dir("").unwrap();
+        drop(live.try_lock("volume.lock").unwrap());
+        drop(file);
+        backing.crash_all_lost();
+        assert_eq!(read_all(&backing, "g"), b"new", "{crash}");
+        assert!(backing.exists("f").unwrap(), "{crash}");
+    }
 }

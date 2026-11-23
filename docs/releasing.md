@@ -24,7 +24,11 @@ The target must also provide the versioned `nbd-client >= 3.27.0` dependency.
 Prepare candidates after committing the intended changes. The command refuses
 staged or unstaged tracked changes and exports only `HEAD`; untracked files,
 local credentials and existing `target/` artifacts do not enter the source
-archive. It builds in an isolated temporary directory with `--release
+archive. With `core.fileMode=false` on POSIX, the check probes a temporary file
+on the checkout filesystem. If its executable bit can be toggled, mode-only
+edits also require a commit. The source archive uses committed file bytes and executable modes,
+including files that local Git archive attributes would omit or transform.
+It builds in an isolated temporary directory with `--release
 --locked --target <rustc host>` and always enables the package builder's
 [ELF and native dependency validation](../packaging/debian/README.md#artifact-validation).
 Source links are rejected during extraction. No cross-compilation or
@@ -54,7 +58,8 @@ hermetic.
 For workspace version `0.1.0`, the package version is
 `0.1.0~rc+rev<count>.git<12-character-commit>`. The count is
 `git rev-list --count <commit>`: all commits reachable from the selected source,
-including merged ancestry. A descendant has a strictly larger count than its
+including merged ancestry. Local graft files and replacement refs are ignored.
+A descendant has a strictly larger count than its
 ancestor, so Debian orders it as an upgrade for the same workspace version even
 when its hash or commit timestamp sorts earlier. The numeric revision precedes
 the hash, so revision 10 also sorts above revision 9.
@@ -108,16 +113,18 @@ candidate_output="$HOME/maki-candidates/$(git rev-parse --short=12 HEAD)-$(dpkg 
 candidate_log="$(mktemp "$HOME/logs/maki-candidate.XXXXXX.log")"
 candidate_status="${candidate_log%.log}.status"
 (
-  rustup run 1.94.0 python3 -B scripts/prepare_release.py --output "$candidate_output"
-  candidate_rc=$?
+  candidate_rc=0
+  rustup run 1.94.0 python3 -B scripts/prepare_release.py --output "$candidate_output" || candidate_rc=$?
   printf '%s\n' "$candidate_rc" > "$candidate_status"
   exit "$candidate_rc"
 ) > "$candidate_log" 2>&1 < /dev/null &
 candidate_pid=$!
 printf 'PID=%s\nlog=%s\nstatus=%s\n' "$candidate_pid" "$candidate_log" "$candidate_status"
-wait "$candidate_pid"
+candidate_rc=0
+wait "$candidate_pid" || candidate_rc=$?
 cat "$candidate_status"
 tail -n 40 "$candidate_log"       # inspect only after the process exits
+(exit "$candidate_rc")
 ```
 
 A successful directory contains:
@@ -126,7 +133,7 @@ A successful directory contains:
 |---|---|
 | `maki_<candidate-version>_<architecture>.deb` | Runtime package with scanned native dependencies |
 | `maki-<candidate-version>-source.tar.gz` | Git archive of the exact committed source, including `Cargo.lock` |
-| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler environment overrides, package dependencies and artifact hashes |
+| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler and Debian compression environment overrides, package dependencies and artifact hashes |
 | `SHA256SUMS` | Hashes of the package, source archive and manifest |
 
 The output appears only after all build and packaging steps succeed. An
@@ -143,7 +150,14 @@ dpkg-deb --contents "$candidate_output"/*.deb
 The fixed source epoch and deterministic package builder make repeated
 packaging of identical artifacts stable. The command does not claim bitwise
 reproducibility across compiler versions, system libraries, paths, or Cargo
-configuration. The recorded environment overrides are diagnostic metadata;
+configuration. The manifest records inherited Rust flag inputs, including
+`CARGO_BUILD_RUSTFLAGS` and the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the
+selected build target. It records the target-specific linker from
+`CARGO_TARGET_<TRIPLE>_LINKER` and compiler wrapper inputs from
+`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`
+and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`. Cargo applies its usual precedence
+when several inputs are set.
+The recorded environment overrides are diagnostic metadata;
 they are not a hermetic-build attestation. Review those overrides before
 sharing the manifest. Checksums establish bundle consistency, not publisher
 authenticity; a public release additionally needs the chosen signing or

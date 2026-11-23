@@ -31,6 +31,8 @@ pub struct FileBacking {
     directory: linux::Directory,
     #[cfg(not(target_os = "linux"))]
     root: PathBuf,
+    /// Set by [`FileBacking::read_only`].
+    read_only: bool,
 }
 
 impl FileBacking {
@@ -40,13 +42,92 @@ impl FileBacking {
         {
             Ok(Self {
                 directory: linux::Directory::new(&root)?,
+                read_only: false,
             })
         }
         #[cfg(not(target_os = "linux"))]
         {
             create_private_dir_all(&root)?;
-            Ok(Self { root })
+            Ok(Self {
+                root,
+                read_only: false,
+            })
         }
+    }
+
+    /// A view of an existing root that only reads, for a source kept where
+    /// nothing can change it (a read-only mount, immutable files, a
+    /// read-only export, files this user may not write). It creates, probes
+    /// and syncs nothing while opening the root, and opens files read-only
+    /// with the same no-follow, regular-file and single-link checks. Creating
+    /// or removing entries, renames, directory syncs and `try_lock` fail with
+    /// `ReadOnlyFilesystem`, and an opened file's descriptor is read-only.
+    /// `try_lock_shared` excludes writers instead; like `try_lock`, it
+    /// creates a lock file that is missing.
+    pub fn read_only(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let root = root.into();
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                directory: linux::Directory::existing(&root)?,
+                read_only: true,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if !fs::metadata(&root)?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "backing root is not a directory",
+                ));
+            }
+            Ok(Self {
+                root,
+                read_only: true,
+            })
+        }
+    }
+
+    /// Take the lock file `path` shared: other shared holders are admitted,
+    /// and an exclusive [`Backing::try_lock`] holder excludes them and is
+    /// excluded (`WouldBlock`). An existing lock file is opened read-only, so
+    /// this works on read-only media. A missing one is created first, as
+    /// `try_lock` does, which needs write access.
+    pub(crate) fn try_lock_shared(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        #[cfg(target_os = "linux")]
+        let file = self.directory.lock_file(path)?;
+        #[cfg(not(target_os = "linux"))]
+        let file = {
+            let p = self.resolve(path, false)?;
+            match open_options().read(true).open(&p) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => open_options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&p)?,
+                file => file?,
+            }
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Box::new(FileLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "lock held exclusively by another operation",
+            )),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Refuse a change through a [`FileBacking::read_only`] view.
+    fn writable(&self) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                "read-only backing view",
+            ));
+        }
+        Ok(())
     }
 
     /// Describe the root directory. On Linux this is the pinned descriptor
@@ -122,6 +203,7 @@ impl FileBacking {
         {
             Ok(Self {
                 directory: self.directory.gc_scope(namespace)?,
+                read_only: self.read_only,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -202,6 +284,17 @@ pub struct RealFile {
     file: File,
 }
 
+#[cfg(target_os = "linux")]
+fn retry_interrupted_allocation(mut allocate: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    loop {
+        match allocate() {
+            0 => return Ok(()),
+            libc::EINTR => continue,
+            errno => return Err(io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
 impl BackingFile for RealFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         read_exact_at(&self.file, offset, buf)
@@ -237,13 +330,10 @@ impl BackingFile for RealFile {
                     "allocation length exceeds off_t",
                 )
             })?;
-            // SAFETY: the descriptor stays open for the call and both
-            // non-negative ranges were checked to fit `off_t`.
-            let error = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) };
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error));
-            }
-            Ok(())
+            retry_interrupted_allocation(|| {
+                // SAFETY: the descriptor stays open and the range fits off_t.
+                unsafe { libc::posix_fallocate(self.file.as_raw_fd(), offset, len) }
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -401,12 +491,21 @@ impl VolumeLock for FileLock {}
 #[cfg(not(target_os = "linux"))]
 impl Backing for FileBacking {
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
+        if create {
+            self.writable()?;
+        }
         let p = self.resolve(path, false)?;
         let file = open_options()
             .read(true)
-            .write(true)
+            .write(!self.read_only)
             .create(create)
             .open(&p)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backing entry is not a regular file",
+            ));
+        }
         Ok(Arc::new(RealFile { file }))
     }
 
@@ -415,14 +514,17 @@ impl Backing for FileBacking {
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
+        self.writable()?;
         fs::remove_file(self.resolve(path, false)?)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.writable()?;
         fs::rename(self.resolve(from, false)?, self.resolve(to, false)?)
     }
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
+        self.writable()?;
         create_private_dir_all(&self.resolve(path, false)?)
     }
 
@@ -430,18 +532,26 @@ impl Backing for FileBacking {
         let p = self.resolve(dir, true)?;
         let mut names = Vec::new();
         for entry in fs::read_dir(p)? {
-            names.push(entry?.file_name().to_string_lossy().into_owned());
+            let name = entry?.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not UTF-8",
+                )
+            })?;
+            names.push(name);
         }
         names.sort();
         Ok(names)
     }
 
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
+        self.writable()?;
         let p = self.resolve(dir, true)?;
         sync_dir_impl(&p)
     }
 
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        self.writable()?;
         let p = self.resolve(path, false)?;
         let file = open_options()
             .read(true)
@@ -499,6 +609,20 @@ fn sync_dir_impl(p: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_allocation_retries_and_preserves_the_terminal_result() {
+        for terminal in [0, libc::ENOSPC] {
+            let mut results = [libc::EINTR, libc::EINTR, terminal].into_iter();
+            let result = retry_interrupted_allocation(|| results.next().unwrap());
+            assert_eq!(
+                result.err().and_then(|e| e.raw_os_error()),
+                (terminal != 0).then_some(terminal)
+            );
+            assert_eq!(results.next(), None);
+        }
+    }
+
     #[test]
     fn read_write_roundtrip_and_eof() {
         let dir = tempfile::tempdir().unwrap();
@@ -527,6 +651,50 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(l1);
         backing.try_lock("volume.lock").unwrap();
+    }
+
+    #[test]
+    fn read_only_view_reads_and_refuses_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = FileBacking::new(dir.path()).unwrap();
+        backing.create_dir_all("sub").unwrap();
+        backing
+            .open("sub/file", true)
+            .unwrap()
+            .write_at(0, b"bytes")
+            .unwrap();
+        assert!(FileBacking::read_only(dir.path().join("missing")).is_err());
+        assert!(!dir.path().join("missing").exists());
+        let view = FileBacking::read_only(dir.path()).unwrap();
+        let file = view.open("sub/file", false).unwrap();
+        let mut bytes = [0; 5];
+        file.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"bytes");
+        assert!(file.write_at(0, b"x").is_err());
+        assert_eq!(view.list("sub").unwrap(), ["file"]);
+        let refused = |result: io::Result<()>| {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::ReadOnlyFilesystem
+            )
+        };
+        refused(view.open("sub/new", true).map(drop));
+        refused(view.remove("sub/file"));
+        refused(view.rename("sub/file", "moved"));
+        refused(view.create_dir_all("new"));
+        refused(view.sync_dir(""));
+        refused(view.try_lock("volume.lock").map(drop));
+        assert_eq!(fs::read(dir.path().join("sub/file")).unwrap(), b"bytes");
+        // Shared holders admit each other and exclude an exclusive holder.
+        let shared = view.try_lock_shared("volume.lock").unwrap();
+        let second = view.try_lock_shared("volume.lock").unwrap();
+        let exclusive = backing.try_lock("volume.lock").err().unwrap();
+        assert_eq!(exclusive.kind(), io::ErrorKind::WouldBlock);
+        drop((shared, second));
+        let exclusive = backing.try_lock("volume.lock").unwrap();
+        let shared = view.try_lock_shared("volume.lock").err().unwrap();
+        assert_eq!(shared.kind(), io::ErrorKind::WouldBlock);
+        drop(exclusive);
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub struct AbStore {
     b: String,
     /// A tighter bound than the record type's `MAX_ENCODED_LEN` when the
     /// valid size follows from context (a shard's geometry), applied to every
-    /// read through this store (R5-025).
+    /// read and write through this store (R5-025).
     max_len: Option<u64>,
 }
 
@@ -54,7 +54,7 @@ impl AbStore {
         }
     }
 
-    /// Treat a copy longer than `max_len` as invalid without reading it.
+    /// Reject an encoded record longer than `max_len` on reads and writes.
     pub fn with_max_len(mut self, max_len: u64) -> Self {
         self.max_len = Some(max_len);
         self
@@ -65,13 +65,12 @@ impl AbStore {
             .map_or(T::MAX_ENCODED_LEN, |max| max.min(T::MAX_ENCODED_LEN))
     }
 
-    /// One side and its exact validated bytes: `Ok(None)` for an absent or
-    /// invalid copy, `Err` for a hard I/O failure.
-    fn read_copy<T: AbRecord>(
+    /// Missing, torn or over-long copies are invalid. Other I/O errors are inconclusive.
+    fn read_bytes<T: AbRecord>(
         &self,
         backing: &dyn Backing,
         path: &str,
-    ) -> Result<Option<(T, Vec<u8>)>, FormatError> {
+    ) -> Result<Option<Vec<u8>>, FormatError> {
         let file = match backing.open(path, false) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -91,71 +90,50 @@ impl AbStore {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(FormatError::Io(e)),
         }
-        Ok(T::decode(&buf).ok().map(|record| (record, buf)))
+        Ok(Some(buf))
     }
 
-    fn read_side<T: AbRecord>(
+    fn read_side<T: AbRecord, V>(
         &self,
         backing: &dyn Backing,
         path: &str,
-    ) -> Result<Option<T>, FormatError> {
-        Ok(self.read_copy(backing, path)?.map(|(record, _)| record))
+        decode: impl FnOnce(&[u8]) -> Result<V, FormatError>,
+    ) -> Result<Option<V>, FormatError> {
+        Ok(self
+            .read_bytes::<T>(backing, path)?
+            .and_then(|bytes| decode(&bytes).ok()))
     }
 
     /// Best valid copy, if any. `Err` only for hard I/O failures.
     pub fn load<T: AbRecord>(&self, backing: &dyn Backing) -> Result<Option<T>, FormatError> {
-        let a = self.read_side::<T>(backing, &self.a)?;
-        let b = self.read_side::<T>(backing, &self.b)?;
-        Ok(match (a, b) {
-            (Some(a), Some(b)) => Some(if a.generation() >= b.generation() {
-                a
-            } else {
-                b
-            }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+        Ok(self.load_with_copy_count::<T>(backing)?.0)
+    }
+
+    /// Select the best record and count its valid copies in the same read.
+    pub fn load_with_copy_count<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+    ) -> Result<(Option<T>, usize), FormatError> {
+        self.load_with_copy_count_by::<T, _>(backing, |bytes| {
+            let record = T::decode(bytes)?;
+            Ok((record.generation(), record))
         })
     }
 
-    /// Raw generation of one side, read type-agnostically (so a foreign or
-    /// newer-version record still ranks) but bounded by `max_len` — the caller
-    /// record type's `MAX_ENCODED_LEN` — so the generation probe cannot be
-    /// forced to read a large corrupt file that `read_copy::<T>` would already
-    /// reject on the typed path (FUP-012).
-    fn raw_generation(
+    /// Validate each frame, retaining only the fields the caller needs.
+    /// The decoder supplies the generation used for the usual A/B selection.
+    pub(crate) fn load_with_copy_count_by<T: AbRecord, V>(
         &self,
         backing: &dyn Backing,
-        path: &str,
-        max_len: u64,
-    ) -> Result<Option<u64>, FormatError> {
-        let file = match backing.open(path, false) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(FormatError::Io(e)),
-        };
-        let len = file.len()?;
-        if len == 0 || len > max_len {
-            return Ok(None);
-        }
-        let mut buf = vec![0u8; len as usize];
-        match file.read_at(0, &mut buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(FormatError::Io(e)),
-        }
-        Ok(RawGeneration::decode(&buf).ok().map(|r| r.generation))
-    }
-
-    fn generations<T: AbRecord>(
-        &self,
-        backing: &dyn Backing,
-    ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        let max = self.bound::<T>();
-        Ok((
-            self.raw_generation(backing, &self.a, max)?,
-            self.raw_generation(backing, &self.b, max)?,
-        ))
+        decode: impl Fn(&[u8]) -> Result<(u64, V), FormatError>,
+    ) -> Result<(Option<V>, usize), FormatError> {
+        let a = self.read_side::<T, _>(backing, &self.a, &decode)?;
+        let b = self.read_side::<T, _>(backing, &self.b, decode)?;
+        Ok(match (a, b) {
+            (Some((ga, a)), Some((gb, b))) => (Some(if ga >= gb { a } else { b }), 2),
+            (Some((_, record)), None) | (None, Some((_, record))) => (Some(record), 1),
+            (None, None) => (None, 0),
+        })
     }
 
     fn target_for(&self, ga: Option<u64>, gb: Option<u64>) -> &str {
@@ -179,10 +157,10 @@ impl AbStore {
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
         let a = self
-            .read_side::<T>(backing, &self.a)?
+            .read_side::<T, _>(backing, &self.a, T::decode)?
             .map(|r| r.generation());
         let b = self
-            .read_side::<T>(backing, &self.b)?
+            .read_side::<T, _>(backing, &self.b, T::decode)?
             .map(|r| r.generation());
         Ok((a, b))
     }
@@ -195,7 +173,14 @@ impl AbStore {
         &self,
         backing: &dyn Backing,
     ) -> Result<(Option<u64>, Option<u64>), FormatError> {
-        self.generations::<T>(backing)
+        let generation = |path: &str| -> Result<_, FormatError> {
+            Ok(self
+                .read_bytes::<T>(backing, path)?
+                .as_deref()
+                .and_then(|bytes| RawGeneration::decode(bytes).ok())
+                .map(|raw| raw.generation))
+        };
+        Ok((generation(&self.a)?, generation(&self.b)?))
     }
 
     /// The side the *next* store will overwrite: a side that does not hold
@@ -227,35 +212,35 @@ impl AbStore {
         backing: &dyn Backing,
         record: &mut T,
     ) -> Result<(), FormatError> {
-        let (ga, gb) = self.generations::<T>(backing)?;
-        let max_existing = ga.into_iter().chain(gb).max().unwrap_or(0);
-        let a = self.read_copy::<T>(backing, &self.a)?;
-        let b = self.read_copy::<T>(backing, &self.b)?;
-        let ta = a.as_ref().map(|(record, _)| record.generation());
-        let tb = b.as_ref().map(|(record, _)| record.generation());
+        let a = self.read_bytes::<T>(backing, &self.a)?;
+        let b = self.read_bytes::<T>(backing, &self.b)?;
+        self.store_with_images(backing, record, a.as_deref(), b.as_deref())
+    }
+
+    /// Use the exact copies already read under the caller's exclusive volume lock.
+    pub(crate) fn store_with_images<T: AbRecord>(
+        &self,
+        backing: &dyn Backing,
+        record: &mut T,
+        a: Option<&[u8]>,
+        b: Option<&[u8]>,
+    ) -> Result<(), FormatError> {
+        let max_existing = [a, b]
+            .into_iter()
+            .flatten()
+            .filter_map(|bytes| RawGeneration::decode(bytes).ok())
+            .map(|raw| raw.generation)
+            .max()
+            .unwrap_or(0);
+        let typed_generation = |bytes: &[u8]| T::decode(bytes).ok().map(|r| r.generation());
+        let ta = a.and_then(typed_generation);
+        let tb = b.and_then(typed_generation);
         let target = self.target_for(ta, tb);
         let preserved = if target == self.a {
-            b.map(|(_, bytes)| (self.b.as_str(), bytes))
+            tb.and(b).map(|bytes| (self.b.as_str(), bytes))
         } else {
-            a.map(|(_, bytes)| (self.a.as_str(), bytes))
+            ta.and(a).map(|bytes| (self.a.as_str(), bytes))
         };
-        if let Some((preserved, bytes)) = preserved {
-            // A failed sync can leave this newer generation readable but
-            // volatile. Retrying (even after restarting the process) must
-            // not overwrite the last durable copy until this one is safe.
-            // Redirty the exact validated image: after writeback EIO a
-            // plain fsync retry may succeed without persisting clean cache
-            // pages. Reassert its exact validated length too: a failed sync
-            // of an earlier shrink can leave a longer durable file even when
-            // the page cache already reports the shorter length (BUG-066).
-            // Preserve the validated bytes without re-encoding them.
-            // Its dirent may also be new if the caller's dirsync failed.
-            let file = backing.open(preserved, false)?;
-            file.set_len(bytes.len() as u64)?;
-            file.write_at(0, &bytes)?;
-            file.sync_data()?;
-            backing.sync_dir(maki_backing::path::parent(preserved))?;
-        }
 
         // Checked increment: a corrupt existing generation near u64::MAX (or a
         // genuinely exhausted sequence) must fail closed, not wrap to 0 — a
@@ -270,8 +255,38 @@ impl AbStore {
                         .to_string(),
                 )
             })?;
+        let original_generation = record.generation();
         record.set_generation(next);
         let bytes = record.encode();
+        // Preserve the caller's generation on validation or preservation failure.
+        record.set_generation(original_generation);
+        if bytes.is_empty() || bytes.len() as u64 > self.bound::<T>() {
+            return Err(FormatError::Invalid(format!(
+                "A/B record length {} is outside the store's 1..={} byte bound",
+                bytes.len(),
+                self.bound::<T>()
+            )));
+        }
+
+        if let Some((preserved, bytes)) = preserved {
+            // A failed sync can leave this newer generation readable but
+            // volatile. Retrying (even after restarting the process) must
+            // not overwrite the last durable copy until this one is safe.
+            // Redirty the exact validated image: after writeback EIO a
+            // plain fsync retry may succeed without persisting clean cache
+            // pages. Reassert its exact validated length too: a failed sync
+            // of an earlier shrink can leave a longer durable file even when
+            // the page cache already reports the shorter length (BUG-066).
+            // Preserve the validated bytes without re-encoding them.
+            // Its dirent may also be new if the caller's dirsync failed.
+            let file = backing.open(preserved, false)?;
+            file.set_len(bytes.len() as u64)?;
+            file.write_at(0, bytes)?;
+            file.sync_data()?;
+            backing.sync_dir(maki_backing::path::parent(preserved))?;
+        }
+
+        record.set_generation(next);
         let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;
         file.write_at(0, &bytes)?;

@@ -1,8 +1,11 @@
 """The background runner must not mistake interruption or empty runs for a pass."""
+import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,10 +32,12 @@ class BackgroundStorageTests(unittest.TestCase):
             "maki-core": ("rollback_protection", "rollback_process"),
         }
         calls = []
+        binary = bytes(range(256)) * 4097
 
         def child(command, _cwd, log, _stop, _timeout, **_kwargs):
             calls.append(command)
             if command[0] == "cargo":
+                self.assertEqual(_kwargs["env"].get("RUSTC"), os.environ.get("RUSTC"))
                 package = command[command.index("-p") + 1]
                 self.assertIn(package, expected)
                 selected = tuple(command[i + 1] for i, arg in enumerate(command) if arg == "--test")
@@ -40,7 +45,9 @@ class BackgroundStorageTests(unittest.TestCase):
                 events = []
                 for name in selected:
                     executable = self.root / (name + "-build")
-                    executable.write_bytes(b"frozen fixture")
+                    executable.write_bytes(binary)
+                    events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(executable),
+                                              "library_path": "/fixture/lib"}))
                     events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
                                               "executable": str(executable)}))
                 log.write_text("\n".join(events))
@@ -50,11 +57,15 @@ class BackgroundStorageTests(unittest.TestCase):
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target"),
                   "profile": "rollback"}
-        with mock.patch.object(self.runner, "run_child", side_effect=child):
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
+                mock.patch.object(self.runner, "run_child", side_effect=child), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole binary read")), \
+                mock.patch.object(Path, "read_text", side_effect=AssertionError("whole build/list log read")):
             binaries = self.runner.prepare(self.root, config, time.monotonic() + 30)
         self.assertEqual(set(binaries), {name for group in expected.values() for name in group})
         manifest = json.loads((self.root / "binaries.json").read_text())
         self.assertEqual(set(manifest), set(binaries))
+        self.assertEqual({entry["sha256"] for entry in manifest.values()}, {hashlib.sha256(binary).hexdigest()})
         self.assertTrue(all(value["expected_tests"] == 1 for value in manifest.values()))
         self.assertEqual(sum(command[0] == "cargo" for command in calls), 2)
 
@@ -88,6 +99,8 @@ class BackgroundStorageTests(unittest.TestCase):
                 for name in groups[package]:
                     artifact = self.root / (name + "-built")
                     artifact.write_bytes(b"fixture binary")
+                    events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(artifact),
+                                              "library_path": "/fixture/lib"}))
                     events.append(json.dumps({"reason": "compiler-artifact", "target": {"name": name},
                                               "executable": str(artifact)}))
                 log.write_text("\n".join(events))
@@ -98,7 +111,8 @@ class BackgroundStorageTests(unittest.TestCase):
             return result
 
         config = {"source": str(self.root), "target_dir": str(self.root / "target")}
-        with mock.patch.object(self.runner, "suite_groups", return_value=groups), \
+        with mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
+                mock.patch.object(self.runner, "suite_groups", return_value=groups), \
                 mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(self.runner, "run_child", side_effect=child):
             error = None
@@ -201,27 +215,95 @@ class BackgroundStorageTests(unittest.TestCase):
                 self.assertEqual(report["passed_tests"], 0)
                 self.assertIn("preparation deadline", report["error"])
 
-    def test_each_started_campaign_uses_its_own_build_directories(self):
-        def completed(command, **_kwargs):
-            if command[:2] == ["git", "archive"]:
-                output = next(value for value in command if value.startswith("--output="))
-                Path(output.split("=", 1)[1]).write_bytes(b"frozen source")
-            return subprocess.CompletedProcess(command, 0)
+    def test_cancel_only_marks_a_valid_live_campaign(self):
+        directory = self.root / "run"
+        directory.mkdir()
+        command = [sys.executable, "-B", self.runner.__file__, "cancel", "--run-dir", str(directory)]
+        result = subprocess.run(command, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((directory / "STOP").exists())
+        controller = {"pid": os.getpid(), "identity": self.runner.process_identity(os.getpid()),
+                      "run_dir": str(self.root)}
+        self.runner.save_json(directory / "controller.json", controller)
+        self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertFalse((directory / "STOP").exists())
+        controller["run_dir"] = str(directory)
+        self.runner.save_json(directory / "controller.json", controller)
+        self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        self.assertTrue((directory / "STOP").is_file())
 
-        process = mock.Mock(pid=os.getpid())
+    def test_frozen_source_uses_original_committed_bytes_and_mode(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        source = self.root / "source"
+        source.mkdir()
+
+        def git(*arguments):
+            return subprocess.check_output(["git", *arguments], cwd=repo, text=True).strip()
+
+        git("init", "-q")
+        (repo / "suite").write_bytes(b"$Format:%H$\n")
+        (repo / "suite").chmod(0o755)
+        (repo / "suite-link").symlink_to("suite")
+        (repo / "expected").write_bytes(b"published fixture")
+        git("add", ".")
+        git("-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-qm", "fixture")
+        (repo / ".git/info/attributes").write_text("suite export-subst\nexpected export-ignore\n")
+        (repo / "local").write_text("untracked")
+        (repo / "expected").write_text("local edit")
+        self.runner.qualification_source().extract_revision(repo, git("rev-parse", "HEAD"), self.root / "source.tar", source)
+        self.assertEqual((source / "expected").read_bytes(), b"published fixture")
+        self.assertEqual((source / "suite").read_bytes(), b"$Format:%H$\n")
+        self.assertEqual((source / "suite").stat().st_mode & 0o111, 0o111)
+        self.assertEqual(os.readlink(source / "suite-link"), "suite")
+        self.assertFalse((source / "local").exists())
+
+    def test_clean_revision_refuses_head_change_during_worktree_check(self):
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-C", self.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                 "-c", "commit.gpgsign=false", *args], text=True).strip()
+
+        git("init", "-q")
+        marker = self.root / "version"
+        marker.write_text("first")
+        git("add", "version")
+        git("commit", "-qm", "first")
+        marker.write_text("second")
+        git("commit", "-qam", "second")
+        snapshot = self.runner.qualification_source()
+        check = snapshot.tracked_changes
+
+        def move_head_after_check(*, repo):
+            dirty = check(repo=repo)
+            self.assertFalse(dirty)
+            git("reset", "--soft", "HEAD^")
+            return dirty
+
+        with mock.patch.object(snapshot, "tracked_changes", side_effect=move_head_after_check):
+            with self.assertRaisesRegex(ValueError, "HEAD changed"):
+                snapshot.clean_revision(self.root)
+
+    @staticmethod
+    def fake_freeze_source(_repo, revision, archive, source):
+        archive.write_bytes(b"frozen source")
+        (source / "scripts").mkdir()
+        (source / "scripts/storage-repeat-validation.py").write_text(f"# runner at {revision}\n")
+
+    def test_each_started_campaign_uses_its_own_build_directories(self):
+        process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
         args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
         with mock.patch.object(self.runner.Path, "home", return_value=self.root), \
                 mock.patch.object(
                     self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)
                 ), \
-                mock.patch.object(self.runner.subprocess, "run", side_effect=completed), \
-                mock.patch.object(
-                    self.runner.subprocess,
-                    "check_output",
-                    side_effect=["revision-one\n", "rustc fixture\n", "cargo fixture\n",
-                                 "revision-two\n", "rustc fixture\n", "cargo fixture\n"],
-                ), \
-                mock.patch.object(self.runner.subprocess, "Popen", return_value=process):
+                mock.patch.object(self.runner.subprocess, "run"), \
+                mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=self.fake_freeze_source), \
+                mock.patch.object(self.runner.qualification_source(), "clean_revision",
+                                  side_effect=["revision-one", "revision-two"]), \
+                mock.patch.object(self.runner.subprocess, "check_output", return_value="cargo fixture\n") as probes, \
+                mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole campaign artifact read")):
             self.runner.start(args)
             first = json.loads((self.root / "logs/maki-storage-latest.json").read_text())
             args.profile = "rollback"
@@ -232,6 +314,13 @@ class BackgroundStorageTests(unittest.TestCase):
         second_config = json.loads((Path(second["run_dir"]) / "config.json").read_text())
         self.assertEqual(Path(first_config["target_dir"]), Path(first["run_dir"]) / "target")
         self.assertEqual(Path(second_config["target_dir"]), Path(second["run_dir"]) / "target")
+        for index, config in enumerate((first_config, second_config)):
+            source = Path(config["source"])
+            runner_text = f"# runner at {config['revision']}\n"
+            self.assertEqual((source.parent / "runner.py").read_text(), runner_text)
+            self.assertEqual(config["source_sha256"], hashlib.sha256(b"frozen source").hexdigest())
+            self.assertEqual(config["runner_sha256"], hashlib.sha256(runner_text.encode()).hexdigest())
+            self.assertEqual(probes.call_args_list[index], mock.call(["cargo", "-V"], cwd=source, text=True))
         self.assertNotEqual(first_config["target_dir"], second_config["target_dir"])
         self.assertEqual(Path(first_config["build_dir"]), Path(first["run_dir"]) / "build")
         self.assertEqual(Path(second_config["build_dir"]), Path(second["run_dir"]) / "build")
@@ -242,6 +331,151 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(second_config["suites"], [
             "rollback_backing", "rollback_model", "rollback_protection", "rollback_process",
         ])
+
+    def test_start_discards_unpublished_snapshots_on_preparation_failure(self):
+        args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
+        logs = self.root / "logs"
+        logs.mkdir()
+        latest = logs / "maki-storage-latest.json"
+        latest.write_text("previous campaign")
+        for failure in ("extract", "cargo", "launch"):
+            def extract(*args):
+                self.fake_freeze_source(*args)
+                if failure == "extract":
+                    raise OSError("extract")
+
+            with (self.subTest(failure=failure),
+                  mock.patch.object(self.runner.Path, "home", return_value=self.root),
+                  mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)),
+                  mock.patch.object(self.runner.qualification_source(), "clean_revision", return_value="revision"),
+                  mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=extract),
+                  mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture",
+                                    side_effect=OSError("cargo") if failure == "cargo" else None),
+                  mock.patch.object(self.runner.subprocess, "Popen", side_effect=OSError("launch")) as launch):
+                with self.assertRaisesRegex(OSError, failure):
+                    self.runner.start(args)
+                self.assertEqual(launch.call_count, int(failure == "launch"))
+                self.assertEqual(list(logs.iterdir()), [latest])
+                self.assertEqual(latest.read_text(), "previous campaign")
+
+    def test_failed_publication_reaps_worker_without_releasing_it(self):
+        args = types.SimpleNamespace(rounds=1, max_seconds=60, suite_timeout=30)
+        process = mock.Mock(pid=os.getpid(), stdin=mock.MagicMock())
+
+        for failed in ("controller.json", "maki-storage-latest.json"):
+            def publish(path, _value):
+                if path.name == failed:
+                    raise OSError("publication failed")
+
+            with self.subTest(failed=failed), \
+                    mock.patch.object(self.runner.Path, "home", return_value=self.root), \
+                    mock.patch.object(self.runner.shutil, "disk_usage", return_value=types.SimpleNamespace(free=3 << 30)), \
+                    mock.patch.object(self.runner.qualification_source(), "clean_revision", return_value="revision"), \
+                    mock.patch.object(self.runner.subprocess, "check_output", return_value="fixture"), \
+                    mock.patch.object(self.runner.subprocess, "run"), \
+                    mock.patch.object(self.runner.qualification_source(), "extract_revision", side_effect=self.fake_freeze_source), \
+                    mock.patch.object(self.runner.subprocess, "Popen", return_value=process), \
+                    mock.patch.object(self.runner, "save_json", side_effect=publish):
+                with self.assertRaisesRegex(OSError, "publication failed"):
+                    self.runner.start(args)
+            process.stdin.__enter__.return_value.write.assert_not_called()
+            process.stdin.__exit__.assert_called_once()
+            process.wait.assert_called_once()
+            process.reset_mock()
+
+    def test_frozen_dynamically_linked_test_runs_with_cargos_runtime_libraries(self):
+        source = self.root / "source"
+        (source / "tests").mkdir(parents=True)
+        (source / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.0.0"\nedition="2021"\n')
+        (source / "Cargo.lock").write_text('version=3\n[[package]]\nname="fixture"\nversion="0.0.0"\n')
+        (source / "tests/campaign.rs").write_text("#[test] fn passes() {}\n")
+        directory = self.root / "run with spaces"
+        directory.mkdir()
+        self.runner.save_json(directory / "config.json", {
+            "source": str(source), "target_dir": str(directory / "target"), "revision": "fixture",
+            "rounds": 1, "max_seconds": 60, "suite_timeout": 20,
+        })
+        environment = dict(os.environ, RUSTFLAGS="-C prefer-dynamic")
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        environment.pop("LD_LIBRARY_PATH", None)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(self.runner, "suite_groups", return_value={"fixture": ("campaign",)}):
+            self.assertEqual(self.runner.worker(directory), 0)
+        manifest = json.loads((directory / "binaries.json").read_text())
+        self.assertTrue(manifest["campaign"]["library_path"])
+        self.assertEqual(json.loads((directory / "status.json").read_text())["passed_tests"], 1)
+
+    def test_cargo_records_same_compiler_and_wrappers_used_for_suite_build(self):
+        source = self.root / "source"
+        (source / "tests").mkdir(parents=True)
+        (source / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.0.0"\nedition="2021"\n')
+        (source / "Cargo.lock").write_text('version=3\n[[package]]\nname="fixture"\nversion="0.0.0"\n')
+        (source / "tests" / "campaign.rs").write_text("#[test] fn passes() {}\n")
+        compiler = shutil.which("rustc")
+        self.assertIsNotNone(compiler)
+        for name in ("ancestor", "project", "env-config", "env-rustc"):
+            path = self.root / name
+            path.write_text(
+                '#!/bin/sh\nif [ "$1" = "-vV" ]; then\n'
+                f'  "$FIXTURE_RUSTC" "$@" && echo "fixture compiler: {name}"\n'
+                'else\n  case " $* " in *" --crate-name campaign "*) '
+                f'echo {name} >> "$FIXTURE_BUILDS";; esac\n'
+                '  exec "$FIXTURE_RUSTC" "$@"\nfi\n')
+            path.chmod(0o700)
+        for name in ("outer", "inner"):
+            path = self.root / name
+            path.write_text('#!/bin/sh\nfor last do :; done\nif [ "$last" = "-vV" ]; then\n'
+                            f'  "$@" && echo "fixture wrapper: {name}"\nelse\n  exec "$@"\nfi\n')
+            path.chmod(0o700)
+        (self.root / ".cargo").mkdir()
+        (self.root / ".cargo/config.toml").write_text(
+            '[build]\nrustc="./ancestor"\nrustc-wrapper="./outer"\n'
+            'rustc-workspace-wrapper="./inner"\n')
+        (source / ".cargo").mkdir()
+        environment = {k: v for k, v in os.environ.items() if k not in (
+            "RUSTC", "CARGO_BUILD_RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")}
+        environment.update(FIXTURE_RUSTC=compiler, FIXTURE_BUILDS=str(self.root / "compilations"))
+        for selected in ("ancestor", "project", "env-config", "env-rustc"):
+            with self.subTest(selected=selected):
+                if selected == "project":
+                    (source / ".cargo/config.toml").write_text('[build]\nrustc="../project"\n')
+                if selected == "env-config":
+                    environment["CARGO_BUILD_RUSTC"] = str(self.root / selected)
+                if selected == "env-rustc":
+                    environment["RUSTC"] = str(self.root / selected)
+                directory = self.root / f"run-{selected}"
+                directory.mkdir()
+                config = {"source": str(source), "target_dir": str(directory / "target")}
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        mock.patch.object(self.runner, "suite_groups", return_value={"fixture": ("campaign",)}):
+                    self.runner.prepare(directory, config, time.monotonic() + 60)
+                recorded = json.loads((directory / "config.json").read_text())
+                self.assertTrue((self.root / selected).samefile(recorded["rustc_executable"]))
+                self.assertIn(f"fixture compiler: {selected}", recorded["rustc"])
+                self.assertIn("fixture wrapper: inner\nfixture wrapper: outer", recorded["rustc"])
+                self.assertEqual((self.root / "compilations").read_text().splitlines()[-1], selected)
+
+    def test_unavailable_or_timed_out_compiler_probe_records_terminal_status(self):
+        for reason, expected in (("exited", "failed"), ("timeout", "incomplete")):
+            with self.subTest(reason=reason):
+                directory = self.root / reason
+                directory.mkdir()
+                self.runner.save_json(directory / "config.json", {
+                    "source": str(directory), "target_dir": str(directory / "target"),
+                    "revision": "fixture", "rounds": 1, "max_seconds": 10, "suite_timeout": 5,
+                })
+                with mock.patch.object(self.runner, "run_child", return_value={
+                        "reason": reason, "exit_code": 1}) as child:
+                    self.assertEqual(self.runner.worker(directory), 1)
+                child.assert_called_once()
+                self.assertLessEqual(child.call_args.args[4], 10)
+                self.assertEqual(child.call_args.args[2], directory / "toolchain.log")
+                status = json.loads((directory / "status.json").read_text())
+                self.assertEqual(status["state"], expected)
+                self.assertIn("compiler probe", status["error"])
 
     def test_prepare_isolates_all_packages_from_inherited_cargo_directories(self):
         calls = []
@@ -262,6 +496,8 @@ class BackgroundStorageTests(unittest.TestCase):
                     for name in groups[package]:
                         artifact = directory / (name + "-built")
                         artifact.write_bytes(b"fixture binary")
+                        events.append(json.dumps({"reason": "maki-test-runtime", "executable": str(artifact),
+                                                  "library_path": "/fixture/lib"}))
                         events.append(json.dumps({"reason": "compiler-artifact",
                                                   "target": {"name": name},
                                                   "executable": str(artifact)}))
@@ -271,6 +507,7 @@ class BackgroundStorageTests(unittest.TestCase):
                 return {"exit_code": 0, "reason": "exited"}
 
             with mock.patch.dict(os.environ, inherited), \
+                    mock.patch.object(self.runner, "cargo_compiler", return_value=("fixture", "version", "x86_64-unknown-linux-gnu")), \
                     mock.patch.object(self.runner, "run_child", side_effect=child):
                 self.runner.prepare(directory, config, time.monotonic() + 30)
                 self.assertEqual(os.environ["CARGO_BUILD_BUILD_DIR"], inherited["CARGO_BUILD_BUILD_DIR"])
@@ -291,6 +528,18 @@ class BackgroundStorageTests(unittest.TestCase):
                      valid.replace("0 failed", "1 failed")):
             with self.assertRaises(ValueError):
                 self.runner.passed_count(text)
+
+    def test_suite_summaries_cross_chunk_boundaries_in_long_lines(self):
+        summary = "test result: ok. ١٤ passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+        block = 64 * 1024
+        for split in range(len(summary) + 1):
+            with self.subTest(split=split):
+                text = "x" * (block - split) + summary + "z" * block
+                self.assertEqual(self.runner.passed_count(io.StringIO(text)), 14)
+        for text in (summary + "x" * block + summary, summary + summary,
+                     summary + "x" * block + summary.replace("١٤", "9" * (3 * block))):
+            with self.assertRaises(ValueError):
+                self.runner.passed_count(io.StringIO(text))
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_child_exit_timeout_and_cancellation_are_distinct(self):
@@ -313,8 +562,8 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual({number: signal.getsignal(number) for number in handlers}, handlers)
 
     def terminal_child(self, directory, elapsed=0, cancelled=False, whole_worker=False,
-                       max_bytes=64 << 20):
-        """Finish a real child during the polling gap, without wall-clock races."""
+                       max_bytes=64 << 20, cleanup_elapsed=None):
+        """Finish a real child during supervision, without wall-clock races."""
         gate_read, gate_write = os.pipe()
         self.addCleanup(os.close, gate_read)
         self.addCleanup(os.close, gate_write)
@@ -328,7 +577,13 @@ class BackgroundStorageTests(unittest.TestCase):
         children = []
         clock = [100.0]
         original_popen = subprocess.Popen
-        original_sleep, original_monotonic = time.sleep, time.monotonic
+        original_wait = self.runner.wait
+        original_killpg = os.killpg
+
+        def kill_group(pid, sig):
+            if cleanup_elapsed is not None:
+                clock[0] = 100 + cleanup_elapsed
+            return original_killpg(pid, sig)
 
         def launch(*args, **kwargs):
             child = original_popen(*args, **kwargs, pass_fds=(gate_read,))
@@ -336,19 +591,16 @@ class BackgroundStorageTests(unittest.TestCase):
             self.addCleanup(self.stop_controller, child)
             return child
 
-        def poll_interval(_duration):
-            # The child cannot exit until the runner has entered its polling
-            # sleep. Observe its exit without consuming its process identity.
+        def poll_interval(futures, timeout):
+            # Release the child when supervision starts waiting for its exit.
             clock[0] = 100 + elapsed
             os.write(gate_write, b"x")
-            deadline = original_monotonic() + 5
-            while os.waitid(os.P_PID, children[0].pid,
-                            os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                self.assertLess(original_monotonic(), deadline, "fixture did not exit")
-                original_sleep(.01)
+            done, _ = original_wait(futures, timeout=5)
+            self.assertEqual(len(done), 1, "fixture did not exit")
 
         with mock.patch.object(self.runner.subprocess, "Popen", side_effect=launch), \
-                mock.patch.object(self.runner.time, "sleep", side_effect=poll_interval), \
+                mock.patch.object(self.runner.os, "killpg", side_effect=kill_group), \
+                mock.patch.object(self.runner, "wait", side_effect=poll_interval), \
                 mock.patch.object(self.runner.time, "monotonic", side_effect=lambda: clock[0]):
             if whole_worker:
                 self.runner.save_json(directory / "config.json", {
@@ -367,6 +619,13 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertEqual(len(children), 1)
         self.assertEqual(children[0].returncode, 0, "the real child must exit and be reaped")
         return result
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
+    def test_exit_before_deadline_stays_successful_through_late_group_cleanup(self):
+        result = self.terminal_child(self.root, elapsed=9.95, cleanup_elapsed=10.05)
+        self.assertEqual(result["reason"], "exited")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertGreater(result["seconds"], 10)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_bug160_child_exit_rechecks_cancellation_deadline_and_output(self):
@@ -427,7 +686,7 @@ class BackgroundStorageTests(unittest.TestCase):
                             (directory / "STOP").touch()
                     return result
 
-                def child(_command, _cwd, log, _stop, _timeout):
+                def child(_command, _cwd, log, _stop, _timeout, env=None):
                     log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
                                    "0 measured; 0 filtered out;\n")
                     return {"exit_code": 0, "reason": "exited", "seconds": 0}
@@ -465,12 +724,12 @@ class BackgroundStorageTests(unittest.TestCase):
                     "revision": "fixture", "source": str(directory),
                 })
                 original_sync, original_replace = os.fsync, os.replace
-                temporary = directory / "status.json.tmp"
 
                 def sync(fd):
                     # Exercise the real final JSON flush/fsync, after all
                     # suite/result checks but before atomic status publication.
-                    if temporary.exists():
+                    temporary = next(directory.glob(".status.json.*.tmp"), None)
+                    if temporary is not None:
                         candidate = json.loads(temporary.read_text())
                         if candidate["state"] in self.runner.TERMINAL:
                             terminal_syncs.append(candidate["state"])
@@ -485,7 +744,7 @@ class BackgroundStorageTests(unittest.TestCase):
                         published.append(json.loads(source.read_text())["state"])
                     original_replace(source, target)
 
-                def child(_command, _cwd, log, _stop, _timeout):
+                def child(_command, _cwd, log, _stop, _timeout, env=None):
                     log.write_text("test result: ok. 1 passed; 0 failed; 0 ignored; "
                                    "0 measured; 0 filtered out;\n")
                     return {"exit_code": 0, "reason": "exited", "seconds": 0}
@@ -510,7 +769,7 @@ class BackgroundStorageTests(unittest.TestCase):
                     self.assertNotIn("passed", published, "an ineligible pass must stay private")
                     self.assertEqual(terminal_syncs, ["passed", expected])
                     self.assertEqual(report["elapsed_seconds"], elapsed)
-                self.assertFalse(temporary.exists())
+                self.assertEqual(list(directory.glob(".status.json.*.tmp")), [])
 
     @unittest.skipUnless(sys.platform == "linux", "Linux background runner")
     def test_supervisor_signal_cleans_build_and_suite_groups_and_records_cancellation(self):
@@ -649,6 +908,16 @@ class BackgroundStorageTests(unittest.TestCase):
             self.root, self.root / "noisy.log", self.root / "STOP", 10, max_bytes=1024)
         self.assertEqual(result["reason"], "output_limit")
         self.assertEqual((self.root / "noisy.log").stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_publications_use_independent_temporary_files(self):
+        path = self.root / "latest.json"
+        def publish_second():
+            self.assertTrue(self.runner.save_json(path, {"run": "second"}))
+            self.assertEqual(json.loads(path.read_text()), {"run": "second"})
+            return True
+        self.assertTrue(self.runner.save_json(path, {"run": "first"}, before_publish=publish_second))
+        self.assertEqual(json.loads(path.read_text()), {"run": "first"})
+        self.assertEqual(list(self.root.iterdir()), [path])
 
     def test_atomic_state_is_private(self):
         self.runner.save_json(self.root / "status.json", {"state": "running"})

@@ -224,12 +224,13 @@ pub(super) fn verify_request(
     Ok(())
 }
 
-pub(super) fn execute(volume: &str, config_path: &str) -> Result<(), ExecError> {
+pub(super) fn execute(volume: &str, config_path: &Path) -> Result<(), ExecError> {
     config::check_volume_name(volume).map_err(|e| identity_error(e.to_string()))?;
-    config::check_abs_path("config", config_path).map_err(|e| identity_error(e.to_string()))?;
+    config::check_abs_path("config", &config_path.to_string_lossy())
+        .map_err(|e| identity_error(e.to_string()))?;
     let state = TrustedState::open_existing()?;
     let _lock = state.lock_existing()?;
-    let config = read_verify_config(Path::new(config_path))?;
+    let config = read_verify_config(config_path)?;
     let request = config::parse(&config)
         .and_then(|config| config.into_request(volume, AttachOverrides::default(), true))
         .map_err(|e| identity_error(e.to_string()))?;

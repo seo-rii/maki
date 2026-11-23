@@ -135,14 +135,14 @@ async fn admission_preserves_configured_checkpoint_headroom() {
     let (backing, _, engine) = fixture_with_checkpoint_headroom(RESERVE, CHECKPOINT_HEADROOM).await;
     let required = RESERVE + CHECKPOINT_HEADROOM + FIRST_APPEND_FOOTPRINT;
     let before = engine.monitoring_snapshot().stats;
-    let writes = backing.storage.pending_write_count();
+    let writes = backing.storage.write_count_since_crash();
 
     backing.storage.set_free_bytes(Some(required - 1));
     assert_storage_full(engine.write(0, &[0x31; UNIT as usize], false).await);
     let rejected = engine.monitoring_snapshot().stats;
     assert_eq!(rejected.appended_sequence, before.appended_sequence);
     assert_eq!(rejected.durable_sequence, before.durable_sequence);
-    assert_eq!(backing.storage.pending_write_count(), writes);
+    assert_eq!(backing.storage.write_count_since_crash(), writes);
 
     backing.storage.set_free_bytes(Some(required));
     engine
@@ -167,11 +167,11 @@ async fn zero_emergency_reserve_disables_headroom_admission() {
 async fn overflowing_checkpoint_headroom_requirement_fails_closed() {
     let (backing, _, engine) = fixture_with_checkpoint_headroom(1, u64::MAX).await;
     backing.storage.set_free_bytes(Some(u64::MAX));
-    let writes = backing.storage.pending_write_count();
+    let writes = backing.storage.write_count_since_crash();
 
     assert_storage_full(engine.write(0, &[0x51; UNIT as usize], false).await);
     assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
-    assert_eq!(backing.storage.pending_write_count(), writes);
+    assert_eq!(backing.storage.write_count_since_crash(), writes);
 }
 
 fn assert_storage_full(result: Result<(), CoreError>) {
@@ -190,7 +190,7 @@ async fn consecutive_write_observes_external_space_drop_without_clock_advance() 
     backing.storage.set_free_bytes(Some(2 * RESERVE));
     engine.write(0, &[0xA5; UNIT as usize], true).await.unwrap();
     let before = engine.monitoring_snapshot().stats;
-    let writes = backing.storage.pending_write_count();
+    let writes = backing.storage.write_count_since_crash();
 
     // Another user of the same filesystem consumes space before the next call.
     backing.storage.set_free_bytes(Some(RESERVE - 1));
@@ -203,7 +203,7 @@ async fn consecutive_write_observes_external_space_drop_without_clock_advance() 
     assert_eq!(after.appended_sequence, before.appended_sequence);
     assert_eq!(after.durable_sequence, before.durable_sequence);
     assert_eq!(
-        backing.storage.pending_write_count(),
+        backing.storage.write_count_since_crash(),
         writes,
         "refused admission changed storage"
     );
@@ -236,7 +236,7 @@ async fn recovered_space_allows_retry_without_clock_advance() {
 async fn admission_reserves_the_exact_next_journal_append_footprint() {
     let (backing, _, engine) = fixture(RESERVE).await;
     let before = engine.monitoring_snapshot().stats;
-    let writes = backing.storage.pending_write_count();
+    let writes = backing.storage.write_count_since_crash();
 
     backing
         .storage
@@ -245,7 +245,7 @@ async fn admission_reserves_the_exact_next_journal_append_footprint() {
     let rejected = engine.monitoring_snapshot().stats;
     assert_eq!(rejected.appended_sequence, before.appended_sequence);
     assert_eq!(rejected.durable_sequence, before.durable_sequence);
-    assert_eq!(backing.storage.pending_write_count(), writes);
+    assert_eq!(backing.storage.write_count_since_crash(), writes);
 
     backing
         .storage
@@ -262,13 +262,13 @@ async fn overflowing_reserve_plus_append_footprint_fails_closed() {
     let (backing, _, engine) = fixture(u64::MAX).await;
     backing.storage.set_free_bytes(Some(u64::MAX));
     let before = engine.monitoring_snapshot().stats;
-    let writes = backing.storage.pending_write_count();
+    let writes = backing.storage.write_count_since_crash();
 
     assert_storage_full(engine.write(0, &[7; UNIT as usize], false).await);
     let after = engine.monitoring_snapshot().stats;
     assert_eq!(after.appended_sequence, before.appended_sequence);
     assert_eq!(after.durable_sequence, before.durable_sequence);
-    assert_eq!(backing.storage.pending_write_count(), writes);
+    assert_eq!(backing.storage.write_count_since_crash(), writes);
 }
 
 #[tokio::test]
@@ -280,6 +280,37 @@ async fn newly_known_shortage_replaces_a_sufficient_cached_sample() {
     assert_storage_full(engine.write(0, &[2; UNIT as usize], false).await);
     assert_eq!(engine.monitoring_snapshot().stats.appended_sequence, 0);
     assert_eq!(clock.now(), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn checkpoint_worker_publishes_its_free_space_sample() {
+    let (backing, clock, engine) = fixture_with_checkpoint_headroom(0, CHECKPOINT_HEADROOM).await;
+    backing
+        .storage
+        .set_free_bytes(Some(2 * CHECKPOINT_HEADROOM));
+    assert_eq!(
+        engine.stats().await.backing_free_bytes,
+        Some(2 * CHECKPOINT_HEADROOM)
+    );
+    engine.write(0, &[5; UNIT as usize], false).await.unwrap();
+    backing.storage.set_free_bytes(Some(17));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while clock.sleeper_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(3600));
+        while engine.monitoring_snapshot().stats.checkpoint_sequence == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint worker did not finish");
+    let snapshot = engine.monitoring_snapshot();
+    assert_eq!(snapshot.stats.backing_free_bytes, Some(17));
+    assert_eq!(snapshot.backing_space_age, Some(Duration::ZERO));
+    let queries = backing.queries.load(Ordering::SeqCst);
+    assert_eq!(engine.stats().await.backing_free_bytes, Some(17));
+    assert_eq!(backing.queries.load(Ordering::SeqCst), queries);
 }
 
 #[tokio::test]
@@ -306,14 +337,14 @@ async fn enabled_reserve_fails_closed_when_space_is_unknown_or_query_fails() {
         let (backing, _, engine) = fixture(RESERVE).await;
         backing.fail_query.store(fail_query, Ordering::SeqCst);
         let before = engine.monitoring_snapshot().stats;
-        let writes = backing.storage.pending_write_count();
+        let writes = backing.storage.write_count_since_crash();
 
         assert_storage_full(engine.write(0, &[3; UNIT as usize], true).await);
         let snapshot = engine.monitoring_snapshot();
         assert_eq!(snapshot.stats.backing_free_bytes, None);
         assert_eq!(snapshot.stats.appended_sequence, before.appended_sequence);
         assert_eq!(snapshot.stats.durable_sequence, before.durable_sequence);
-        assert_eq!(backing.storage.pending_write_count(), writes);
+        assert_eq!(backing.storage.write_count_since_crash(), writes);
     }
 }
 
@@ -436,4 +467,34 @@ fn real_file_checkpoint_slot_has_physical_blocks_before_journal_ack() {
         assert!(metadata.len() > 0 && metadata.blocks() > 0, "{allocation}");
     }
     assert_eq!(volume.journal_appended_sequence(), 1);
+}
+
+#[test]
+fn fresh_statistics_do_not_wait_for_a_blocking_worker() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            for available in [Some(RESERVE), None] {
+                let (backing, _, engine) = fixture(0).await;
+                engine.stop_checkpoint_worker().await;
+                backing.storage.set_free_bytes(available);
+                assert_eq!(engine.stats().await.backing_free_bytes, available);
+
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let worker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = wait.recv();
+                });
+                started_rx.await.unwrap();
+                let cached = tokio::time::timeout(Duration::from_secs(1), engine.stats()).await;
+                drop(release);
+                worker.await.unwrap();
+                assert_eq!(cached.unwrap().backing_free_bytes, available);
+                assert_eq!(backing.queries.load(Ordering::SeqCst), 1);
+            }
+        });
 }

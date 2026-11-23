@@ -114,6 +114,30 @@ fn invalid_workloads_never_create_a_volume() {
 }
 
 #[test]
+fn direct_io_must_fit_at_every_slot_before_the_volume_is_created() {
+    let (dir, path) = fixture();
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[volume]", "[volume]\ndevice_block_size = 512")
+        + "\n[nbd]\nminimum_io = 4096\nmaximum_io = 4096\n[limits]\nmax_plaintext_bytes = 4096\n";
+    std::fs::write(&path, config).unwrap();
+
+    let output = run(&path, &["--fua"], &["4", "1536"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("8192"));
+    assert!(!dir.path().join("vol").exists());
+
+    // A one-slot working set never touches a second unit. Direct workloads
+    // still support sub-NBD I/O sizes when the actual request costs fit.
+    let allowed = run(&path, &["--fua", "--working-set", "1536"], &["4", "1536"]);
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+}
+
+#[test]
 fn existing_volume_geometry_still_bounds_a_changed_config() {
     let (dir, config) = fixture();
     let output = run(&config, &[], &["1", "4096"]);
@@ -139,4 +163,48 @@ fn existing_volume_geometry_still_bounds_a_changed_config() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
     assert!(output.stdout.is_empty());
     assert_eq!(std::fs::read(&superblock).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_report_pipe_after_the_workload_exits_quietly() {
+    for flags in [&["--json"][..], &[][..]] {
+        let (_dir, config) = fixture();
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+            .args(flags)
+            .arg(&config)
+            .args(["2", "4096"])
+            .env("MAKI_CREDENTIAL_BENCHMARK_REPORT_KEY", "17".repeat(32))
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_report_destination_reports_the_completed_workload() {
+    let (_dir, config) = fixture();
+    let full = std::fs::File::options()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_maki-benchmark"))
+        .arg("--json")
+        .arg(&config)
+        .args(["2", "4096"])
+        .env("MAKI_CREDENTIAL_BENCHMARK_REPORT_KEY", "17".repeat(32))
+        .stdout(full)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("verification completed, but writing the report failed"));
 }

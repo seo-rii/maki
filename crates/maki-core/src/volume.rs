@@ -10,11 +10,13 @@
 //! checkpoint at that boundary would then delete its journal segment without
 //! ever copying it into a slot.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use maki_backing::{Backing, VolumeLock};
 use maki_format::ab::AbStore;
 use maki_format::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
+use maki_format::journal::RECORD_HEADER_SIZE;
 use maki_format::layout;
 use maki_format::superblock::Superblock;
 
@@ -23,7 +25,7 @@ use crate::fp;
 use crate::journal::{effective_segment_size, JournalWriter};
 use crate::overlay::Overlay;
 use crate::recovery::{recover_bounded, Recovered, RecoveryError, RecoveryProgress};
-use crate::store::{CheckpointSlotPlan, SlotRead, SlotStore};
+use crate::store::{CheckpointSlotPlan, SlotStore};
 
 #[derive(Debug, Clone)]
 pub struct VolumeOptions {
@@ -38,6 +40,13 @@ impl Default for VolumeOptions {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiscardProbe {
+    Unwritten,
+    Written,
+    Unreadable,
+}
+
 pub struct Volume {
     backing: Arc<dyn Backing>,
     _lock: Box<dyn VolumeLock>,
@@ -45,6 +54,8 @@ pub struct Volume {
     journal: JournalWriter,
     store: SlotStore,
     overlay: Overlay,
+    /// Framed bytes appended above the published checkpoint, including pending records.
+    uncheckpointed_record_bytes: u64,
     ck_ab: AbStore,
     ck_state: CheckpointState,
     /// Checkpoint state can be durable before journal deletion/fsync and
@@ -58,6 +69,7 @@ pub struct Volume {
 pub(crate) struct PreparedCheckpoint {
     base_checkpoint: u64,
     horizon: u64,
+    durable_record_bytes: u64,
     allow_discard: bool,
     items: Vec<(u64, Arc<crate::overlay::OverlayVersion>)>,
     slots: CheckpointSlotPlan,
@@ -131,25 +143,23 @@ impl Volume {
         // returns, so attach normally receives an empty replay. Keep this
         // construction for the public/full-replay recovery contract and as
         // a defensive invariant if another recovery mode is added.
-        let mut overlay = Overlay::new();
-        for record in replay {
-            overlay.publish(record.unit_index, record.sequence, record.payload);
-        }
-        overlay.promote(durable_sequence);
-
         store.schedule_reclamation();
-
-        let volume = Self {
+        let mut volume = Self {
             backing,
             _lock: lock,
             superblock,
             journal,
             store,
-            overlay,
+            overlay: Overlay::new(),
+            uncheckpointed_record_bytes: 0,
             ck_ab: AbStore::new(CHECKPOINT_STATE_A, CHECKPOINT_STATE_B),
             ck_state: checkpoint_state,
             checkpoint_cleanup_pending: false,
         };
+        for record in replay {
+            volume.publish_record(record.unit_index, record.sequence, record.payload);
+        }
+        volume.overlay.promote(durable_sequence);
         volume.sanitize();
         Ok(volume)
     }
@@ -164,6 +174,17 @@ impl Volume {
 
     pub fn checkpoint_sequence(&self) -> u64 {
         self.ck_state.checkpoint_sequence
+    }
+
+    /// Durable journal record bytes above the published checkpoint. Each
+    /// record includes its framing, including a header-only discard.
+    pub fn checkpoint_lag_bytes(&self) -> u64 {
+        self.uncheckpointed_record_bytes - self.journal.pending_bytes()
+    }
+
+    fn publish_record(&mut self, unit: u64, sequence: u64, payload: Vec<u8>) {
+        self.uncheckpointed_record_bytes += RECORD_HEADER_SIZE as u64 + payload.len() as u64;
+        self.overlay.publish(unit, sequence, payload);
     }
 
     pub fn journal_durable_sequence(&self) -> u64 {
@@ -246,6 +267,12 @@ impl Volume {
         self.overlay.latest_bytes()
     }
 
+    pub(crate) fn overlay_ciphertext_len(&self, unit: u64) -> Option<usize> {
+        self.overlay
+            .get(unit)
+            .map(|version| version.ciphertext.len())
+    }
+
     pub fn supports_discard(&self) -> bool {
         self.store.supports_discard()
     }
@@ -294,9 +321,21 @@ impl Volume {
         }
         // A live overlay tombstone can hide the first stored allocation.
         // Keep searching without checkpointing or changing the volume.
-        for unit in self.store.allocated_units() {
-            if let Some((_, data)) = self.read_ct(unit)? {
-                return Ok(Some((unit, data)));
+        // If both valid allocation maps lag behind the slot data, the normal
+        // read path can still serve an unlisted slot. Probe those last.
+        let mut previous_shard = None;
+        for unit in self
+            .store
+            .allocated_units()
+            .chain(self.store.unlisted_units())
+        {
+            self.check_freshness()?;
+            // Any remaining overlay entry is a tombstone hiding the slot.
+            if self.overlay.get(unit).is_some() {
+                continue;
+            }
+            if let Some(header) = self.store.scan_slot_header(unit, &mut previous_shard)? {
+                return Ok(Some((unit, self.store.read_ciphertext(&header)?)));
             }
         }
         Ok(None)
@@ -306,6 +345,15 @@ impl Volume {
     /// With `fua`, the record is made durable and verified before returning
     /// (SPEC §24).
     pub fn write_ct(&mut self, unit: u64, ciphertext: &[u8], fua: bool) -> Result<u64, CoreError> {
+        self.write_ciphertext(unit, Cow::Borrowed(ciphertext), fua)
+    }
+
+    pub(crate) fn write_ciphertext(
+        &mut self,
+        unit: u64,
+        ciphertext: Cow<'_, [u8]>,
+        fua: bool,
+    ) -> Result<u64, CoreError> {
         self.check_freshness()?;
         // Counter refusal must precede physical reservation and its barrier,
         // including an exhausted segment index when this append would roll.
@@ -322,7 +370,7 @@ impl Volume {
         // for slot data: an admitted record always has physical completion
         // space even if another filesystem user consumes every free byte.
         self.store.reserve_slot(unit)?;
-        let appended = self.journal.append(unit, ciphertext);
+        let appended = self.journal.append(unit, &ciphertext);
         // An automatic roll inside `append` may have advanced the durable
         // boundary (even when the append itself failed). Promote *before*
         // publishing, so a just-durable previous version of this unit is
@@ -333,7 +381,10 @@ impl Volume {
         // barrier (or recovery) would surface it anyway. Publish before the
         // FUA sync so a sync failure never leaves the live view behind the
         // on-disk journal.
-        self.overlay.publish(unit, sequence, ciphertext.to_vec());
+        // Chargeable overlay storage is the ciphertext length. Do not retain
+        // extra capacity a provider may have reserved for temporary work.
+        let data = ciphertext.into_owned().into_boxed_slice().into_vec();
+        self.publish_record(unit, sequence, data);
         self.overlay.promote(self.journal.durable_sequence());
         if fua {
             let sync = self.journal.sync();
@@ -376,18 +427,31 @@ impl Volume {
                 self.sanitize();
                 return Ok(sequence);
             }
-        } else if self.reclaim_unwritten(unit)? {
+        } else if self.reclaim_unwritten(unit)? == DiscardProbe::Unwritten {
             // Only a header proving the unit unwritten skips the tombstone;
             // a damaged slot is retired by one rather than refused (R5-012).
-            return Ok(self.journal.appended_sequence());
+            // There is no new record. A FUA result must not acknowledge
+            // another unit's unsynced append as a durable discard.
+            return Ok(if fua {
+                self.journal.durable_sequence()
+            } else {
+                self.journal.appended_sequence()
+            });
         }
+        self.append_discard(unit, fua)
+    }
+
+    /// Journal a tombstone for a v3 unit already checked for reclamation.
+    /// The caller must check freshness and hold the same exclusive volume
+    /// lock from classification through append.
+    pub(crate) fn append_discard(&mut self, unit: u64, fua: bool) -> Result<u64, CoreError> {
         if self.journal.next_sequence() == u64::MAX {
             return Err(CoreError::Corrupt("journal sequence exhausted".into()));
         }
         let appended = self.journal.append(unit, &[]);
         self.overlay.promote(self.journal.durable_sequence());
         let sequence = appended?;
-        self.overlay.publish(unit, sequence, Vec::new());
+        self.publish_record(unit, sequence, Vec::new());
         self.overlay.promote(self.journal.durable_sequence());
         if fua {
             let sync = self.journal.sync();
@@ -407,16 +471,23 @@ impl Volume {
     /// release hint. A volatile overlay tombstone must not expose the older
     /// durable write's reservation to reclamation. Header errors still take
     /// the normal tombstone path so damaged units can be retired (R5-012).
-    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<bool, CoreError> {
+    pub(crate) fn reclaim_unwritten(&mut self, unit: u64) -> Result<DiscardProbe, CoreError> {
         self.check_freshness()?;
         if let Some(version) = self.overlay.get(unit) {
-            return Ok(version.ciphertext.is_empty());
+            return Ok(if version.ciphertext.is_empty() {
+                DiscardProbe::Unwritten
+            } else {
+                DiscardProbe::Written
+            });
         }
-        if !matches!(self.store.slot_sequence(unit), Ok(None)) {
-            return Ok(false);
+        match self.store.slot_sequence(unit) {
+            Ok(Some(_)) => Ok(DiscardProbe::Written),
+            Err(_) => Ok(DiscardProbe::Unreadable),
+            Ok(None) => {
+                self.store.reclaim_unwritten(unit)?;
+                Ok(DiscardProbe::Unwritten)
+            }
         }
-        self.store.reclaim_unwritten(unit)?;
-        Ok(true)
     }
 
     /// FLUSH barrier (SPEC §25): everything appended becomes durable.
@@ -447,20 +518,35 @@ impl Volume {
     /// Read one unit's ciphertext: overlay first, then slots.
     /// `None` = unwritten zeros.
     pub fn read_ct(&self, unit: u64) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
+        self.read_ct_if(unit, &mut None, |_| Ok(true))
+    }
+
+    /// Read a present unit only if its version needs a payload. A skipped
+    /// payload and an unwritten unit both return None to the caller. Reuse
+    /// the shard length only while holding this volume's read guard.
+    pub(crate) fn read_ct_if(
+        &self,
+        unit: u64,
+        shard_len: &mut Option<(u64, u64)>,
+        needs_payload: impl FnOnce(u64) -> Result<bool, CoreError>,
+    ) -> Result<Option<(u64, Vec<u8>)>, CoreError> {
         self.check_freshness()?;
         if let Some(v) = self.overlay.get(unit) {
-            if self.supports_discard() && v.ciphertext.is_empty() {
+            if (self.supports_discard() && v.ciphertext.is_empty()) || !needs_payload(v.sequence)? {
                 return Ok(None);
             }
             return Ok(Some((v.sequence, v.ciphertext.clone())));
         }
-        match self.store.read_slot(unit)? {
-            SlotRead::Zero => Ok(None),
-            SlotRead::Ciphertext {
-                write_sequence,
-                data,
-            } => Ok(Some((write_sequence, data))),
+        let Some(header) = self.store.scan_slot_header(unit, shard_len)? else {
+            return Ok(None);
+        };
+        if !needs_payload(header.write_sequence)? {
+            return Ok(None);
         }
+        Ok(Some((
+            header.write_sequence,
+            self.store.read_ciphertext(&header)?,
+        )))
     }
 
     /// Checkpoint (SPEC §26). Consumes only durable journal records;
@@ -495,6 +581,7 @@ impl Volume {
         Ok(PreparedCheckpoint {
             base_checkpoint,
             horizon: durable.max(base_checkpoint),
+            durable_record_bytes: self.checkpoint_lag_bytes(),
             allow_discard,
             items,
             slots,
@@ -515,6 +602,7 @@ impl Volume {
         let PreparedCheckpoint {
             base_checkpoint,
             horizon,
+            durable_record_bytes,
             allow_discard,
             items,
             slots: _,
@@ -526,6 +614,9 @@ impl Volume {
             )));
         }
         if horizon <= base_checkpoint {
+            // An idle plan can finish without touching the backing. Check the
+            // session before reporting success or clearing a degraded state.
+            self.check_freshness()?;
             // Nothing new is durable; still retire anything a previously
             // interrupted checkpoint applied but could not clean up, and
             // persist metadata the store repaired at open (an adopted shard
@@ -545,9 +636,11 @@ impl Volume {
             if self.checkpoint_cleanup_pending {
                 fp("checkpoint.dirsync")?;
                 self.backing.sync_dir(layout::JOURNAL_DIR)?;
+                // A published checkpoint can leave covered versions behind
+                // only while its journal cleanup is pending.
+                self.overlay.retire(base_checkpoint);
                 self.checkpoint_cleanup_pending = false;
             }
-            self.overlay.retire(base_checkpoint);
             // Physical reclamation is a space hint (R5-008): a window that
             // cannot be punched (ENOSPC splitting an extent, EIO) is logged
             // and retried by a later checkpoint, never failed here, or
@@ -605,6 +698,8 @@ impl Volume {
         self.ck_ab.store(self.backing.as_ref(), &mut new_state)?;
         self.backing.sync_dir(layout::CHECKPOINT_DIR)?;
         self.ck_state = new_state;
+        // Newer appends may have arrived while slot writes ran unlocked.
+        self.uncheckpointed_record_bytes -= durable_record_bytes;
         self.checkpoint_cleanup_pending = true;
         // Physical reclamation. The checkpoint is published from here on: a
         // failure only leaves space unreclaimed (the discard map is durable
@@ -695,6 +790,37 @@ mod discard_tests {
     use super::{Volume, VolumeOptions};
 
     #[test]
+    fn reopened_reclamation_finishes_at_the_end_of_a_partial_shard() {
+        let backing = Arc::new(CrashableBacking::new());
+        create_volume_with_discard(
+            backing.as_ref(),
+            Superblock {
+                generation: 0,
+                volume_uuid: uuid::Uuid::from_u128(0xdec1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "trim-tail".into(),
+                key_identity: "key".into(),
+                geometry: Geometry::compute(512, 512, 512, 520, 512, 8 << 20).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+        )
+        .unwrap();
+        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        volume.write_ct(0, &[0x41; 520], true).unwrap();
+        volume.checkpoint().unwrap();
+        volume.discard_ct(0, true).unwrap();
+        volume.checkpoint().unwrap();
+        drop(volume);
+
+        let mut reopened = Volume::recover(backing, VolumeOptions::default()).unwrap();
+        assert!(reopened.has_pending_reclamation());
+        reopened.checkpoint().unwrap();
+        assert!(!reopened.has_pending_reclamation());
+        assert!(reopened.read_ct(0).unwrap().is_none());
+    }
+
+    #[test]
     fn zero_trim_registered_during_checkpoint_preserves_its_durable_write() {
         let backing = Arc::new(CrashableBacking::new());
         create_volume_with_discard(
@@ -758,6 +884,8 @@ mod discard_tests {
         let completed = prepared.execute().unwrap();
         volume.write_ct(1, &[0x13; 1032], true).unwrap(); // durable reservation 3
         volume.discard_ct(1, false).unwrap(); // volatile latest tombstone 4
+        let header = maki_format::journal::RECORD_HEADER_SIZE as u64;
+        assert_eq!(volume.checkpoint_lag_bytes(), header + (header + 1032));
 
         backing.set_fault_hook(Some(Arc::new(move |operation| match operation {
             FaultOp::WriteAt { path, len, .. } if path.ends_with(".dat") && *len == slot_size => {
@@ -766,7 +894,12 @@ mod discard_tests {
             _ => None,
         })));
         assert_eq!(volume.finish_checkpoint(completed).unwrap(), 2);
+        assert_eq!(volume.checkpoint_lag_bytes(), header + 1032);
         backing.set_fault_hook(None);
+        volume.flush().unwrap();
+        assert_eq!(volume.checkpoint_lag_bytes(), header + 1032 + header);
+        volume.checkpoint().unwrap();
+        assert_eq!(volume.checkpoint_lag_bytes(), 0);
     }
 }
 
@@ -821,6 +954,10 @@ mod reservation_barrier_tests {
             "checkpoint published after another fsync discarded its dirty writes"
         );
         assert_eq!(volume.checkpoint_sequence(), 0);
+        assert_eq!(
+            volume.checkpoint_lag_bytes(),
+            maki_format::journal::RECORD_HEADER_SIZE as u64 + 512
+        );
         volume.checkpoint().unwrap(); // rewrite all slots from the kept journal
         drop(volume);
         backing.crash_all_lost();
@@ -830,7 +967,7 @@ mod reservation_barrier_tests {
 }
 
 #[cfg(test)]
-mod zero_trim_freshness_tests {
+mod volume_tests {
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -838,7 +975,7 @@ mod zero_trim_freshness_tests {
     use maki_backing::{Backing, BackingFile, MemBacking, VolumeLock};
     use maki_format::{geometry::Geometry, init, superblock::Superblock};
 
-    use super::{Volume, VolumeOptions};
+    use super::{DiscardProbe, Volume, VolumeOptions};
 
     #[derive(Default)]
     struct FreshnessGate {
@@ -891,8 +1028,7 @@ mod zero_trim_freshness_tests {
         }
     }
 
-    #[test]
-    fn zero_trim_prefilter_rechecks_freshness_before_skipping_overlay_tombstone() {
+    fn open_volume() -> (Arc<FreshnessGate>, Volume) {
         let backing = Arc::new(FreshnessGate::default());
         init::create_volume_with_discard(
             backing.as_ref(),
@@ -908,10 +1044,55 @@ mod zero_trim_freshness_tests {
             },
         )
         .unwrap();
-        let mut volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        let volume = Volume::recover(backing.clone(), VolumeOptions::default()).unwrap();
+        (backing, volume)
+    }
+
+    #[test]
+    fn owned_ciphertext_moves_to_the_overlay_without_retaining_spare_capacity() {
+        let (_backing, mut volume) = open_volume();
+        let payload = vec![0xab; 520];
+        let address = payload.as_ptr();
+        volume.write_ciphertext(0, payload.into(), false).unwrap();
+        let stored = &volume.overlay.get(0).unwrap().ciphertext;
+        assert_eq!(stored.as_ptr(), address);
+
+        let mut oversized = Vec::with_capacity(65536);
+        oversized.extend_from_slice(&[0xcd; 520]);
+        volume.write_ciphertext(0, oversized.into(), true).unwrap();
+        let stored = &volume.overlay.get(0).unwrap().ciphertext;
+        assert_eq!(stored.capacity(), stored.len());
+        assert_eq!(stored, &[0xcd; 520]);
+        volume.checkpoint().unwrap();
+        assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![0xcd; 520]);
+    }
+
+    #[test]
+    fn idle_checkpoint_requires_a_current_session() {
+        let (backing, mut volume) = open_volume();
+        assert_eq!(volume.checkpoint().unwrap(), 0);
+
+        // The engine releases its volume lock between preparation and publication.
+        let prepared = volume.prepare_checkpoint().unwrap();
+        backing.revoked.store(true, Ordering::SeqCst);
+        let completed = prepared.execute().unwrap();
+        let error = volume.finish_checkpoint(completed).unwrap_err();
+        assert!(error.to_string().contains("test writer revoked"));
+        assert!(volume.checkpoint().is_err());
+
+        backing.revoked.store(false, Ordering::SeqCst);
+        assert_eq!(volume.checkpoint().unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_trim_prefilter_rechecks_freshness_before_skipping_overlay_tombstone() {
+        let (backing, mut volume) = open_volume();
         volume.write_ct(0, &[0x41; 520], true).unwrap();
         volume.discard_ct(0, false).unwrap();
-        assert!(volume.reclaim_unwritten(0).unwrap());
+        assert_eq!(
+            volume.reclaim_unwritten(0).unwrap(),
+            DiscardProbe::Unwritten
+        );
 
         // The engine's initial guard may pass before a request waits for its
         // unit locks. The zero-only publication path must check again even

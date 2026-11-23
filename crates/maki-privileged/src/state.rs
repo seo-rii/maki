@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{check_abs_path, check_lvm_name, check_uuid, check_volume_name};
+use crate::config::{check_abs_path, check_instance_name, check_lvm_name, check_uuid};
 use crate::plan::{AttachmentIdentity, BOUND_DEVICE_RECORD_DIR};
 use crate::probe::nbd_index;
 
@@ -64,7 +64,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 impl BoundDeviceRecord {
     fn validate(&self) -> io::Result<()> {
-        check_volume_name(&self.volume).map_err(|e| invalid(e.to_string()))?;
+        check_instance_name(&self.volume).map_err(|e| invalid(e.to_string()))?;
         check_uuid("volume_uuid", &self.attachment.volume_uuid)
             .map_err(|e| invalid(e.to_string()))?;
         check_abs_path("nbd_socket", &self.attachment.nbd_socket)
@@ -233,7 +233,7 @@ impl TrustedState {
     }
 
     fn record_name(volume: &str) -> io::Result<CString> {
-        check_volume_name(volume).map_err(|e| invalid(e.to_string()))?;
+        check_instance_name(volume).map_err(|e| invalid(e.to_string()))?;
         CString::new(format!("{volume}.nbd")).map_err(|_| invalid("invalid volume name"))
     }
 

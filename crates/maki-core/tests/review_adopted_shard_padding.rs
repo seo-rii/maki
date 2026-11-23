@@ -5,9 +5,12 @@
 //! proves a finished creation, so the file was truncated and every cleared
 //! slot beyond its end reads EIO. The bitmap's last byte has padding bits
 //! past the shard's last unit when the unit count is not a multiple of
-//! eight. They name no unit: a map whose only set bits are padding is empty,
-//! and the deep check and attach must both treat the shard as unwritten.
+//! eight, and in a partial last shard the positions past the device's last
+//! unit name no unit either. A map whose only set bits are padding or such
+//! positions is empty, and the deep check and attach must both treat the
+//! shard as unwritten.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -25,6 +28,9 @@ use maki_test_support::CrashableBacking;
 
 /// Five units per shard: the bitmap's single byte has three padding bits.
 const UNITS_PER_SHARD: u64 = 5;
+/// Seven units: shard 1 holds units 5 and 6, and its positions 2..=4
+/// (units 7..=9) lie past the device's last unit.
+const NUM_UNITS: u64 = 7;
 
 fn superblock() -> Superblock {
     Superblock {
@@ -33,15 +39,29 @@ fn superblock() -> Superblock {
         provider_type: "fake".into(),
         crypto_compatibility_id: "test-profile-v1".into(),
         key_identity: "k".into(),
-        geometry: Geometry::compute(512, 1024, 512, 1032, 2 * 5 * 1024, 5 * 1024).unwrap(),
+        geometry: Geometry::compute(
+            512,
+            1024,
+            512,
+            1032,
+            NUM_UNITS * 1024,
+            UNITS_PER_SHARD * 1024,
+        )
+        .unwrap(),
         format_version: 1,
         created_unix: 0,
     }
 }
 
-/// A volume whose shard 0 exists only as a zero-length data file next to
+/// The device's units in `shard`.
+fn units_of(shard: u64) -> Range<u64> {
+    assert_eq!(superblock().geometry.num_units(), NUM_UNITS);
+    shard * UNITS_PER_SHARD..((shard + 1) * UNITS_PER_SHARD).min(NUM_UNITS)
+}
+
+/// A volume whose `shard` exists only as a zero-length data file next to
 /// two CRC-valid allocation copies holding `bitmap` as their only byte.
-fn volume_with_short_orphan(bitmap: u8) -> Arc<CrashableBacking> {
+fn volume_with_short_orphan(shard: u64, bitmap: u8) -> Arc<CrashableBacking> {
     let block = superblock();
     assert_eq!(block.geometry.units_per_shard(), UNITS_PER_SHARD);
     let volume_uuid = block.volume_uuid;
@@ -66,12 +86,12 @@ fn volume_with_short_orphan(bitmap: u8) -> Arc<CrashableBacking> {
     image[n - 5] = bitmap;
     let crc = crc32fast::hash(&image[..n - 4]);
     image[n - 4..].copy_from_slice(&crc.to_le_bytes());
-    for path in [layout::shard_alloc_a(0), layout::shard_alloc_b(0)] {
+    for path in [layout::shard_alloc_a(shard), layout::shard_alloc_b(shard)] {
         let file = backing.open(&path, true).unwrap();
         file.write_at(0, &image).unwrap();
         file.sync_data().unwrap();
     }
-    let data = backing.open(&layout::shard_data(0), true).unwrap();
+    let data = backing.open(&layout::shard_data(shard), true).unwrap();
     assert_eq!(data.len().unwrap(), 0);
     data.sync_data().unwrap();
     backing.sync_dir(layout::DATA_DIR).unwrap();
@@ -96,20 +116,21 @@ fn deep_errors(backing: &Arc<CrashableBacking>) -> Vec<String> {
     .errors
 }
 
-#[test]
-fn padding_bits_do_not_make_a_never_finished_shard_truncated() {
-    // Every padding bit set, no unit allocated.
-    let backing = volume_with_short_orphan(0b1110_0000);
+/// The deep check finds nothing and every unit of `shard` reads as a hole.
+fn assert_unwritten(shard: u64, bitmap: u8) {
+    let backing = volume_with_short_orphan(shard, bitmap);
     let errors = deep_errors(&backing);
     assert!(
         errors.is_empty(),
-        "deep check: a shard with no allocated unit is unwritten: {errors:?}"
+        "shard {shard}, bitmap {bitmap:#010b}: deep check: a shard with no allocated unit is \
+         unwritten: {errors:?}"
     );
     let volume = recover(&backing);
-    for unit in 0..UNITS_PER_SHARD {
+    for unit in units_of(shard) {
         assert!(
             matches!(volume.read_ct(unit), Ok(None)),
-            "unit {unit} of a never-finished shard reads as a hole, got {:?}",
+            "shard {shard}, bitmap {bitmap:#010b}: unit {unit} of a never-finished shard reads \
+             as a hole, got {:?}",
             volume
                 .read_ct(unit)
                 .map(|ct| ct.map(|(sequence, _)| sequence))
@@ -117,20 +138,40 @@ fn padding_bits_do_not_make_a_never_finished_shard_truncated() {
     }
 }
 
+#[test]
+fn padding_bits_do_not_make_a_never_finished_shard_truncated() {
+    // Every padding bit set, no unit allocated.
+    assert_unwritten(0, 0b1110_0000);
+}
+
+#[test]
+fn positions_past_the_device_end_do_not_make_a_never_finished_shard_truncated() {
+    // Shard 1's positions past the device's last unit: the first and the
+    // last alone, all of them, and all of them with the padding bits.
+    for bitmap in [0b0000_0100, 0b0001_0000, 0b0001_1100, 0b1111_1100] {
+        assert_unwritten(1, bitmap);
+    }
+}
+
 /// Control: the same short orphan with a map that lists a real unit is
-/// truncated, so the classification above is the one under test.
+/// truncated, so the classification above is the one under test. In the
+/// partial last shard this holds for its last unit too, set next to a
+/// position past the device's end.
 #[test]
 fn a_listed_unit_still_makes_a_short_orphan_truncated() {
-    let backing = volume_with_short_orphan(0b0000_0001);
-    assert!(
-        !deep_errors(&backing).is_empty(),
-        "deep check: a truncated shard's cleared slots beyond its end are damage"
-    );
-    let volume = recover(&backing);
-    for unit in 0..UNITS_PER_SHARD {
+    for (shard, bitmap) in [(0, 0b0000_0001), (1, 0b0000_0001), (1, 0b0001_0010)] {
+        let backing = volume_with_short_orphan(shard, bitmap);
         assert!(
-            volume.read_ct(unit).is_err(),
-            "unit {unit} of a truncated shard reads EIO"
+            !deep_errors(&backing).is_empty(),
+            "shard {shard}, bitmap {bitmap:#010b}: deep check: a truncated shard's cleared \
+             slots beyond its end are damage"
         );
+        let volume = recover(&backing);
+        for unit in units_of(shard) {
+            assert!(
+                volume.read_ct(unit).is_err(),
+                "shard {shard}, bitmap {bitmap:#010b}: unit {unit} of a truncated shard reads EIO"
+            );
+        }
     }
 }

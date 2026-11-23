@@ -201,7 +201,7 @@ async fn mixed_final_verification_checks_the_last_write_without_a_later_measured
 
 fn options() -> Options {
     Options {
-        config_path: String::new(),
+        config_path: Default::default(),
         destroy_data: false,
         json: true,
         fua: false,
@@ -225,10 +225,40 @@ fn samples() -> Samples {
 }
 
 #[tokio::test]
+async fn queued_workers_do_not_count_as_pending_engine_calls() {
+    let (engine, _) = fixture().await;
+    let options = options();
+    let slots = options.ops;
+    let oracle = Arc::new(Oracle::new(slots, &options).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        slots,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples,
+    ));
+
+    // On this current-thread runtime, the first poll queues a distinct-slot
+    // cohort and waits for a result before any worker can run.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 0);
+
+    writes.await.unwrap();
+    assert!(pending.peak.load(Ordering::SeqCst) > 0);
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn same_address_previous_generation_fails_the_real_read_phase() {
     let (engine, provider) = fixture().await;
     let options = options();
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     phase(
@@ -313,7 +343,7 @@ async fn measured_read_coverage_survives_a_later_unread_overwrite() {
     let (engine, _) = fixture().await;
     let mut options = options();
     options.ops = 1;
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     let pending = Arc::new(Pending::default());
     let mut samples = samples();
     for kind in [Kind::Write, Kind::Read, Kind::Write] {
@@ -321,7 +351,10 @@ async fn measured_read_coverage_survives_a_later_unread_overwrite() {
             .await
             .unwrap();
     }
-    assert_eq!(oracle.generation(0), 2);
+    assert_eq!(
+        oracle.state(0).load(Ordering::Acquire) & !READ_AFTER_WRITE_FLAG,
+        2
+    );
     assert_eq!(samples.reads.report().samples, 1);
     let verification = verify_final(&engine, &options, &oracle).await.unwrap();
     assert_eq!(verification.written_slots, 1);
@@ -335,7 +368,7 @@ async fn rejected_write_does_not_advance_expected_generation() {
     let (engine, provider) = fixture().await;
     let mut options = options();
     options.ops = 1;
-    let oracle = Arc::new(Oracle::new(1).unwrap());
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
     provider
         .inner
         .fail_next([CryptoError::NonRetryableRequest("injected".into())]);
@@ -355,11 +388,160 @@ async fn rejected_write_does_not_advance_expected_generation() {
 }
 
 #[test]
+fn oracle_tracks_the_initialized_address_range() {
+    let mut options = options();
+    for (ops, expected) in [(1, 1), (32, 32), (48, 32)] {
+        options.ops = ops;
+        assert_eq!(
+            Oracle::new(32, &options).unwrap().generations.len(),
+            expected
+        );
+    }
+    options.ops = 1;
+    options.random = true;
+    let sparse = Oracle::new(32, &options).unwrap();
+    assert_eq!(sparse.generations.len(), 1);
+    assert_eq!(sparse.slot_index, [random_slot(0, options.seed, 32)]);
+    options.ops = 16;
+    let dense = Oracle::new(32, &options).unwrap();
+    assert_eq!(dense.generations.len(), 32);
+    assert!(dense.slot_index.is_empty());
+    options.random = false;
+    options.read_percent = Some(100);
+    assert_eq!(Oracle::new(32, &options).unwrap().generations.len(), 32);
+}
+
+#[test]
 fn oracle_capacity_has_an_explicit_byte_bound() {
     let max_slots = MAX_ORACLE_BYTES / std::mem::size_of::<AtomicU64>() as u64;
     assert!(validate_oracle_capacity(max_slots).is_ok());
     assert!(validate_oracle_capacity(max_slots + 1).is_err());
     assert!(validate_oracle_capacity(u64::MAX).is_err());
-    let oracle = Oracle::new(512).unwrap();
+    let oracle = Oracle::new(
+        512,
+        &Options {
+            read_percent: Some(100),
+            ..options()
+        },
+    )
+    .unwrap();
     assert_eq!(oracle.generations.len(), 512);
+}
+
+#[tokio::test]
+async fn repeated_benchmark_rejects_prior_run_data() {
+    let (engine, _) = faulty_fixture(None).await;
+    let mut options = options();
+    options.ops = 1;
+    run(engine.clone(), &options, 4096).await.unwrap();
+    let error = run(engine, &options, 4096)
+        .await
+        .err()
+        .expect("old write passed verification");
+    assert!(error.contains("read verification failed"), "{error}");
+}
+
+#[test]
+fn payload_distinguishes_every_crypto_unit_in_a_large_request() {
+    let bytes = data_for(uuid::Uuid::new_v4(), 0, 1, 16 * 1024);
+    let units = bytes
+        .as_chunks::<4096>()
+        .0
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(units.len(), 4);
+}
+
+#[tokio::test]
+async fn a_serial_phase_polls_the_engine_in_its_first_poll() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.concurrency = 1;
+    let oracle = Arc::new(Oracle::new(options.ops, &options).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    let mut writes = std::pin::pin!(phase(
+        &engine,
+        &options,
+        options.ops,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(writes.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending.peak.load(Ordering::SeqCst), 1);
+    writes.await.unwrap();
+    assert_eq!(pending.current.load(Ordering::SeqCst), 0);
+}
+
+thread_local! {
+    pub(super) static PATTERN_BUFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[tokio::test]
+async fn measured_reads_and_final_sweep_verify_without_building_write_buffers() {
+    let (engine, _) = fixture().await;
+    let mut options = options();
+    options.ops = 1;
+    options.concurrency = 1;
+    let oracle = Arc::new(Oracle::new(1, &options).unwrap());
+    let pending = Arc::new(Pending::default());
+    let mut samples = samples();
+    PATTERN_BUFFERS.set(0);
+    phase(
+        &engine,
+        &options,
+        1,
+        Kind::Write,
+        &oracle,
+        &pending,
+        &mut samples,
+    )
+    .await
+    .unwrap();
+    assert_eq!(PATTERN_BUFFERS.replace(0), 1);
+    phase(
+        &engine,
+        &options,
+        1,
+        Kind::Read,
+        &oracle,
+        &pending,
+        &mut samples,
+    )
+    .await
+    .unwrap();
+    let measured = PATTERN_BUFFERS.replace(0);
+    let report = verify_final(&engine, &options, &oracle).await.unwrap();
+    assert_eq!(report.final_sweep_verified_slots, 1);
+    assert_eq!((measured, PATTERN_BUFFERS.get()), (0, 0));
+}
+
+#[test]
+fn verification_checks_length_and_partial_pattern_blocks() {
+    let id = uuid::Uuid::from_bytes([0x71; 16]);
+    let offset = 512;
+    let generation = 9;
+    for size in [0, 1, 31, 32, 33, 65] {
+        let mut data = data_for(id, offset, generation, size);
+        assert!(matches_data(&data, id, offset, generation, size));
+        assert!(!matches_data(&data, id, offset, generation, size + 1));
+        if let Some(last) = data.last_mut() {
+            *last ^= 1;
+            assert!(!matches_data(&data, id, offset, generation, size));
+        }
+    }
+    let data = data_for(id, offset, generation, 65);
+    assert!(!matches_data(&data, id, offset, generation, 64));
+    assert!(!matches_data(&data, id, offset + 1, generation, 65));
+    assert!(!matches_data(&data, id, offset, generation + 1, 65));
+    assert!(!matches_data(
+        &data,
+        uuid::Uuid::nil(),
+        offset,
+        generation,
+        65
+    ));
 }

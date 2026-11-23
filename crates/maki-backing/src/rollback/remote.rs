@@ -8,7 +8,7 @@ use crate::remote_witness::{
 use crate::witness::Anchor;
 
 use super::enrollment::Enrollment;
-use super::gc::{namespace_fence, GcReport, OperationGuard, TOMBSTONE};
+use super::gc::{namespace_fence, GcReport, OperationGuard, OPERATION_LOCK, TOMBSTONE};
 
 const REMOTE_MAGIC: &[u8] = b"MAKI-REMOTE-WITNESS-COW-V2\n";
 
@@ -211,6 +211,16 @@ impl Backing for Scope {
 }
 
 fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
+    open_root(root, create, false)
+}
+
+/// The snapshot root a restore copies from, through a read-only view: a
+/// restore only reads it, so it may be kept where nothing can change it.
+fn backup_root(root: &Path) -> io::Result<Arc<FileBacking>> {
+    open_root(root, false, true)
+}
+
+fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileBacking>> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -220,7 +230,11 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
     if !create && !root.is_dir() {
         return Err(missing());
     }
-    let disk = Arc::new(FileBacking::new(root)?);
+    let disk = Arc::new(if read_only {
+        FileBacking::read_only(root)?
+    } else {
+        FileBacking::new(root)?
+    });
     if !create {
         let marker = disk.open(MARKER, false)?;
         let mut bytes = vec![0; REMOTE_MAGIC.len()];
@@ -235,16 +249,20 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
     Ok(disk)
 }
 
-/// Called with both root operation and enrollment locks held.
-fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
-    if disk.list("")?.iter().any(|name| {
-        !matches!(
-            name.as_str(),
-            "remote.enroll.lock" | "remote.operation.lock"
-        )
-    }) {
+fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
+    if disk
+        .list("")?
+        .iter()
+        .any(|name| !matches!(name.as_str(), super::ENROLL_LOCK | OPERATION_LOCK))
+    {
         return Err(input("remote enrollment requires an empty backing"));
     }
+    Ok(())
+}
+
+/// Called with both root operation and enrollment locks held.
+fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+    require_empty_remote_root(disk)?;
     let marker = disk.open(MARKER, true)?;
     marker.write_at(0, REMOTE_MAGIC)?;
     marker.set_len(REMOTE_MAGIC.len() as u64)?;
@@ -503,7 +521,7 @@ impl RollbackBacking {
         }
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
             return Err(invalid("enrollment approval is stale"));
         }
@@ -545,7 +563,7 @@ impl RollbackBacking {
         }
         let disk = remote_root(root, true)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         initialize_remote_root(disk.as_ref())?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
@@ -633,7 +651,7 @@ impl RollbackBacking {
         disk.create_dir_all(&name)?;
         disk.sync_dir("")?;
         let target = scope(disk.clone(), &name)?;
-        let disk_lock = target.try_lock("rollback.lock")?;
+        let disk_lock = target.try_lock(super::LOCK)?;
         let bytes = manifest.encode()?;
         let arena = copy_generation(source.as_deref(), target.as_ref(), &manifest, &bytes)?;
         disk.sync_dir("")?;
@@ -691,8 +709,13 @@ impl RollbackBacking {
         expected.validate()?;
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
-        let backup = remote_root(source_root, false)?;
-        let _source_guard = OperationGuard::acquire(backup.as_ref())?;
+        // Every operation that changes a root holds its operation lock
+        // exclusively, so sharing it keeps them all off the source while it
+        // is read, as an exclusive lock did, without needing write access to
+        // the snapshot. Everything read from it is authenticated against the
+        // approved descriptor before it is used.
+        let backup = backup_root(source_root)?;
+        let _source_lock = backup.try_lock_shared(OPERATION_LOCK)?;
         let source_disk = scope(backup.clone(), &source.namespace)?;
         let (mut manifest, _) = load_generation(source_disk.as_ref(), source)?;
         let current = expected
@@ -749,6 +772,17 @@ impl RollbackBacking {
         Ok(result)
     }
 
+    /// Refuse an occupied or unreadable destination before claiming a writer.
+    /// A missing directory is created by the copy, which rechecks emptiness
+    /// under the destination locks even if this preflight succeeded.
+    pub fn check_snapshot_destination(target: &Path) -> io::Result<()> {
+        match FileBacking::read_only(target) {
+            Ok(disk) => require_empty_remote_root(&disk),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Copy the committed state under the session mutex. The caller must keep
     /// the returned descriptor separately from the potentially rolled-back data.
     pub fn snapshot_remote(&self, target: &Path) -> io::Result<Descriptor> {
@@ -761,7 +795,7 @@ impl RollbackBacking {
         let _source_guard = OperationGuard::acquire(source_root.as_ref())?;
         let disk = remote_root(target, true)?;
         let _target_guard = OperationGuard::acquire(disk.as_ref())?;
-        let _enrollment = disk.try_lock("remote.enroll.lock")?;
+        let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         initialize_remote_root(disk.as_ref())?;
         disk.create_dir_all(&descriptor.namespace)?;
         disk.sync_dir("")?;
