@@ -229,9 +229,10 @@ changing it does not reload a running connection pool.
    the packaged production unit and its automatic recovery handler.
 
 Removing this private root from `ca_file` is not certificate revocation and
-does not remove the roots the transport trusts without it: the compiled-in
-public roots, the host's trust store, or both, depending on the
-[transport](configuration.md#providers). Qualify the deployment's actual chain,
+does not remove the roots every transport trusts without it: the compiled-in
+public roots and the host's trust store ([providers](configuration.md#providers)).
+A private root that is also installed in the host's trust store stays trusted
+until it is removed there too. Qualify the deployment's actual chain,
 DNS/IP names, proxy, trust policy, and rollback procedure separately. Retain
 old trust or certificates for rollback only when the security policy permits.
 

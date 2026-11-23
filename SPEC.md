@@ -983,6 +983,19 @@ For HTTP this is the `item_index_path` response mapping (required for batch
 layouts), for WebSocket the `unit` field of each response item, and for gRPC
 the `unit_index` field of `CryptoItem`.
 
+TLS trust: every remote transport verifies the server's certificate chain and
+the endpoint's host name, and all of them trust the same roots: the host's
+trust store (the system CA bundle, or the files `SSL_CERT_FILE` and
+`SSL_CERT_DIR` name when either is set, read best effort, so a certificate that
+does not parse is skipped), the public roots compiled into the binary, and the
+configured `ca_file`. A configured CA bundle adds to the other roots and MUST
+NOT replace them; every certificate in it MUST parse, and a bundle without one
+MUST be refused. The compiled-in roots keep the set from ever being empty, so an
+endpoint that none of the roots vouches for fails at the TLS handshake as an
+endpoint failure, not at provider construction. No setting disables
+certificate or host-name verification. The remote witness (§21) is not a crypto
+transport: it trusts only its configured CA.
+
 Retry safety: a provider whose capabilities do not declare `retry_safe` is
 sent each request at most once. No retry, failover, or transport-level resend
 happens after the request may have been sent. A request that the transport

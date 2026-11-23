@@ -6,7 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-maki-crypto.workspace = true
+# `tls-trust`: the roots every remote transport trusts.
+maki-crypto = { workspace = true, features = ["tls-trust"] }
 maki-crypto-local.workspace = true
 maki-format.workspace = true
 thiserror.workspace = true

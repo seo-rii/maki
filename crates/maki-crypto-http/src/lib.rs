@@ -44,6 +44,9 @@ mod request_tests;
 #[cfg(test)]
 mod sensitive_tests;
 
+#[cfg(test)]
+mod trust_tests;
+
 /// Bytes wiped when dropped: every copy of plaintext this crate makes on
 /// the way to and from the wire (third review, F09) — payload copies, the
 /// serialized request body, the response body, and decoded payloads.
@@ -458,7 +461,8 @@ impl std::fmt::Debug for OpSpec {
 
 #[derive(Clone, Default)]
 pub struct TlsSpec {
-    /// PEM CA bundle to trust (replaces nothing; added as a root).
+    /// PEM CA bundle (`ca_file`), added to the host's trust store and the
+    /// compiled-in public roots; it replaces neither.
     pub ca_pem: Option<Vec<u8>>,
     /// PEM client certificate + key for mTLS.
     pub identity_pem: Option<Vec<u8>>,
@@ -619,6 +623,106 @@ pub fn read_tls_file(
 
 fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
+}
+
+/// The roots this transport trusts: the host's trust store, the compiled-in
+/// public roots and the configured `ca_file`, the same for every remote
+/// transport (`maki_crypto::tls_trust`). Read once, when the provider is
+/// built.
+fn trusted_roots(tls: Option<&TlsSpec>) -> Result<rustls::RootCertStore, CryptoError> {
+    maki_crypto::tls_trust::trusted_roots(tls.and_then(|tls| tls.ca_pem.as_deref()))
+        .map_err(|error| fatal(error.to_string()))
+}
+
+/// The client's rustls configuration, as reqwest would build it apart from
+/// the roots: [`trusted_roots`]; the crypto provider an embedder installed
+/// for the process, else ring (never left for rustls to infer from crate
+/// features, which panics when both backends are linked); TLS 1.2 and 1.3;
+/// the client identity of `identity_pem`, if any; and ALPN `http/1.1`, the
+/// only protocol this reqwest build offers. Certificate and host-name
+/// verification are rustls's own; nothing here relaxes them.
+fn client_tls_config(tls: Option<&TlsSpec>) -> Result<rustls::ClientConfig, CryptoError> {
+    let roots = trusted_roots(tls)?;
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::ring::default_provider()));
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| fatal(format!("bad TLS protocol configuration: {e}")))?
+        .with_root_certificates(roots);
+    let mut config = match tls.and_then(|tls| tls.identity_pem.as_deref()) {
+        Some(pem) => {
+            let (certificates, key) = client_identity(pem)?;
+            builder
+                .with_client_auth_cert(certificates, key)
+                .map_err(|e| fatal(format!("bad client identity: {e}")))?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Split a combined client certificate/private-key PEM as reqwest's
+/// `Identity::from_pem` does: every certificate in order and the last
+/// PKCS #8, PKCS #1 or SEC1 private key; any other recognised PEM section is
+/// refused. A decoded key that rustls does not take is erased.
+fn client_identity(
+    pem: &[u8],
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    CryptoError,
+> {
+    use rustls::pki_types::pem::{PemObject as _, SectionKind};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    struct Key(Option<PrivateKeyDer<'static>>);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            if let Some(key) = &mut self.0 {
+                key.zeroize();
+            }
+        }
+    }
+
+    let mut certificates = Vec::new();
+    let mut key = Key(None);
+    for section in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
+        let (kind, mut der) =
+            section.map_err(|_| fatal("bad client identity: invalid identity PEM"))?;
+        let next = match kind {
+            SectionKind::Certificate => {
+                certificates.push(CertificateDer::from(der));
+                continue;
+            }
+            SectionKind::PrivateKey => PrivateKeyDer::Pkcs8(der.into()),
+            SectionKind::RsaPrivateKey => PrivateKeyDer::Pkcs1(der.into()),
+            SectionKind::EcPrivateKey => PrivateKeyDer::Sec1(der.into()),
+            _ => {
+                der.zeroize();
+                return Err(fatal(
+                    "bad client identity: a PEM section is neither a certificate nor a private key",
+                ));
+            }
+        };
+        if let Some(mut previous) = key.0.replace(next) {
+            previous.zeroize();
+        }
+    }
+    match (certificates.is_empty(), key.0.take()) {
+        (false, Some(private_key)) => Ok((certificates, private_key)),
+        (_, mut unused) => {
+            if let Some(unused) = &mut unused {
+                unused.zeroize();
+            }
+            Err(fatal(
+                "bad client identity: private key or certificate not found",
+            ))
+        }
+    }
 }
 
 /// Own header values while an operation specification is being assembled.
@@ -852,32 +956,16 @@ impl HttpCryptoProvider {
         // `http2` feature). A request that is not retry-safe is sent at most
         // once, and a connect failure proves the request unsent only while
         // no earlier copy of it can have gone out (SPEC §18).
-        let mut builder = reqwest::Client::builder()
+        // The TLS configuration is the provider's, not reqwest's: reqwest's
+        // own trusts only its compiled-in roots, never the host's store
+        // (`client_tls_config`).
+        let tls = client_tls_config(spec.tls.as_ref())?;
+        let client = reqwest::Client::builder()
             .timeout(spec.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
-            .use_rustls_tls();
-        if let Some(tls) = &spec.tls {
-            if let Some(ca) = &tls.ca_pem {
-                let certificates = reqwest::Certificate::from_pem_bundle(ca)
-                    .map_err(|e| fatal(format!("bad CA certificate: {e}")))?;
-                if certificates.is_empty() {
-                    return Err(fatal("custom TLS CA bundle contains no certificates"));
-                }
-                // Building the rustls client validates each DER certificate;
-                // a valid root must not hide an invalid member of the bundle.
-                for certificate in certificates {
-                    builder = builder.add_root_certificate(certificate);
-                }
-            }
-            if let Some(identity) = &tls.identity_pem {
-                let identity = reqwest::Identity::from_pem(identity)
-                    .map_err(|e| fatal(format!("bad client identity: {e}")))?;
-                builder = builder.identity(identity);
-            }
-        }
-        let client = builder
+            .use_preconfigured_tls(tls)
             .build()
             .map_err(|e| fatal(format!("http client build failed: {e}")))?;
         Ok(Self { client, spec })
