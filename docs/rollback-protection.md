@@ -233,7 +233,7 @@ witness_root = "/mnt/maki-witness/protected"
 capacity = "128MiB"
 ```
 
-Both directories must be empty for creation. Provision the independent witness
+Start from two empty directories. Provision the independent witness
 mount first, create both per-volume directories for the daemon user, and run
 the creation as that user, as for any volume
 ([volume lifecycle](operations.md#volume-lifecycle)). Add `--discard` for a v3
@@ -254,11 +254,15 @@ run before the first start. An existing raw or protected backing is refused;
 there is no implicit enrollment, in-place conversion or automatic witness
 recreation.
 
-Creation publishes the witness anchor last, and until then nothing can open
-the volume, so nothing was acknowledged. A creation that is killed, loses
-power or fails on its way (a full disk while it reserves the arena, for
-example) is completed by running `maki volume create` again, with nothing
-to remove by hand. The format marker and the anchor are each written under
+The outer creation publishes the witness anchor last, and until then
+nothing can open the volume, so nothing was acknowledged. A `maki volume
+create` that is killed, loses power or fails before it publishes the anchor
+(a full disk while it reserves the arena, for example) is completed by
+running it again, with nothing to remove by hand. Once the anchor is
+published, the command initializes the volume inside the backing; one that
+stops there is refused by a later `create`, which never writes over an
+anchor: if the volume was never attached, empty both directories and create
+it again. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
