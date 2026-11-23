@@ -54,6 +54,14 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Misuse with its reason: an option or argument the command cannot use,
+/// refused before anything is read or contacted. Status 2, like [`usage`];
+/// a command that fails exits 1 ([`fail`]).
+fn misuse(message: String) -> ExitCode {
+    diagnostic!("error: {message}");
+    ExitCode::from(2)
+}
+
 /// Write `text` to stdout and flush it.
 ///
 /// `println!` panics when the write fails, and the panic replaces the
@@ -248,7 +256,7 @@ fn main() -> ExitCode {
     }
     let timeout = match take_timeout(&mut args) {
         Ok(t) => t,
-        Err(e) => return fail(e),
+        Err(e) => return misuse(e),
     };
     // A leading --timeout can expose a helper verb. Route it before
     // interpreting the helper's NBD socket as a control socket.
@@ -260,7 +268,7 @@ fn main() -> ExitCode {
     }
     let socket = match take_socket(&mut args) {
         Ok(socket) => socket,
-        Err(e) => return fail(e),
+        Err(e) => return misuse(e),
     };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     if let Some(socket) = socket {
@@ -313,25 +321,38 @@ fn main() -> ExitCode {
             }
         }
         ["volume", verb, config, tail @ ..] => {
+            // A malformed approval is misuse, refused before the
+            // configuration is read.
             let command = match (*verb, tail) {
-                ("witness", []) => RemoteVolume::Witness,
-                ("gc", []) => RemoteVolume::Gc,
-                ("snapshot", [directory]) => RemoteVolume::Snapshot { directory },
+                ("witness", []) => Ok(RemoteVolume::Witness),
+                ("gc", []) => Ok(RemoteVolume::Gc),
+                ("snapshot", [directory]) => Ok(RemoteVolume::Snapshot { directory }),
                 ("resume-enrollment", [fence, identity] | [fence, identity, "--discard"]) => {
-                    RemoteVolume::ResumeEnrollment {
-                        fence,
-                        identity,
-                        discard: tail.len() == 3,
-                    }
+                    enrollment_approval(fence, identity).map(|(fence, identity)| {
+                        RemoteVolume::ResumeEnrollment {
+                            fence,
+                            identity,
+                            discard: tail.len() == 3,
+                        }
+                    })
                 }
-                ("takeover", [fence, root]) => RemoteVolume::Takeover { fence, root },
-                ("restore", [directory, fence, root, approved_source]) => RemoteVolume::Restore {
-                    directory,
-                    fence,
-                    root,
-                    approved_source,
-                },
+                ("takeover", [fence, root]) => {
+                    Approval::parse(fence, root).map(|approval| RemoteVolume::Takeover { approval })
+                }
+                ("restore", [directory, fence, root, approved_source]) => {
+                    Approval::parse(fence, root).and_then(|approval| {
+                        Ok(RemoteVolume::Restore {
+                            directory,
+                            approval,
+                            approved_source: approved_hash(approved_source)?,
+                        })
+                    })
+                }
                 _ => return usage(),
+            };
+            let command = match command {
+                Ok(command) => command,
+                Err(error) => return misuse(error),
             };
             let inspects = matches!(command, RemoteVolume::Witness);
             match remote_volume(config, command) {
@@ -467,9 +488,9 @@ fn control_by_socket(argv: &[&str], socket: String, timeout: Option<Duration>) -
             timeout.unwrap_or(CONTROL_TIMEOUT),
         ),
         ["status" | "metrics" | "checkpoint" | "drain" | "reload", ..] => {
-            fail("pass either a volume configuration or --socket <path>, not both".to_string())
+            misuse("pass either a volume configuration or --socket <path>, not both".to_string())
         }
-        _ => fail(
+        _ => misuse(
             "--socket applies only to the control commands (status, metrics, \
                    checkpoint, drain, reload)"
                 .to_string(),
@@ -483,35 +504,35 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
         if !matches!(*flag, "--max-bytes" | "--ttl") {
-            return fail(format!("reload cache: unknown option {flag:?}"));
+            return misuse(format!("reload cache: unknown option {flag:?}"));
         }
         let Some(value) = args.next() else {
-            return fail(format!("reload cache: {flag} needs a value"));
+            return misuse(format!("reload cache: {flag} needs a value"));
         };
         match *flag {
             "--max-bytes" => {
                 if max_bytes.is_some() {
-                    return fail("reload cache: duplicate --max-bytes".into());
+                    return misuse("reload cache: duplicate --max-bytes".into());
                 }
                 let Ok(value) = value.parse::<u64>() else {
-                    return fail(format!("--max-bytes: {value:?} is not an integer"));
+                    return misuse(format!("--max-bytes: {value:?} is not an integer"));
                 };
                 max_bytes = Some(value);
             }
             "--ttl" => {
                 if ttl.is_some() {
-                    return fail("reload cache: duplicate --ttl".into());
+                    return misuse("reload cache: duplicate --ttl".into());
                 }
                 match value.parse::<maki_format::config::MakiDuration>() {
                     Ok(duration) if !duration.0.is_zero() => ttl = Some(*value),
-                    _ => return fail(format!("--ttl: {value:?} is not a positive duration")),
+                    _ => return misuse(format!("--ttl: {value:?} is not a positive duration")),
                 }
             }
             _ => unreachable!(),
         }
     }
     let Some(max_bytes) = max_bytes else {
-        return fail("reload cache needs the new size: maki reload <config> cache --max-bytes <bytes> [--ttl <duration>]".into());
+        return misuse("reload cache needs the new size: maki reload <config> cache --max-bytes <bytes> [--ttl <duration>]".into());
     };
     let mut payload = serde_json::json!({ "max_bytes": max_bytes });
     if let Some(ttl) = ttl {
@@ -636,18 +657,45 @@ fn approved_hash(text: &str) -> Result<[u8; 32], String> {
     Ok(hash)
 }
 
+/// The fence and current root an administrator approved for a takeover or
+/// a restore.
+struct Approval {
+    fence: u64,
+    root: [u8; 32],
+}
+
+impl Approval {
+    fn parse(fence: &str, root: &str) -> Result<Self, String> {
+        Ok(Self {
+            fence: fence
+                .parse()
+                .map_err(|_| "expected fence must be an unsigned integer")?,
+            root: approved_hash(root)?,
+        })
+    }
+}
+
+/// The fence and storage identity of the never-activated authority that
+/// `resume-enrollment` is approved for.
+fn enrollment_approval(fence: &str, identity: &str) -> Result<(u64, uuid::Uuid), String> {
+    let fence = fence
+        .parse()
+        .map_err(|_| "approved fence must be an unsigned integer")?;
+    let identity =
+        uuid::Uuid::parse_str(identity).map_err(|_| "approved storage identity must be a UUID")?;
+    if identity.is_nil() {
+        return Err("approved storage identity must be nonzero".into());
+    }
+    Ok((fence, identity))
+}
+
 fn approved_record(
     rpc: &dyn maki_backing::remote_witness::Rpc,
-    fence: &str,
-    root: &str,
+    approval: &Approval,
 ) -> Result<maki_backing::remote_witness::Record, String> {
-    let fence: u64 = fence
-        .parse()
-        .map_err(|_| "expected fence must be an unsigned integer")?;
-    let root = approved_hash(root)?;
     let record = witness_record(rpc)?;
-    if record.fence != fence
-        || record.current.as_ref().map(|current| current.anchor.root) != Some(root)
+    if record.fence != approval.fence
+        || record.current.as_ref().map(|current| current.anchor.root) != Some(approval.root)
     {
         return Err("authority changed or approval does not match its current fence/root; inspect and obtain a new approval".into());
     }
@@ -716,18 +764,16 @@ enum RemoteVolume<'a> {
         directory: &'a str,
     },
     Takeover {
-        fence: &'a str,
-        root: &'a str,
+        approval: Approval,
     },
     Restore {
         directory: &'a str,
-        fence: &'a str,
-        root: &'a str,
-        approved_source: &'a str,
+        approval: Approval,
+        approved_source: [u8; 32],
     },
     ResumeEnrollment {
-        fence: &'a str,
-        identity: &'a str,
+        fence: u64,
+        identity: uuid::Uuid,
         discard: bool,
     },
 }
@@ -774,14 +820,6 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, Stri
             identity,
             discard,
         } => {
-            let fence: u64 = fence
-                .parse()
-                .map_err(|_| "approved fence must be an unsigned integer")?;
-            let identity = uuid::Uuid::parse_str(identity)
-                .map_err(|_| "approved storage identity must be a UUID")?;
-            if identity.is_nil() {
-                return Err("approved storage identity must be nonzero".into());
-            }
             // Initialization records the provider in the new superblock.
             // Refuse one this build cannot construct before asking the
             // authority anything (M-008).
@@ -837,8 +875,8 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, Stri
             }
             serde_json::to_string(&descriptor).map_err(|e| e.to_string())?
         }
-        RemoteVolume::Takeover { fence, root } => {
-            let before = approved_record(rpc.as_ref(), fence, root)?;
+        RemoteVolume::Takeover { approval } => {
+            let before = approved_record(rpc.as_ref(), &approval)?;
             let backing = RollbackBacking::takeover_remote(
                 Path::new(&cfg.backing.root),
                 rpc.clone(),
@@ -851,16 +889,14 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, Stri
         }
         RemoteVolume::Restore {
             directory,
-            fence,
-            root,
+            approval,
             approved_source,
         } => {
-            let approved_source = approved_hash(approved_source)?;
             let source = read_snapshot(Path::new(directory))?;
             if source.anchor.root != approved_source {
                 return Err("snapshot root does not match the independently approved root".into());
             }
-            let before = approved_record(rpc.as_ref(), fence, root)?;
+            let before = approved_record(rpc.as_ref(), &approval)?;
             let backing = RollbackBacking::restore_remote(
                 Path::new(&cfg.backing.root),
                 Path::new(directory),

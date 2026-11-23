@@ -15,6 +15,10 @@
 //! tens of thousands of units evicts on every insert, and a linear scan
 //! there would turn the hot read path quadratic.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

@@ -4,6 +4,10 @@
 //! single client call never retries. Identity-pinned endpoint sets retry the
 //! same operation after transport failures, resolving possible durable commits.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod failover;
 
 pub mod etcd;

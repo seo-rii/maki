@@ -374,9 +374,13 @@ fn the_failed_start_rollback_queues_for_the_attach_lock_only_with_an_intent() {
     let started = Instant::now();
 
     // A complete attachment, then no record at all: not this path's.
-    assert!(!finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    assert!(
+        !finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
     state.remove("pg").unwrap();
-    assert!(!finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    assert!(
+        !finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(system.fake.steps.is_empty());
 
@@ -391,7 +395,8 @@ fn the_failed_start_rollback_queues_for_the_attach_lock_only_with_an_intent() {
     let busy = state.lock().unwrap();
     let started = Instant::now();
     let soon = started + Duration::from_millis(150);
-    let error = finish_interrupted_activation_by(&plan, &state, &mut system, soon).unwrap_err();
+    let error =
+        finish_interrupted_activation_by(&plan, &state, &mut system, soon, COMMANDS).unwrap_err();
     assert!(
         matches!(&error, ExecError::Io(error) if error.kind() == io::ErrorKind::TimedOut),
         "{error}"
@@ -401,9 +406,59 @@ fn the_failed_start_rollback_queues_for_the_attach_lock_only_with_an_intent() {
     assert_eq!(state.read("pg").unwrap(), Some(record));
 
     drop(busy);
-    assert!(finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    assert!(
+        finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
     assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
     assert!(state.read("pg").unwrap().is_none());
+}
+
+/// The command budget the failed-start tests give the rollback.
+const COMMANDS: Duration = Duration::from_secs(20);
+
+/// The lock wait and the rollback's commands have separate budgets: the
+/// commands' time starts once the lock is held. With one deadline for both,
+/// a lock granted late in its wait (the helpers queued ahead of the hook
+/// took their time) left the scoped deactivation too little or nothing.
+#[test]
+fn the_failed_start_rollback_has_its_command_budget_once_it_holds_the_lock() {
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.command_limits.clear();
+    let lock_deadline = Instant::now() + Duration::from_secs(60);
+    let busy = state.lock().unwrap();
+    let (released, result) = std::thread::scope(|scope| {
+        let rollback = scope.spawn(|| {
+            finish_interrupted_activation_by(&plan, &state, &mut system, lock_deadline, COMMANDS)
+        });
+        let started = Instant::now();
+        while state.lock_waiters() == 0 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let released = Instant::now();
+        drop(busy);
+        (released, rollback.join().unwrap())
+    });
+    let finished = Instant::now();
+    assert!(result.unwrap());
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    for limit in &system.fake.command_limits {
+        let limit = limit.expect("every rollback command runs under the hook's limit");
+        assert!(
+            limit >= released + COMMANDS,
+            "the command budget was counted from before the lock was granted"
+        );
+        assert!(
+            limit <= finished + COMMANDS,
+            "the commands may run past their budget from the lock: {:?} too late",
+            limit - (finished + COMMANDS)
+        );
+    }
 }
 
 #[test]

@@ -124,7 +124,10 @@ fn setup(partitioned: bool) -> (Fixture, TrustedState, Plan, BoundDeviceRecord, 
         ("nbd3/dev", "43:96"),
         ("dm-0/dev", "253:0"),
         ("dm-0/dm/name", "vg_maki_pg-data"),
-        ("dm-0/dm/uuid", "LVM-fixture"),
+        (
+            "dm-0/dm/uuid",
+            "LVM-aaaaaabbbbccccddddeeeeffffgggggghhhhhhiiiijjjjkkkkllllmmmmnnnnnn",
+        ),
     ] {
         std::fs::write(root.join(path), content).unwrap();
     }

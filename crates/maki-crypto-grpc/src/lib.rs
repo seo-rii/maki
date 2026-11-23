@@ -17,6 +17,10 @@
 //! The provider's private wire items erase their owned data on drop and field
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +31,7 @@ use async_trait::async_trait;
 use prost::Message as _;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::metadata::{MetadataKey, MetadataValue};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::transport::{Channel, ClientTlsConfig, Identity};
 use zeroize::Zeroize;
 
 use maki_crypto::{
@@ -677,8 +681,10 @@ impl std::fmt::Debug for GrpcClientIdentity {
     }
 }
 
-/// Verified TLS configuration. Native platform roots remain enabled when a
-/// custom CA is supplied; the custom CA augments rather than replaces them.
+/// Verified TLS configuration. The server is verified against the roots
+/// every remote transport trusts: the host's trust store, the compiled-in
+/// public roots and `ca_certificate_pem`, which adds to them and replaces
+/// neither.
 #[derive(Clone, Default)]
 pub struct GrpcTlsConfig {
     pub ca_certificate_pem: Option<Vec<u8>>,
@@ -729,6 +735,14 @@ fn fatal(msg: impl Into<String>) -> CryptoError {
     CryptoError::ProviderFatal(msg.into())
 }
 
+/// The roots this transport trusts: the host's trust store, the compiled-in
+/// public roots and the configured CA, the same for every remote transport
+/// (`maki_crypto::tls_trust`). Read once, when the provider is built.
+fn trusted_roots(tls: &GrpcTlsConfig) -> Result<rustls::RootCertStore, CryptoError> {
+    maki_crypto::tls_trust::trusted_roots(tls.ca_certificate_pem.as_deref())
+        .map_err(|error| fatal(error.to_string()))
+}
+
 /// A URI host without the brackets that enclose an IPv6 literal.
 fn unbracketed(host: &str) -> &str {
     host.strip_prefix('[')
@@ -777,15 +791,14 @@ impl GrpcCryptoProvider {
                 return Err(fatal("https endpoint requires explicit TLS configuration"));
             }
             (Some("https"), Some(tls)) => {
-                // A configured CA adds trust to the host's roots, as for the
-                // HTTP and WebSocket transports. tonic refuses to build the
-                // connector when native roots are requested and none load, so
-                // on a host with an empty OS store the CA in hand was useless
-                // (BUG-097): request native roots only if there are any, or if
-                // no CA is configured (then nothing is trusted and attach
-                // fails closed, as before).
-                let native_roots = tls.ca_certificate_pem.is_none()
-                    || !rustls_native_certs::load_native_certs().certs.is_empty();
+                // tonic gets the roots as trust anchors. Its own native-root
+                // loader refuses an empty host store, which made a configured
+                // CA useless on such a host (BUG-097), and its webpki feature
+                // pulls a second webpki-roots line. The compiled-in roots
+                // make the set non-empty, so the provider is built whatever
+                // the host's store holds, and an endpoint none of the roots
+                // vouches for is refused at the handshake (EndpointFatal).
+                let roots = trusted_roots(&tls)?;
                 // Left unset, tonic takes the TLS server name from the URI
                 // host, which keeps an IPv6 literal's brackets ("[::1]"):
                 // neither a DNS name nor an IP address to rustls, so such an
@@ -799,30 +812,9 @@ impl GrpcCryptoProvider {
                     .map(unbracketed)
                     .ok_or_else(|| fatal("gRPC endpoint URL has no host"))?
                     .to_owned();
-                let mut config = ClientTlsConfig::new().domain_name(server_name);
-                if native_roots {
-                    config = config.with_native_roots();
-                }
-                if let Some(ca) = tls.ca_certificate_pem {
-                    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
-                    // Tonic silently skips unparsable DER certificates and
-                    // accepts a PEM file with no certificates. Validate every
-                    // configured root before preserving its additive policy.
-                    let mut roots = rustls::RootCertStore::empty();
-                    for certificate in
-                        CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(&ca))
-                    {
-                        let certificate = certificate
-                            .map_err(|_| fatal("invalid custom TLS CA certificate encoding"))?;
-                        roots
-                            .add(certificate)
-                            .map_err(|_| fatal("invalid custom TLS CA certificate"))?;
-                    }
-                    if roots.is_empty() {
-                        return Err(fatal("custom TLS CA bundle contains no certificates"));
-                    }
-                    config = config.ca_certificate(Certificate::from_pem(ca));
-                }
+                let mut config = ClientTlsConfig::new()
+                    .domain_name(server_name)
+                    .trust_anchors(roots.roots);
                 if let Some(identity) = tls.client_identity {
                     if identity.certificate_pem.is_empty() || identity.private_key_pem.is_empty() {
                         return Err(fatal(

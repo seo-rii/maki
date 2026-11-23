@@ -407,9 +407,12 @@ task, release its socket, and fail its pending requests without disturbing a
 successor connection.
 
 All remote transports support verified TLS and optional client certificate
-authentication. WSS and gRPC configuration resolves client keys through the
-same credential router as HTTP. Explicit TLS settings cannot be applied to a
-plaintext endpoint, and certificate failures never downgrade the connection.
+authentication. They trust one set of roots, built by `maki_crypto::tls_trust`:
+the host's trust store, the public roots compiled into the binary and the
+configured `ca_file` ([configuration](configuration.md#providers)). WSS and
+gRPC configuration resolves client keys through the same credential router as
+HTTP. Explicit TLS settings cannot be applied to a plaintext endpoint, and
+certificate failures never downgrade the connection.
 
 Provider errors are classified as throttled, retryable, endpoint-fatal,
 request-fatal, or provider-fatal. Only eligible failures enter bounded full-
