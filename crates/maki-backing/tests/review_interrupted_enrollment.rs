@@ -7,6 +7,13 @@
 //! marker that was created and never written is neither kind, and both
 //! commands refused it.
 //!
+//! `maki-witness init` has the same shape on the authority's side: an
+//! initialization that is cut or fails before its first record is published
+//! must be one the operator can simply run again. What it must never do is
+//! stand in for an enrolled authority: an empty `remote.state`, which is
+//! what a truncated state file of an enrolled authority looks like, is
+//! refused by `init` and by `serve`, and left as it is.
+//!
 //! The interrupted commands run in child processes: one is killed by a
 //! seccomp filter at its first file write, the other has every file write
 //! refused by a zero file-size limit.
@@ -18,7 +25,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use maki_backing::remote_witness::{
-    namespace, Action, CanonicalState, Phase, Record, Request, Role, Rpc,
+    namespace, Action, CanonicalState, Phase, Record, Request, Role, Rpc, SessionAuthorization,
+    StateStore,
 };
 use maki_backing::{Backing, RollbackBacking};
 
@@ -180,6 +188,7 @@ fn step(step: &str, path: &Path) -> ! {
     }
     let outcome = match command {
         "create" => RollbackBacking::create_remote(path, authority().0, CAPACITY).map(drop),
+        "init" => StateStore::create(path, IDENTITY).map(drop),
         other => panic!("unknown command {other}"),
     };
     eprintln!("{command}: {outcome:?}");
@@ -516,4 +525,201 @@ fn snapshot_reuses_a_target_whose_marker_was_never_written() {
         MARKER
     );
     assert!(target.join(&descriptor.namespace).is_dir());
+}
+
+fn inspect_store(store: &mut StateStore) -> Record {
+    store
+        .handle(
+            Role::Admin,
+            &Request {
+                operation_id: [0; 16],
+                expected: None,
+                action: Action::Inspect,
+                authorization: None,
+            },
+        )
+        .unwrap()
+}
+
+/// Run `maki-witness init` again after an interrupted one and serve the
+/// result: the initial record of the identity, exactly once.
+fn init_again_and_serve(state: &Path, left: &[String]) {
+    let again = StateStore::create(state, IDENTITY).map(drop);
+    let served = StateStore::open(state);
+    assert!(
+        again.is_ok() && served.is_ok(),
+        "an interrupted init is stranded with {left:?}: init: {:?}; serve: {:?}",
+        again.err().map(|error| error.to_string()),
+        served.err().map(|error| error.to_string())
+    );
+    let record = inspect_store(&mut served.unwrap());
+    assert_eq!(
+        (record.identity, record.fence, record.phase),
+        (IDENTITY, 0, Phase::Released)
+    );
+    assert!(record.current.is_none());
+    assert_eq!(
+        StateStore::create(state, IDENTITY).err().unwrap().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+}
+
+#[test]
+fn witness_init_killed_before_its_state_is_written_can_be_run_again() {
+    use std::os::unix::process::ExitStatusExt;
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("authority");
+    let Some(killed) = interrupted(
+        "witness_init_killed_before_its_state_is_written_can_be_run_again",
+        "init killed",
+        &state,
+    ) else {
+        return;
+    };
+    assert_eq!(killed.status.signal(), Some(libc::SIGSYS), "{killed:?}");
+    let left = entries(&state);
+    assert!(left.iter().any(|name| name == "remote.lock"), "{left:?}");
+    init_again_and_serve(&state, &left);
+}
+
+#[test]
+fn witness_init_whose_state_write_failed_can_be_run_again() {
+    child();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("authority");
+    let Some(failed) = interrupted(
+        "witness_init_whose_state_write_failed_can_be_run_again",
+        "init refused",
+        &state,
+    ) else {
+        return;
+    };
+    assert_eq!(failed.status.code(), Some(FAILED), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("File too large"),
+        "the state write must have failed: {failed:?}"
+    );
+    let left = entries(&state);
+    init_again_and_serve(&state, &left);
+}
+
+/// An empty `remote.state` can be an initialization that stopped after
+/// creating the file (releases that created it before writing it) or an
+/// enrolled authority whose state was truncated. The two cannot be told
+/// apart, so neither command replaces it: both name the two causes and the
+/// only safe way out, and the directory stays as it was.
+#[test]
+fn an_empty_witness_state_is_refused_with_its_causes_and_the_way_out() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(StateStore::create(dir.path(), IDENTITY).unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(dir.path().join("remote.state"))
+        .unwrap();
+    let before = entries(dir.path());
+    let refused = [
+        (
+            "init",
+            StateStore::create(dir.path(), IDENTITY).map(drop),
+            io::ErrorKind::AlreadyExists,
+        ),
+        (
+            "serve",
+            StateStore::open(dir.path()).map(drop),
+            io::ErrorKind::InvalidData,
+        ),
+    ];
+    for (command, outcome, kind) in refused {
+        let error = outcome
+            .err()
+            .unwrap_or_else(|| panic!("{command} accepted it"));
+        assert_eq!(error.kind(), kind, "{command}: {error}");
+        let text = error.to_string();
+        assert!(
+            text.contains("remote.state is empty")
+                && text.contains("did not complete")
+                && text.contains("lost its state")
+                && text.contains("never been served")
+                && text.contains("remove remote.state"),
+            "{command}: {text}"
+        );
+    }
+    assert_eq!(entries(dir.path()), before);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("remote.state"))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// The safety side of the same state: an authority that has accepted a
+/// claim and whose state file is then truncated is never initialized again
+/// by rerunning `init`, which would reset its fence to zero.
+#[test]
+fn control_an_enrolled_authority_whose_state_was_truncated_is_never_initialized_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = StateStore::create(dir.path(), IDENTITY).unwrap();
+    let expected = inspect_store(&mut store);
+    let claimed = store
+        .handle(
+            Role::Writer,
+            &Request {
+                operation_id: [1; 16],
+                expected: Some(expected),
+                action: Action::Claim,
+                authorization: Some(SessionAuthorization::from_bytes([9; 32])),
+            },
+        )
+        .unwrap();
+    assert_eq!(claimed.fence, 1);
+    drop(store);
+    let state = dir.path().join("remote.state");
+    let published = std::fs::read(&state).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&state)
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            StateStore::create(dir.path(), IDENTITY)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(StateStore::open(dir.path()).is_err());
+        assert_eq!(std::fs::metadata(&state).unwrap().len(), 0);
+    }
+    // Only the authority's own bytes bring it back, at its own fence.
+    std::fs::write(&state, &published).unwrap();
+    assert_eq!(
+        inspect_store(&mut StateStore::open(dir.path()).unwrap()),
+        claimed
+    );
+}
+
+/// `remote.next` is never state. Whatever a failed or killed initialization
+/// left there, the next one writes its own record over it.
+#[test]
+fn control_init_writes_over_a_staged_state_left_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    for staged in [&[][..], b"MAKIRW02 and then not a record at all"] {
+        let dir = tempfile::tempdir().unwrap();
+        let next = dir.path().join("remote.next");
+        std::fs::write(&next, staged).unwrap();
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(StateStore::open(dir.path()).is_err());
+        let mut store = StateStore::create(dir.path(), IDENTITY).unwrap();
+        assert_eq!(inspect_store(&mut store).fence, 0);
+        drop(store);
+        assert!(!next.exists());
+        assert_eq!(
+            inspect_store(&mut StateStore::open(dir.path()).unwrap()).identity,
+            IDENTITY
+        );
+    }
 }

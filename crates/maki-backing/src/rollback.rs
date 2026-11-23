@@ -25,7 +25,7 @@ pub mod gc;
 mod local_load_tests;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
-mod review_restore;
+pub(crate) mod review_restore;
 use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};
 use remote::Witness;
 

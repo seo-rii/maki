@@ -868,6 +868,10 @@ fn commit(backing: &dyn Backing) -> io::Result<()> {
     backing.sync_dir("")
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "remote_witness_init_tests.rs"]
+mod init_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
