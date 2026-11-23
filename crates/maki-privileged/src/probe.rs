@@ -102,9 +102,66 @@ pub(crate) fn mountinfo_lines(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// Split a record at its first ` - `: mount fields (including the
 /// optional ones) before it, filesystem fields after it. Paths cannot
 /// contain the separator because their spaces are escaped.
-pub(crate) fn split_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
+fn split_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let at = line.windows(3).position(|window| window == b" - ")?;
     Some((&line[..at], &line[at + 3..]))
+}
+
+/// One mountinfo record's fields, still escaped, at the positions Linux's
+/// `show_mountinfo` writes them: `id parent major:minor root mountpoint
+/// options [optional...] - fstype source superopts`.
+pub(crate) struct MountRecord<'a> {
+    /// The mounted filesystem's `major:minor` (field 3).
+    pub(crate) device: &'a [u8],
+    /// The mount's root within its filesystem (field 4).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) root: &'a [u8],
+    pub(crate) mountpoint: &'a [u8],
+    /// The per-mount options (field 6).
+    pub(crate) options: &'a [u8],
+    pub(crate) fstype: &'a [u8],
+    /// Empty when the source string given to mount(2) was empty.
+    pub(crate) source: &'a [u8],
+    /// The superblock options, up to the end of the record.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) super_options: &'a [u8],
+}
+
+/// Split a record into its fields by position. One ASCII space separates
+/// fields: Linux escapes the spaces inside paths, the type and the source
+/// (`\040`; tabs, newlines and backslashes too in paths) and keeps other
+/// bytes (Unicode whitespace, carriage return, form-feed, bytes that are
+/// not UTF-8) as field data. No field before the separator is ever empty: they are
+/// numbers, paths (at least `/`), option lists and tags. After it come
+/// exactly the type, the source and the superblock options (`rw` or `ro`
+/// first). Only the source can be empty, when the string given to mount(2)
+/// was (`mount -t tmpfs '' /dir`), and that is the one way the kernel
+/// writes two consecutive spaces (`- tmpfs  rw`). Any other record is not
+/// one the kernel wrote, and is `None`.
+pub(crate) fn mount_record(line: &[u8]) -> Option<MountRecord<'_>> {
+    let (mount, filesystem) = split_record(line)?;
+    let mut fields = mount.split(|&byte| byte == b' ');
+    if fields.clone().any(<[u8]>::is_empty) {
+        return None;
+    }
+    // id parent major:minor root mountpoint options [optional...]
+    let (device, root) = (fields.nth(2)?, fields.next()?);
+    let (mountpoint, options) = (fields.next()?, fields.next()?);
+    let mut fields = filesystem.splitn(3, |&byte| byte == b' ');
+    let (fstype, source) = (fields.next()?, fields.next()?);
+    let super_options = fields.next()?;
+    if fstype.is_empty() || super_options.is_empty() {
+        return None;
+    }
+    Some(MountRecord {
+        device,
+        root,
+        mountpoint,
+        options,
+        fstype,
+        source,
+        super_options,
+    })
 }
 
 /// Decode the octal escapes mountinfo uses (`\040` for a space, ...) into
@@ -122,15 +179,6 @@ pub(crate) fn unescape(field: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
-}
-
-/// Mountinfo fields are separated by ASCII spaces. Linux escapes spaces,
-/// tabs, newlines and backslashes inside paths, but preserves other whitespace
-/// (including Unicode, carriage return and form-feed) as part of the field.
-pub(crate) fn mountinfo_fields(record: &[u8]) -> impl Iterator<Item = &[u8]> {
-    record
-        .split(|&byte| byte == b' ')
-        .filter(|field| !field.is_empty())
 }
 
 /// The comma-separated options of a per-mount or superblock options field.
@@ -151,26 +199,17 @@ fn lossy(field: &[u8]) -> String {
 pub fn parse_mountinfo(text: &(impl AsRef<[u8]> + ?Sized), mountpoint: &str) -> Option<MountEntry> {
     let mut found = None;
     for line in mountinfo_lines(text.as_ref()) {
-        // id parent major:minor root mountpoint options [optional...] - fstype source superopts
-        let Some((left, right)) = split_record(line) else {
+        let Some(record) = mount_record(line) else {
             continue;
         };
-        let left: Vec<&[u8]> = mountinfo_fields(left).collect();
-        if left.len() < 6 {
-            continue;
-        }
-        if unescape(left[4]) != mountpoint.as_bytes() {
-            continue;
-        }
-        let right: Vec<&[u8]> = mountinfo_fields(right).collect();
-        if right.len() < 2 {
+        if unescape(record.mountpoint) != mountpoint.as_bytes() {
             continue;
         }
         found = Some(MountEntry {
-            fstype: lossy(right[0]),
-            source: lossy(&unescape(right[1])),
-            major_minor: lossy(left[2]),
-            mount_options: mount_options(left[5]).map(lossy).collect(),
+            fstype: lossy(record.fstype),
+            source: lossy(&unescape(record.source)),
+            major_minor: lossy(record.device),
+            mount_options: mount_options(record.options).map(lossy).collect(),
         });
     }
     found

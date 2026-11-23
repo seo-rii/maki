@@ -306,3 +306,48 @@ fn non_utf8_mount_records_are_compared_as_exact_bytes() {
     let observed = observe(&fixture.record, &lookalike, &sys).unwrap();
     assert!(!observed.mounted && !observed.nested);
 }
+
+/// Linux prints a mount whose source string is empty (`mount -t tmpfs ''
+/// /dir`) as an empty field: `- tmpfs  rw,...`. One such mount anywhere in
+/// the namespace is ordinary state, and the fields after it keep their
+/// meaning.
+#[test]
+fn empty_mount_sources_keep_detach_observation_exact() {
+    let fixture = Fixture::new();
+    let mountpoint = fixture.record.attachment.mountpoint.clone();
+    let unrelated = "41 25 0:41 / /run/empty rw,relatime - tmpfs  rw,mode=755\n";
+    let observed = fixture.observe(unrelated).unwrap();
+    assert!(!observed.mounted && !observed.nested && !observed.nbd_in_use);
+    let below = format!("41 25 0:41 / {mountpoint}/wal rw - tmpfs  rw\n");
+    assert!(fixture.observe(&below).unwrap().nested);
+
+    // The volume is identified by device number, root and type; an empty
+    // source does not change that, and its super options are still read.
+    fixture.mapping("vg--maki-data--lv", "nbd3");
+    let volume = format!("40 25 253:0 / {mountpoint} rw - xfs  rw\n");
+    let observed = fixture.observe(&format!("{unrelated}{volume}")).unwrap();
+    assert!(observed.mounted && observed.writable && !observed.nested);
+    let read_only = format!("40 25 253:0 / {mountpoint} rw - xfs  ro\n");
+    let observed = fixture.observe(&read_only).unwrap();
+    assert!(observed.mounted && !observed.writable);
+}
+
+/// Only the source field of a record can be empty. A record with any other
+/// empty field could shift the mountpoint and hide a mount, so it fails the
+/// observation, like a record without all three filesystem fields.
+#[test]
+fn records_with_other_empty_fields_fail_the_observation() {
+    let fixture = Fixture::new();
+    let mountpoint = &fixture.record.attachment.mountpoint;
+    for mounts in [
+        format!("41 25 253:9 /  {mountpoint} rw - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}  rw - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw  - xfs /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw -  /dev/x rw\n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs /dev/x \n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs  \n"),
+        format!("41 25 253:9 / {mountpoint}2 rw - xfs /dev/x\n"),
+    ] {
+        assert!(fixture.observe(&mounts).is_err(), "{mounts:?}");
+    }
+}
