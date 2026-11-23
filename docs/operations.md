@@ -678,6 +678,21 @@ deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check.
 
+Detach, cleanup, recover and grow address the VG only where attach found it.
+`vgchange --activate n` and `lvextend` run with the record's candidate PVs as
+`--devices` (the NBD device and its partitions, as attach recorded them), and
+the deactivation also selects the record's VG UUID; `lvextend` has no
+selection, and with `--devices` it looks for the VG name only on those
+devices. The record holds them in its mapping proof or pre-activation intent,
+and the VG UUID in its administrator pins; a record from before both is held
+to its NBD device. A VG of the same name on another disk (a second disk, a
+cloned image) is therefore never extended or deactivated, and because
+`--devices` replaces the host's own LVM device scan, a devices file or filter
+that leaves `/dev/nbd*` out does not stop detach or grow either. The
+deactivation still names the VG: when LVM cannot read it, as after the daemon
+stopped serving, the command fails instead of succeeding without effect, and
+cleanup can continue with the fallback below.
+
 `maki-attach cleanup --volume <volume>` is the idempotent selector used by the
 packaged service lifecycle. Under the same single attach lock, no trusted
 record is already clean and succeeds without probing the backend. A matching

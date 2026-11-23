@@ -136,11 +136,14 @@ pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecE
 }
 
 fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError> {
+    let mut command = command::controlled(program);
+    command.args(args);
+    run_command(step, command)
+}
+
+fn run_command(step: &PlannedStep, mut command: std::process::Command) -> Result<(), ExecError> {
     tracing::info!("maki-attach: {step}");
-    let out = command::capture(
-        command::controlled(program).args(args),
-        command::Policy::STEP,
-    )?;
+    let out = command::capture(&mut command, command::Policy::STEP)?;
     if !out.status.success() {
         return Err(ExecError::StepFailed {
             step: step.to_string(),
@@ -669,7 +672,12 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         PlannedStep::LvmActivate { .. } => Err(identity_error(
             "LVM activation requires a connected record and verified preflight",
         )),
-        PlannedStep::LvmDeactivate { vg_name } => run(step, "vgchange", &["-an", vg_name]),
+        // By name alone LVM looks for the VG on every device its own scan
+        // admits: the recorded attachment's commands are built from its
+        // record instead (`run_recorded_lvm`).
+        PlannedStep::LvmDeactivate { .. } | PlannedStep::LvExtend { .. } => Err(identity_error(
+            "LVM deactivation and growth run only within the recorded attachment's devices",
+        )),
         PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => {
             let output = command::capture(
                 command::controlled("blkid").args([
@@ -730,20 +738,6 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             let target = nbd_client_target(device)?;
             run(step, "nbd-client", &["-d", &target])
         }
-        PlannedStep::LvExtend {
-            vg_name,
-            lv_name,
-            target_bytes,
-            ..
-        } => run(
-            step,
-            "lvextend",
-            &[
-                "-L",
-                &format!("{target_bytes}b"),
-                &format!("{vg_name}/{lv_name}"),
-            ],
-        ),
         PlannedStep::XfsGrowfs { mountpoint } => run(step, "xfs_growfs", &[mountpoint.as_str()]),
     }
 }
@@ -760,6 +754,35 @@ fn identity_error(message: impl Into<String>) -> ExecError {
         step: "nbd-identity".into(),
         message: message.into(),
     }
+}
+
+/// Run detach's or recovery's VG deactivation, or grow's `lvextend`, for
+/// `record`'s attachment, addressed by the record's VG and LV names within
+/// the devices and VG UUID attach activated it with. By name alone, LVM
+/// resolves the VG over whatever its own scan admits: another disk's VG of
+/// the same name (a second disk, a cloned image) when the host's scan
+/// leaves the NBD devices out or the daemon serves no reads, or a refusal
+/// for the duplicate name when it sees both.
+fn run_recorded_lvm(
+    system: &mut impl System,
+    step: &PlannedStep,
+    record: &BoundDeviceRecord,
+) -> Result<(), ExecError> {
+    let scope = lvm_preflight::recorded_scope(record)?;
+    let identity = &record.attachment;
+    let command = match step {
+        PlannedStep::LvmDeactivate { .. } => {
+            lvm_preflight::recorded_deactivation_command(&scope, &identity.vg_name)
+        }
+        PlannedStep::LvExtend { target_bytes, .. } => lvm_preflight::recorded_extend_command(
+            &scope,
+            &identity.vg_name,
+            &identity.lv_name,
+            *target_bytes,
+        ),
+        _ => return Err(identity_error("not an LVM step of the recorded attachment")),
+    };
+    system.run_scoped_lvm(step, command)
 }
 
 /// System interactions are isolated so tests exercise the same ordering,
@@ -848,6 +871,17 @@ trait System {
     }
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
+    /// Run `command`, the LVM command of `step` that [`run_recorded_lvm`]
+    /// built from the record. A system that runs no commands of its own
+    /// runs the step.
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        drop(command);
+        self.run_step(step, None)
+    }
     /// What the host still shows of `record`'s attachment, whose device
     /// carries another connection: see [`displaced::remains`].
     fn displaced_remains(
@@ -967,6 +1001,14 @@ impl System for LinuxSystem {
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         nbd_backend_at(Path::new("/sys/block"), device)
+    }
+
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        run_command(step, command)
     }
 
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
@@ -1655,7 +1697,7 @@ fn execute_with_options(
                     }
                     Ok(())
                 } else {
-                    match system.run_step(step, None) {
+                    match run_recorded_lvm(system, step, current) {
                         Err(error)
                             if allow_proof_deactivation
                                 && current.recovery.is_some()
@@ -1681,6 +1723,9 @@ fn execute_with_options(
             PlannedStep::MountXfs { .. } if connects => {
                 verify_mount_target(record.as_ref().unwrap(), system)
                     .and_then(|()| system.run_step(step, None))
+            }
+            PlannedStep::LvExtend { .. } if grows => {
+                run_recorded_lvm(system, step, record.as_ref().unwrap())
             }
             other => system.run_step(other, None),
         };

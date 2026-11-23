@@ -666,6 +666,18 @@ impl System for Host {
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         crate::detach::observe(record, &self.mounts(), &self.sysfs)
     }
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        let program = command.get_program().to_str().unwrap().to_owned();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        self.command(step.kind(), |host| host.simulate_lvm(step, &program, &args))
+    }
     fn displaced_remains(
         &self,
         record: &BoundDeviceRecord,

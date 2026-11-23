@@ -191,3 +191,87 @@ fn recovery_never_deactivates_a_namesake() {
         assert_namesake_untouched(&host, &case);
     }
 }
+
+fn argv(command: &std::process::Command) -> Vec<String> {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| arg.to_str().unwrap().to_owned())
+        .collect()
+}
+
+const NO_DUPLICATE_PV_CHANGES: &str = "devices { allow_changes_with_duplicate_pvs=0 }";
+
+/// The commands name the recorded VG and LV within the devices and VG UUID
+/// that attach verified: from the mapping proof, the activation intent or
+/// the administrator pins. A record from before either exists is held to
+/// its NBD device.
+#[test]
+fn every_kind_of_record_scopes_its_commands_to_what_attach_verified() {
+    let (_host, state, _) = attached(Scan::Everything, false);
+    let proven = state.read("pg").unwrap().unwrap();
+
+    let mut host = Host::new();
+    let intent_state = host.state();
+    host.killed_after = Some("lvm-activate");
+    assert!(killed(|| {
+        let _ = execute_with(&plan_attach(&request(&PG)), Some(&intent_state), &mut host);
+    }));
+    let intended = intent_state.read("pg").unwrap().unwrap();
+    assert!(intended.recovery_intent.is_some());
+
+    let legacy = BoundDeviceRecord {
+        recovery: None,
+        recovery_intent: None,
+        ..proven.clone()
+    };
+    let pinned = BoundDeviceRecord {
+        attachment: (&super::pinned(&PG)).into(),
+        ..legacy.clone()
+    };
+
+    let uuid = format!("vg_uuid={}", PG.vg_uuid);
+    for (record, select) in [
+        (&proven, Some(&uuid)),
+        (&intended, Some(&uuid)),
+        (&pinned, Some(&uuid)),
+        (&legacy, None),
+    ] {
+        let scope = lvm_preflight::recorded_scope(record).unwrap();
+        let mut expected = vec!["vgchange", "--devices", "/dev/nbd3", "--activate", "n"];
+        if let Some(select) = select {
+            expected.extend(["--select", select]);
+        }
+        expected.extend(["--config", NO_DUPLICATE_PV_CHANGES, "vg_maki_pg"]);
+        assert_eq!(
+            argv(&lvm_preflight::recorded_deactivation_command(
+                &scope,
+                "vg_maki_pg"
+            )),
+            expected
+        );
+        assert_eq!(
+            argv(&lvm_preflight::recorded_extend_command(
+                &scope,
+                "vg_maki_pg",
+                "data",
+                2 << 30
+            )),
+            [
+                "lvextend",
+                "--devices",
+                "/dev/nbd3",
+                "--config",
+                NO_DUPLICATE_PV_CHANGES,
+                "-L",
+                "2147483648b",
+                "vg_maki_pg/data"
+            ]
+        );
+    }
+
+    // Pins that name another VG than the proof are not resolved either way.
+    let mut conflicting = proven.clone();
+    conflicting.attachment = (&super::pinned(&DB)).into();
+    conflicting.attachment.vg_name = proven.attachment.vg_name.clone();
+    assert!(lvm_preflight::recorded_scope(&conflicting).is_err());
+}

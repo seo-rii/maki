@@ -2258,7 +2258,11 @@ for compatibility; that does not establish the filesystem UUID match required
 by this production profile. The filesystem probe follows LVM activation.
 The separate pre-activation check compares independently probed PV labels
 with complete LVM metadata and scopes the helper's activation to verified
-NBD candidates and the discovered VG UUID. For the production profile, the
+NBD candidates and the discovered VG UUID. Detach, recovery and growth MUST
+address the VG within the same scope, as the trusted record holds it: its
+candidate devices and, where the record names it, its VG UUID. They MUST NOT
+resolve the VG name over the host's own LVM device scan, where another disk's
+VG can carry the same name. For the production profile, the
 root-owned attachment configuration MUST also provide the complete PV UUID set,
 VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
 refuse activation. These administrator pins are part of the trusted attachment

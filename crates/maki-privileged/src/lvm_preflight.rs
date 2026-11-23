@@ -859,6 +859,128 @@ pub(super) fn deactivate(
     Ok(())
 }
 
+/// Where a recorded attachment's volume group lives, as attach activated
+/// it: the candidate PVs and, when the record names it, the VG UUID.
+/// Detach, recovery and growth address the VG only within this scope, so
+/// LVM never resolves its name over other disks, whose VGs may carry the
+/// same name, and finds it where attach did even when the host's own LVM
+/// scan leaves the NBD devices out (`--devices` replaces that scan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecordedScope {
+    devices: Vec<String>,
+    vg_uuid: Option<String>,
+}
+
+/// LVM's spelling of a UUID: 6-4-4-4-4-4-6 alphanumerics.
+fn lvm_uuid_from_bare(bare: &str) -> Option<String> {
+    if bare.len() != 32 || !bare.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for length in [6, 4, 4, 4, 4, 4, 6] {
+        groups.push(&bare[start..start + length]);
+        start += length;
+    }
+    Some(groups.join("-"))
+}
+
+/// The scope of `record`: the devices and VG UUID of its pre-activation
+/// intent, or the candidate devices and mapping VG UUID of its completed
+/// proof. A record with neither, from before both existed, is scoped to its
+/// NBD device. Administrator pins name the VG UUID too, and must agree.
+pub(super) fn recorded_scope(record: &BoundDeviceRecord) -> io::Result<RecordedScope> {
+    let (devices, vg_uuid) = if let Some(intent) = &record.recovery_intent {
+        let verified = intent.verified();
+        (
+            verified
+                .devices
+                .iter()
+                .map(|device| device.path.clone())
+                .collect(),
+            Some(verified.vg_uuid.clone()),
+        )
+    } else if let Some(proof) = &record.recovery {
+        let vg_uuid = proof
+            .vg_uuid()
+            .as_deref()
+            .and_then(lvm_uuid_from_bare)
+            .ok_or_else(|| invalid("recovery proof does not name one VG UUID"))?;
+        (proof.candidate_devices(), Some(vg_uuid))
+    } else {
+        (vec![record.device.clone()], None)
+    };
+    let pinned = record
+        .attachment
+        .lvm_identity
+        .as_ref()
+        .map(|pins| pins.vg_uuid.clone());
+    let vg_uuid = match (vg_uuid, pinned) {
+        (Some(recorded), Some(pinned)) if recorded != pinned => {
+            return Err(invalid(
+                "recorded VG UUID differs from the administrator pin",
+            ))
+        }
+        (recorded, pinned) => recorded.or(pinned),
+    };
+    if devices.is_empty() || devices.len() > MAX_DEVICES {
+        return Err(invalid("invalid recorded LVM device count"));
+    }
+    for device in &devices {
+        crate::config::check_abs_path("recorded LVM device", device)
+            .map_err(|_| invalid("invalid recorded LVM device path"))?;
+    }
+    if let Some(uuid) = &vg_uuid {
+        crate::config::check_lvm_uuid("VG UUID", uuid)
+            .map_err(|_| invalid("invalid recorded VG UUID"))?;
+    }
+    Ok(RecordedScope { devices, vg_uuid })
+}
+
+fn scoped(program: &str, scope: &RecordedScope) -> Command {
+    let mut command = controlled_command(program);
+    command.args(["--devices", &scope.devices.join(",")]);
+    command
+}
+
+/// Deactivation of the recorded VG for detach and recovery, within the
+/// scope attach activated it in. The VG is named as well as selected by
+/// UUID: LVM refuses a name it cannot find on those devices, as after the
+/// daemon stopped serving reads, where a selection alone succeeds without
+/// doing anything.
+pub(super) fn recorded_deactivation_command(scope: &RecordedScope, vg_name: &str) -> Command {
+    let mut command = scoped("vgchange", scope);
+    command.args(["--activate", "n"]);
+    if let Some(uuid) = &scope.vg_uuid {
+        command.args(["--select", &format!("vg_uuid={uuid}")]);
+    }
+    command.args([
+        "--config",
+        "devices { allow_changes_with_duplicate_pvs=0 }",
+        vg_name,
+    ]);
+    command
+}
+
+/// Growth of the recorded LV within the recorded devices. `lvextend` takes
+/// no `--select`; with `--devices` it finds the VG name only there.
+pub(super) fn recorded_extend_command(
+    scope: &RecordedScope,
+    vg_name: &str,
+    lv_name: &str,
+    target_bytes: u64,
+) -> Command {
+    let mut command = scoped("lvextend", scope);
+    command.args([
+        "--config",
+        "devices { allow_changes_with_duplicate_pvs=0 }",
+        "-L",
+        &format!("{target_bytes}b"),
+        &format!("{vg_name}/{lv_name}"),
+    ]);
+    command
+}
+
 fn deactivation_command(verified: &VerifiedLvm) -> Command {
     let mut command = controlled_command("vgchange");
     command.args([
