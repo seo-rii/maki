@@ -12,6 +12,11 @@
 //! make. Only a candidate that could not be examined is skipped: a pass
 //! still ends when it cannot authenticate the current namespace, and a
 //! retired namespace whose lifetime lock cannot be opened keeps its files.
+//!
+//! The same holds for a namespace whose retirement cannot be finished: one
+//! GC may examine but not empty (its directory is not writable), whose
+//! tombstone then sorts before every namespace on every pass, and one GC
+//! may not rename (its directory is immutable).
 #![cfg(target_os = "linux")]
 
 #[path = "support/shared_dir.rs"]
@@ -137,6 +142,28 @@ struct ModesApply([CapabilityData; 2]);
 impl ModesApply {
     /// `None`, with the reason printed, where `closed` can still be opened.
     fn unless_openable(test: &str, closed: &Path) -> Option<Self> {
+        Self::unless(test, closed, "opened", |path| {
+            std::fs::File::open(path).is_ok()
+        })
+    }
+
+    /// `None`, with the reason printed, where an entry can still be created
+    /// in `directory`.
+    fn unless_writable(test: &str, directory: &Path) -> Option<Self> {
+        Self::unless(test, directory, "written", |path| {
+            let probe = path.join("probe");
+            let created = std::fs::File::create(&probe).is_ok();
+            let _ = std::fs::remove_file(probe);
+            created
+        })
+    }
+
+    fn unless(
+        test: &str,
+        closed: &Path,
+        verb: &str,
+        allowed: impl Fn(&Path) -> bool,
+    ) -> Option<Self> {
         let guard = capabilities(None).and_then(|saved| {
             let mut reduced = saved;
             for capability in [CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH] {
@@ -146,9 +173,9 @@ impl ModesApply {
             Ok(Self(saved))
         });
         match guard {
-            Ok(guard) if std::fs::File::open(closed).is_err() => Some(guard),
+            Ok(guard) if !allowed(closed) => Some(guard),
             Ok(_) => {
-                eprintln!("{test}: skipped: {} can still be opened", closed.display());
+                eprintln!("{test}: skipped: {} can still be {verb}", closed.display());
                 None
             }
             Err(error) => {
@@ -309,6 +336,149 @@ fn a_retired_namespace_whose_lock_cannot_be_opened_keeps_its_files() {
 
     drop(modes);
     set_mode(&retired.join("rollback.lock"), 0o600);
+}
+
+/// Each entry of `directory` with its bytes, sorted by name.
+fn contents(directory: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            (name, std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A namespace directory GC may read but not write (an administrator's
+/// `chmod a-w`, or a tree copied back with the modes of a read-only copy)
+/// passes examination, and its retirement renames it to a tombstone, which
+/// changes only the root. Unlinking its files then fails, on that pass and
+/// on every later one. A tombstone sorts before every namespace, so ending
+/// the pass there leaves the predecessor of every later activation on disk,
+/// each a full arena.
+#[test]
+fn gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink() {
+    const TEST: &str = "gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    set_mode(&root.path().join(&stuck), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, &root.path().join(&stuck)) else {
+        set_mode(&root.path().join(&stuck), 0o700);
+        return;
+    };
+    let tombstone = format!(".remote-gc-{stuck}");
+
+    for _ in 0..3 {
+        let backing = RollbackBacking::open_remote(root.path(), writer.clone()).unwrap();
+        let current = inspect(writer.as_ref()).current.unwrap().namespace;
+        assert_eq!(
+            namespaces(root.path()),
+            [current],
+            "the automatic pass must retire each predecessor past the tombstone it cannot empty"
+        );
+        assert_eq!(
+            entries(root.path(), ".remote-gc-"),
+            std::slice::from_ref(&tombstone)
+        );
+        commit(&backing, b"attached");
+    }
+    let kept = contents(&root.path().join(&tombstone));
+    assert_eq!(kept.len(), 4, "{kept:?}");
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+        .expect("a tombstone GC cannot empty must not end the pass");
+    assert!(report.removed.is_empty());
+    assert_eq!(namespaces(root.path()).len(), 1);
+    // Nothing more is removed from it than the failing step allowed.
+    assert_eq!(contents(&root.path().join(&tombstone)), kept);
+
+    drop(modes);
+    set_mode(&root.path().join(&tombstone), 0o700);
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, [stuck]);
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+}
+
+const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+
+fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path)?;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the descriptor is open and both ioctls access one c_int.
+    unsafe {
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if immutable {
+            flags |= FS_IMMUTABLE_FL;
+        } else {
+            flags &= !FS_IMMUTABLE_FL;
+        }
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Clears the immutable flag again on drop.
+struct Immutable(PathBuf);
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        let _ = set_immutable(&self.0, false);
+    }
+}
+
+/// An immutable namespace directory passes examination (its files stay
+/// writable), and renaming it to its tombstone fails with nothing changed.
+#[test]
+fn gc_reclaims_past_a_namespace_it_cannot_rename() {
+    const TEST: &str = "gc_reclaims_past_a_namespace_it_cannot_rename";
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("{TEST}: skipped: setting the immutable flag needs root");
+        return;
+    }
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    if let Err(error) = set_immutable(&root.path().join(&stuck), true) {
+        eprintln!("{TEST}: skipped: the filesystem refuses the immutable flag ({error})");
+        return;
+    }
+    let immutable = Immutable(root.path().join(&stuck));
+
+    for _ in 0..3 {
+        let backing = RollbackBacking::open_remote(root.path(), writer.clone()).unwrap();
+        let current = inspect(writer.as_ref()).current.unwrap().namespace;
+        assert_eq!(
+            namespaces(root.path()),
+            [stuck.clone(), current],
+            "the automatic pass must retire each predecessor past the namespace it cannot rename"
+        );
+        commit(&backing, b"attached");
+    }
+    let kept = contents(&root.path().join(&stuck));
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+        .expect("a namespace GC cannot rename must not end the pass");
+    assert!(report.removed.is_empty());
+    assert_eq!(contents(&root.path().join(&stuck)), kept);
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+
+    drop(immutable);
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, [stuck]);
 }
 
 /// What GC may delete is decided against the authority's current

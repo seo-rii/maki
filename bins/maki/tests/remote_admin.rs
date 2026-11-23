@@ -803,6 +803,119 @@ fn gc_reports_a_namespace_it_cannot_examine_and_reclaims_the_rest() {
     assert_eq!(report["details_truncated"], false);
     assert!(f.root.join(&odd).join("rollback.arena").is_dir());
 }
+/// Run `maki` with `args` as a caller file modes apply to: a root test drops
+/// CAP_DAC_OVERRIDE from the command's bounding set before it runs. `None`,
+/// with the reason printed, where that cannot be done.
+fn run_under_modes(args: &[&str]) -> Option<Output> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
+    command.args(args);
+    // SAFETY: runs in the forked child before exec and only makes raw
+    // system calls.
+    unsafe {
+        command.pre_exec(|| {
+            const CAP_DAC_OVERRIDE: libc::c_ulong = 1;
+            if libc::geteuid() == 0
+                && libc::prctl(libc::PR_CAPBSET_DROP, CAP_DAC_OVERRIDE, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.output() {
+        Ok(output) => Some(output),
+        Err(error) => {
+            eprintln!("skipping: cannot drop CAP_DAC_OVERRIDE for the command ({error})");
+            None
+        }
+    }
+}
+/// A predecessor namespace GC may examine but not empty is renamed to a
+/// tombstone that every later pass meets first. That must not end the
+/// pass: `maki volume gc` names the tombstone with the step that failed,
+/// and the namespaces behind it are reclaimed.
+#[test]
+fn gc_reports_a_tombstone_it_cannot_empty_and_reclaims_the_rest() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    drop(f.create());
+    let namespaces = || {
+        let mut names: Vec<String> = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("remote-0"))
+            .collect();
+        names.sort();
+        names
+    };
+    let set_mode = |name: &str, mode| {
+        std::fs::set_permissions(f.root.join(name), std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let stuck = namespaces().pop().unwrap();
+    let tombstone = format!(".remote-gc-{stuck}");
+    set_mode(&stuck, 0o500);
+    let takeover = || {
+        let before = inspect(f.writer.as_ref());
+        run_under_modes(&[
+            "volume",
+            "takeover",
+            f.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ])
+    };
+    let succeeded = |output: &Output| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let Some(first) = takeover() else {
+        set_mode(&stuck, 0o700);
+        return;
+    };
+    succeeded(&first);
+    assert!(f.root.join(&tombstone).is_dir());
+    let second = takeover().unwrap();
+    succeeded(&second);
+    let current = inspect(f.writer.as_ref()).current.unwrap().namespace;
+    assert_eq!(
+        namespaces(),
+        [current],
+        "the automatic pass must retire the predecessor past the tombstone"
+    );
+    let log = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        log.contains("WARN")
+            && log.contains(&tombstone)
+            && log.contains("unlinking rollback.arena"),
+        "the automatic pass must log the tombstone it could not empty and why: {log}"
+    );
+
+    let output = run_under_modes(&["volume", "gc", f.path(false)]).unwrap();
+    succeeded(&output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unfinished = report["unfinished"].as_array().unwrap();
+    assert_eq!(unfinished.len(), 1, "{report}");
+    assert_eq!(unfinished[0]["name"], tombstone.as_str());
+    assert_eq!(
+        unfinished[0]["error"],
+        "unlinking rollback.arena: Permission denied (os error 13)"
+    );
+    assert_eq!(report["counts"]["unfinished"], 1);
+    assert_eq!(report["counts"]["skipped_unreadable"], 0);
+    assert_eq!(report["counts"]["removed"], 0);
+    assert!(f.root.join(&tombstone).join("rollback.arena").is_file());
+
+    set_mode(&tombstone, 0o700);
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["removed"], serde_json::json!([stuck]));
+    assert_eq!(report["counts"]["unfinished"], 0);
+}
 struct LoseClaims(Arc<dyn Rpc>);
 impl Rpc for LoseClaims {
     fn call(&self, request: &Request) -> std::io::Result<Record> {
