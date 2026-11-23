@@ -232,12 +232,14 @@ def document_lines(text):
         if changed:
             in_paragraph = False
         content = columns[pos:]
-        # Only the container margin uses expanded tab stops. Keep literal tabs
-        # in the body (e.g. code spans and link labels).
+        # The container margin and the indentation after it use the line's
+        # tab stops: a tab there advances to the next multiple of four
+        # columns, which can be less than four past the margin. Keep literal
+        # tabs in the body (e.g. code spans and link labels).
         if "\t" in line:
             column = 0
             offset = 0
-            while column < pos and offset < len(line):
+            while offset < len(line) and (column < pos or line[offset] in " \t"):
                 column += 4 - column % 4 if line[offset] == "\t" else 1
                 offset += 1
             content = " " * (column - pos) + line[offset:]
