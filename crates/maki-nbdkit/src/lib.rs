@@ -9,6 +9,11 @@
 //! - `plugin` (Linux only): the `nbdkit_plugin` C ABI shim exporting
 //!   `plugin_init`.
 
+// Diagnostics go through `tracing` and the plugin's `diagnostic!`: the
+// `print!` family panics when the write fails (a closed pipe, a full disk),
+// and nbdkit's stderr can be either. Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod adapter;
 pub mod config_file;
 pub mod control;

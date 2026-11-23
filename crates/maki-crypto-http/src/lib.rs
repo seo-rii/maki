@@ -16,6 +16,10 @@
 //! `unsupported-compatibility-id`. No other status reports either, and the
 //! body of an error response is not read.
 
+// Diagnostics go through `tracing`: the `print!` family panics when the
+// write fails (a closed pipe, a full disk). Tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::time::Duration;
 
 use async_trait::async_trait;
