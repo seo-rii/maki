@@ -76,7 +76,10 @@ ROOT_TARGETS = (
     "crates/maki-nbdkit/tests/review_memory_budget_mountinfo.rs",
     "crates/maki-privileged/tests/review_mountinfo_bytes.rs",
     "crates/maki-privileged/tests/review_mountinfo_empty_source.rs",
-    # Unit tests: workload_verify_tests.rs gives the sentinel to uid 65534.
+    # Unit tests: workload_verify_tests.rs gives the sentinel to uid 65534;
+    # the witness tests in maki-backing check root's owner rules for the
+    # temporary anchor record (owners are recorded, not applied).
+    "crates/maki-backing/src/lib.rs",
     "crates/maki-privileged/src/lib.rs",
 )
 

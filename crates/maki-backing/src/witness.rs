@@ -57,9 +57,24 @@ impl FileWitness {
             .any(|file| relative.starts_with(file))
     }
 
+    /// Whether `name` is an entry that a creation leaves in the witness
+    /// directory before it publishes the anchor: the lock, and the record
+    /// under its temporary name, which nothing reads.
+    pub(crate) fn left_by_an_unpublished_creation(name: &str) -> bool {
+        [LOCK_FILE, TEMP_FILE].contains(&name)
+    }
+
     pub fn create(path: &Path, identity: [u8; 16], root: [u8; 32]) -> io::Result<Self> {
         validate_identity(&identity)?;
-        let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(path)?);
+        Self::create_backing(Arc::new(FileBacking::new(path)?), identity, root)
+    }
+
+    pub(crate) fn create_backing(
+        backing: Arc<dyn Backing>,
+        identity: [u8; 16],
+        root: [u8; 32],
+    ) -> io::Result<Self> {
+        validate_identity(&identity)?;
         let lock = backing.try_lock(LOCK_FILE)?;
         if backing.exists(ANCHOR_FILE)? {
             return Err(io::Error::new(
@@ -73,13 +88,25 @@ impl FileWitness {
             generation: 0,
             root,
         };
-        // FileBacking's confined rename replaces an existing target. Install
-        // an empty target only after the locked non-existence check; a crash
-        // here leaves invalid enrollment rather than a silently usable anchor.
-        let target = backing.open(ANCHOR_FILE, true)?;
-        target.set_len(0)?;
-        target.sync_data()?;
-        publish_anchor(backing.as_ref(), &anchor)?;
+        // The first record is published like every later one: written and
+        // synced under the temporary name, renamed into place, and the
+        // directory synced. A creation that a kill, a power loss or a
+        // failure stops before the rename leaves no anchor (the next one
+        // removes what it left under the temporary name), and one that got
+        // past it left the complete record. No anchor is replaced, so the
+        // record is the directory owner's: in a directory another user
+        // owns, a root process creates it for that user (`FileBacking`),
+        // and in a root-owned one it is root's. Run as root, the temporary
+        // record must be one of root's or that owner's files, as for every
+        // later publication (`hand_over_temporary`, SPEC §8).
+        let owner = if running_as_root() {
+            backing.directory_owner("")?
+        } else {
+            None
+        };
+        write_temporary(backing.as_ref(), &encode(&anchor), owner)?;
+        backing.rename(TEMP_FILE, ANCHOR_FILE)?;
+        backing.sync_dir("")?;
 
         Ok(Self {
             backing,
@@ -104,7 +131,7 @@ impl FileWitness {
         Self::open_backing(backing)
     }
 
-    fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
+    pub(crate) fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
         let lock = backing.try_lock(LOCK_FILE)?;
         let anchor = read_anchor(backing.as_ref())?;
         // A prior process may have observed rename success and directory-sync
@@ -332,7 +359,18 @@ fn running_as_root() -> bool {
 
 fn read_anchor(backing: &dyn Backing) -> io::Result<Anchor> {
     let file = backing.open(ANCHOR_FILE, false)?;
-    if file.len()? != ENCODED_LEN as u64 {
+    let len = file.len()?;
+    if len == 0 {
+        // Never completed by this release, which publishes the anchor whole.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the witness anchor is empty: either a volume create of an earlier release did not \
+             complete, or this witness lost its state. Only if the volume was never attached, \
+             remove the empty anchor and run volume create again, which refuses a backing that \
+             holds committed data; otherwise restore the witness directory",
+        ));
+    }
+    if len != ENCODED_LEN as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid witness anchor length",
@@ -353,6 +391,15 @@ fn encode(anchor: &Anchor) -> [u8; ENCODED_LEN] {
     let checksum = checksum(&bytes[..BODY_LEN]);
     bytes[BODY_LEN..].copy_from_slice(&checksum);
     bytes
+}
+
+/// [`decode`] of a record of any length, for the crate's crash models.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn decode_anchor(bytes: &[u8]) -> io::Result<Anchor> {
+    let bytes: &[u8; ENCODED_LEN] = bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid witness anchor length"))?;
+    decode(bytes)
 }
 
 fn decode(bytes: &[u8; ENCODED_LEN]) -> io::Result<Anchor> {
@@ -996,6 +1043,79 @@ mod tests {
             } else {
                 // Root's own file is emptied and then handed over.
                 drop(opened.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    [
+                        "temp_owner",
+                        "temp_write",
+                        "temp_sync_all",
+                        "rename",
+                        "directory_sync"
+                    ]
+                );
+                assert_eq!(fault.given(), [daemon]);
+            }
+        }
+    }
+
+    /// The first record follows the same rule: `create` removes a stale
+    /// temporary record, and a file someone who can write the directory
+    /// puts back under that name before it is opened again is published
+    /// only if it is root's or the directory owner's, whose record it is.
+    /// Only a root run checks the refusal; `scripts/run_root_tests.py` runs
+    /// this crate's unit tests as root.
+    #[cfg(unix)]
+    #[test]
+    fn root_creates_the_first_record_only_in_a_file_of_root_or_the_directory_owner() {
+        const TEST: &str =
+            "root_creates_the_first_record_only_in_a_file_of_root_or_the_directory_owner";
+        // SAFETY: geteuid has no preconditions.
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if !as_root {
+            eprintln!("{TEST}: the refusal of another user's file is skipped without root");
+        }
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        for planter in [other, root, daemon] {
+            let dir = tempdir().unwrap();
+            let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+            fault.report_directory_owner(daemon);
+            fault.replant_temporary(b"put back", planter);
+            let backing: Arc<dyn Backing> = fault.clone();
+            let created = FileWitness::create_backing(backing, IDENTITY, ROOT_A);
+
+            if !as_root {
+                drop(created.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"],
+                    "{planter:?}"
+                );
+                assert!(fault.given().is_empty());
+            } else if planter == other {
+                let error = created.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("uid 4444"), "{error}");
+                assert!(error.to_string().contains("uid 4242"), "{error}");
+                assert!(fault.trace().is_empty());
+                assert!(fault.given().is_empty());
+                assert!(!dir.path().join(super::ANCHOR_FILE).exists());
+            } else if planter == daemon {
+                drop(created.unwrap());
+                assert_eq!(
+                    fault.trace(),
+                    ["temp_write", "temp_sync", "rename", "directory_sync"]
+                );
+                assert!(fault.given().is_empty());
+            } else {
+                drop(created.unwrap());
                 assert_eq!(
                     fault.trace(),
                     [

@@ -470,6 +470,21 @@ record. Under the attach lock, attach MUST read every record before it
 chooses or connects a device, MUST NOT allocate or connect a device that
 another volume's record names, and MUST refuse while a record cannot be read.
 
+A record whose device is connected under an identity other than the recorded
+one MUST be kept, and every verb of its volume MUST refuse without a command,
+unless observation under the attach lock proves that nothing of the recorded
+attachment remains: the record names its VG UUID (mapping proof, activation
+intent or administrator pins); no device-mapper device on the host belongs to
+that VG; every holder of the device and of its partitions is an LVM mapping
+of another VG (a device-mapper uuid of `LVM-` and another VG UUID), not any
+other device-mapper or block device; nothing is mounted at the recorded
+mountpoint and no mount is of a mapping of that VG; no other volume's record
+names the device with the same VG UUID or with none; and the device's backend
+stays the same across the observation. Every such observation MUST be
+readable. Attach, cleanup, recover and detach MAY then retire the record
+without any command and without touching the device or its connection; grow
+MUST refuse.
+
 A detach retry MAY skip a step whose completion is verified from current mount
 and block-device observations. Destructive steps still require matching live
 identity. If every detach step has already completed, the helper MAY retire
@@ -2303,7 +2318,13 @@ for compatibility; that does not establish the filesystem UUID match required
 by this production profile. The filesystem probe follows LVM activation.
 The separate pre-activation check compares independently probed PV labels
 with complete LVM metadata and scopes the helper's activation to verified
-NBD candidates and the discovered VG UUID. For the production profile, the
+NBD candidates and the discovered VG UUID. Detach and recovery MUST deactivate
+the VG within the same scope, as the trusted record holds it: its candidate
+devices and, where the record names it, its VG UUID. Growth MUST extend the LV
+within the recorded candidate devices, after the live check that the mapping
+is the recorded one; `lvextend` cannot select a VG by UUID. These commands
+MUST NOT resolve the VG name over the host's own LVM device scan, where
+another disk's VG can carry the same name. For the production profile, the
 root-owned attachment configuration MUST also provide the complete PV UUID set,
 VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
 refuse activation. These administrator pins are part of the trusted attachment

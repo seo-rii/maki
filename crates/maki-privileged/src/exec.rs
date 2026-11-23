@@ -27,6 +27,9 @@ mod lvm_preflight;
 #[path = "allocation.rs"]
 mod allocation;
 
+#[path = "displaced.rs"]
+mod displaced;
+
 use crate::detach::DetachObservation;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
 use crate::probe::{nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices};
@@ -133,11 +136,14 @@ pub fn check_mount_target(mountpoint: &str, trusted: &[u32]) -> Result<(), ExecE
 }
 
 fn run(step: &PlannedStep, program: &str, args: &[&str]) -> Result<(), ExecError> {
+    let mut command = command::controlled(program);
+    command.args(args);
+    run_command(step, command)
+}
+
+fn run_command(step: &PlannedStep, mut command: std::process::Command) -> Result<(), ExecError> {
     tracing::info!("maki-attach: {step}");
-    let out = command::capture(
-        command::controlled(program).args(args),
-        command::Policy::STEP,
-    )?;
+    let out = command::capture(&mut command, command::Policy::STEP)?;
     if !out.status.success() {
         return Err(ExecError::StepFailed {
             step: step.to_string(),
@@ -666,7 +672,12 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         PlannedStep::LvmActivate { .. } => Err(identity_error(
             "LVM activation requires a connected record and verified preflight",
         )),
-        PlannedStep::LvmDeactivate { vg_name } => run(step, "vgchange", &["-an", vg_name]),
+        // By name alone LVM looks for the VG on every device its own scan
+        // admits: the recorded attachment's commands are built from its
+        // record instead (`run_recorded_lvm`).
+        PlannedStep::LvmDeactivate { .. } | PlannedStep::LvExtend { .. } => Err(identity_error(
+            "LVM deactivation and growth run only within the recorded attachment's devices",
+        )),
         PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => {
             let output = command::capture(
                 command::controlled("blkid").args([
@@ -727,20 +738,6 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             let target = nbd_client_target(device)?;
             run(step, "nbd-client", &["-d", &target])
         }
-        PlannedStep::LvExtend {
-            vg_name,
-            lv_name,
-            target_bytes,
-            ..
-        } => run(
-            step,
-            "lvextend",
-            &[
-                "-L",
-                &format!("{target_bytes}b"),
-                &format!("{vg_name}/{lv_name}"),
-            ],
-        ),
         PlannedStep::XfsGrowfs { mountpoint } => run(step, "xfs_growfs", &[mountpoint.as_str()]),
     }
 }
@@ -757,6 +754,35 @@ fn identity_error(message: impl Into<String>) -> ExecError {
         step: "nbd-identity".into(),
         message: message.into(),
     }
+}
+
+/// Run detach's or recovery's VG deactivation, or grow's `lvextend`, for
+/// `record`'s attachment, addressed by the record's VG and LV names within
+/// the devices and VG UUID attach activated it with. By name alone, LVM
+/// resolves the VG over whatever its own scan admits: another disk's VG of
+/// the same name (a second disk, a cloned image) when the host's scan
+/// leaves the NBD devices out or the daemon serves no reads, or a refusal
+/// for the duplicate name when it sees both.
+fn run_recorded_lvm(
+    system: &mut impl System,
+    step: &PlannedStep,
+    record: &BoundDeviceRecord,
+) -> Result<(), ExecError> {
+    let scope = lvm_preflight::recorded_scope(record)?;
+    let identity = &record.attachment;
+    let command = match step {
+        PlannedStep::LvmDeactivate { .. } => {
+            lvm_preflight::recorded_deactivation_command(&scope, &identity.vg_name)
+        }
+        PlannedStep::LvExtend { target_bytes, .. } => lvm_preflight::recorded_extend_command(
+            &scope,
+            &identity.vg_name,
+            &identity.lv_name,
+            *target_bytes,
+        ),
+        _ => return Err(identity_error("not an LVM step of the recorded attachment")),
+    };
+    system.run_scoped_lvm(step, command)
 }
 
 /// System interactions are isolated so tests exercise the same ordering,
@@ -845,6 +871,28 @@ trait System {
     }
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
+    /// Run `command`, the LVM command of `step` that [`run_recorded_lvm`]
+    /// built from the record. A system that runs no commands of its own
+    /// runs the step.
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        drop(command);
+        self.run_step(step, None)
+    }
+    /// What the host still shows of `record`'s attachment, whose device
+    /// carries another connection: see [`displaced::remains`].
+    fn displaced_remains(
+        &self,
+        _record: &BoundDeviceRecord,
+        _vg_uuid: &str,
+    ) -> io::Result<Option<String>> {
+        Err(io::Error::other(
+            "the host's mappings and mounts cannot be observed",
+        ))
+    }
 }
 
 struct LinuxSystem;
@@ -955,22 +1003,127 @@ impl System for LinuxSystem {
         nbd_backend_at(Path::new("/sys/block"), device)
     }
 
+    fn run_scoped_lvm(
+        &mut self,
+        step: &PlannedStep,
+        command: std::process::Command,
+    ) -> Result<(), ExecError> {
+        run_command(step, command)
+    }
+
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         crate::detach::observe(record, &read_mountinfo()?, Path::new("/sys/class/block"))
     }
+
+    fn displaced_remains(
+        &self,
+        record: &BoundDeviceRecord,
+        vg_uuid: &str,
+    ) -> io::Result<Option<String>> {
+        displaced::remains(
+            record,
+            vg_uuid,
+            &read_mountinfo()?,
+            Path::new("/sys/class/block"),
+        )
+    }
 }
 
-/// The refusal of every verb that finds the recorded device connected under
-/// an identity other than the recorded one. Nothing is changed and the record
-/// is kept: no observation shows whose the device's present users are.
-fn other_identity(record: &BoundDeviceRecord, refused: &str) -> ExecError {
-    identity_error(format!(
+/// The refusal of a verb that finds the recorded device connected under an
+/// identity other than the recorded one. Nothing is changed and the record
+/// is kept.
+fn other_identity_message(record: &BoundDeviceRecord, refused: &str) -> String {
+    format!(
         "{device} is recorded for volume {volume} but is connected under another identity; \
          refusing {refused} and keeping the attach record. Detach the volume or disconnect the \
          NBD client that uses {device} now, then run `maki-attach cleanup --volume {volume}`",
         device = record.device,
         volume = record.volume,
-    ))
+    )
+}
+
+fn other_identity(record: &BoundDeviceRecord, refused: &str) -> ExecError {
+    identity_error(other_identity_message(record, refused))
+}
+
+/// Retire `record`, whose device was seen carrying the connection
+/// `displaced_by`, when the host shows that nothing of the recorded
+/// attachment remains; otherwise refuse `refused` and keep the record.
+///
+/// Nothing is run, and nothing of the device or of its present connection
+/// is touched. The caller holds the attach lock, under which every record is
+/// written, and has read `record` under it. The record is retired only when
+/// it names its VG UUID, no other record names the device with the same or
+/// no VG UUID, and two observations of the host, each followed by the same
+/// backend, show nothing of the attachment (see [`displaced::remains`]).
+fn retire_displaced(
+    record: &BoundDeviceRecord,
+    displaced_by: &str,
+    refused: &str,
+    state: &TrustedState,
+    system: &impl System,
+) -> Result<(), ExecError> {
+    let kept = |reason: &dyn std::fmt::Display| {
+        identity_error(format!(
+            "{}. The record is not retired automatically: {reason}",
+            other_identity_message(record, refused)
+        ))
+    };
+    let vg_uuid = displaced::recorded_vg_uuid(record).map_err(|reason| kept(&reason))?;
+    // With two records on one device, a mapping can be told to be the other
+    // volume's only by its VG UUID.
+    for other in state
+        .records_of_other_volumes(&record.volume)
+        .map_err(|error| kept(&error))?
+        .into_iter()
+        .filter(|other| other.device == record.device)
+    {
+        match displaced::recorded_vg_uuid(&other) {
+            Ok(theirs) if theirs != vg_uuid => {}
+            Ok(_) => {
+                return Err(kept(&format!(
+                    "the attach record of volume {} names {} with the same VG UUID, so their \
+                     mappings cannot be told apart",
+                    other.volume, other.device
+                )))
+            }
+            Err(_) => {
+                return Err(kept(&format!(
+                    "the attach record of volume {} names {} and carries no VG UUID to tell \
+                     their mappings apart",
+                    other.volume, other.device
+                )))
+            }
+        }
+    }
+    // A mapping or a mount can appear while the host is walked: look twice,
+    // and hold the device to the same connection after each look.
+    for _ in 0..2 {
+        match system.displaced_remains(record, &vg_uuid) {
+            Ok(None) => {}
+            Ok(Some(remaining)) => return Err(kept(&remaining)),
+            Err(error) => {
+                return Err(kept(&format!(
+                    "the host's mappings, holders and mounts cannot be read ({error})"
+                )))
+            }
+        }
+        if system.backend(&record.device)?.as_deref() != Some(displaced_by) {
+            return Err(kept(&format!(
+                "the connection on {} changed while the host was observed",
+                record.device
+            )));
+        }
+    }
+    state.remove(&record.volume)?;
+    tracing::warn!(
+        "maki-attach: retired the attach record of volume {}: {} is connected under another \
+         identity and nothing of the recorded attachment remains; nothing was run against the \
+         device",
+        record.volume,
+        record.device
+    );
+    Ok(())
 }
 
 fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
@@ -1008,6 +1161,16 @@ fn verify_detach_state(
         Some(_) => return Err(other_identity(record, "to act on the attachment")),
         None => false,
     };
+    observe_detach_state(record, system, connected)
+}
+
+/// The detach observation of `record`, whose device is `connected` under
+/// the recorded identity or carries no backend.
+fn observe_detach_state(
+    record: &BoundDeviceRecord,
+    system: &impl System,
+    connected: bool,
+) -> Result<(bool, DetachObservation), ExecError> {
     let observed = if record.recovery.is_some() || record.recovery_intent.is_some() {
         system.recovery_observation(record)?
     } else {
@@ -1033,7 +1196,17 @@ fn verify_live_attachment(
     record: &BoundDeviceRecord,
     system: &impl System,
 ) -> Result<(), ExecError> {
-    let (connected, observed) = verify_detach_state(record, system)?;
+    let (connected, observed) = match system.backend(&record.device)? {
+        Some(identifier) if identifier != record.connection_id => {
+            return Err(identity_error(format!(
+                "{}. A grow needs the recorded attachment connected; cleanup retires the record \
+                 without touching the device once it can show that nothing of the attachment \
+                 remains",
+                other_identity_message(record, "to grow")
+            )))
+        }
+        backend => observe_detach_state(record, system, backend.is_some())?,
+    };
     if !connected {
         return Err(identity_error(
             "recorded NBD device is no longer connected; refusing to grow",
@@ -1256,27 +1429,36 @@ fn execute_with_options(
         if connects {
             if let Some(prior) = &prior {
                 match system.backend(&prior.device)? {
-                    None => {}
+                    None => {
+                        // A missing NBD backend is not proof the volume is
+                        // fully detached: a crashed daemon can leave a live
+                        // mount, an active VG, or other holders behind.
+                        // Replacing the trusted record then would discard the
+                        // recovery identity of a volume that is still partly
+                        // attached, so re-observe and refuse unless every
+                        // upper-layer resource is also gone (FUP-002). An
+                        // unreadable observation fails closed via `?`.
+                        let observed = system.detach_observation(prior)?;
+                        if observed.mounted || observed.vg_active || observed.nbd_in_use {
+                            return Err(identity_error(
+                                "recorded device is disconnected but the attachment still has an \
+                                 active mount, VG mapping, or holder; complete detach before \
+                                 re-attaching",
+                            ));
+                        }
+                    }
                     Some(identifier) if identifier == prior.connection_id => {
                         return Err(identity_error(
                             "recorded device is still connected; detach or verify its stale state before attaching",
                         ))
                     }
-                    Some(_) => return Err(other_identity(prior, "to attach")),
-                }
-                // A missing NBD backend is not proof the volume is fully
-                // detached: a crashed daemon can leave a live mount, an active
-                // VG, or other holders behind. Replacing the trusted record
-                // then would discard the recovery identity of a volume that is
-                // still partly attached, so re-observe and refuse unless every
-                // upper-layer resource is also gone (FUP-002). An unreadable
-                // observation fails closed via `?`.
-                let observed = system.detach_observation(prior)?;
-                if observed.mounted || observed.vg_active || observed.nbd_in_use {
-                    return Err(identity_error(
-                        "recorded device is disconnected but the attachment still has an active \
-                         mount, VG mapping, or holder; complete detach before re-attaching",
-                    ));
+                    // The device is another connection's now. Its holders are
+                    // that connection's, so the check above cannot apply;
+                    // the record goes only if nothing of it remains, and
+                    // allocation below leaves the device out.
+                    Some(identifier) => {
+                        retire_displaced(prior, &identifier, "to attach", state, system)?
+                    }
                 }
             }
             // This volume's own record is judged above and replaced below.
@@ -1301,7 +1483,22 @@ fn execute_with_options(
             }
             if disconnects {
                 // Verify before umount or VG deactivation can affect anything.
-                verify_detach_state(&prior, system)?;
+                let connected = match system.backend(&prior.device)? {
+                    Some(identifier) if identifier == prior.connection_id => true,
+                    // Another connection's device: nothing of this attachment
+                    // is left to detach once the record is retired.
+                    Some(identifier) => {
+                        retire_displaced(&prior, &identifier, "to detach", state, system)?;
+                        tracing::warn!(
+                            "maki-attach: volume {} was not attached on {}; nothing was detached",
+                            plan.volume,
+                            prior.device
+                        );
+                        return Ok(());
+                    }
+                    None => false,
+                };
+                observe_detach_state(&prior, system, connected)?;
                 plan.bind_device(&prior.device);
             } else {
                 // Grow: the attachment must still be the live one whose
@@ -1500,7 +1697,7 @@ fn execute_with_options(
                     }
                     Ok(())
                 } else {
-                    match system.run_step(step, None) {
+                    match run_recorded_lvm(system, step, current) {
                         Err(error)
                             if allow_proof_deactivation
                                 && current.recovery.is_some()
@@ -1526,6 +1723,9 @@ fn execute_with_options(
             PlannedStep::MountXfs { .. } if connects => {
                 verify_mount_target(record.as_ref().unwrap(), system)
                     .and_then(|()| system.run_step(step, None))
+            }
+            PlannedStep::LvExtend { .. } if grows => {
+                run_recorded_lvm(system, step, record.as_ref().unwrap())
             }
             other => system.run_step(other, None),
         };
@@ -1670,7 +1870,21 @@ fn cleanup_with(
             execute_with_options(plan, Some(state), system, true)
         }
         None => recover_with(plan, state, system),
-        Some(_) => Err(other_identity(&record, "cleanup")),
+        Some(identifier) => {
+            // The connected and disconnected paths each compare the plan
+            // with the record before their first step; so does this one.
+            if plan.attachment.as_ref() != Some(&record.attachment)
+                || plan.steps.iter().any(|step| {
+                    matches!(step, PlannedStep::NbdDisconnect { device }
+                        if device != crate::plan::AUTO_NBD_DEVICE && device != &record.device)
+                })
+            {
+                return Err(identity_error(
+                    "cleanup configuration does not match the trusted attach record",
+                ));
+            }
+            retire_displaced(&record, &identifier, "cleanup", state, system)
+        }
     }
 }
 

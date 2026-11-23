@@ -12,6 +12,11 @@
 //! make. Only a candidate that could not be examined is skipped: a pass
 //! still ends when it cannot authenticate the current namespace, and a
 //! retired namespace whose lifetime lock cannot be opened keeps its files.
+//!
+//! The same holds for a namespace whose retirement cannot be finished: one
+//! GC may examine but not empty (its directory is not writable), whose
+//! tombstone then sorts before every namespace on every pass, and one GC
+//! may not rename (its directory is immutable).
 #![cfg(target_os = "linux")]
 
 #[path = "support/shared_dir.rs"]
@@ -24,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
-use maki_backing::remote_gc::GcUnreadable;
+use maki_backing::remote_gc::{GcUnfinished, GcUnreadable};
 use maki_backing::remote_witness::{
     namespace, Action, CanonicalState, Record, Request, Role, Rpc, StateStore,
 };
@@ -137,6 +142,28 @@ struct ModesApply([CapabilityData; 2]);
 impl ModesApply {
     /// `None`, with the reason printed, where `closed` can still be opened.
     fn unless_openable(test: &str, closed: &Path) -> Option<Self> {
+        Self::unless(test, closed, "opened", |path| {
+            std::fs::File::open(path).is_ok()
+        })
+    }
+
+    /// `None`, with the reason printed, where an entry can still be created
+    /// in `directory`.
+    fn unless_writable(test: &str, directory: &Path) -> Option<Self> {
+        Self::unless(test, directory, "written", |path| {
+            let probe = path.join("probe");
+            let created = std::fs::File::create(&probe).is_ok();
+            let _ = std::fs::remove_file(probe);
+            created
+        })
+    }
+
+    fn unless(
+        test: &str,
+        closed: &Path,
+        verb: &str,
+        allowed: impl Fn(&Path) -> bool,
+    ) -> Option<Self> {
         let guard = capabilities(None).and_then(|saved| {
             let mut reduced = saved;
             for capability in [CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH] {
@@ -146,9 +173,9 @@ impl ModesApply {
             Ok(Self(saved))
         });
         match guard {
-            Ok(guard) if std::fs::File::open(closed).is_err() => Some(guard),
+            Ok(guard) if !allowed(closed) => Some(guard),
             Ok(_) => {
-                eprintln!("{test}: skipped: {} can still be opened", closed.display());
+                eprintln!("{test}: skipped: {} can still be {verb}", closed.display());
                 None
             }
             Err(error) => {
@@ -311,6 +338,296 @@ fn a_retired_namespace_whose_lock_cannot_be_opened_keeps_its_files() {
     set_mode(&retired.join("rollback.lock"), 0o600);
 }
 
+/// Each entry of `directory` with its bytes, sorted by name.
+fn contents(directory: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            (name, std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A namespace directory GC may read but not write (an administrator's
+/// `chmod a-w`, or a tree copied back with the modes of a read-only copy)
+/// passes examination, and its retirement renames it to a tombstone, which
+/// changes only the root. Unlinking its files then fails, on that pass and
+/// on every later one. A tombstone sorts before every namespace, so ending
+/// the pass there leaves the predecessor of every later activation on disk,
+/// each a full arena.
+#[test]
+fn gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink() {
+    const TEST: &str = "gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    set_mode(&root.path().join(&stuck), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, &root.path().join(&stuck)) else {
+        set_mode(&root.path().join(&stuck), 0o700);
+        return;
+    };
+    let tombstone = format!(".remote-gc-{stuck}");
+
+    for _ in 0..3 {
+        let backing = RollbackBacking::open_remote(root.path(), writer.clone()).unwrap();
+        let current = inspect(writer.as_ref()).current.unwrap().namespace;
+        assert_eq!(
+            namespaces(root.path()),
+            [current],
+            "the automatic pass must retire each predecessor past the tombstone it cannot empty"
+        );
+        assert_eq!(
+            entries(root.path(), ".remote-gc-"),
+            std::slice::from_ref(&tombstone)
+        );
+        commit(&backing, b"attached");
+    }
+    let kept = contents(&root.path().join(&tombstone));
+    assert_eq!(kept.len(), 4, "{kept:?}");
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+        .expect("a tombstone GC cannot empty must not end the pass");
+    assert!(report.removed.is_empty());
+    assert_eq!(namespaces(root.path()).len(), 1);
+    // Reported under its tombstone name with the step and the OS error,
+    // apart from the entries GC could not examine.
+    assert_eq!(
+        report.unfinished,
+        [GcUnfinished {
+            name: tombstone.clone(),
+            error: "unlinking rollback.arena: Permission denied (os error 13)".into(),
+        }]
+    );
+    assert_eq!(report.counts.unfinished, 1);
+    assert!(report.skipped_unreadable.is_empty());
+    assert!(!report.details_truncated);
+    // Nothing more is removed from it than the failing step allowed.
+    assert_eq!(contents(&root.path().join(&tombstone)), kept);
+
+    drop(modes);
+    set_mode(&root.path().join(&tombstone), 0o700);
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, [stuck]);
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+}
+
+const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+const FS_APPEND_FL: libc::c_int = 0x20;
+
+fn set_flag(path: &Path, flag: libc::c_int, on: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path)?;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the descriptor is open and both ioctls access one c_int.
+    unsafe {
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if on {
+            flags |= flag;
+        } else {
+            flags &= !flag;
+        }
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
+    set_flag(path, FS_IMMUTABLE_FL, immutable)
+}
+
+/// Clears the immutable flag again on drop.
+struct Immutable(PathBuf);
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        let _ = set_immutable(&self.0, false);
+    }
+}
+
+/// Clears the append-only flag again on drop.
+struct AppendOnly(PathBuf);
+
+impl Drop for AppendOnly {
+    fn drop(&mut self) {
+        let _ = set_flag(&self.0, FS_APPEND_FL, false);
+    }
+}
+
+/// An immutable namespace directory passes examination (its files stay
+/// writable), and renaming it to its tombstone fails with nothing changed.
+#[test]
+fn gc_reclaims_past_a_namespace_it_cannot_rename() {
+    const TEST: &str = "gc_reclaims_past_a_namespace_it_cannot_rename";
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("{TEST}: skipped: setting the immutable flag needs root");
+        return;
+    }
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    if let Err(error) = set_immutable(&root.path().join(&stuck), true) {
+        eprintln!("{TEST}: skipped: the filesystem refuses the immutable flag ({error})");
+        return;
+    }
+    let immutable = Immutable(root.path().join(&stuck));
+
+    for _ in 0..3 {
+        let backing = RollbackBacking::open_remote(root.path(), writer.clone()).unwrap();
+        let current = inspect(writer.as_ref()).current.unwrap().namespace;
+        assert_eq!(
+            namespaces(root.path()),
+            [stuck.clone(), current],
+            "the automatic pass must retire each predecessor past the namespace it cannot rename"
+        );
+        commit(&backing, b"attached");
+    }
+    let kept = contents(&root.path().join(&stuck));
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+        .expect("a namespace GC cannot rename must not end the pass");
+    assert!(report.removed.is_empty());
+    assert_eq!(
+        report.unfinished,
+        [GcUnfinished {
+            name: stuck.clone(),
+            error: "renaming the immutable or append-only namespace directory to its tombstone: \
+                    Operation not permitted (os error 1)"
+                .into(),
+        }]
+    );
+    assert_eq!(report.counts.unfinished, 1);
+    assert_eq!(contents(&root.path().join(&stuck)), kept);
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+
+    drop(immutable);
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, [stuck]);
+}
+
+/// Renaming a namespace inside the root needs write permission on the root,
+/// not on the namespace. A rename that fails because of the root or its
+/// filesystem (here a root the daemon user may not write) is no namespace's
+/// own problem: it ends the pass, as it did, and names the namespace,
+/// instead of listing every candidate as unfinished and succeeding.
+#[test]
+fn a_rename_the_root_refuses_ends_the_pass() {
+    const TEST: &str = "a_rename_the_root_refuses_ends_the_pass";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+    // Two quiescent abandoned forks, which a pass would retire.
+    let mut stale = Vec::new();
+    for last in [1, 2] {
+        let mut session = [0; 16];
+        session[15] = last;
+        let name = namespace(1, session);
+        std::fs::create_dir(root.path().join(&name)).unwrap();
+        std::fs::write(root.path().join(&name).join("rollback.lock"), b"").unwrap();
+        stale.push(name);
+    }
+    let mode = std::fs::metadata(root.path()).unwrap().mode();
+    set_mode(root.path(), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, root.path()) else {
+        set_mode(root.path(), mode);
+        return;
+    };
+
+    let result = RollbackBacking::collect_remote(root.path(), writer.as_ref());
+    drop(modes);
+    set_mode(root.path(), mode);
+    let error = match result {
+        Ok(report) => panic!(
+            "the pass completed: unfinished {:?}, removed {:?}",
+            report.unfinished, report.removed
+        ),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(
+        error
+            .to_string()
+            .starts_with(&format!("GC stopped while retiring {}: ", stale[0])),
+        "{error}"
+    );
+    for name in &stale {
+        assert!(root.path().join(name).join("rollback.lock").is_file());
+    }
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, stale);
+}
+
+/// An append-only root refuses every rename out of it with the same EPERM
+/// an immutable namespace gets. It is the root's flag, not the namespace's:
+/// the pass ends, also when the namespace carries a flag of its own.
+#[test]
+fn an_append_only_root_ends_the_pass() {
+    const TEST: &str = "an_append_only_root_ends_the_pass";
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("{TEST}: skipped: setting the append-only flag needs root");
+        return;
+    }
+    for namespace_immutable in [false, true] {
+        let writer = authority();
+        let root = tempfile::tempdir().unwrap();
+        let created =
+            RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+        commit(&created, b"created");
+        drop(created);
+        drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+        let stale = first_stale_name();
+        std::fs::create_dir(root.path().join(&stale)).unwrap();
+        std::fs::write(root.path().join(&stale).join("rollback.lock"), b"").unwrap();
+        let immutable = if namespace_immutable {
+            if let Err(error) = set_immutable(&root.path().join(&stale), true) {
+                eprintln!("{TEST}: skipped: the filesystem refuses the immutable flag ({error})");
+                return;
+            }
+            Some(Immutable(root.path().join(&stale)))
+        } else {
+            None
+        };
+        if let Err(error) = set_flag(root.path(), FS_APPEND_FL, true) {
+            eprintln!("{TEST}: skipped: the filesystem refuses the append-only flag ({error})");
+            return;
+        }
+        let append_only = AppendOnly(root.path().to_owned());
+
+        let error = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+            .expect_err("a rename an append-only root refuses must end the pass");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("GC stopped while retiring {stale}: ")),
+            "namespace immutable: {namespace_immutable}: {error}"
+        );
+        assert!(root.path().join(&stale).join("rollback.lock").is_file());
+
+        drop(append_only);
+        drop(immutable);
+        let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+        assert_eq!(report.removed, [stale]);
+    }
+}
+
 /// What GC may delete is decided against the authority's current
 /// generation, which it reads from the current namespace. That one being
 /// unreadable is not a candidate to step past: nothing is retired.
@@ -430,6 +747,43 @@ fn the_automatic_pass_logs_the_namespaces_it_could_not_examine() {
             && events[0].contains("error=opening rollback.arena: Is a directory (os error 21)"),
         "{events:#?}"
     );
+}
+
+#[test]
+fn the_automatic_pass_logs_the_namespaces_it_could_not_finish_retiring() {
+    const TEST: &str = "the_automatic_pass_logs_the_namespaces_it_could_not_finish_retiring";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    set_mode(&root.path().join(&stuck), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, &root.path().join(&stuck)) else {
+        set_mode(&root.path().join(&stuck), 0o700);
+        return;
+    };
+    let tombstone = format!(".remote-gc-{stuck}");
+
+    // The pass that renames it, and every later one, says so.
+    for _ in 0..2 {
+        let (backing, events) =
+            logged(|| RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+        commit(&backing, b"attached");
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(
+            events[0].starts_with("WARN maki_backing::rollback::remote ")
+                && events[0].contains("automatic remote GC could not finish retiring")
+                && events[0].contains("count=1")
+                && events[0].contains(&format!("namespace={tombstone}"))
+                && events[0]
+                    .contains("error=unlinking rollback.arena: Permission denied (os error 13)"),
+            "{events:#?}"
+        );
+    }
+
+    drop(modes);
+    set_mode(&root.path().join(&tombstone), 0o700);
 }
 
 /// The authority of a writer whose activation was accepted, and which then

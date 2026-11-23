@@ -5,6 +5,8 @@
 use super::*;
 
 pub(super) const FILE: &str = "remote.enrollment";
+/// The binding while it is written, before it is renamed to [`FILE`].
+pub(super) const FILE_NEXT: &str = "remote.enrollment.next";
 const MAGIC: &[u8; 8] = b"MAKIRE01";
 const DOMAIN: &[u8] = b"maki.remote.enrollment.v1\0";
 const LENGTH: usize = 64;
@@ -47,6 +49,14 @@ impl Enrollment {
     /// Bind only an explicitly approved, never-activated authority. Existing
     /// bytes must match exactly; this operation cannot replace another binding.
     /// The caller holds the root enrollment lock until its remote claim ends.
+    ///
+    /// A new binding is written and synced as [`FILE_NEXT`], renamed to
+    /// [`FILE`], and the directory is synced, so the published name never
+    /// holds an empty or torn binding, whatever kills this process, cuts
+    /// the power or fails in between. Nothing reads the staged name: a
+    /// staged binding that a failed write or sync left is removed, and one
+    /// that a kill or a power loss left is truncated and written again
+    /// through a new descriptor, never synced as it is.
     pub(super) fn load_or_create(
         disk: &dyn Backing,
         identity: [u8; 16],
@@ -54,17 +64,37 @@ impl Enrollment {
     ) -> io::Result<Self> {
         let expected = Self { identity, capacity };
         let bytes = expected.encode()?;
-        if disk.exists(FILE)? && Self::load(disk)? != expected {
-            return Err(invalid(
-                "enrollment identity or capacity differs from approval",
-            ));
+        if disk.exists(FILE)? {
+            if Self::load(disk)? != expected {
+                return Err(invalid(
+                    "enrollment identity or capacity differs from approval",
+                ));
+            }
+            // Failed writeback can leave readable bytes clean and
+            // non-durable, and a rename whose directory sync failed may not
+            // be durable either. Rewrite the exact validated binding before
+            // retrying its syncs.
+            let file = disk.open(FILE, false)?;
+            file.write_at(0, &bytes)?;
+            file.set_len(LENGTH as u64)?;
+            file.sync_data()?;
+            disk.sync_dir("")?;
+            return Ok(expected);
         }
-        // Failed writeback can leave readable bytes clean and non-durable.
-        // Rewrite the exact validated binding before retrying its sync.
-        let file = disk.open(FILE, true)?;
-        file.write_at(0, &bytes)?;
-        file.set_len(LENGTH as u64)?;
-        file.sync_data()?;
+        let staged = (|| {
+            let file = disk.open(FILE_NEXT, true)?;
+            file.set_len(0)?;
+            file.write_at(0, &bytes)?;
+            file.set_len(LENGTH as u64)?;
+            file.sync_data()
+        })();
+        if let Err(error) = staged {
+            // A staged binding that stays does no harm: the next attempt
+            // writes it again.
+            let _ = disk.remove(FILE_NEXT);
+            return Err(error);
+        }
+        disk.rename(FILE_NEXT, FILE)?;
         disk.sync_dir("")?;
         Ok(expected)
     }
@@ -387,13 +417,18 @@ mod tests {
     #[test]
     fn readable_enrollment_after_failed_sync_is_rewritten_before_recovery_acknowledges_it() {
         let disk = WritebackBacking::new();
-        assert!(Enrollment::load_or_create(&disk, ID, PAGE).is_err());
-        // Linux leaves failed-writeback bytes readable but clean. Sync alone
-        // cannot persist them; the existing binding must be rewritten first.
         let expected = Enrollment {
             identity: ID,
             capacity: PAGE,
         };
+        // A binding published under its name whose writeback then failed
+        // (one an earlier release wrote in place, or a rewrite below).
+        let file = disk.open(FILE, true).unwrap();
+        file.write_at(0, &expected.encode().unwrap()).unwrap();
+        assert!(file.sync_data().is_err());
+        drop(file);
+        // Linux leaves failed-writeback bytes readable but clean. Sync alone
+        // cannot persist them; the existing binding must be rewritten first.
         assert_eq!(Enrollment::load(&disk).unwrap(), expected);
         assert_eq!(
             Enrollment::load_or_create(&disk, ID, PAGE).unwrap(),

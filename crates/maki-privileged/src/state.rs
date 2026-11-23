@@ -372,6 +372,17 @@ impl TrustedState {
     /// instead of leaving it out. Other names (the lock, a temporary record
     /// of a killed write) are not records.
     pub fn devices_of_other_volumes(&self, volume: &str) -> io::Result<BTreeMap<String, String>> {
+        let mut devices = BTreeMap::new();
+        for record in self.records_of_other_volumes(volume)? {
+            devices.entry(record.device).or_insert(record.volume);
+        }
+        Ok(devices)
+    }
+
+    /// Every other volume's trusted record, by volume name, read as
+    /// [`Self::devices_of_other_volumes`] reads them: an entry that cannot
+    /// be read fails the listing and is named.
+    pub fn records_of_other_volumes(&self, volume: &str) -> io::Result<Vec<BoundDeviceRecord>> {
         // List the directory this descriptor holds, wherever its path now
         // leads; each record is then opened relative to the descriptor.
         let listing = format!("/proc/self/fd/{}", self.directory.as_raw_fd());
@@ -386,7 +397,7 @@ impl TrustedState {
             }
         }
         names.sort();
-        let mut devices = BTreeMap::new();
+        let mut records = Vec::new();
         for name in names {
             let unreadable = |error: io::Error| {
                 io::Error::new(
@@ -408,11 +419,9 @@ impl TrustedState {
                 continue;
             }
             // An entry removed since the listing reserves nothing.
-            if let Some(record) = self.read(other).map_err(unreadable)? {
-                devices.entry(record.device).or_insert(record.volume);
-            }
+            records.extend(self.read(other).map_err(unreadable)?);
         }
-        Ok(devices)
+        Ok(records)
     }
 
     pub fn write(&self, record: &BoundDeviceRecord) -> io::Result<()> {

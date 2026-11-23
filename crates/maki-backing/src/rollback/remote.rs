@@ -263,7 +263,7 @@ fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
     for name in disk.list("")? {
         let unpublished = match name.as_str() {
             super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
-            MARKER => unwritten_marker(disk)?,
+            MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
             _ => false,
         };
         if !unpublished {
@@ -273,52 +273,12 @@ fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `rollback.format` was created and never completely written: it
-/// is empty or a torn copy of the marker, each byte the marker's or still
-/// zero. The marker itself is not.
-fn unwritten_marker(disk: &dyn Backing) -> io::Result<bool> {
-    let marker = disk.open(MARKER, false)?;
-    let len = marker.len()?;
-    if len > REMOTE_MAGIC.len() as u64 {
-        return Ok(false);
-    }
-    let mut bytes = vec![0; len as usize];
-    marker.read_at(0, &mut bytes)?;
-    Ok(bytes != REMOTE_MAGIC
-        && bytes
-            .iter()
-            .zip(REMOTE_MAGIC)
-            .all(|(byte, expected)| *byte == 0 || byte == expected))
-}
-
 /// Publish the format marker. Called with both root operation and
-/// enrollment locks held.
-///
-/// The marker is written and synced under its staging name, renamed into
-/// place, and the directory is synced, so `rollback.format` never names an
-/// empty or torn marker, whatever kills this process, cuts the power or
-/// fails in between. Until the rename nothing is published and the creation
-/// can simply be run again. A staged marker that a failed write or sync
-/// left is never synced as it is: it is truncated and written again through
-/// a new descriptor first.
+/// enrollment locks held. Until it is published the creation can simply be
+/// run again (`super::publish_marker`).
 fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
     require_empty_remote_root(disk)?;
-    let staged = (|| {
-        let marker = disk.open(super::MARKER_NEXT, true)?;
-        marker.set_len(0)?;
-        marker.write_at(0, REMOTE_MAGIC)?;
-        marker.set_len(REMOTE_MAGIC.len() as u64)?;
-        marker.sync_data()
-    })();
-    if let Err(error) = staged {
-        // Leave the root as this run found it where that still works. A
-        // staged marker that stays does no harm: the next creation accepts
-        // and rewrites it.
-        let _ = disk.remove(super::MARKER_NEXT);
-        return Err(error);
-    }
-    disk.rename(super::MARKER_NEXT, MARKER)?;
-    disk.sync_dir("")
+    super::publish_marker(disk, REMOTE_MAGIC)
 }
 
 /// Say what to do with a root that enrollment recovery cannot open because
@@ -358,6 +318,15 @@ fn collect_after_activation(
                     namespace = %first.name,
                     error = %first.error,
                     "automatic remote GC kept retired writer namespaces it could not examine; \
+                     `maki volume gc` lists each with its error"
+                );
+            }
+            if let Some(first) = report.unfinished.first() {
+                tracing::warn!(
+                    count = report.counts.unfinished,
+                    namespace = %first.name,
+                    error = %first.error,
+                    "automatic remote GC could not finish retiring writer namespaces; \
                      `maki volume gc` lists each with its error"
                 );
             }
