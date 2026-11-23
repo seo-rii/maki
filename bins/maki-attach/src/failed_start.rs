@@ -62,15 +62,16 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
     let status = std::env::var("EXIT_STATUS").ok();
     if !failed_main_process(result.as_deref(), code.as_deref(), status.as_deref()) {
         if plan_only {
-            println!("# no automatic recovery: no failed ExecStart is established");
+            crate::print_plan("# no automatic recovery: no failed ExecStart is established\n")?;
         }
         return Ok(());
     }
     let unit = format!("maki-recover@{volume}.service");
     if plan_only {
-        println!("# would schedule {unit} only if the manager still has the original attach start job running");
-        println!("# coordinator stops workloads before identity-checked cleanup");
-        return Ok(());
+        return crate::print_plan(&format!(
+            "# would schedule {unit} only if the manager still has the original attach start job running\n\
+             # coordinator stops workloads before identity-checked cleanup\n"
+        ));
     }
     #[cfg(target_os = "linux")]
     {
