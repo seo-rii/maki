@@ -142,9 +142,21 @@ before the backing or a remote witness changes. Enable the `fake-provider`
 feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
-endpoint URL. The TLS section is optional when system/default trust is enough.
-A custom `ca_file` adds trust; it does not disable the built-in roots. There is
-no certificate-verification bypass setting.
+endpoint URL. The TLS section is optional when the transport's default trust
+is enough, and that default differs by transport:
+
+| `crypto.provider` | Roots trusted without `ca_file` |
+|---|---|
+| `remote-http` | Only the public roots compiled into the binary (the `webpki-roots` set). The host's trust store is never read |
+| `remote-grpc` | Only the host's trust store. With no `ca_file`, an `https://` endpoint on a host whose store is empty is refused at attach |
+| `remote-websocket` | The host's trust store and the compiled-in public roots |
+
+The host's trust store is the system CA bundle, or the files that
+`SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. A custom `ca_file`
+adds its certificates to the transport's roots; it does not replace them. A
+private CA installed only in the host's trust store is therefore trusted by
+`remote-grpc` and `remote-websocket` but not by `remote-http`, which needs it
+in `ca_file`. There is no certificate-verification bypass setting.
 
 For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
 
