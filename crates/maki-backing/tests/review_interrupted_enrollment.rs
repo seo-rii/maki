@@ -427,6 +427,39 @@ fn control_a_published_marker_is_continued_by_enrollment_recovery_only() {
     assert_eq!(inspect(admin.as_ref()).fence, 1);
 }
 
+/// One file later the creation writes the binding. Cut there, it leaves a
+/// published marker and an unwritten binding: enrollment recovery refuses
+/// the binding rather than write over it, and continues once the operator
+/// has moved it out of the root.
+#[test]
+fn control_an_unwritten_binding_is_quarantined_before_enrollment_recovery_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = locked_root(dir.path());
+    std::fs::write(root.join("rollback.format"), MARKER).unwrap();
+    std::fs::write(root.join("remote.enrollment"), b"").unwrap();
+    let (writer, admin) = authority();
+    assert!(RollbackBacking::create_remote(&root, writer, CAPACITY).is_err());
+    let record = inspect(admin.as_ref());
+    let error = RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "invalid enrollment metadata length");
+    assert_eq!(inspect(admin.as_ref()), record);
+    std::fs::rename(
+        root.join("remote.enrollment"),
+        dir.path().join("remote.enrollment.kept"),
+    )
+    .unwrap();
+    RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record).unwrap();
+    assert_eq!(inspect(admin.as_ref()).fence, 1);
+    assert_eq!(
+        std::fs::metadata(root.join("remote.enrollment"))
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
 /// Only a root that holds nothing else is an interrupted creation. An
 /// unwritten marker beside a namespace, a binding or any other entry, and a
 /// marker holding anything but a torn copy, are refused and left as they

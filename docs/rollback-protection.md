@@ -139,8 +139,12 @@ empty or partly written beside nothing but those lock files is completed by
 `resume-enrollment` refuses such a root with a message that says to create
 the volume again. Once `rollback.format` holds the marker, `volume create`
 refuses the root (`remote enrollment requires an empty backing`) and the
-procedure below continues it. An interrupted `maki-witness init` is a
-separate case, described with
+procedure below continues it. A creation that stopped while it wrote the
+binding, the next file, leaves a `remote.enrollment` that is empty or
+incomplete, which `resume-enrollment` refuses as invalid enrollment metadata:
+move that file out of the backing root, keep it, and resume, which then
+writes the binding for the approved identity and capacity. An interrupted
+`maki-witness init` is a separate case, described with
 [the authority's initialization](remote-witness-service.md#initialize-a-local-authority).
 
 Keep the volume detached and automatic restarts disabled. Preserve the failed
