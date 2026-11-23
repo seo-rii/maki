@@ -870,6 +870,18 @@ async fn dispatch_endpoint_set(
     })
     .await
     .map_err(|e| DaemonError::Unsupported(format!("canary storage worker failed: {e}")))??;
+    // The set excludes the candidate for good when this validation fails
+    // with `ProviderFatal` or `UnsupportedContext` (`EndpointValidator`).
+    // `reference` and `candidate` are the set's validation views, which
+    // relabel every failure an endpoint returns that proves nothing, so the
+    // checks below reach such a verdict only from the candidate's own
+    // replies. The random-prefix wrapper stacked on the views here has
+    // errors of its own, but none that a configuration attach accepted can
+    // produce: it checks the capabilities, unit size and RPC byte budgets
+    // that configuration validation, the reachability probe and `verify`
+    // already checked, and the checks split their requests by its batch
+    // limits. Its one runtime failure, an operating-system random source
+    // that fails, fails every encrypt the volume serves as well.
     let validation_context = context.clone();
     let validator: EndpointValidator = Arc::new(move |reference, candidate, _request_context| {
         let context = validation_context.clone();

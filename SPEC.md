@@ -1104,17 +1104,40 @@ status is `Retryable`.
 | `bad-request` | `NonRetryableRequest` |
 | Anything else, a missing class included | Contract violation |
 
-A WebSocket `integrity` or `unsupported-context` error with another reason,
-with none, or in a frame that repeats its `id`, `error`, `class` or `reason`
-member is a contract violation as well. A WebSocket error frame has no class
-for an endpoint failure; the refused upgrade of a connection reports one:
-status `429` is `Throttled`, `408` and 5xx are `Retryable`, and any other
-status is `EndpointFatal`.
+A member that a WebSocket response repeats is read from its last occurrence,
+so a frame's class is the last `class` member of its last `error` member. An
+`integrity` or `unsupported-context` class selected this way is a contract
+violation as well when its `reason` is not one of that class's two tokens, or
+when the frame does not hold exactly one `id`, `error`, `class` and `reason`
+member with a numeric `id` and a string `reason`. A WebSocket error frame has
+no class for an endpoint failure; the upgrade that opens a connection reports
+one. A refused upgrade with status `429` is `Throttled`, with `408` or a 5xx
+status `Retryable`, and with any other 3xx or 4xx status `EndpointFatal`; so
+is a reply that is not a valid upgrade (a `101` without the upgrade headers or
+with the wrong accept key, a status below 300 or above 599, a head that is not
+HTTP). An upgrade reply cut short by a lost connection is `Retryable`.
 
 Without a classified answer, every transport reports a timeout or a lost
-connection as `Retryable`, a TLS authentication or protocol failure as
-`EndpointFatal`, and a reply that breaks the transport's framing or size limit
-as a contract violation.
+connection, also one that cuts a reply short, as `Retryable`, and a TLS
+authentication or protocol failure as `EndpointFatal`. On an established
+connection, a reply that breaks the framing of the transport's messages or
+their size limit is a contract violation: an HTTP/1.1 response head or chunked
+body that does not parse, or a body that only the connection's close ends; a
+gRPC message whose length prefix, count or final status breaks the gRPC
+protocol, or a stream that ends inside a message; a WebSocket frame that breaks
+the WebSocket protocol or is not a JSON text frame with a numeric `id`. Two
+protocol failures are classified otherwise. A WebSocket upgrade reply that is
+not a valid upgrade is `EndpointFatal`, as above. An HTTP/2 error below the
+gRPC messages, a reset stream or a GOAWAY, is no framing violation: it reaches
+Maki as the gRPC status that the gRPC library derives from it and is classified
+by the gRPC table. A reset, and a GOAWAY that refuses the call (its last stream
+ID is below the call's stream, so the server did not process it), is classified
+by its error code: `ENHANCE_YOUR_CALM` is `Throttled` (`ResourceExhausted`),
+`INADEQUATE_SECURITY` is `EndpointFatal` (`PermissionDenied`), and every other
+code is `Retryable`. A GOAWAY that accepted the call and then closes the
+connection under it is `Retryable` whatever its code. Either way the request
+was handed to the connection and counts as sent: a call that a GOAWAY refused
+is not resent or failed over unless the provider is `retry_safe`.
 
 ---
 
@@ -1423,9 +1446,9 @@ slot valid
 → decrypt
 ```
 
-On an envelope-v3 volume the shard's discard map (§21) is consulted before
-the allocation map and the slot: a unit whose discard bit is set reads as
-zero, whatever they hold.
+On an envelope-v3 volume the shard's discard map (record layout below) is
+consulted before the allocation map and the slot: a unit whose discard bit is
+set reads as zero, whatever they hold.
 
 Slot headers are authoritative; the shard catalog and the allocation maps
 are accelerators. An A/B record legitimately falls back to its older
@@ -1462,10 +1485,10 @@ ignore them. `units` is the volume's `units_per_shard` in every shard, so a
 copy is `32 + ceil(units_per_shard / 8)` bytes; attach accepts no map of
 another size.
 
-An envelope-v3 volume keeps a second map per shard, the discard map, stored
-A/B as `data/shard-<index>.discard.a` and `data/shard-<index>.discard.b`. It
-is the same record, with the same magic, version and bit order; a set bit
-means the unit was discarded and reads as zero.
+The discard map of an envelope-v3 volume (§21) is stored A/B as
+`data/shard-<index>.discard.a` and `data/shard-<index>.discard.b`. It is the
+same record, with the same magic, version and bit order; a set bit marks a
+discarded unit.
 
 The shard catalog (`shard-catalog.a`, `shard-catalog.b`):
 
@@ -2064,9 +2087,10 @@ conclusive (excluded for the life of the set):
 inconclusive (validated again later):
   a transport error, timeout or admission limit; a reply that does
   not parse, is truncated or has the wrong shape; a request refused
-  without an integrity failure (a generic bad request), by either
-  peer and whatever the request, a negative self-test probe
-  included; any other failure of the validated peer
+  without an integrity failure (a generic bad request) or a fatal
+  error that the endpoint's own provider reports, by either peer and
+  whatever the request, a negative self-test probe included; any
+  other failure of the validated peer
 ```
 
 A definitive integrity failure is `CryptoError::Integrity`, the evidence a
