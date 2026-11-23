@@ -285,8 +285,9 @@ pub(crate) enum GcRemoval {
     /// Nothing about it was changed.
     Unreadable(io::Error),
     /// The candidate passed examination, and a step that changes it alone
-    /// (its rename, an unlink in it, the sync of its directory, its
-    /// removal) failed, for the reason held. `tombstone` says whether it is
+    /// (its rename when its own directory is immutable or append-only, an
+    /// unlink in it, the sync of its directory, its removal) failed, for
+    /// the reason held. `tombstone` says whether it is
     /// now under its tombstone name.
     Unfinished {
         tombstone: bool,

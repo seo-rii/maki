@@ -720,6 +720,17 @@ fn examining(step: impl std::fmt::Display, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{step}: {error}"))
 }
 
+/// Whether `directory` carries the immutable or the append-only flag. A
+/// filesystem without the flags has neither.
+fn immutable_or_append_only(directory: &File) -> bool {
+    const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+    const FS_APPEND_FL: libc::c_int = 0x20;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: valid descriptor; FS_IOC_GETFLAGS writes one int.
+    let read = unsafe { libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+    read == 0 && (flags & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
+}
+
 /// A retirement that stopped at a step changing the candidate alone.
 fn unfinished(tombstone: bool, step: impl std::fmt::Display, error: io::Error) -> GcRemoval {
     GcRemoval::Unfinished {
@@ -874,15 +885,17 @@ impl Directory {
     /// [`GcRemoval::Unreadable`]: nothing about it has been changed, and
     /// the failure says nothing about any other candidate, so the caller
     /// keeps it and goes on. A step of its retirement that changes the
-    /// candidate alone (its rename, which changes nothing when it fails, an
-    /// unlink in it, the sync of its directory, its removal) that fails is
+    /// candidate alone (its rename when its own directory is immutable or
+    /// append-only, which changes nothing, an unlink in it, the sync of its
+    /// directory, its removal) that fails is
     /// returned as [`GcRemoval::Unfinished`]: the tombstone, once renamed,
     /// is already durable, and every other candidate's deletion rests on its
     /// own examination, lock and durable tombstone, so the caller keeps it
     /// as the step left it and goes on; a later pass resumes it. An error is
-    /// returned only for the root itself (its mount identity, its syncs) and
-    /// for an entry that changed identity while it was being retired, which
-    /// only something other than this pass can have done.
+    /// returned only for the root itself (its mount identity, its syncs, a
+    /// rename it or its filesystem refuses) and for an entry that changed
+    /// identity while it was being retired, which only something other than
+    /// this pass can have done.
     pub(super) fn gc_retire(&self, original: &str, retired: bool) -> io::Result<GcRemoval> {
         validate(original, false)?;
         if original.contains('/') {
@@ -922,16 +935,26 @@ impl Directory {
             } != 0
             {
                 let error = io::Error::last_os_error();
+                // Renaming a directory inside its parent needs no
+                // permission on the directory itself, so a failure is the
+                // root's or its filesystem's (no write permission on the
+                // root, a read-only or full filesystem, an append-only root,
+                // an I/O error) and ends the pass, except the namespace's own
+                // immutable or append-only flag, which concerns it alone.
+                // Nothing has been renamed either way.
                 return if error.kind() == io::ErrorKind::AlreadyExists {
                     Ok(GcRemoval::Unrecognized)
-                } else {
-                    // An immutable or append-only namespace directory, for
-                    // example. Nothing has been renamed.
+                } else if error.raw_os_error() == Some(libc::EPERM)
+                    && immutable_or_append_only(&directory)
+                {
                     Ok(unfinished(
                         false,
-                        "renaming the namespace to its tombstone",
+                        "renaming the immutable or append-only namespace directory to its \
+                         tombstone",
                         error,
                     ))
+                } else {
+                    Err(error)
                 };
             }
         }

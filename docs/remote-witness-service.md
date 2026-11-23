@@ -591,18 +591,23 @@ until it is removed.
 A namespace that passed examination and whose retirement stopped at a step
 that changes it alone is kept as that step left it and listed under
 `unfinished`, and GC goes on to the next entry. The step is renaming it to
-its tombstone, which changes nothing when it fails (for an immutable or
-append-only directory, for example,
-`renaming the namespace to its tombstone: Operation not permitted (os error 1)`),
+its tombstone when its own directory is immutable or append-only, which
+changes nothing
+(`renaming the immutable or append-only namespace directory to its tombstone: Operation not permitted (os error 1)`),
 or, once the durable tombstone exists, unlinking one of its files, syncing
 its directory or removing it (for a directory the daemon user may read but
 not write, `unlinking rollback.arena: Permission denied (os error 13)`).
 `name` is the entry as GC left it: the namespace if the rename failed, its
 `.remote-gc-` tombstone otherwise. Tombstones sort before every namespace,
 so a later pass meets the entry first and resumes its retirement. Correct
-the mode, owner or flag the error points to (`chmod u+w`, `chown -R`,
-`chattr -i` or `-a`) and run GC again, rather than removing the files by
-hand: GC removes them only while it holds the namespace's lifetime lock.
+the mode, owner or flag the error points to on that entry (`chmod u+w`,
+`chown -R`, `chattr -i` or `-a`) and run GC again, rather than removing the
+files by hand: GC removes them only while it holds the namespace's lifetime
+lock. Renaming a namespace needs write permission on the root, not on the
+namespace, so a rename that fails for any other reason (no write permission
+on the root, a read-only or full filesystem, an append-only or immutable
+root, an I/O error) concerns the root and ends the pass, as described
+below.
 
 GC walks the root in sorted pages of at most 4,096 names and continues past
 pages containing only retained, live or unrecognized entries. Each page scans
@@ -626,8 +631,9 @@ own examination, lifetime lock and durable tombstone. A pass ends with an
 error, keeping every namespace it has not yet retired, when it cannot tell
 what may be deleted or cannot delete it durably: an authority failure or a
 changed record, a root whose marker, current generation, binding, listing or
-mount identity it cannot read, a failed sync of the root directory, or an
-entry that changed identity while GC was retiring it, which the error names.
+mount identity it cannot read, a rename into a tombstone that the root or its
+filesystem refuses, a failed sync of the root directory, or an entry that
+changed identity while GC was retiring it, which the error names.
 A failed automatic pass does not turn successful activation into an
 unacknowledged commit, and only the log reports it: a `WARN` event gives the
 error that ended the pass, and one names the first namespace the pass could

@@ -64,8 +64,9 @@ pub struct GcUnreadable {
 
 /// A lower-fence namespace, or the tombstone of one, that passed
 /// examination and whose retirement stopped at a step that changes it alone
-/// (renaming it to its tombstone, an unlink in it, the sync of its
-/// directory, removing it), with the error, which names the step. `name` is
+/// (renaming it to its tombstone when its own directory is immutable or
+/// append-only, an unlink in it, the sync of its directory, removing it),
+/// with the error, which names the step. `name` is
 /// the entry as the pass left it: the namespace if renaming it failed, its
 /// tombstone otherwise. The pass went on; a later pass resumes it.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -160,15 +161,17 @@ impl<'a> OperationGuard<'a> {
     /// tell what may be deleted, or to delete it durably: the authority
     /// (unavailable, invalid, or changed since the pass began), the root (its
     /// marker, the authority's current generation in it, its binding, its
-    /// listing, its mount identity, its syncs), and an entry that changed
-    /// identity while the pass retired it, which names that namespace. A
+    /// listing, its mount identity, its syncs, a rename it or its
+    /// filesystem refuses), and an entry that changed identity while the
+    /// pass retired it, which names that namespace. A
     /// lower-fence namespace the pass cannot open or examine is not such a
     /// failure: nothing about it has been changed and every other candidate
     /// is judged on its own lock and contents, so it is kept, reported under
     /// `skipped_unreadable` with the error, and the pass goes on. Nor is a
-    /// step of a retirement that changes that candidate alone (renaming it,
-    /// which changes nothing when it fails, an unlink in it, the sync of its
-    /// directory, removing it): once renamed, its tombstone is durable, and
+    /// step of a retirement that changes that candidate alone (renaming it
+    /// when its own directory is immutable or append-only, which changes
+    /// nothing, an unlink in it, the sync of its directory, removing it):
+    /// once renamed, its tombstone is durable, and
     /// every other candidate's deletion rests on its own examination, lock
     /// and durable tombstone. It is kept as the step left it, reported under
     /// `unfinished` with the error, and a later pass resumes it.

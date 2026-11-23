@@ -503,7 +503,8 @@ fn gc_reclaims_past_a_namespace_it_cannot_rename() {
         report.unfinished,
         [GcUnfinished {
             name: stuck.clone(),
-            error: "renaming the namespace to its tombstone: Operation not permitted (os error 1)"
+            error: "renaming the immutable or append-only namespace directory to its tombstone: \
+                    Operation not permitted (os error 1)"
                 .into(),
         }]
     );
