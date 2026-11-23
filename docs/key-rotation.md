@@ -1,8 +1,8 @@
 # Credential rotation and key migration
 
 Check [format compatibility](durable-recovery.md) before restarting a volume
-with the current binary. Writable recovery requires v2 metadata; a legacy v1
-volume needs the separate preservation and migration procedure. Credential
+with the current binary. Writable recovery requires v2 or v3 metadata; a legacy
+v1 volume needs the separate preservation and migration procedure. Credential
 rotation alone does not upgrade its format or prove ambiguous legacy history.
 
 An authentication credential can be replaced on an existing volume only when
@@ -222,7 +222,9 @@ changing it does not reload a running connection pool.
    the packaged production unit and its automatic recovery handler.
 
 Removing this private root from `ca_file` is not certificate revocation and
-does not remove built-in public roots. Qualify the deployment's actual chain,
+does not remove the roots the transport trusts without it: the compiled-in
+public roots, the host's trust store, or both, depending on the
+[transport](configuration.md#providers). Qualify the deployment's actual chain,
 DNS/IP names, proxy, trust policy, and rollback procedure separately. Retain
 old trust or certificates for rollback only when the security policy permits.
 

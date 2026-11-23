@@ -20,14 +20,24 @@ HTTP example is available at
 | `limits` | Request, byte, queue, batch, endpoint concurrency, and in-memory overlay bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
 | `backing.rollback_protection` | Experimental Linux COW format: preallocated logical-page `capacity` and exactly one independent local `witness_root` or mTLS `remote` authority (new volumes only; [remote service](remote-witness-service.md)) |
-| `cache` | Read-cache mode, size, TTL, locking, and zeroization |
+| `cache` | Read-cache mode, size, TTL, and hit verification (`lock_memory` and `zeroize_on_evict` are accepted but select nothing; see [read cache](#read-cache)) |
 | `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
-Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
+Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`: a bare
+integer number of bytes, or a quoted string with the unit `B`, `KiB`, `MiB`,
+`GiB` or `TiB`. Nine byte-valued keys are plain integers and take only the
+bare number (`4096`, never `"4KiB"`): `volume.device_block_size`,
+`volume.crypto_unit_size`, `crypto.random_prefix_bytes`,
+`crypto.capabilities.supported_plaintext_sizes`,
+`crypto.capabilities.max_ciphertext_size`, `backing.slot_alignment`,
+`nbd.device_block_size`, `nbd.minimum_io` and `nbd.preferred_io`. A string
+there is a schema error, reported with its line and column only.
 Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
 as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
+(The remote witness `timeout_ms` is not such a duration: it is an integer
+number of milliseconds.)
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
 letters, digits, `_` and `-`, and must not start with `-`, matching the
@@ -132,9 +142,21 @@ before the backing or a remote witness changes. Enable the `fake-provider`
 feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
-endpoint URL. The TLS section is optional when system/default trust is enough.
-A custom `ca_file` adds trust; it does not disable the built-in roots. There is
-no certificate-verification bypass setting.
+endpoint URL. The TLS section is optional when the transport's default trust
+is enough, and that default differs by transport:
+
+| `crypto.provider` | Roots trusted without `ca_file` |
+|---|---|
+| `remote-http` | Only the public roots compiled into the binary (the `webpki-roots` set). The host's trust store is never read |
+| `remote-grpc` | Only the host's trust store. With no `ca_file`, an `https://` endpoint on a host whose store is empty is refused at attach |
+| `remote-websocket` | The host's trust store and the compiled-in public roots |
+
+The host's trust store is the system CA bundle, or the files that
+`SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. A custom `ca_file`
+adds its certificates to the transport's roots; it does not replace them. A
+private CA installed only in the host's trust store is therefore trusted by
+`remote-grpc` and `remote-websocket` but not by `remote-http`, which needs it
+in `ca_file`. There is no certificate-verification bypass setting.
 
 For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
 
@@ -210,8 +232,9 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s` or whose reciprocal cannot
   be represented by `Duration`, an
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
-  targets above their maxima, or a batch byte limit smaller than one crypto
-  unit;
+  targets above their maxima, or a `crypto.batch.max_bytes` smaller than one
+  provider plaintext unit (`volume.crypto_unit_size +
+  crypto.random_prefix_bytes`);
 - a retry strategy other than `exponential-full-jitter`, a
   `capabilities.mode` other than `declared`, `availability_policy = "bounded-error"` without a
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
@@ -681,7 +704,12 @@ outside the configured constraints fail cleanly.
 
 `cache.mode = "read"` keeps decrypted units in a versioned LRU keyed by
 `(unit, write_sequence)`, bounded by `cache.max_bytes` and `cache.ttl`, with
-entries in zeroizing (and, with `lock_memory`, page-locked) buffers. A read
+entries in zeroizing buffers that are page-locked as
+`security.memory_lock_mode` selects. `cache.lock_memory` and
+`cache.zeroize_on_evict` are accepted but select neither: an entry is zeroized
+when its last owner drops it whatever `zeroize_on_evict` says, and
+`lock_memory = false` does not unlock entries (validation only refuses
+`lock_memory = true` with `memory_lock_mode = "off"`). A read
 first establishes each unit's current version — the overlay entry, or the
 64-byte slot header — and serves a hit without reading the ciphertext
 payload or calling the provider; a miss reads, verifies and decrypts the
