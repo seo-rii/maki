@@ -22,10 +22,12 @@ for a first installation.
 | systemd | 249 or later for `OnSuccess=` in the recovery unit | 252 |
 | util-linux | `blkid`, `blockdev`, `findmnt` | Included |
 
-The Debian package declares these dependencies:
+The Debian package declares these dependencies, followed by the native
+library packages that `dpkg-shlibdeps` finds in the binaries at build time
+(such as `libc6`):
 
 ```text
-Depends: nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd, kmod
+Depends: nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod
 ```
 
 so `apt install ./maki_*.deb` refuses to install until a suitable
@@ -56,29 +58,54 @@ standard Debian backport workflow below produces an equivalent versioned
 package. Review it before use and keep the resulting `.deb` with your
 deployment artifacts so every host installs the same build.
 
+The repository records no digest for the upstream `nbd-3.27.1.tar.xz`, and
+the download location alone does not prove what it serves. Before the first
+build, verify the tarball against the upstream maintainer's OpenPGP
+signature for the release (`gpg --verify <signature> nbd-3.27.1.tar.xz`),
+using a release key whose fingerprint you confirmed independently of the
+download. Do not build a tarball whose signature you could not verify.
+Record its SHA-256 (`sha256sum nbd-3.27.1.tar.xz`) with your deployment
+artifacts and set it for every build with
+`export NBD_TARBALL_SHA256=<verified digest>`.
+
+The recipe runs in a subshell that stops at the first failed command. It
+builds in a new directory, refuses a tarball with any other digest before
+building, and installs exactly the client package its build produced for the
+host architecture:
+
 ```bash
+(
+set -euo pipefail
 # 1. Build dependencies of the existing Debian source package, plus the
 #    autoconf archive the upstream build needs. Enable `deb-src` first:
 #    uncomment the deb-src lines in /etc/apt/sources.list, or add
 #    "Types: deb deb-src" to the .sources file if the host uses deb822.
 apt update
-apt install -y build-essential devscripts autoconf-archive
+apt install -y build-essential devscripts autoconf-archive curl
 apt build-dep -y nbd-client
 
-# 2. Fetch the Debian packaging and the upstream release tarball.
-mkdir -p /usr/local/src/nbd && cd /usr/local/src/nbd
+# 2. Fetch the Debian packaging and the upstream release tarball into a new,
+#    empty directory, and check the tarball against the verified digest.
+nbd_build="$(mktemp -d /usr/local/src/nbd-3.27.1.XXXXXX)"
+printf 'building in %s\n' "$nbd_build"
+cd "$nbd_build"
 apt source nbd-client
 curl -fsSLO https://github.com/NetworkBlockDevice/nbd/releases/download/nbd-3.27.1/nbd-3.27.1.tar.xz
-sha256sum nbd-3.27.1.tar.xz      # compare with the upstream release page
+printf '%s  nbd-3.27.1.tar.xz\n' "${NBD_TARBALL_SHA256:-}" | sha256sum --check --strict
 
 # 3. Rebase the Debian packaging onto the new upstream version.
 cd nbd-3.24*/
 uupdate --upstream-version 3.27.1 ../nbd-3.27.1.tar.xz
 cd ../nbd-3.27.1
 
-# 4. Build unsigned binary packages and install the client.
+# 4. Build unsigned binary packages, then install the client package this
+#    build wrote to the parent directory (its name omits the epoch).
 dpkg-buildpackage -us -uc -b
-apt install -y ../nbd-client_3.27.1-*_amd64.deb   # the epoch is not part of the file name
+nbd_version="$(dpkg-parsechangelog --show-field Version)"
+nbd_deb="$(cd .. && pwd)/nbd-client_${nbd_version#*:}_$(dpkg --print-architecture).deb"
+apt install -y "$nbd_deb"
+sha256sum "$nbd_deb"
+)
 ```
 
 Verify the result before continuing:
@@ -88,8 +115,11 @@ dpkg -s nbd-client | grep '^Version'         # 1:3.27.1-… or later
 nbd-client -h 2>&1 | grep -o 'version [0-9.]*'
 ```
 
-`uupdate` may report packaging patches that no longer apply; drop patches
-that upstream 3.27 already contains and re-run the build. If the
+`uupdate` may carry over packaging patches that no longer apply, and
+`dpkg-buildpackage` then stops. Drop the patches that upstream 3.27 already
+contains from `debian/patches/series` in the printed directory's
+`nbd-3.27.1` subdirectory, then repeat step 4 there inside
+`( set -euo pipefail; … )`. If the
 `libnl-genl-3` development package is missing, netlink support is compiled
 out and `maki-attach` will fail closed at attach time, so keep
 `apt build-dep` in step 1.
