@@ -803,7 +803,10 @@ the provider wire; the derived ID binds the volume's plaintext layout. Changing
 the prefix length or enabling/disabling it on an existing volume MUST refuse
 attach. Batch limits and remote admission MUST account for expanded plaintext,
 and endpoint/canary verification MUST cover the same prefix wrapper used for
-volume I/O. See [random plaintext prefixes](docs/random-plaintext-prefix.md).
+volume I/O. The wrapper translates the derived ID to the base ID without
+binding either: the attach self-test's compatibility-ID probe MUST reach the
+provider through it (§18), and its own refusal of another ID is not context
+evidence. See [random plaintext prefixes](docs/random-plaintext-prefix.md).
 
 ---
 
@@ -902,17 +905,22 @@ for gRPC the `volume_id`, `compatibility_id` and `format_version` fields of
 `CryptoBatchRequest`. A provider that declares context binding MUST tie
 ciphertext to all of them. Maki's attach self-test probes each field
 separately (plus the unit index) and refuses attach when a foreign value
-decrypts to the original plaintext. WebSocket and gRPC always send each
-item's unit index; an HTTP mapping that declares context binding MUST also
+decrypts to the original plaintext. The probes run on the provider stack the
+volume is served through and MUST reach the provider: with random prefixes
+(§17) the compatibility-ID probe is forwarded through the wrapper, so the
+provider is asked to decrypt under the same foreign base ID as on a volume
+without a prefix and the verdict is the same. WebSocket and gRPC always send
+each item's unit index; an HTTP mapping that declares context binding MUST also
 map a per-item `unit_index` field (in `fields` of a per-item body, in
 `item_fields` of a batch, whose top-level fields belong to no item), and
 configuration validation rejects one that omits any of these fields. A
-schema-level refusal is accepted only as `CryptoError::UnsupportedContext` for
-the exact field that probe changed: `FormatVersion` or `CompatibilityId`. A
-generic bad request, provider failure, or a refusal of another field does not
-prove context binding. Definitive `CryptoError::Integrity` or a valid changed
-plaintext also satisfies a context probe; an unavailable endpoint remains
-inconclusive.
+schema-level refusal is accepted only as the provider's
+`CryptoError::UnsupportedContext` for the exact field that probe changed:
+`FormatVersion` or `CompatibilityId`; a layer that does not bind a field never
+answers with one. A generic bad request, provider failure, or a refusal of
+another field does not prove context binding. Definitive
+`CryptoError::Integrity` or a valid changed plaintext also satisfies a context
+probe; an unavailable endpoint remains inconclusive.
 
 Explicit schema refusals use HTTP status `422` or gRPC status
 `FailedPrecondition` with exactly one `maki-crypto-error` header/metadata value:

@@ -633,17 +633,18 @@ The [prefix wrapper](random-plaintext-prefix.md) has focused provider, config
 and daemon suites:
 
 ```sh
-cargo test -p maki-crypto --test random_prefix
+cargo test -p maki-crypto --test random_prefix --test review_prefix_context_probe
 cargo test -p maki-format --test random_prefix_config
 cargo test -p maki-nbdkit --test random_prefix --test random_prefix_remote --test random_prefix_admission
 ```
 
 The tests inspect the actual expanded plaintext, fresh per-unit prefixes,
 provider response validation, capabilities and batch sizes, compatibility
-gates, authenticated-prefix corruption, partial writes, discard, reopen and
-two-endpoint remote operation. They do not establish a randomness benefit for
-every possible provider algorithm; existing nonce and integrity requirements
-still apply.
+gates, authenticated-prefix corruption, partial writes, discard, reopen,
+two-endpoint remote operation, and that the attach self-test's context probes
+reach the provider and give the same verdict with and without the prefix. They
+do not establish a randomness benefit for every possible provider algorithm;
+existing nonce and integrity requirements still apply.
 
 ## Experimental rollback backing
 
