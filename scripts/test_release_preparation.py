@@ -604,6 +604,10 @@ class ReleasePreparationTests(unittest.TestCase):
             (ancestor_config, "profile.release.debug = 0\n"),
             (home_config, '[unstable]\nbuild-std = ["std"]\n'),
             (ancestor_config, "[profile.release\n"),
+            # An included file is read like the including one, but it is
+            # not one of the files Cargo looks for by name.
+            (home_config, 'include = ["release.toml"]\n'),
+            (ancestor_config, 'include = [{ path = "release.toml", optional = true }]\n'),
         )):
             with self.subTest(config=config.name, text=text):
                 original = config.read_text()
