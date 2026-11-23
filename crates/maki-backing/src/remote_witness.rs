@@ -932,6 +932,53 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), initial());
     }
 
+    /// A state with a current descriptor and both hashes. The initial state
+    /// above holds neither, and a state re-encoded differently from its
+    /// stored bytes is refused.
+    #[test]
+    fn active_state_has_a_fixed_golden_vector() {
+        let body = concat!(
+            r#"{"format":2,"record":{"identity":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
+            r#""current":{"anchor":{"identity":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
+            r#""generation":4,"#,
+            r#""root":[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4]},"#,
+            r#""epoch":0,"#,
+            r#""namespace":"remote-0000000000000001-02020202020202020202020202020202"},"#,
+            r#""fence":1,"session":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"#,
+            r#""phase":"active","restore_source":null,"#,
+            r#""last_operation":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]},"#,
+            r#""last_request_hash":"#,
+            r#"[5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5],"#,
+            r#""session_authorization_hash":"#,
+            r#"[6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6]}"#,
+        );
+        let bytes = encode(&active()).unwrap();
+        assert_eq!(&bytes[..8], b"MAKIRW02");
+        // The body's length, 630, as a little-endian u32.
+        assert_eq!(bytes[8..12], [0x76, 0x02, 0x00, 0x00]);
+        assert_eq!(
+            std::str::from_utf8(&bytes[12..bytes.len() - 32]).unwrap(),
+            body
+        );
+        let hash: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hash,
+            "79deeb629281f9aaecaa6e7308a2284b15a37ae21e7b97bab8deb2d134a04873"
+        );
+        assert_eq!(decode(&wrap(body.as_bytes())).unwrap(), active());
+        for (phase, name) in [
+            (Phase::Released, r#""released""#),
+            (Phase::Claimed, r#""claimed""#),
+            (Phase::RestoreClaimed, r#""restore_claimed""#),
+            (Phase::Active, r#""active""#),
+        ] {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), name);
+        }
+    }
+
     #[test]
     fn checksum_valid_but_noncanonical_unknown_or_inconsistent_records_fail() {
         let initial = initial();

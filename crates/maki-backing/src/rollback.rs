@@ -1345,6 +1345,106 @@ mod tests {
         );
     }
 
+    /// A manifest with a directory, files, mapped pages and reservations.
+    /// The empty manifest above holds none of the nested records, and a
+    /// manifest re-encoded differently from its stored bytes is refused.
+    #[test]
+    fn populated_manifest_has_a_fixed_vector() {
+        let manifest = Manifest {
+            format: 1,
+            identity: std::array::from_fn(|i| 17 + i as u8),
+            generation: 7,
+            capacity: 4 * PAGE,
+            next_id: 4,
+            entries: BTreeMap::from([
+                ("volume.lock".to_string(), Entry::File(3)),
+                ("data/shard-00000000.dat".to_string(), Entry::File(1)),
+                ("data".to_string(), Entry::Directory),
+            ]),
+            files: BTreeMap::from([
+                (3, Node::default()),
+                (
+                    1,
+                    Node {
+                        len: 2 * PAGE + 5,
+                        pages: BTreeMap::from([
+                            (
+                                2,
+                                PageRef {
+                                    slot: 1,
+                                    hash: std::array::from_fn(|i| 192 + i as u8),
+                                },
+                            ),
+                            (
+                                0,
+                                PageRef {
+                                    slot: 5,
+                                    hash: std::array::from_fn(|i| 160 + i as u8),
+                                },
+                            ),
+                        ]),
+                        reserved: BTreeSet::from([2, 0, 1]),
+                    },
+                ),
+            ]),
+        };
+        manifest.validate().unwrap();
+        let expected = concat!(
+            r#"{"format":1,"identity":[17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],"#,
+            r#""generation":7,"capacity":16384,"next_id":4,"#,
+            r#""entries":{"data":"Directory","data/shard-00000000.dat":{"File":1},"#,
+            r#""volume.lock":{"File":3}},"#,
+            r#""files":{"1":{"len":8197,"pages":{"#,
+            r#""0":{"slot":5,"hash":[160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,"#,
+            r#"175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191]},"#,
+            r#""2":{"slot":1,"hash":[192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,"#,
+            r#"207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223]}},"#,
+            r#""reserved":[0,1,2]},"#,
+            r#""3":{"len":0,"pages":{},"reserved":[]}}}"#,
+        );
+        let bytes = manifest.encode().unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
+        let root: String = digest(b"maki.rollback.manifest.v1\0", &bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            root,
+            "022e67a7dccc1684d502bf346987caf4f37c435bb4aa726126b8c0b91cb796da"
+        );
+        let decoded: Manifest = serde_json::from_str(expected).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.encode().unwrap(), bytes);
+    }
+
+    /// The local format marker, and a manifest slot as enrollment writes it:
+    /// the manifest's length as a little-endian u64, then the manifest.
+    #[test]
+    fn local_marker_and_manifest_slot_have_fixed_encodings() {
+        let root = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = RollbackBacking::create(root.path(), witness.path(), 2 * PAGE).unwrap();
+        let identity = backing.state.lock().committed.identity;
+        assert_eq!(
+            std::fs::read(root.path().join("rollback.format")).unwrap(),
+            b"MAKI-WITNESS-COW-V1\n"
+        );
+        let identity: Vec<String> = identity.iter().map(u8::to_string).collect();
+        let expected = format!(
+            concat!(
+                r#"{{"format":1,"identity":[{}],"generation":0,"capacity":8192,"#,
+                r#""next_id":1,"entries":{{}},"files":{{}}}}"#
+            ),
+            identity.join(",")
+        );
+        let slot = std::fs::read(root.path().join("rollback.manifest.0")).unwrap();
+        assert_eq!(slot[..8], (expected.len() as u64).to_le_bytes());
+        assert_eq!(
+            std::str::from_utf8(&slot[8..8 + expected.len()]).unwrap(),
+            expected
+        );
+    }
+
     struct FailingSync(Arc<dyn BackingFile>);
     impl BackingFile for FailingSync {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
