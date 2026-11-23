@@ -555,9 +555,19 @@ cross-endpoint check succeeds against a validated endpoint.
 Each background validation RPC shares the serving RPC count and resident-byte
 budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
 owns these validation tasks and cancels them when its final owner is dropped.
-A reference endpoint's contract error defers candidate validation; it does not
-prove that the candidate is incompatible. Candidate contract errors and actual
-cross-key incompatibility still exclude that candidate.
+Only proof that the candidate serves another contract excludes it until the
+daemon restarts (`rejected: true` in its status): another key (either endpoint
+refuses or misdecrypts the other's ciphertext, or the volume canary fails
+authentication or decrypts to the wrong plaintext), another compatibility id,
+a claimed capability it does not honour, or an explicit refusal of the
+volume's context. Anything else shows only that an exchange failed and is
+inconclusive: a transport error or timeout, a reply that does not parse or is
+truncated (a proxy error page, an endpoint restarting mid-response) from
+either endpoint, or any other failure of the validated reference. The
+candidate then stays quarantined and is validated again after
+`circuit_breaker.open_initial`, the spacing doubling after each further
+inconclusive attempt up to `circuit_breaker.open_max`; it serves only once a
+later validation succeeds in full.
 HalfOpen breaker probes return their admission slots on every exit, including
 operation deadlines, cancellation, request/provider errors, and refusal by the
 retry budget. These neutral outcomes leave the endpoint's failure count

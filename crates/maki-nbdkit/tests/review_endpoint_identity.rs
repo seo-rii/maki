@@ -1,11 +1,13 @@
 use base64::Engine as _;
 use futures_util::FutureExt;
-use maki_crypto::{CiphertextUnit, CryptoContext, CryptoProvider, PlaintextUnit, SecretBuffer};
-use maki_crypto_local::{keysource::MapKeySource, AesXtsProvider};
+use maki_crypto::{
+    CiphertextUnit, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit, SecretBuffer,
+};
+use maki_crypto_local::{keysource::MapKeySource, AesGcmSivProvider, AesXtsProvider};
 use maki_test_support::http_chaos::{Handler, RecordedRequest, ResponseSpec, TestServer};
 use serde_json::json;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -14,14 +16,32 @@ fn xts(seed: u8) -> AesXtsProvider {
     keys.insert("audit", (0..64).map(|n| n ^ seed).collect());
     AesXtsProvider::new(&keys, "audit", 512, "audit-uuid-v1").unwrap()
 }
+/// An authenticated cipher: a ciphertext under another key is refused.
+fn gcm(seed: u8) -> AesGcmSivProvider {
+    let mut keys = MapKeySource::new();
+    keys.insert("audit", vec![seed; 32]);
+    AesGcmSivProvider::new(&keys, "audit", 512, "audit-uuid-v1").unwrap()
+}
 fn handler(seed: u8, unavailable: Arc<AtomicBool>) -> Handler {
     handler_with_canary_key(seed, seed, unavailable)
 }
 
 fn handler_with_canary_key(seed: u8, canary_seed: u8, unavailable: Arc<AtomicBool>) -> Handler {
-    let common = xts(0x10);
-    let actual = xts(seed);
-    let canary_key = xts(canary_seed);
+    serve(xts, seed, canary_seed, unavailable)
+}
+
+/// Serve `cipher(seed)`, `cipher(canary_seed)` for the key canary's unit.
+/// A refused ciphertext is answered with the wire contract's integrity
+/// failure (HTTP 422, `maki-crypto-error: auth-tag-mismatch`).
+fn serve<P: CryptoProvider + 'static>(
+    cipher: fn(u8) -> P,
+    seed: u8,
+    canary_seed: u8,
+    unavailable: Arc<AtomicBool>,
+) -> Handler {
+    let common = cipher(0x10);
+    let actual = cipher(seed);
+    let canary_key = cipher(canary_seed);
     Arc::new(move |req: &RecordedRequest| {
         if unavailable.load(Ordering::SeqCst) {
             return ResponseSpec::status(503);
@@ -58,15 +78,21 @@ fn handler_with_canary_key(seed: u8, canary_seed: u8, unavailable: Arc<AtomicBoo
                 .remove(0)
                 .data
         } else {
-            provider
+            match provider
                 .decrypt_batch(&context, &[CiphertextUnit { unit_index, data }])
                 .now_or_never()
                 .unwrap()
-                .unwrap()
-                .remove(0)
-                .data
-                .expose()
-                .to_vec()
+            {
+                Ok(mut plain) => plain.remove(0).data.expose().to_vec(),
+                Err(CryptoError::Integrity(_)) => {
+                    let mut refused = ResponseSpec::status(422);
+                    refused
+                        .headers
+                        .push(("maki-crypto-error".into(), "auth-tag-mismatch".into()));
+                    return refused;
+                }
+                Err(error) => panic!("test cipher failed: {error}"),
+            }
         };
         ResponseSpec::json(
             &json!({"data":base64::engine::general_purpose::STANDARD.encode(output)}),
@@ -291,6 +317,138 @@ async fn recovered_quarantined_endpoint_must_match_the_canary() {
     })
     .await
     .expect("recovered wrong-key endpoint must be rejected");
+}
+
+/// With an authenticated cipher a wrong key cannot decrypt the canary to the
+/// wrong plaintext: it refuses it with an integrity failure. That refusal is
+/// proof of another key, like the wrong plaintext above, so the recovered
+/// quarantined endpoint is rejected for the life of the set rather than
+/// deferred (and validated again) forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovered_quarantined_endpoint_whose_canary_is_refused_is_rejected() {
+    for (case, seed, canary_seed) in [
+        ("another key", 0x22, 0x22),
+        ("another canary key", 0x11, 0x22),
+    ] {
+        let unavailable = Arc::new(AtomicBool::new(true));
+        let a = TestServer::start(serve(gcm, 0x11, 0x11, Arc::new(AtomicBool::new(false)))).await;
+        let b = TestServer::start(serve(gcm, seed, canary_seed, unavailable.clone())).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("volume");
+        let raw = config(&root, &[a.url(), b.url()]).replace(
+            "max_ciphertext_size = 512\nintegrity = \"none\"",
+            "max_ciphertext_size = 540\nintegrity = \"contractual\"",
+        );
+        assert!(raw.contains("integrity = \"contractual\""));
+        let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+        maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+        let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
+            .await
+            .unwrap();
+        let endpoints = endpoints.unwrap();
+        assert!(!endpoints.endpoint_status()[1].validated, "{case}");
+        engine.write(5120, &[0x77; 512], true).await.unwrap();
+        unavailable.store(false, Ordering::SeqCst);
+        let canary_probes = || {
+            b.requests
+                .lock()
+                .iter()
+                .filter(|request| is_canary_decrypt(request))
+                .count()
+        };
+        let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert_eq!(engine.read(5120, 512).await.unwrap(), [0x77; 512]);
+                let peer = &endpoints.endpoint_status()[1];
+                assert!(
+                    !peer.validated,
+                    "{case}: wrong-key endpoint must never be promoted"
+                );
+                if peer.rejected {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            rejected.is_ok(),
+            "{case}: an endpoint that refused the volume canary {} time(s) is still only \
+             deferred: {:?}",
+            canary_probes(),
+            endpoints.endpoint_status()[1]
+        );
+        assert!(canary_probes() >= 1, "{case}");
+        drop(engine);
+    }
+}
+
+fn is_canary_decrypt(request: &RecordedRequest) -> bool {
+    request.path == "/decrypt"
+        && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["unit"].as_u64()
+            == Some(maki_format::canary::CANARY_UNIT_INDEX)
+}
+
+/// Only an integrity refusal of the canary is proof. A canary decrypt that
+/// fails as an exchange (an unavailable endpoint, a reply without the
+/// payload) leaves the recovered endpoint quarantined, and a later complete
+/// validation admits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_canary_exchange_defers_a_recovered_endpoint_until_it_validates() {
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let a = TestServer::start(serve(gcm, 0x11, 0x11, Arc::new(AtomicBool::new(false)))).await;
+    let healthy = serve(gcm, 0x11, 0x11, unavailable.clone());
+    let glitches = Arc::new(AtomicUsize::new(0));
+    let glitched = glitches.clone();
+    let b = TestServer::start(Arc::new(move |request: &RecordedRequest| {
+        if !is_canary_decrypt(request) {
+            return healthy(request);
+        }
+        match glitched.fetch_add(1, Ordering::SeqCst) {
+            0 => ResponseSpec::status(503),
+            1 => ResponseSpec::json(&json!({})),
+            _ => healthy(request),
+        }
+    }))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("volume");
+    let raw = config(&root, &[a.url(), b.url()]).replace(
+        "max_ciphertext_size = 512\nintegrity = \"none\"",
+        "max_ciphertext_size = 540\nintegrity = \"contractual\"",
+    );
+    let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+    maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+    let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
+        .await
+        .unwrap();
+    let endpoints = endpoints.unwrap();
+    assert!(!endpoints.endpoint_status()[1].validated);
+    engine.write(5120, &[0x77; 512], true).await.unwrap();
+    unavailable.store(false, Ordering::SeqCst);
+    let validated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            assert_eq!(engine.read(5120, 512).await.unwrap(), [0x77; 512]);
+            let peer = &endpoints.endpoint_status()[1];
+            assert!(
+                !peer.rejected,
+                "a failed canary exchange is not proof: {peer:?}"
+            );
+            if peer.validated {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        validated.is_ok(),
+        "recovered endpoint never validated after {} canary decrypt(s): {:?}",
+        glitches.load(Ordering::SeqCst),
+        endpoints.endpoint_status()[1]
+    );
+    assert!(glitches.load(Ordering::SeqCst) >= 3);
+    drop(engine);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
