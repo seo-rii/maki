@@ -588,17 +588,22 @@ budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
 owns these validation tasks and cancels them when its final owner is dropped.
 Only proof that the candidate serves another contract excludes it until the
 daemon restarts (`rejected: true` in its status): another key (either endpoint
-refuses or misdecrypts the other's ciphertext, or the volume canary fails
-authentication or decrypts to the wrong plaintext), another compatibility id,
-a claimed capability it does not honour, or an explicit refusal of the
-volume's context. Anything else shows only that an exchange failed and is
-inconclusive: a transport error or timeout, a reply that does not parse or is
-truncated (a proxy error page, an endpoint restarting mid-response) from
-either endpoint, or any other failure of the validated reference. The
+refuses the other's ciphertext with an integrity failure or decrypts it to the
+wrong plaintext, or the candidate does so with the volume canary), another
+compatibility id, a claimed capability it does not honour, or an explicit
+refusal of the volume's context. Anything else shows only that an exchange
+failed and is inconclusive: a transport error or timeout, a reply that does
+not parse or is truncated (a proxy error page, an endpoint restarting
+mid-response) or a request refused without an integrity failure (a generic 4xx
+such as 400 or 421, a WebSocket `bad-request`, a gRPC `InvalidArgument`) from
+either endpoint, whatever the request, or any other failure of the validated
+reference. The
 candidate then stays quarantined and is validated again after
 `circuit_breaker.open_initial`, the spacing doubling after each further
 inconclusive attempt up to `circuit_breaker.open_max`; it serves only once a
-later validation succeeds in full.
+later validation succeeds in full. Attach itself is stricter: a generic
+refusal of a tamper or context probe, or of the other endpoint's ciphertext,
+refuses the attach.
 HalfOpen breaker probes return their admission slots on every exit, including
 operation deadlines, cancellation, request/provider errors, and refusal by the
 retry budget. These neutral outcomes leave the endpoint's failure count

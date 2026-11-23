@@ -451,6 +451,206 @@ async fn a_failed_canary_exchange_defers_a_recovered_endpoint_until_it_validates
     drop(engine);
 }
 
+/// A reply the HTTP transport cannot take for an integrity verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refuse {
+    /// A generic 421 where the tampered ciphertext of the endpoint's
+    /// self-test is due the integrity failure.
+    TamperProbe,
+    /// A generic 421 to the endpoint's first decrypt of a self-test pattern
+    /// unit (0 to 2) after its canary decrypt: the other endpoint's
+    /// ciphertext in the cross-endpoint check.
+    CrossDecrypt,
+}
+
+/// `healthy`, except that the first request `refuse` describes, once
+/// `enabled`, is answered with HTTP 421 (which sets `refused`).
+fn refusing_once(
+    healthy: Handler,
+    refuse: Option<Refuse>,
+    enabled: Arc<AtomicBool>,
+    refused: Arc<AtomicBool>,
+) -> Handler {
+    let canary_seen = AtomicBool::new(false);
+    Arc::new(move |request: &RecordedRequest| {
+        let response = healthy(request);
+        if response.status == 503 {
+            return response;
+        }
+        let pattern_decrypt = request.path == "/decrypt"
+            && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["unit"]
+                .as_u64()
+                .is_some_and(|unit| unit < 3);
+        let due = match refuse {
+            Some(Refuse::TamperProbe) => response.status == 422,
+            Some(Refuse::CrossDecrypt) => pattern_decrypt && canary_seen.load(Ordering::SeqCst),
+            None => false,
+        };
+        if is_canary_decrypt(request) {
+            canary_seen.store(true, Ordering::SeqCst);
+        }
+        if due && enabled.load(Ordering::SeqCst) && !refused.swap(true, Ordering::SeqCst) {
+            return ResponseSpec::status(421);
+        }
+        response
+    })
+}
+
+fn authenticated(raw: String) -> String {
+    let raw = raw.replace(
+        "max_ciphertext_size = 512\nintegrity = \"none\"",
+        "max_ciphertext_size = 540\nintegrity = \"contractual\"",
+    );
+    assert!(raw.contains("integrity = \"contractual\""));
+    raw
+}
+
+/// A refusal without the wire contract's integrity verdict (a generic 4xx,
+/// such as a proxy's 421) is not proof either, whichever endpoint sends it
+/// and whatever it answers: the tampered ciphertext of the candidate's
+/// self-test, or a decrypt of the other endpoint's ciphertext in the
+/// cross-endpoint check. The recovered endpoint stays quarantined and a
+/// later complete validation admits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_refusal_defers_a_recovered_endpoint_until_it_validates() {
+    let mut excluded = Vec::new();
+    for (case, reference_refuses, candidate_refuses) in [
+        (
+            "the candidate answers the tamper probe with a 421",
+            None,
+            Some(Refuse::TamperProbe),
+        ),
+        (
+            "the candidate answers the decrypt of the reference's ciphertext with a 421",
+            None,
+            Some(Refuse::CrossDecrypt),
+        ),
+        (
+            "the validated reference answers the decrypt of the candidate's ciphertext with a 421",
+            Some(Refuse::CrossDecrypt),
+            None,
+        ),
+    ] {
+        let unavailable = Arc::new(AtomicBool::new(true));
+        let attached = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        let a = TestServer::start(refusing_once(
+            serve(gcm, 0x11, 0x11, Arc::new(AtomicBool::new(false))),
+            reference_refuses,
+            attached.clone(),
+            refused.clone(),
+        ))
+        .await;
+        let b = TestServer::start(refusing_once(
+            serve(gcm, 0x11, 0x11, unavailable.clone()),
+            candidate_refuses,
+            attached.clone(),
+            refused.clone(),
+        ))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("volume");
+        let raw = authenticated(config(&root, &[a.url(), b.url()]));
+        let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+        maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+        let (engine, _, endpoints) = maki_nbdkit::daemon::attach_from_config_with_stats(&config)
+            .await
+            .unwrap();
+        let endpoints = endpoints.unwrap();
+        assert!(!endpoints.endpoint_status()[1].validated, "{case}");
+        engine.write(5120, &[0x77; 512], true).await.unwrap();
+        attached.store(true, Ordering::SeqCst);
+        unavailable.store(false, Ordering::SeqCst);
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert_eq!(engine.read(5120, 512).await.unwrap(), [0x77; 512]);
+                let peer = endpoints.endpoint_status().remove(1);
+                if peer.validated || peer.rejected {
+                    break peer;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{case}: the recovered endpoint never validated: {:?}",
+                endpoints.endpoint_status()[1]
+            )
+        });
+        if settled.rejected {
+            excluded.push(format!(
+                "{case}: a refusal without an integrity verdict is not proof: {settled:?}"
+            ));
+        }
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "{case}: no request was refused"
+        );
+        drop(engine);
+    }
+    assert!(excluded.is_empty(), "{excluded:#?}");
+}
+
+/// Attach keeps its verdicts for the same replies: an endpoint that answers
+/// the tamper probe, or either decrypt of the cross-endpoint check, with a
+/// generic refusal is not proven and the volume does not attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_still_refuses_an_endpoint_after_a_generic_refusal() {
+    for (case, first_refuses, second_refuses, verdict) in [
+        (
+            "the second endpoint answers the tamper probe with a 421",
+            None,
+            Some(Refuse::TamperProbe),
+            "unsupported: endpoint \"ep1\" failed its self-test: provider fatal: integrity \
+             self-test: the negative probe was rejected with a NonRetryableRequest-class error, \
+             not a definitive integrity failure — the capability is not proven; attach refused",
+        ),
+        (
+            "the second endpoint answers the decrypt of the first one's ciphertext with a 421",
+            None,
+            Some(Refuse::CrossDecrypt),
+            "provider fatal: cross-endpoint decrypt A→B failed: non-retryable request: HTTP 421 \
+             — endpoints are not interchangeable",
+        ),
+        (
+            "the first endpoint answers the decrypt of the second one's ciphertext with a 421",
+            Some(Refuse::CrossDecrypt),
+            None,
+            "provider fatal: cross-endpoint decrypt B→A failed: non-retryable request: HTTP 421 \
+             — endpoints are not interchangeable",
+        ),
+    ] {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let refused = Arc::new(AtomicBool::new(false));
+        let a = TestServer::start(refusing_once(
+            serve(gcm, 0x11, 0x11, Arc::new(AtomicBool::new(false))),
+            first_refuses,
+            enabled.clone(),
+            refused.clone(),
+        ))
+        .await;
+        let b = TestServer::start(refusing_once(
+            serve(gcm, 0x11, 0x11, Arc::new(AtomicBool::new(false))),
+            second_refuses,
+            enabled.clone(),
+            refused.clone(),
+        ))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("volume");
+        let raw = authenticated(config(&root, &[a.url(), b.url()]));
+        let config = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+        maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+        let error = maki_nbdkit::daemon::attach_from_config(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{case}: the volume attached"));
+        assert_eq!(error.to_string(), verdict, "{case}");
+        assert!(refused.load(Ordering::SeqCst), "{case}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_error_retries_a_transient_failure_while_time_remains() {
     let fail_once = Arc::new(AtomicBool::new(false));

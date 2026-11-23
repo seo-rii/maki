@@ -2035,16 +2035,27 @@ Validation evidence is either conclusive or inconclusive:
 ```text
 conclusive (excluded for the life of the set):
   replies that passed validation show another key (either peer
-  refuses or misdecrypts the other's ciphertext, or the volume canary
-  is refused or decrypts to the wrong plaintext), another
-  compatibility id, or a claimed capability that is not honoured; an
-  explicit refusal of the volume's real context
+  refuses the other's ciphertext, or the candidate the volume canary,
+  with a definitive integrity failure, or decrypts it to the wrong
+  plaintext), another compatibility id, or a claimed capability that
+  is not honoured; an explicit refusal of the volume's real context
 
 inconclusive (validated again later):
   a transport error, timeout or admission limit; a reply that does
-  not parse, is truncated or has the wrong shape; any other failure
-  of the validated peer
+  not parse, is truncated or has the wrong shape; a request refused
+  without an integrity failure (a generic bad request), by either
+  peer and whatever the request, a negative self-test probe
+  included; any other failure of the validated peer
 ```
+
+A definitive integrity failure is `CryptoError::Integrity`, the evidence a
+negative self-test probe requires (§18); a generic refusal, such as an HTTP
+4xx that the transport does not classify as one, never is. This distinction
+applies to validation after attach. At attach an endpoint whose self-test or
+cross-endpoint check fails with anything but a transport failure refuses the
+attach: there a generic refusal of a negative probe leaves the capability
+unproven, and one of the other endpoint's ciphertext leaves the pair
+unproven.
 
 After an inconclusive attempt the endpoint stays quarantined and is
 validated again after `open_initial`; the spacing doubles after each further
