@@ -11,6 +11,11 @@
 //!        or `{"id": n, "error": {"class": …, "message": …}}`
 //! Integrity errors require `class: "integrity"` and a `reason` of exactly
 //! `"auth-tag-mismatch"` or `"context-mismatch"`; remote messages are ignored.
+//! Context refusals require `class: "unsupported-context"` and a `reason` of
+//! exactly `"unsupported-format-version"` or `"unsupported-compatibility-id"`.
+//! The remaining classes are `"throttled"`, `"retryable"` and
+//! `"bad-request"`; any other class, and either class above without one of
+//! its reasons, is a contract violation.
 //!
 //! Concurrency-safe request/response correlation by `id`: responses may
 //! arrive out of order; responses with unknown ids (stale, from an earlier

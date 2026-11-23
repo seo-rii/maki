@@ -951,6 +951,92 @@ context evidence. These tokens denote a field refusal, not an authentication
 failure; they cannot satisfy unit-index, volume-UUID, or tamper probes. Remote
 error text is ignored.
 
+Integrity failures use the same carriers with their own tokens: HTTP status
+`422` or gRPC status `FailedPrecondition` with exactly one `maki-crypto-error`
+header/metadata value, `auth-tag-mismatch` (the ciphertext failed
+authentication) or `context-mismatch` (the ciphertext is not bound to the
+context it was presented under). WebSocket uses `error.class = "integrity"`
+and one of the same two `error.reason` values. Either token yields
+`CryptoError::Integrity`. A token is compared exactly: a missing, unknown,
+repeated or comma-joined value is not an integrity failure, and neither is a
+token under any other HTTP or gRPC status.
+
+A provider that declares integrity MUST answer a ciphertext it cannot
+authenticate with an integrity failure; the attach self-test accepts nothing
+else from its tamper probe. A negative probe (the tamper probe and the
+context probes above) is judged by its classified result alone:
+
+- `CryptoError::Integrity` satisfies the tamper probe and every context probe.
+- A successful reply never satisfies the tamper probe, whatever plaintext it
+  carries. It satisfies a context probe only when it is well formed and its
+  plaintext differs from the original.
+- `CryptoError::UnsupportedContext` satisfies only the probe that changed the
+  field it names.
+- A `Retryable`, `Throttled` or `EndpointFatal` error is inconclusive and is
+  returned unchanged: the endpoint is not validated (§34).
+- A contract violation (a malformed or mislabelled reply) is not an answer:
+  the self-test fails without a verdict on the capability.
+- Every other result leaves the capability unproven and refuses attach: a
+  generic bad request (an HTTP `400`, a `422` without one recognised token,
+  a gRPC `InvalidArgument`, a WebSocket `bad-request`), a refusal of another
+  field, or a provider failure.
+
+The cross-endpoint check (§34) reads a refusal the other way: an endpoint
+that answers its peer's ciphertext with anything but a transport failure or a
+contract violation, an integrity failure included, fails the check as not
+interchangeable, and attach is refused. These are the verdicts at attach; §34
+states what each means for a quarantined endpoint that is validated later.
+
+Each transport classifies a provider's answer as follows (classes in §31).
+`Integrity` has the class `NonRetryableRequest`; `UnsupportedContext` and a
+contract violation (`CryptoError::Contract`) have the class `ProviderFatal`.
+In each table a row applies only when no row above it does.
+
+| HTTP response status | Result |
+| --- | --- |
+| 2xx | Success; a body that does not satisfy the response mapping is a contract violation |
+| `422` with exactly one `maki-crypto-error` header, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `429` | `Throttled` |
+| `408` | `Retryable` |
+| 3xx, `401`, `403`, `404`, `405`, `407`, `410` | `EndpointFatal`; a redirect is never followed |
+| Any other 4xx | `NonRetryableRequest` |
+| Any other status | `Retryable` |
+
+| gRPC status | Result |
+| --- | --- |
+| `OK` | Success; a reply that is not one message answering the request's items is a contract violation |
+| `FailedPrecondition` with exactly one `maki-crypto-error` metadata value, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `ResourceExhausted` | `Throttled` |
+| `Unauthenticated`, `PermissionDenied`, `Unimplemented` | `EndpointFatal` |
+| `InvalidArgument`, `NotFound`, `OutOfRange`, any other `FailedPrecondition` | `NonRetryableRequest` |
+| Any other status (`Unavailable`, `DeadlineExceeded`, `Aborted`, `Internal`, `Cancelled`, `Unknown`, `AlreadyExists`, `DataLoss`) | `Retryable` |
+
+A gRPC response with an HTTP status other than 200 and no `grpc-status` is
+taken as an intermediary's answer, not the provider's, and is classified by
+that HTTP status: `401`, `403` and `404` are `EndpointFatal`, every other
+status is `Retryable`.
+
+| WebSocket `error.class` | Result |
+| --- | --- |
+| `integrity` with `error.reason` `auth-tag-mismatch` or `context-mismatch` | `Integrity` |
+| `unsupported-context` with `error.reason` `unsupported-format-version` or `unsupported-compatibility-id` | `UnsupportedContext` |
+| `throttled` | `Throttled` |
+| `retryable` | `Retryable` |
+| `bad-request` | `NonRetryableRequest` |
+| Anything else, a missing class included | Contract violation |
+
+A WebSocket `integrity` or `unsupported-context` error with another reason,
+with none, or in a frame that repeats its `id`, `error`, `class` or `reason`
+member is a contract violation as well. A WebSocket error frame has no class
+for an endpoint failure; the refused upgrade of a connection reports one:
+status `429` is `Throttled`, `408` and 5xx are `Retryable`, and any other
+status is `EndpointFatal`.
+
+Without a classified answer, every transport reports a timeout or a lost
+connection as `Retryable`, a TLS authentication or protocol failure as
+`EndpointFatal`, and a reply that breaks the transport's framing or size limit
+as a contract violation.
+
 ---
 
 # 19. HTTP Configuration Example

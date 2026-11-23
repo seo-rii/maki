@@ -4,6 +4,24 @@
 // are configured per volume (`encrypt_path` / `decrypt_path`) — but the
 // message shapes must match these definitions. Responses MUST echo each
 // item's unit_index and preserve request order; Maki validates both.
+//
+// An error is classified by its gRPC status code; the status message and
+// details are ignored. Two failures also need a metadata value: status
+// FAILED_PRECONDITION with exactly one `maki-crypto-error` value.
+//
+//   auth-tag-mismatch             the ciphertext failed authentication
+//   context-mismatch              the ciphertext is not bound to this context
+//   unsupported-format-version    this format_version is not accepted
+//   unsupported-compatibility-id  this compatibility_id is not accepted
+//
+// The first two are integrity failures. A service that declares integrity
+// MUST answer a ciphertext it cannot authenticate with one of them: at attach
+// Maki sends a tampered ciphertext and accepts no other answer, neither a
+// success nor another status. Without one of these values
+// FAILED_PRECONDITION, INVALID_ARGUMENT, NOT_FOUND and OUT_OF_RANGE are
+// request errors, RESOURCE_EXHAUSTED is throttling, UNAUTHENTICATED,
+// PERMISSION_DENIED and UNIMPLEMENTED mark the endpoint unusable, and every
+// other code is retryable (SPEC §18 has the full table).
 
 syntax = "proto3";
 

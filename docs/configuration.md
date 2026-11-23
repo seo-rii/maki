@@ -476,6 +476,9 @@ configured pointer reaches are validated but not kept, so the size limit also
 bounds the memory a response takes, not only its wire bytes.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
+How each response status is classified, and the `maki-crypto-error` header
+that reports an integrity failure or a context refusal, is listed under
+[provider error signals](#provider-error-signals).
 
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
@@ -608,6 +611,116 @@ details (`grpc-status-details-bin`) are discarded before the status is read:
 an error's class follows only its `grpc-status` code and `maki-crypto-error`
 metadata, and text or details that do not decode neither change that class nor
 turn an OK status into an error.
+
+## Provider error signals
+
+A remote provider reports a failure through its transport's status, never
+through text: an HTTP error body, a gRPC status message or its details, and a
+WebSocket `error.message` are ignored. This section lists every signal the
+transports recognise and the error each becomes
+([SPEC §18](../SPEC.md#18-remote-crypto) is normative).
+
+Two failures carry an explicit token:
+
+| Failure | Token | Meaning |
+|---|---|---|
+| Integrity | `auth-tag-mismatch` | The ciphertext failed authentication |
+| Integrity | `context-mismatch` | The ciphertext is not bound to the context it was presented under |
+| Context refusal | `unsupported-format-version` | The provider does not accept the request's format version |
+| Context refusal | `unsupported-compatibility-id` | The provider does not accept the request's compatibility ID |
+
+| Transport | Where the token goes |
+|---|---|
+| HTTP | Status 422 with exactly one `maki-crypto-error` response header whose value is the token |
+| gRPC | Status `FailedPrecondition` with exactly one `maki-crypto-error` metadata value |
+| WebSocket | `{"id": n, "error": {"class": "integrity", "reason": "<token>"}}`, or `"class": "unsupported-context"` for a context refusal |
+
+A token is compared exactly. A missing, unknown, repeated or comma-joined
+value, or a token on any other HTTP or gRPC status, is not one of these
+signals: the response is classified by its status alone. A WebSocket
+`integrity` or `unsupported-context` error whose `reason` is absent or is not
+one of that class's two tokens, or whose frame repeats `id`, `error`, `class`
+or `reason`, is a contract error.
+
+In each table below a row applies only when no row above it does.
+
+| HTTP response | Error |
+|---|---|
+| 2xx | None; the body must satisfy the response mapping, or it is a contract error |
+| 422 with exactly one `maki-crypto-error` header, holding a token | Integrity failure or unsupported context, by the token |
+| 429 | Throttled |
+| 408 | Retryable |
+| 3xx, 401, 403, 404, 405, 407, 410 | Endpoint failure; a redirect is never followed |
+| Any other 4xx, such as 400, 409, 413 or a 422 without one token | Request error |
+| Any other status, such as 500, 502, 503 or 504 | Retryable |
+
+| gRPC status | Error |
+|---|---|
+| `OK` | None; the reply must be one message that answers the request's items, or it is a contract error |
+| `FailedPrecondition` with exactly one `maki-crypto-error` metadata value, holding a token | Integrity failure or unsupported context, by the token |
+| `ResourceExhausted` | Throttled |
+| `Unauthenticated`, `PermissionDenied`, `Unimplemented` | Endpoint failure |
+| `InvalidArgument`, `NotFound`, `OutOfRange`, any other `FailedPrecondition` | Request error |
+| Any other status: `Unavailable`, `DeadlineExceeded`, `Aborted`, `Internal`, `Cancelled`, `Unknown`, `AlreadyExists`, `DataLoss` | Retryable |
+
+A gRPC response with an HTTP status other than 200 and no `grpc-status`, such
+as a proxy's error page, is classified by that HTTP status: 401, 403 and 404
+are endpoint failures and every other status is retryable.
+
+| WebSocket `error.class` | Error |
+|---|---|
+| `integrity` with one of its two `reason` tokens | Integrity failure |
+| `unsupported-context` with one of its two `reason` tokens | Unsupported context |
+| `throttled` | Throttled |
+| `retryable` | Retryable |
+| `bad-request` | Request error |
+| Anything else, a missing class included | Contract error |
+
+A WebSocket error frame cannot report an endpoint failure. The upgrade that
+opens a connection can, as described [above](#websocket-and-grpc-contracts).
+
+A failure without such an answer is classified the same way on all three
+transports: a timeout or a lost connection is retryable, a TLS authentication
+or protocol failure is an endpoint failure, and a reply that breaks the
+transport's framing or its size limit (`max_response_bytes`,
+`max_message_bytes`, `max_frame_bytes`) is a contract error.
+
+Each error's message carries a fixed prefix, and the dispatcher handles each
+kind differently:
+
+| Error | Message prefix | What the dispatcher does |
+|---|---|---|
+| Retryable | `retryable:` | Counts a failure on the endpoint's circuit breaker, fails over to another endpoint, then retries with backoff under the availability policy |
+| Throttled | `throttled:` | The same as retryable, with no extra backoff |
+| Endpoint failure | `endpoint fatal:` | Opens the endpoint's circuit at once; the request fails over like a retryable one |
+| Request error | `non-retryable request:` | Fails the operation at once: no retry, no failover, no breaker charge |
+| Integrity failure | `integrity failure:` | The same as a request error |
+| Unsupported context | `unsupported crypto context:` | Fails the operation at once: no retry, no failover, no breaker charge |
+| Contract error | `provider contract violation:` | Counts a failure on the breaker and never sends this operation to that endpoint again; it moves to another validated endpoint only when the provider is `retry_safe` |
+
+With `retry_safe = false`, a retryable, throttled or endpoint-failure error on
+a request that may have been sent is returned without another attempt (see
+[above](#websocket-and-grpc-contracts)).
+
+At attach, a provider that declares `integrity` or `context_binding` is
+given negative probes: a tampered ciphertext to decrypt, and an intact one to
+decrypt under a changed unit index, volume UUID, format version or
+compatibility ID. Only these answers pass:
+
+| Probe | Passes with |
+|---|---|
+| Tampered ciphertext (`integrity`) | An integrity failure. Any successful reply fails the probe, whatever plaintext it carries |
+| Changed unit index or volume UUID (`context_binding`) | An integrity failure, or a well-formed reply whose plaintext differs from the original |
+| Changed format version or compatibility ID (`context_binding`) | The same, or a context refusal that names the changed field |
+
+A retryable, throttled or endpoint-failure answer to a probe is inconclusive:
+the endpoint is quarantined, or the attach fails when no other endpoint is
+reachable. A contract error fails the self-test and the attach. Any other
+answer, such as a 400, a 422 without a token, a gRPC `InvalidArgument` or a
+WebSocket `bad-request`, refuses the attach, because the declared capability
+was not proven. The cross-endpoint check reads a refusal the other way: an
+endpoint that answers another endpoint's ciphertext with an integrity failure
+or a request error is not interchangeable with it, and the attach is refused.
 
 ## Backing directory identity
 
