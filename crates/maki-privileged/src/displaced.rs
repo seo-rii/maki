@@ -24,6 +24,23 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// The VG UUID of an LVM mapping's device-mapper uuid,
+/// `LVM-<VG UUID><LV UUID>` with an optional `-<suffix>` for internal LVs
+/// (`-tdata`, `-real`, ...), both UUIDs without their dashes. `None` for
+/// every other uuid, an empty one included.
+fn lvm_mapping_vg(uuid: &str) -> Option<&str> {
+    let identity = uuid.strip_prefix("LVM-")?;
+    let (uuids, suffix) = identity.split_at_checked(64)?;
+    let suffix_ok = suffix.is_empty()
+        || suffix.strip_prefix('-').is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    (uuids.bytes().all(|byte| byte.is_ascii_alphanumeric()) && suffix_ok).then(|| &uuids[..32])
+}
+
 /// An LVM UUID as device-mapper writes it: 32 alphanumerics, no dashes.
 fn bare(uuid: &str) -> Option<String> {
     let bare = uuid.replace('-', "");
@@ -69,7 +86,9 @@ pub(super) fn recorded_vg_uuid(record: &BoundDeviceRecord) -> Result<String, &'s
 /// Something remains while a mount sits at the recorded mountpoint, a mount
 /// is of a mapping of the recorded VG, any device-mapper device on the host
 /// belongs to that VG, or a holder of the device or of one of its partitions
-/// is not a device-mapper device.
+/// is not an LVM mapping of another VG: a crypt, multipath or partition
+/// mapping, or one without a uuid, could have been set up on the recorded
+/// VG's device as well as on the present connection's.
 pub(super) fn remains(
     record: &BoundDeviceRecord,
     vg_uuid: &str,
@@ -151,11 +170,20 @@ pub(super) fn remains(
         }
         // A holder that appeared after the walk above is read here.
         let uuid = std::fs::read_to_string(sysfs.join(holder).join("dm/uuid"))?;
-        if uuid.trim().starts_with(&owned) {
-            return Ok(Some(format!(
-                "{holder} is a mapping of the recorded volume group on /dev/{device}; it now \
-                 reads the other connection's data"
-            )));
+        match lvm_mapping_vg(uuid.trim()) {
+            Some(vg) if vg != vg_uuid => {}
+            Some(_) => {
+                return Ok(Some(format!(
+                    "{holder} is a mapping of the recorded volume group on /dev/{device}; it \
+                     now reads the other connection's data"
+                )))
+            }
+            None => {
+                return Ok(Some(format!(
+                    "{holder} holds /dev/{device} and is not an LVM mapping of another volume \
+                     group, so it cannot be shown not to be the recorded attachment's"
+                )))
+            }
         }
     }
     Ok(None)

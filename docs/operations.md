@@ -645,7 +645,9 @@ only when every observation shows that nothing of the attachment remains:
   intent or the administrator LVM pins;
 - no device-mapper device on the host belongs to that VG (its uuid starts with
   `LVM-` and the VG UUID without dashes), and every holder of the device and of
-  its partitions is a device-mapper device of another VG;
+  its partitions is an LVM mapping of another VG, whose uuid is `LVM-` and
+  that VG's UUID. A crypt, multipath or partition mapping, a mapping without a
+  uuid, or any other kind of holder keeps the record;
 - nothing is mounted at the recorded mountpoint, and no mount is of a mapping
   of that VG;
 - no other volume's record names the device with the same VG UUID (a cloned
