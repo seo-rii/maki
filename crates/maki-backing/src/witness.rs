@@ -93,10 +93,18 @@ impl FileWitness {
         // directory synced. A creation that a kill, a power loss or a
         // failure stops before the rename leaves no anchor (the next one
         // removes what it left under the temporary name), and one that got
-        // past it left the complete record. No anchor is replaced, so there
-        // is no owner to keep: in a directory another user owns, a root
-        // process creates the record for that user (`FileBacking`).
-        write_temporary(backing.as_ref(), &encode(&anchor), None)?;
+        // past it left the complete record. No anchor is replaced, so the
+        // record is the directory owner's: in a directory another user
+        // owns, a root process creates it for that user (`FileBacking`),
+        // and in a root-owned one it is root's. Run as root, the temporary
+        // record must be one of root's or that owner's files, as for every
+        // later publication (`hand_over_temporary`, SPEC §8).
+        let owner = if running_as_root() {
+            backing.directory_owner("")?
+        } else {
+            None
+        };
+        write_temporary(backing.as_ref(), &encode(&anchor), owner)?;
         backing.rename(TEMP_FILE, ANCHOR_FILE)?;
         backing.sync_dir("")?;
 
