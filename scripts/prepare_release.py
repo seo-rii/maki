@@ -19,6 +19,21 @@ import tempfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The committed Cargo.toml defines the release profile, including the unwind
+# panic strategy that the nbdkit plugin's panic boundary needs. Nightly and
+# Cargo-internal switches change what a stable toolchain compiles.
+REFUSED_PREFIXES = ("CARGO_PROFILE_RELEASE_", "CARGO_UNSTABLE_", "__CARGO_")
+REFUSED_NAMES = ("RUSTC_BOOTSTRAP",)
+# C toolchain inputs of the native dependencies: aws-lc-sys and ring build
+# through the cc, cmake and pkg-config helpers, and aws-lc-sys looks for a
+# system library under the OPENSSL_*_DIR settings.
+NATIVE_NAMES = frozenset((
+    "CC", "CXX", "AR", "RANLIB", "ASM", "CFLAGS", "CXXFLAGS", "ARFLAGS", "RANLIBFLAGS", "ASMFLAGS",
+    "LDFLAGS", "CXXSTDLIB", "CROSS_COMPILE", "CRATE_CC_NO_DEFAULTS", "CC_FORCE_DISABLE",
+    "CC_SHELL_ESCAPED_FLAGS", "CC_KNOWN_WRAPPER_CUSTOM",
+    "OPENSSL_DIR", "OPENSSL_INCLUDE_DIR", "OPENSSL_LIB_DIR",
+))
+NATIVE_PREFIXES = ("CMAKE", "PKG_CONFIG", "AWS_LC_", "RING_")
 
 
 def fail(message):
@@ -174,6 +189,60 @@ def candidate_source_version():
     return commit, workspace_version, f"{workspace_version}~rc+rev{revision}.git{commit[:12]}"
 
 
+def refused_build_inputs(environment):
+    return sorted(key for key in environment if key in REFUSED_NAMES or key.startswith(REFUSED_PREFIXES))
+
+
+def native_build_input(key, host):
+    # The helpers also read each name with a HOST_ or TARGET_ prefix or with
+    # a suffix naming the target, in its own or its underscore spelling.
+    for suffix in (f"_{host}", f"_{host.replace('-', '_')}"):
+        if key.endswith(suffix):
+            key = key[:-len(suffix)]
+            break
+    for prefix in ("HOST_", "TARGET_"):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+    return key in NATIVE_NAMES or key.startswith(NATIVE_PREFIXES)
+
+
+def cargo_configuration(source, environment):
+    """Return the Cargo configuration files the build reads from outside the committed source."""
+    import tomllib
+
+    # Cargo reads .cargo/config (or else .cargo/config.toml) in its physical
+    # working directory and every parent, then the one in CARGO_HOME, which
+    # is relative to that directory if it is not absolute.
+    source = source.resolve()
+    home = environment.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    directories = [directory / ".cargo" for directory in (source, *source.parents)] + [source / home]
+    records, seen = [], set()
+    for directory in directories:
+        for name in ("config", "config.toml"):
+            try:
+                contents = (directory / name).read_bytes()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            path = (directory / name).resolve()
+            # Committed configuration is part of the archived source.
+            if path not in seen and not path.is_relative_to(source):
+                seen.add(path)
+                try:
+                    settings = tomllib.loads(contents.decode("utf-8"))
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+                    fail(f"cannot parse Cargo configuration {path}: {error}")
+                profiles = settings.get("profile")
+                for table, present in (("profile.release", isinstance(profiles, dict) and "release" in profiles),
+                                       ("unstable", "unstable" in settings)):
+                    if present:
+                        fail(f"Cargo configuration {path} sets [{table}] outside the committed source; "
+                             "remove it before preparing a candidate")
+                records.append({"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()})
+            break
+    return records
+
+
 def publish_bundle(bundle, output):
     # The Debian builder runs on Linux. RENAME_NOREPLACE makes the existence
     # check part of the rename, including when the destination is an empty dir.
@@ -196,6 +265,10 @@ def prepare(output):
     if output.exists() or output.is_symlink():
         fail(f"output already exists: {output}")
     commit, workspace_version, version = candidate_source_version()
+    refused = refused_build_inputs(os.environ)
+    if refused:
+        fail("the committed Cargo.toml defines the release profile and candidates use stable toolchain "
+             f"features only; unset {', '.join(refused)} before preparing a candidate")
     tree = git("rev-parse", f"{commit}^{{tree}}")
     epoch = commit_epoch(commit)
     architecture = run(["dpkg", "--print-architecture"])
@@ -251,6 +324,7 @@ def prepare(output):
         environment["CARGO_TARGET_DIR"] = str(work / "target")
         environment["CARGO_BUILD_BUILD_DIR"] = str(work / "build")
         environment["RUSTC"] = compiler
+        configuration = cargo_configuration(source, environment)
         # Probe in the same directory and environment as the build. This also
         # keeps rustup's per-directory toolchain selection consistent.
         rustc = run([compiler, "-vV"], cwd=source, env=environment)
@@ -271,9 +345,12 @@ def prepare(output):
             for key in ("RUSTC", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
                         f"{target_prefix}_RUSTFLAGS", f"{target_prefix}_LINKER", "CARGO_BUILD_RUSTFLAGS",
                         "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
-                        "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                        "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                        "CARGO_INCREMENTAL", "CARGO_BUILD_INCREMENTAL")
             if key in environment
         }
+        build_environment.update((key, value) for key, value in environment.items()
+                                 if native_build_input(key, host))
         command = [
             "cargo", "build", "--release", "--locked", "--target", host,
             "-p", "maki", "-p", "maki-attach", "-p", "maki-check", "-p", "maki-nbdkit",
@@ -300,6 +377,7 @@ def prepare(output):
             "build": {
                 "command": command,
                 "compiler_environment": build_environment,
+                "cargo_configuration": configuration,
                 "package_environment": {
                     key: environment[key] for key in (
                         "DPKG_DEB_COMPRESSOR_TYPE", "DPKG_DEB_COMPRESSOR_LEVEL", "DPKG_DEB_THREADS_MAX"

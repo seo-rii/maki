@@ -133,7 +133,7 @@ A successful directory contains:
 |---|---|
 | `maki_<candidate-version>_<architecture>.deb` | Runtime package with scanned native dependencies |
 | `maki-<candidate-version>-source.tar.gz` | Git archive of the exact committed source, including `Cargo.lock` |
-| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler and Debian compression environment overrides, package dependencies and artifact hashes |
+| `manifest.json` | Commit/tree IDs, source epoch, distro/version, architecture, Rust target, tool versions, build command, compiler and Debian compression environment overrides, Cargo configuration files outside the source, package dependencies and artifact hashes |
 | `SHA256SUMS` | Hashes of the package, source archive and manifest |
 
 The output appears only after all build and packaging steps succeed. An
@@ -150,16 +150,21 @@ dpkg-deb --contents "$candidate_output"/*.deb
 The fixed source epoch and deterministic package builder make repeated
 packaging of identical artifacts stable. The command does not claim bitwise
 reproducibility across compiler versions, system libraries, paths, or Cargo
-configuration. The manifest records inherited Rust flag inputs, including
-`CARGO_BUILD_RUSTFLAGS` and the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the
-selected build target. It records the target-specific linker from
-`CARGO_TARGET_<TRIPLE>_LINKER` and compiler wrapper inputs from
-`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`
-and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`. Cargo applies its usual precedence
-when several inputs are set.
+configuration. It handles inherited build inputs as follows; Cargo applies its
+usual precedence when several are set:
+
+| Input | Handling |
+|---|---|
+| `CARGO_PROFILE_RELEASE_*`, `RUSTC_BOOTSTRAP`, `CARGO_UNSTABLE_*` and Cargo-internal `__CARGO_*` variables; a `[profile.release]` or `[unstable]` table in Cargo configuration outside the committed source | Refused before building. The committed `Cargo.toml` defines the release profile, including the `unwind` panic strategy that the nbdkit plugin's panic boundary needs, and candidates use stable toolchain features only. Commit a needed profile change instead |
+| `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS` and the `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for the selected build target; the target-specific linker from `CARGO_TARGET_<TRIPLE>_LINKER`; compiler wrappers from `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`; `CARGO_INCREMENTAL` and `CARGO_BUILD_INCREMENTAL` | Recorded in `compiler_environment` |
+| C toolchain inputs of the aws-lc-sys and ring build scripts: `CC`, `CFLAGS`, `CXX`, `CXXFLAGS`, `AR`, `ARFLAGS`, `RANLIB`, `RANLIBFLAGS`, `ASM`, `ASMFLAGS`, `LDFLAGS`, `CXXSTDLIB`, `CROSS_COMPILE`, `CRATE_CC_NO_DEFAULTS`, `CC_FORCE_DISABLE`, `CC_SHELL_ESCAPED_FLAGS` and `CC_KNOWN_WRAPPER_CUSTOM`, also with a `HOST_` or `TARGET_` prefix or a suffix naming the selected target (`CC_x86_64-unknown-linux-gnu`, `CFLAGS_x86_64_unknown_linux_gnu`); every `CMAKE*`, `PKG_CONFIG*`, `AWS_LC_*` and `RING_*` variable; `OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR` and `OPENSSL_LIB_DIR`, where aws-lc-sys looks for a system library | Recorded in `compiler_environment` |
+| Cargo configuration outside the committed source: `.cargo/config` (or else `.cargo/config.toml`) in each directory above the extracted source, then in `CARGO_HOME` | Path and SHA-256 recorded in `cargo_configuration`, in Cargo's search order |
+
+Independently of this command, `maki-nbdkit` does not compile with
+`panic = "abort"`, however that strategy is selected.
 The recorded environment overrides are diagnostic metadata;
-they are not a hermetic-build attestation. Review those overrides before
-sharing the manifest. Checksums establish bundle consistency, not publisher
+they are not a hermetic-build attestation. Review the recorded values and
+configuration paths before sharing the manifest. Checksums establish bundle consistency, not publisher
 authenticity; a public release additionally needs the chosen signing or
 attestation policy.
 
@@ -216,6 +221,7 @@ fixtures, a simulated Cargo build and the real Debian package/dependency tools.
 It checks committed-source provenance, checksums, deterministic packaging,
 version ordering with real Git history and `dpkg`, shallow- and dirty-source
 refusal, output preservation, source-link refusal, intermediate build isolation,
-compiler selection and failure cleanup without rebuilding the Rust workspace.
+compiler selection, refused and recorded build inputs and failure cleanup
+without rebuilding the Rust workspace.
 The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.
