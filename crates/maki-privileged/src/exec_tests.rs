@@ -554,6 +554,60 @@ fn new_auto_and_fixed_attachments_record_and_verify_the_kernel_identifier() {
     }
 }
 
+const UNREAD_STDOUT_CHILD: &str = "MAKI_PRIVILEGED_EXEC_TEST_UNREAD_STDOUT";
+
+/// Runs in a copy of this test binary (see the test below): an attach that
+/// allocates its device, with a stdout nobody reads.
+#[test]
+fn child_attaches_with_an_allocated_device_and_an_unread_stdout() {
+    use std::os::fd::AsRawFd;
+    if std::env::var_os(UNREAD_STDOUT_CHILD).is_none() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = FakeSystem::default();
+    let mut request = request();
+    request.nbd_device = AUTO_NBD_DEVICE.into();
+    let plan = plan_attach(&request);
+    // The harness reports on stdout as well, so descriptor 1 becomes the
+    // closed pipe only now, and the child exits before the harness writes
+    // this test's result.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    // SAFETY: both descriptors are open; `dup2` only replaces descriptor 1.
+    assert_eq!(unsafe { libc::dup2(writer.as_raw_fd(), 1) }, 1);
+    let attached = execute_with(&plan, Some(&state), &mut system).is_ok()
+        && system.mounted
+        && state.read("pg").is_ok_and(|record| record.is_some());
+    drop(fixture);
+    std::process::exit(if attached { 0 } else { 1 });
+}
+
+/// The executor announces the device it allocated on stdout, after loading
+/// the NBD module and before connecting. `println!` panics when that write
+/// fails, so a reader that had gone ended the attach there with status 101.
+#[test]
+fn an_attach_that_allocates_its_device_survives_an_unread_stdout() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exec::tests::child_attaches_with_an_allocated_device_and_an_unread_stdout",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UNREAD_STDOUT_CHILD, "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn cleanup_is_idempotent_when_no_trusted_record_exists() {
     let fixture = Fixture::new();
