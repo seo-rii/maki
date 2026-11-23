@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use latency::{Latencies, LatencyReport};
 
-const USAGE: &str = "usage: maki-benchmark [--destroy-data] [--json] [--fua] [--concurrency 1..256]\n  [--access sequential|random] [--read-percent 0..100] [--working-set bytes]\n  [--flush-every operations] [--seed integer] <config.toml> [ops] [io-size]";
+const USAGE: &str = "usage: maki-benchmark [--destroy-data] [--json] [--fua] [--concurrency 1..256]\n  [--access sequential|random] [--read-percent 0..100] [--working-set bytes]\n  [--flush-every operations] [--seed integer] <config.toml> [ops] [io-size]\n       maki-benchmark --help | --version";
 const MAX_OPERATIONS: u64 = 1_000_000_000;
 
 /// `eprintln!` that cannot panic. The macro panics when the write fails,
@@ -217,24 +217,26 @@ struct Report {
 
 fn main() -> ExitCode {
     maki_core::logging::install_default_logging();
-    if std::env::args_os().len() == 2
-        && matches!(
-            std::env::args_os()
-                .nth(1)
-                .as_deref()
-                .and_then(std::ffi::OsStr::to_str),
-            Some("--help" | "-h")
-        )
-    {
+    // Asking for help or the version is not misuse (BUG-112). Either is
+    // answered only as the sole argument, before any configuration is read.
+    let mut arguments = std::env::args_os().skip(1);
+    let sole = match (arguments.next(), arguments.next()) {
+        (Some(only), None) => only.into_string().ok(),
+        _ => None,
+    };
+    let answer = match sole.as_deref() {
+        Some("--help" | "-h") => Some(format!(
+            "{USAGE}\nOverwrites a disposable volume; reports verified I/O and latency.\n"
+        )),
+        Some("--version" | "-V") => Some(format!("maki-benchmark {}\n", env!("CARGO_PKG_VERSION"))),
+        _ => None,
+    };
+    if let Some(answer) = answer {
         // `println!` panics when the write fails. As for the report below,
-        // a reader that has gone is not a failure; help that could not be
-        // written is.
+        // a reader that has gone is not a failure; an answer that could not
+        // be written is.
         let mut out = io::stdout().lock();
-        let written = writeln!(
-            out,
-            "{USAGE}\nOverwrites a disposable volume; reports verified I/O and latency."
-        )
-        .and_then(|()| out.flush());
+        let written = out.write_all(answer.as_bytes()).and_then(|()| out.flush());
         return match written {
             Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
                 diagnostic!("error: writing the output failed: {error}");

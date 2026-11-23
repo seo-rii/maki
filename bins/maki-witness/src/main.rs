@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use uuid::Uuid;
 
-const HELP: &str = "maki-witness init STATE_DIRECTORY VOLUME_UUID\nmaki-witness init-etcd ETCD_CONFIG.toml VOLUME_UUID\nmaki-witness serve SERVER_CONFIG.toml\nmaki-witness inspect CLIENT_CONFIG.toml\nmaki-witness fingerprint CERTIFICATE.pem\n\ninit and init-etcd refuse existing state; serve never initializes missing state.\nserve requires exactly one state_dir or pinned etcd quorum configuration.\nTLS 1.3 and certificate allow-list authentication are mandatory.\n";
+const HELP: &str = "maki-witness init STATE_DIRECTORY VOLUME_UUID\nmaki-witness init-etcd ETCD_CONFIG.toml VOLUME_UUID\nmaki-witness serve SERVER_CONFIG.toml\nmaki-witness inspect CLIENT_CONFIG.toml\nmaki-witness fingerprint CERTIFICATE.pem\nmaki-witness --help | --version\n\ninit and init-etcd refuse existing state; serve never initializes missing state.\nserve requires exactly one state_dir or pinned etcd quorum configuration.\nTLS 1.3 and certificate allow-list authentication are mandatory.\n";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// `eprintln!` that cannot panic. The macro panics when the write fails,
@@ -140,6 +140,10 @@ fn report_initialization(record: &Record) -> io::Result<()> {
 fn run(args: &[String]) -> io::Result<()> {
     match args {
         [help] if help == "--help" || help == "-h" => print_result(HELP)?,
+        // BUG-112: every deployed binary reports its revision.
+        [version] if version == "--version" || version == "-V" => {
+            print_result(concat!("maki-witness ", env!("CARGO_PKG_VERSION"), "\n"))?;
+        }
         [command, directory, identity] if command == "init" => {
             let identity = Uuid::parse_str(identity).map_err(|_| {
                 io::Error::new(

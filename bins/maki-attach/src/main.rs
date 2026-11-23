@@ -33,9 +33,7 @@ macro_rules! diagnostic {
     }};
 }
 
-fn usage() -> ExitCode {
-    diagnostic!(
-        "usage:
+const USAGE: &str = "usage:
   maki-attach attach --volume <v> [--config <attach.toml>] [--nbd-device /dev/nbdN]
                      [--vg <vg>] [--lv <lv>] [--mountpoint <dir>] [--socket <path>]
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
@@ -45,10 +43,14 @@ fn usage() -> ExitCode {
   maki-attach recover-failed-start --volume <v> [--plan] (systemd ExecStopPost hook)
   maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
+  maki-attach --help | --version
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
-requires the volume UUID (config or --uuid); --plan prints the plan without it."
-    );
+requires the volume UUID (config or --uuid); --plan prints the plan without it.";
+
+/// Misuse: the usage on stderr, status 2.
+fn usage() -> ExitCode {
+    diagnostic!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -158,6 +160,28 @@ fn main() -> ExitCode {
     // exit status.
     maki_privileged::logging::install_default_logging();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Asking for help or the version is not misuse (BUG-112). Either is
+    // answered only as the sole argument, before the arguments are
+    // validated and before any configuration or attachment state is looked
+    // at; anywhere else it is refused like any other unknown argument.
+    if let [only] = args.as_slice() {
+        let answer = match only.to_str() {
+            Some("--help" | "-h" | "help") => Some(format!("{USAGE}\n")),
+            Some("--version" | "-V") => {
+                Some(format!("maki-attach {}\n", env!("CARGO_PKG_VERSION")))
+            }
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            return match print_stdout(&answer) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    diagnostic!("error: writing the output failed: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
     if let Err(error) = validate_arguments(&args) {
         diagnostic!("error: {error}");
         return usage();
