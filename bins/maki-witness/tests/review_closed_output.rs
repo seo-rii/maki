@@ -4,6 +4,10 @@
 //! with a stdout nobody reads died before serving. A stdout reader that has
 //! gone is not a failure; any other failure to write a requested result is
 //! an error.
+//!
+//! `eprintln!` panics the same way: with a stderr nobody reads, every error
+//! (1) became 101. A diagnostic that cannot be delivered is dropped; the
+//! status stands.
 #![cfg(unix)]
 
 use std::net::TcpListener;
@@ -210,5 +214,32 @@ fn a_result_that_cannot_be_written_is_an_error() {
             stderr.contains("maki-witness: writing the output failed"),
             "{args:?}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    for args in [
+        vec![],
+        vec!["no-such-command"],
+        vec!["serve", missing.to_str().unwrap()],
+        vec![
+            "init",
+            dir.path().join("state").to_str().unwrap(),
+            "not-a-uuid",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-witness"))
+            .args(&args)
+            .env("RUST_BACKTRACE", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(closed_pipe())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
     }
 }

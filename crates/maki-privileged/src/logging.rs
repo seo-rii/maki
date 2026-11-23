@@ -155,6 +155,30 @@ mod tests {
         );
     }
 
+    /// With a stderr nobody reads the sink cannot write its events. It must
+    /// drop them: the executor logs every step, and a panic there would end
+    /// the helper in the middle of an attach or a detach.
+    #[test]
+    fn events_nobody_reads_are_dropped_without_a_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::child_emits_events",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .env_remove(super::LOG_ENV)
+            .env("RUST_BACKTRACE", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child failed on its first event");
+    }
+
     #[test]
     fn maki_log_directives_filter_the_output() {
         let stderr = child_stderr(Some("error"));

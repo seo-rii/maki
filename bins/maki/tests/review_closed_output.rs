@@ -12,6 +12,10 @@
 //! `volume create` already did. Any other failure to write a report (a full
 //! destination) is reported on stderr and fails a command whose output is
 //! its result.
+//!
+//! `eprintln!` panics the same way: with a stderr nobody reads, misuse (2),
+//! the helper-verb instruction (3) and every error (1) all became 101. A
+//! diagnostic that cannot be delivered is dropped; the status stands.
 #![cfg(unix)]
 
 #[path = "support/volume_config.rs"]
@@ -187,5 +191,51 @@ fn a_report_that_cannot_be_written_fails_the_command_and_names_the_verdict() {
         stderr(&failed).contains("check FAILED, but writing the report failed"),
         "{}",
         stderr(&failed)
+    );
+}
+
+#[test]
+fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
+    let missing = "/nonexistent-maki-closed-output/volume.toml";
+    for (args, status) in [
+        (vec![], 2),
+        (vec!["no-such-command"], 2),
+        (vec!["check", missing, "--timeout", "5"], 2),
+        (vec!["attach", "--volume", "example"], 3),
+        (vec!["check", missing], 1),
+        (vec!["volume", "inspect", missing], 1),
+        (vec!["status", missing, "--timeout", "0"], 1),
+        (vec!["status", "--socket"], 1),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki"))
+            .args(&args)
+            .env("RUST_BACKTRACE", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(closed_pipe())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(status), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// The logging sink writes to stderr too: an event nobody can read (here
+/// the refusal of an invalid `MAKI_LOG`) must not stop the command.
+#[test]
+fn a_log_event_nobody_reads_does_not_stop_the_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_maki"))
+        .arg("--version")
+        .env("MAKI_LOG", "warning")
+        .env("RUST_BACKTRACE", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(closed_pipe())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("maki {}", env!("CARGO_PKG_VERSION"))
     );
 }

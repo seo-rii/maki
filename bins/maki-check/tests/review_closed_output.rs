@@ -4,6 +4,10 @@
 //! into status 101. A closed stdout is not a failure and never hides the
 //! verdict; any other failure to write the report is reported on stderr and
 //! fails the command.
+//!
+//! `eprintln!` panics the same way: with a stderr nobody reads, misuse (2)
+//! and every error (1) became 101. A diagnostic that cannot be delivered is
+//! dropped; the status stands.
 #![cfg(unix)]
 
 use std::io::{Seek, SeekFrom, Write};
@@ -138,4 +142,37 @@ fn a_report_that_cannot_be_written_fails_the_command_and_names_the_verdict() {
         "{}",
         stderr(&failed)
     );
+}
+
+#[test]
+fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing").to_string_lossy().into_owned();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let protected = dir.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    std::fs::write(protected.join("rollback.format"), b"").unwrap();
+    // A superblock copy that cannot be read is an error, not a verdict.
+    let unreadable = dir.path().join("unreadable");
+    std::fs::create_dir_all(unreadable.join("superblock.a")).unwrap();
+    for (args, status) in [
+        (vec![], 2),
+        (vec!["--no-such-option"], 2),
+        (vec!["--journal-segment-size"], 2),
+        (vec![missing.as_str()], 1),
+        (vec![file.to_str().unwrap(), "--deep"], 1),
+        (vec![protected.to_str().unwrap()], 1),
+        (vec![unreadable.to_str().unwrap()], 1),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-check"))
+            .args(&args)
+            .env("RUST_BACKTRACE", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(closed_pipe())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(status), "{args:?}");
+    }
 }

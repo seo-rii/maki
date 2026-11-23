@@ -3,6 +3,12 @@
 //! exited 101. A stdout reader that has gone is not a failure; any other
 //! failure to write a requested plan is reported on stderr and fails the
 //! preview, which produces nothing else.
+//!
+//! `eprintln!` panics the same way, and so did the helper's logging sink,
+//! which fell back to `eprintln!` when it could not write an event: with a
+//! stderr nobody reads, a usage error (2) became 101, and so would any step
+//! the executor reports. A diagnostic or an event that cannot be delivered
+//! is dropped; the status stands.
 #![cfg(unix)]
 
 use std::process::{Command, Output, Stdio};
@@ -98,4 +104,48 @@ fn a_plan_that_cannot_be_written_fails_the_preview() {
             "{args:?}: {stderr}"
         );
     }
+}
+
+fn unread_stderr(args: &[&str], log: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maki-attach"));
+    command
+        .args(args)
+        .env("RUST_BACKTRACE", "0")
+        .env_remove("MAKI_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(closed_pipe());
+    if let Some(log) = log {
+        command.env("MAKI_LOG", log);
+    }
+    command.output().expect("spawn maki-attach")
+}
+
+#[test]
+fn diagnostics_nobody_reads_do_not_replace_the_exit_status() {
+    for args in [
+        vec![],
+        vec!["no-such-command"],
+        vec!["attach"],
+        vec!["attach", "--volume", VOLUME, "--plan", "--unknown"],
+        // Execution needs the volume UUID; nothing is planned or run.
+        vec!["attach", "--volume", VOLUME],
+        vec!["verify", "--volume", VOLUME, "--config", "relative.toml"],
+        vec!["grow", "--volume", VOLUME, "--size-bytes", "4097", "--plan"],
+    ] {
+        let output = unread_stderr(&args, None);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// The executor reports every step through the logging sink. An event that
+/// cannot be written (here the refusal of an invalid `MAKI_LOG`) must not
+/// stop the helper.
+#[test]
+fn a_log_event_nobody_reads_does_not_stop_the_helper() {
+    let args = ["attach", "--volume", VOLUME, "--plan"];
+    let output = unread_stderr(&args, Some("warning"));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, helper(&args, Stdio::piped()).stdout);
 }
