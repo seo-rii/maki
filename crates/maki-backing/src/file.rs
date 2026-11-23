@@ -26,6 +26,17 @@ mod linux;
 /// `Backing` over a real directory tree. Linux pins the root and resolves
 /// every component through directory descriptors without following symlinks.
 /// Other development platforms perform pathname validation only.
+///
+/// Entries are created owner-only (`0600` files, `0700` directories) for
+/// the user that runs the process, except that on Linux a process running
+/// as root creates a file or directory inside the root, in a directory
+/// another user owns, for that user (the directory's uid and gid): an
+/// offline check or inspect run as root may recreate a lock file or
+/// manifest slot in the daemon user's volume, and must not lock that user
+/// out. A file is given away before it is linked under its name, an
+/// existing entry is never given away, and a refused change creates
+/// nothing. The root and missing ancestors of it, which [`FileBacking::new`]
+/// creates, belong to the user that runs the process.
 pub struct FileBacking {
     #[cfg(target_os = "linux")]
     directory: linux::Directory,
@@ -589,6 +600,16 @@ impl Backing for FileBacking {
     #[cfg(not(unix))]
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         Ok(None)
+    }
+
+    #[cfg(unix)]
+    fn directory_owner(&self, dir: &str) -> io::Result<Option<crate::FileOwner>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(self.resolve(dir, true)?)?;
+        Ok(Some(crate::FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
     }
 }
 

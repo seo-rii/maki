@@ -143,14 +143,10 @@ outer backing's enrollment.
 
 Run both commands as root: the administrator key must stay unreadable to the
 daemon user. `resume-enrollment` creates the new writer namespace owner-only
-(`0700` directories, `0600` files) as root, so the daemon cannot open it until
-the backing is handed back, as after takeover or restore
-([remote witness operations](remote-witness-service.md#snapshot-takeover-and-restore)).
-Do that before the next start:
-
-```sh
-chown -R maki:maki /var/lib/maki/protected
-```
+(`0700` directories, `0600` files) for the owner of the backing root, as
+takeover and restore do
+([remote witness operations](remote-witness-service.md#snapshot-takeover-and-restore)),
+so a backing root that belongs to the daemon user needs no hand-back.
 
 The authority must have `current = null`; successful first activation makes
 that condition permanently unavailable. Recovery compares the full inspected
@@ -220,10 +216,12 @@ install -d -o maki -g maki -m 0700 /var/lib/maki/protected /mnt/maki-witness/pro
 sudo -u maki maki volume create /etc/maki/volumes/protected.toml
 ```
 
-Creation writes the backing tree and the witness files (`anchor`,
-`witness.lock`) owner-only (`0700` directories, `0600` files) as the user that
-runs it. Run as root, it leaves both root-owned, so the daemon cannot open
-them; the command then warns with the `chown -R maki:maki` of both paths to
+Creation writes the backing files and the witness files (`anchor`,
+`witness.lock`) owner-only (`0600`) as the user that runs it. Run as root, it
+creates each of them for the owner of its directory, so with both directories
+created as above the result is the same. A directory the command has to
+create itself is root's, and so is everything in it, so the daemon cannot open
+it; the command then warns with the `chown -R maki:maki` of each such path to
 run before the first start. An existing raw or protected backing is refused;
 there is no implicit enrollment, in-place conversion or automatic witness
 recreation.
@@ -244,7 +242,7 @@ paths their own explicit access rule. The witness directory is sensitive state,
 not a cache. Do not include it in the backing's restore operation.
 
 Use `maki check <config.toml> --deep` or `maki volume inspect <config.toml>` while
-the volume is detached, and run them as the daemon user:
+the volume is detached, as the daemon user or as root:
 
 ```sh
 sudo -u maki maki check /etc/maki/volumes/protected.toml --deep
@@ -252,14 +250,19 @@ sudo -u maki maki check /etc/maki/volumes/protected.toml --deep
 
 These acquire the exclusive witness session and reestablish the selected
 witness record's durability without advancing it, by writing the record to a
-new file renamed over the old one. That file keeps the replaced record's owner
-even when root runs the command, but anything else a root run has to create is
-owned by root: a lock file or inactive manifest slot that is missing (after a
-partial restore, for example) is recreated for root, and the daemon then
-cannot attach. After such a run, return both paths with `chown -R maki:maki`
-before starting the daemon. `maki-check`, which takes only a backing root path
-and no configuration, cannot open this outer format. Removing the rollback
-configuration stanza does not enable raw fallback.
+new file renamed over the old one. They also recreate a lock file
+(`rollback.lock`, `witness.lock`) or inactive manifest slot that is missing
+(after a partial restore, for example). Run as root, they create every such
+file for the owner of its directory, so the daemon can still open both paths
+and nothing has to be handed back. The new witness record keeps the replaced
+record's owner, except that a root-owned record in a directory the daemon user
+owns goes back to that user, and a record of a third user is refused with an
+error naming both owners. Root never changes the owner of a file it did not
+create: a restored copy whose files lost their owners must still be returned
+with `chown -R maki:maki` (see the recovery procedure below). `maki-check`,
+which takes only a backing root path and no configuration, cannot open this
+outer format. Removing the rollback configuration stanza does not enable raw
+fallback.
 
 ## Capacity and durability
 
@@ -369,7 +372,7 @@ complete recovery plan.
    Preserve the failed backing as evidence, recover the complete matching
    backing under its trusted configuration, owned by the daemon user like the
    original (`chown -R maki:maki` it if the copy did not keep its owners), and
-   run `sudo -u maki maki check <config.toml> --deep` offline
+   run `maki check <config.toml> --deep` offline, as the daemon user or root
    ([which user](#local-configuration-and-creation)). This acquires the
    witness lock and verifies structural consistency and restores physical
    reservations. Provide the complete fixed footprint even when the restored

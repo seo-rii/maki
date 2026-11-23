@@ -65,6 +65,19 @@ them through filesystem permissions and ownership. Non-Linux development
 backends retain pathname validation and do not provide this single-link check;
 the supported data plane is Linux-only.
 
+A process running as root (an offline check, inspect, creation or remote
+administration command) creates each file and directory below the backing
+root for the owner of the directory it creates it in, when that owner is not
+root, so a lock file or manifest slot it recreates in the daemon user's tree
+stays openable by the daemon. A new file is created unnamed (`O_TMPFILE`),
+given away and synced with fsync before it is linked under its name; on a
+filesystem without unnamed files it is created under its name and given away
+before anything is written to it. A new directory is given away only while it
+is still empty. An entry that already exists is opened as it is and never
+changes owner, and a refused owner change removes what was created. The
+backing root itself, when `FileBacking::new` creates it, belongs to the user
+that runs the process. The local witness directory follows the same rule.
+
 ## Read and write semantics
 
 The engine divides the device into fixed crypto units. Reads take a consistent

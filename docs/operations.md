@@ -113,8 +113,7 @@ the reported values.
 all owner-only (`0700` directories, `0600` files). The command must target an
 empty, reviewed backing location, and the tree must end up owned by the daemon
 user: `/var/lib/maki` is `root:maki 0750`, so create the volume directory for
-the daemon and run the command as that user rather than as root (a root-owned
-`0700` tree is unreadable to the daemon, which then fails to attach):
+the daemon and run the command as that user:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/example
@@ -127,6 +126,15 @@ default copy-on-write data, ZFS) is unsupported. On btrfs, running
 `chattr +C /var/lib/maki/example` between the two commands makes every backing
 file created afterwards NOCOW; that configuration is not qualified
 ([copy-on-write filesystems](deployment/support-matrix.md#copy-on-write-filesystems)).
+
+A `maki` command run as root creates every file and directory below an
+existing backing root for the owner of the directory it creates it in, so a
+root `volume create` into a volume directory created as above leaves the same
+daemon-owned tree. A volume directory the command has to create itself is
+root's, and so is everything in it: a root-owned `0700` tree is unreadable to
+the daemon, which then fails to attach. `volume create` then warns with the
+`chown -R maki:maki` to run before the first start. The offline commands below
+follow the same rule.
 
 The packaged units derive every path from the systemd instance name, so with
 them the instance, the file names and two configuration values must agree. For
@@ -166,6 +174,9 @@ attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
+It recreates a missing `volume.lock` (a restore or copy can drop the empty
+file); run as root, it creates the file for the owner of the backing root, so
+the daemon can still take the lock and nothing has to be handed back.
 When checking a backing root directly, `maki-check` needs no segment size:
 like recovery, it bounds each journal segment file by the largest file a
 writer can produce under any valid `journal_segment_size` (at most 1 GiB), so

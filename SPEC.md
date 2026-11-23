@@ -386,6 +386,17 @@ The NBD Unix Domain Socket:
 MUST be created behind a restrictive runtime ancestor.
 Administrative control access MUST NOT grant access to the NBD socket.
 
+An administrative command run as root on a volume the daemon user owns (an
+offline check or inspect, a creation into existing directories, a remote
+takeover, restore or enrollment recovery) MUST create each file and
+directory it adds below the backing root or in a local witness directory for
+the owner of the directory it is created in, when that owner is not root, so
+that it never leaves an entry the daemon cannot open. It MUST NOT give away
+an entry it did not create, MUST give a new file its owner before writing to
+it, and MUST refuse rather than keep an entry it cannot give away. The
+backing root itself, when such a command creates it, belongs to the user
+that runs the command.
+
 Privileged attachment state MUST be opened through root-controlled directory
 descriptors without following symlinks. Detach MUST verify its requested
 volume UUID, socket, mountpoint, VG, LV, and device against a trusted record

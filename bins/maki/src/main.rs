@@ -453,9 +453,13 @@ fn reload_cache(target: &ControlTarget<'_>, flags: &[&str], timeout: Duration) -
     control(target, "reload", Some("cache"), payload, timeout)
 }
 
-/// The backing tree is created owner-only; a root-created volume is
-/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). A local
-/// rollback witness is created the same way, so name both paths.
+/// The backing tree is created owner-only, and a root-owned entry in it is
+/// unreadable to the `maki` daemon user (SPEC 8: `maki:maki 0700`). Root
+/// creates each file for the owner of its directory, but every directory it
+/// creates is its own, and so is everything below one: a backing root or
+/// local rollback witness directory that did not exist, or a plain volume's
+/// journal, data and checkpoint directories. Name each path that holds such
+/// an entry.
 fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Option<String> {
     if !as_root {
         return None;
@@ -465,21 +469,56 @@ fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Opt
         .rollback_protection
         .as_ref()
         .filter(|rollback| rollback.remote.is_none() && !rollback.witness_root.is_empty())
-        .map(|rollback| (cfg.backing.root.as_str(), rollback.witness_root.as_str()));
-    Some(match local_witness {
-        Some((root, witness)) => format!(
-            "the volume tree {root} and the rollback witness in {witness} were created \
-             owner-only by root; the daemon runs as the maki user and cannot open them. Run \
-             `maki volume create` as that user (sudo -u maki ...) or \
-             `chown -R maki:maki {root_arg} {witness_arg}` before starting the service",
-            root_arg = shell_word(root),
-            witness_arg = shell_word(witness)
-        ),
-        None => "the volume tree was created owner-only by root; the daemon runs as the maki \
-                 user and cannot open it. Run `maki volume create` as that user \
-                 (sudo -u maki ...) or chown the tree to maki:maki before starting the service"
-            .to_string(),
-    })
+        .map(|rollback| rollback.witness_root.as_str());
+    let held: Vec<(&str, &str)> = [("the volume tree", cfg.backing.root.as_str())]
+        .into_iter()
+        .chain(local_witness.map(|witness| ("the rollback witness in", witness)))
+        .filter(|(_, path)| holds_root_owned_entry(std::path::Path::new(path)))
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = held
+        .iter()
+        .map(|(what, path)| format!("{what} {path}"))
+        .collect();
+    let arguments: Vec<String> = held.iter().map(|(_, path)| shell_word(path)).collect();
+    Some(format!(
+        "{} {} entries created owner-only by root; the daemon runs as the maki user and \
+         cannot open them. Run `maki volume create` as that user (sudo -u maki ...) or \
+         `chown -R maki:maki {}` before starting the service",
+        named.join(" and "),
+        if held.len() == 1 { "holds" } else { "hold" },
+        arguments.join(" ")
+    ))
+}
+
+/// Whether `path` or anything below it is owned by root. An entry that
+/// cannot be described counts, so the warning errs towards a hand-back.
+#[cfg(unix)]
+fn holds_root_owned_entry(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    if metadata.uid() == 0 {
+        return true;
+    }
+    if !metadata.is_dir() {
+        return false;
+    }
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => holds_root_owned_entry(&entry.path()),
+            Err(_) => true,
+        }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn holds_root_owned_entry(_path: &std::path::Path) -> bool {
+    true
 }
 
 #[cfg(unix)]

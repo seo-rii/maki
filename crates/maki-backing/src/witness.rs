@@ -199,6 +199,10 @@ fn write_temporary(
     owner: Option<FileOwner>,
 ) -> io::Result<()> {
     let file = backing.open(TEMP_FILE, true)?;
+    // A file a failed earlier publication left (or anyone put) here is
+    // emptied first, so handing it over gives nobody bytes they could not
+    // read before.
+    file.set_len(0)?;
     // Hand the new record over before it holds a byte; `publish_anchor`
     // renames it over the anchor only after this change is synced with it.
     let given = match owner {
@@ -216,7 +220,6 @@ fn write_temporary(
         }
         _ => false,
     };
-    file.set_len(0)?;
     file.write_at(0, bytes)?;
     file.set_len(ENCODED_LEN as u64)?;
     // fdatasync need not persist an owner change; fsync does.
@@ -244,7 +247,40 @@ fn replaced_owner(backing: &dyn Backing) -> io::Result<Option<FileOwner>> {
     if !running_as_root() {
         return Ok(None);
     }
-    backing.open(ANCHOR_FILE, false)?.owner()
+    let replaced = backing.open(ANCHOR_FILE, false)?.owner()?;
+    publication_owner(backing.directory_owner("")?, replaced)
+}
+
+/// Whom root publishes the record for, given the witness directory's owner
+/// and the replaced anchor's. In a directory another user owns, every file
+/// root creates is that user's (`FileBacking`), and the record is too: an
+/// anchor root owns there is what a root run that did not keep the owner
+/// left, and goes back to the directory's owner. An anchor of a third user
+/// is refused rather than given to either: whoever owns the directory can
+/// put any file there, and root must not hand a record to a user it cannot
+/// tell is the volume's. A root-owned directory keeps the replaced
+/// anchor's owner.
+fn publication_owner(
+    directory: Option<FileOwner>,
+    replaced: Option<FileOwner>,
+) -> io::Result<Option<FileOwner>> {
+    let (Some(directory), Some(anchor)) = (directory, replaced) else {
+        return Ok(replaced);
+    };
+    if directory.uid == 0 || anchor.uid == directory.uid {
+        Ok(Some(anchor))
+    } else if anchor.uid == 0 {
+        Ok(Some(directory))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the witness directory belongs to uid {} but its anchor to uid {}; give both to \
+                 the daemon user before opening the witness",
+                directory.uid, anchor.uid
+            ),
+        ))
+    }
 }
 
 fn running_as_root() -> bool {
@@ -697,6 +733,109 @@ mod tests {
     }
 
     #[test]
+    fn root_publishes_for_the_directory_owner_and_refuses_a_third_anchor_owner() {
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        let dir = tempdir().unwrap();
+        drop(FileWitness::create(dir.path(), IDENTITY, ROOT_A).unwrap());
+        // A daemon-owned directory with a root-owned anchor: what a root
+        // run that did not keep the anchor's owner left, here with the
+        // temporary file of a failed publication.
+        std::fs::write(dir.path().join(super::TEMP_FILE), b"left behind").unwrap();
+        let fault = Arc::new(FaultBacking::new(dir.path()).unwrap());
+        fault.report_directory_owner(daemon);
+        fault.report_anchor_owner(root);
+        let backing: Arc<dyn Backing> = fault.clone();
+        drop(FileWitness::open_backing(backing).unwrap());
+
+        // An anchor of a third user in the daemon's directory.
+        let refused = Arc::new(FaultBacking::new(dir.path()).unwrap());
+        refused.report_directory_owner(daemon);
+        refused.report_anchor_owner(other);
+        let backing: Arc<dyn Backing> = refused.clone();
+        let opened = FileWitness::open_backing(backing);
+
+        if super::running_as_root() {
+            // The record goes back to the directory's owner.
+            assert_eq!(
+                fault.trace(),
+                [
+                    "temp_owner",
+                    "temp_write",
+                    "temp_sync_all",
+                    "rename",
+                    "directory_sync"
+                ]
+            );
+            assert_eq!(fault.given(), [daemon]);
+            // Refused before anything is written or given away.
+            let error = opened.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("uid 4242"), "{error}");
+            assert!(error.to_string().contains("uid 4444"), "{error}");
+            assert!(refused.trace().is_empty());
+            assert!(refused.given().is_empty());
+        } else {
+            // Nobody else can give a file away; they publish as themselves.
+            let publish = ["temp_write", "temp_sync", "rename", "directory_sync"];
+            assert_eq!(fault.trace(), publish);
+            drop(opened.unwrap());
+            assert_eq!(refused.trace(), publish);
+            assert!(fault.given().is_empty() && refused.given().is_empty());
+        }
+    }
+
+    #[test]
+    fn root_publishes_for_the_anchor_or_directory_owner_it_can_trust() {
+        use super::publication_owner;
+        let daemon = FileOwner {
+            uid: 4242,
+            gid: 4343,
+        };
+        let daemon_group = FileOwner {
+            uid: 4242,
+            gid: 4646,
+        };
+        let other = FileOwner {
+            uid: 4444,
+            gid: 4545,
+        };
+        let root = FileOwner { uid: 0, gid: 0 };
+        // A backing without ownership, or an anchor without one, keeps
+        // whatever the anchor reports.
+        assert_eq!(publication_owner(None, None).unwrap(), None);
+        assert_eq!(publication_owner(None, Some(other)).unwrap(), Some(other));
+        assert_eq!(publication_owner(Some(daemon), None).unwrap(), None);
+        // A root-owned directory keeps the replaced anchor's owner.
+        for anchor in [root, daemon, other] {
+            assert_eq!(
+                publication_owner(Some(root), Some(anchor)).unwrap(),
+                Some(anchor)
+            );
+        }
+        // The directory owner's own anchor keeps its owner and group.
+        assert_eq!(
+            publication_owner(Some(daemon_group), Some(daemon)).unwrap(),
+            Some(daemon)
+        );
+        // A root-owned anchor goes back to the directory's owner.
+        assert_eq!(
+            publication_owner(Some(daemon), Some(root)).unwrap(),
+            Some(daemon)
+        );
+        // A third user's anchor is given to nobody.
+        let error = publication_owner(Some(daemon), Some(other)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn encoding_has_a_fixed_vector() {
         let anchor = Anchor {
             identity: [0x01; 16],
@@ -769,6 +908,7 @@ mod tests {
         pending: Arc<Mutex<Option<FailAt>>>,
         trace: Arc<Mutex<Vec<&'static str>>>,
         anchor_owner: Mutex<Option<FileOwner>>,
+        directory_owner: Mutex<Option<FileOwner>>,
         given: Arc<Mutex<Vec<FileOwner>>>,
     }
 
@@ -779,6 +919,7 @@ mod tests {
                 pending: Arc::new(Mutex::new(None)),
                 trace: Arc::new(Mutex::new(Vec::new())),
                 anchor_owner: Mutex::new(None),
+                directory_owner: Mutex::new(None),
                 given: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -794,6 +935,12 @@ mod tests {
         /// Make the anchor report `owner` instead of its real owner.
         fn report_anchor_owner(&self, owner: FileOwner) {
             *self.anchor_owner.lock().unwrap() = Some(owner);
+        }
+
+        /// Make the witness directory report `owner` instead of its real
+        /// owner.
+        fn report_directory_owner(&self, owner: FileOwner) {
+            *self.directory_owner.lock().unwrap() = Some(owner);
         }
 
         /// Owners given to temporary files. They are recorded, not applied,
@@ -910,6 +1057,11 @@ mod tests {
 
         fn set_owner(&self, owner: FileOwner) -> io::Result<()> {
             assert!(self.temporary, "only a new record is given away");
+            assert_eq!(
+                self.inner.len().unwrap(),
+                0,
+                "a file is handed over only once it holds nothing"
+            );
             self.trace.lock().unwrap().push("temp_owner");
             let mut pending = self.pending.lock().unwrap();
             if *pending == Some(FailAt::TempOwner) {
@@ -975,6 +1127,13 @@ mod tests {
 
         fn free_bytes(&self) -> io::Result<Option<u64>> {
             self.inner.free_bytes()
+        }
+
+        fn directory_owner(&self, dir: &str) -> io::Result<Option<FileOwner>> {
+            match *self.directory_owner.lock().unwrap() {
+                Some(owner) => Ok(Some(owner)),
+                None => self.inner.directory_owner(dir),
+            }
         }
     }
 }
