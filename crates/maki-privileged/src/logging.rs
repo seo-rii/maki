@@ -38,6 +38,11 @@ pub fn install_default_logging() -> bool {
         .with_writer(io::stderr)
         .with_ansi(false)
         .with_target(false)
+        // This builder's default reports an event it could not write with
+        // `eprintln!`, which panics when stderr is the writer that failed (a
+        // pipe whose reader has gone): the helper would die at the first
+        // step it logs. An event that cannot be delivered is dropped.
+        .log_internal_errors(false)
         .try_init()
         .is_ok();
     if let (true, Some(reason)) = (installed, refused) {

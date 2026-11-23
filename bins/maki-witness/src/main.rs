@@ -1,4 +1,9 @@
 //! Local or quorum-backed witness process. Initialization is always explicit.
+
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -15,6 +20,17 @@ use uuid::Uuid;
 
 const HELP: &str = "maki-witness init STATE_DIRECTORY VOLUME_UUID\nmaki-witness init-etcd ETCD_CONFIG.toml VOLUME_UUID\nmaki-witness serve SERVER_CONFIG.toml\nmaki-witness inspect CLIENT_CONFIG.toml\nmaki-witness fingerprint CERTIFICATE.pem\n\ninit and init-etcd refuse existing state; serve never initializes missing state.\nserve requires exactly one state_dir or pinned etcd quorum configuration.\nTLS 1.3 and certificate allow-list authentication are mandatory.\n";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,7 +163,9 @@ fn run(args: &[String]) -> io::Result<()> {
             // default soft limit of 1024 is reachable at max_connections =
             // 256 (BUG-124 raised it for the other binaries).
             if let Err(error) = maki_backing::raise_open_file_limit() {
-                eprintln!("maki-witness: warning: cannot raise the open-file soft limit: {error}");
+                diagnostic!(
+                    "maki-witness: warning: cannot raise the open-file soft limit: {error}"
+                );
             }
             // Validate credentials before opening state; never create state during serve.
             let server = Arc::new(Server::new(config.server)?);
@@ -198,7 +216,7 @@ fn run(args: &[String]) -> io::Result<()> {
 
 fn main() {
     if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        eprintln!("maki-witness: {error}");
+        diagnostic!("maki-witness: {error}");
         std::process::exit(1);
     }
 }

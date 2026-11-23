@@ -1,6 +1,11 @@
 //! Engine throughput and latency over a configured, disposable volume.
 //! An existing volume needs --destroy-data: its working set is overwritten.
 
+// Output goes through `diagnostic!` and explicit writes to a locked stdout:
+// the `print!` family panics when a write fails (a closed pipe, a full
+// disk), which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 mod latency;
 mod workload;
 
@@ -16,6 +21,17 @@ use latency::{Latencies, LatencyReport};
 
 const USAGE: &str = "usage: maki-benchmark [--destroy-data] [--json] [--fua] [--concurrency 1..256]\n  [--access sequential|random] [--read-percent 0..100] [--working-set bytes]\n  [--flush-every operations] [--seed integer] <config.toml> [ops] [io-size]";
 const MAX_OPERATIONS: u64 = 1_000_000_000;
+
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
 
 struct Options {
     config_path: PathBuf,
@@ -221,7 +237,7 @@ fn main() -> ExitCode {
         .and_then(|()| out.flush());
         return match written {
             Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
-                eprintln!("error: writing the output failed: {error}");
+                diagnostic!("error: writing the output failed: {error}");
                 ExitCode::FAILURE
             }
             _ => ExitCode::SUCCESS,
@@ -230,7 +246,7 @@ fn main() -> ExitCode {
     let options = match parse_args() {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("error: {error}\n{USAGE}");
+            diagnostic!("error: {error}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -240,14 +256,14 @@ fn main() -> ExitCode {
     let raw = match maki_nbdkit::config_file::read_volume_config(&options.config_path) {
         Ok(raw) => raw,
         Err(error) => {
-            eprintln!("error: {}: {error}", options.config_path.display());
+            diagnostic!("error: {}: {error}", options.config_path.display());
             return ExitCode::FAILURE;
         }
     };
     let creation = match maki_nbdkit::daemon::VolumeCreationConfig::parse(&raw) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: {error}");
+            diagnostic!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -264,11 +280,11 @@ fn main() -> ExitCode {
         options.ops.min(slots) * io_size as u64
     });
     if let Err(error) = config.validate_fixed_io_working_set(io_size as u64, working_set_bytes) {
-        eprintln!("{error}");
+        diagnostic!("{error}");
         return ExitCode::from(2);
     }
     if let Err(error) = workload::validate_oracle_capacity(working_set_bytes / io_size as u64) {
-        eprintln!("{error}");
+        diagnostic!("{error}");
         return ExitCode::from(2);
     }
     // A refusal must not claim a remote writer or advance its fence. The actual
@@ -276,7 +292,7 @@ fn main() -> ExitCode {
     let existing = match maki_nbdkit::daemon::volume_layout_present(config) {
         Ok(present) => present,
         Err(error) => {
-            eprintln!("error: cannot open the existing volume: {error}");
+            diagnostic!("error: cannot open the existing volume: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -286,7 +302,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("error: cannot start runtime: {error}");
+            diagnostic!("error: cannot start runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -298,7 +314,7 @@ fn main() -> ExitCode {
             // A plain volume may have appeared after the existing-volume probe.
             Err(DaemonError::Format(FormatError::AlreadyExists(_))) => None,
             Err(error) => {
-                eprintln!("error: cannot create and attach the volume: {error}");
+                diagnostic!("error: cannot create and attach the volume: {error}");
                 return ExitCode::FAILURE;
             }
         }
@@ -306,7 +322,7 @@ fn main() -> ExitCode {
     let engine = match created {
         Some(engine) => engine,
         None if !options.destroy_data => {
-            eprintln!(
+            diagnostic!(
                 "error: {} names an existing volume; the benchmark overwrites its \
                  data. Pass --destroy-data to run it anyway.",
                 options.config_path.display()
@@ -316,7 +332,7 @@ fn main() -> ExitCode {
         None => match runtime.block_on(maki_nbdkit::daemon::attach_from_config(config)) {
             Ok(engine) => engine,
             Err(error) => {
-                eprintln!("attach failed: {error}");
+                diagnostic!("attach failed: {error}");
                 return ExitCode::FAILURE;
             }
         },
@@ -329,7 +345,7 @@ fn main() -> ExitCode {
         || io_size as u64 > engine.max_request_bytes()
         || !io_size.is_multiple_of(actual_block)
     {
-        eprintln!(
+        diagnostic!(
             "io-size {io_size} does not fit the attached volume: size {}, block {}, maximum I/O {}",
             engine.size(),
             actual_block,
@@ -385,7 +401,7 @@ fn main() -> ExitCode {
     let report = match result {
         Ok(report) => report,
         Err(error) => {
-            eprintln!("benchmark failed: {error}");
+            diagnostic!("benchmark failed: {error}");
             return ExitCode::FAILURE;
         }
     };

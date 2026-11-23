@@ -5,6 +5,11 @@
 //! journal (with the recovery scanner) and every allocated slot (review
 //! M-018). The deep check takes the volume lock: run it after detach.
 
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,8 +19,19 @@ use maki_backing::Backing;
 const USAGE: &str =
     "usage: maki-check <volume-backing-root> [--deep] [--journal-segment-size <bytes>]";
 
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+    diagnostic!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -39,7 +55,7 @@ fn print_result(text: &str) -> ExitCode {
     match print_stdout(text) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: writing the output failed: {error}");
+            diagnostic!("error: writing the output failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -51,7 +67,7 @@ fn main() -> ExitCode {
     maki_core::logging::install_default_logging();
     // Opening a volume keeps every shard data file open (BUG-124).
     if let Err(e) = maki_backing::raise_open_file_limit() {
-        eprintln!("warning: cannot raise the open-file soft limit: {e}");
+        diagnostic!("warning: cannot raise the open-file soft limit: {e}");
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut root: Option<&std::path::Path> = None;
@@ -88,18 +104,18 @@ fn main() -> ExitCode {
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
-            eprintln!("error: {display}: not a directory");
+            diagnostic!("error: {display}: not a directory");
             return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("error: {display}: {e}");
+            diagnostic!("error: {display}: {e}");
             return ExitCode::FAILURE;
         }
     }
     // A rollback-protected root keeps the volume inside an outer format that
     // only the configured daemon path can open (BUG-110).
     if root.join("rollback.format").exists() {
-        eprintln!(
+        diagnostic!(
             "error: {display} is a rollback-protected backing; maki-check cannot open its \
              outer format. Run `maki check <config.toml> [--deep]` with the volume configuration"
         );
@@ -108,7 +124,7 @@ fn main() -> ExitCode {
     let backing = match maki_backing::FileBacking::new(root) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: {display}: {e}");
+            diagnostic!("error: {display}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -136,7 +152,7 @@ fn main() -> ExitCode {
             // A report that could not be written is an error, which still
             // names the verdict.
             if let Err(error) = print_stdout(&text) {
-                eprintln!("error: check {verdict}, but writing the report failed: {error}");
+                diagnostic!("error: check {verdict}, but writing the report failed: {error}");
                 return ExitCode::FAILURE;
             }
             if report.ok() {
@@ -146,7 +162,7 @@ fn main() -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            diagnostic!("error: {e}");
             ExitCode::FAILURE
         }
     }

@@ -5,6 +5,11 @@
 //! the daemon control socket (Unix). `attach`/`detach`/`grow` delegate to
 //! the privileged helper.
 
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -31,9 +36,20 @@ const USAGE: &str = "usage:
   maki attach|detach|grow ...          delegated to maki-attach (privileged)
   maki --help | --version";
 
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 /// Misuse: the usage on stderr, status 2.
 fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+    diagnostic!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -194,7 +210,7 @@ fn main() -> ExitCode {
     maki_core::logging::install_default_logging();
     // Opening a volume keeps every shard data file open (BUG-124).
     if let Err(e) = maki_backing::raise_open_file_limit() {
-        eprintln!("warning: cannot raise the open-file soft limit: {e}");
+        diagnostic!("warning: cannot raise the open-file soft limit: {e}");
     }
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [volume, verb, config] = raw_args.as_slice() {
@@ -211,7 +227,7 @@ fn main() -> ExitCode {
         .map(std::ffi::OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
     else {
-        eprintln!("error: command-line arguments must be valid UTF-8");
+        diagnostic!("error: command-line arguments must be valid UTF-8");
         return ExitCode::from(2);
     };
     // Helper options belong to the helper, including its NBD --socket
@@ -417,7 +433,7 @@ fn privileged_helper(args: &[String]) -> ExitCode {
         .map(|arg| shell_word(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    eprintln!("this operation requires the privileged helper: run `maki-attach {command}`");
+    diagnostic!("this operation requires the privileged helper: run `maki-attach {command}`");
     ExitCode::from(3)
 }
 
@@ -583,7 +599,7 @@ fn running_as_root() -> bool {
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("error: {message}");
+    diagnostic!("error: {message}");
     ExitCode::FAILURE
 }
 

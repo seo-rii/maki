@@ -7,6 +7,11 @@
 //! only, with NBD device allocation, mount-identity verification and
 //! reverse rollback on failure.
 
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,8 +22,19 @@ use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, GrowRequest};
 
 mod failed_start;
 
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 fn usage() -> ExitCode {
-    eprintln!(
+    diagnostic!(
         "usage:
   maki-attach attach --volume <v> [--config <attach.toml>] [--nbd-device /dev/nbdN]
                      [--vg <vg>] [--lv <lv>] [--mountpoint <dir>] [--socket <path>]
@@ -135,7 +151,7 @@ fn main() -> ExitCode {
     maki_privileged::logging::install_default_logging();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let Err(error) = validate_arguments(&args) {
-        eprintln!("error: {error}");
+        diagnostic!("error: {error}");
         return usage();
     }
     let Some(verb) = args.first().and_then(|verb| verb.to_str()) else {
@@ -150,7 +166,7 @@ fn main() -> ExitCode {
         return match failed_start::run(&volume, plan_only) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("error: {error}");
+                diagnostic!("error: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -162,13 +178,13 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from(config::default_path(&volume)));
     if verb == "verify" {
         if let Err(error) = config::check_volume_name(&volume) {
-            eprintln!("error: {error}");
+            diagnostic!("error: {error}");
             return ExitCode::from(2);
         }
         // Workload gates use only the root-controlled config. An argument
         // cannot replace its filesystem pin or any stored attachment identity.
         if let Err(error) = config::check_abs_path("config", &config_path.to_string_lossy()) {
-            eprintln!("error: {error}");
+            diagnostic!("error: {error}");
             return ExitCode::from(2);
         }
         if plan_only {
@@ -182,7 +198,7 @@ fn main() -> ExitCode {
             return match print_plan(&preview) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("error: {error}");
+                    diagnostic!("error: {error}");
                     ExitCode::FAILURE
                 }
             };
@@ -196,21 +212,21 @@ fn main() -> ExitCode {
                     if let Err(error) = print_stdout(&format!(
                         "verified current storage attachment for volume {volume}\n"
                     )) {
-                        eprintln!(
+                        diagnostic!(
                             "warning: volume {volume} was verified, but writing the confirmation failed: {error}"
                         );
                     }
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
-                    eprintln!("error: {error}");
+                    diagnostic!("error: {error}");
                     ExitCode::FAILURE
                 }
             };
         }
         #[cfg(not(target_os = "linux"))]
         {
-            eprintln!("verification requires Linux");
+            diagnostic!("verification requires Linux");
             return ExitCode::from(3);
         }
     }
@@ -229,7 +245,7 @@ fn main() -> ExitCode {
         match loaded {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("error: {e}");
+                diagnostic!("error: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -256,7 +272,7 @@ fn main() -> ExitCode {
     let request = match request {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error: {e}");
+            diagnostic!("error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -266,7 +282,7 @@ fn main() -> ExitCode {
         "detach" | "recover" | "cleanup" => plan_detach(&request),
         "grow" => {
             if args.iter().any(|arg| arg == "--add-bytes") {
-                eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
+                diagnostic!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
                 return ExitCode::from(2);
             }
             // Plain decimal digits only: `u64::from_str` accepts a leading
@@ -282,7 +298,7 @@ fn main() -> ExitCode {
             // LVM refuses a byte size that is not sector aligned, so such a
             // target would fail on every attempt, retries included.
             if target % 512 != 0 {
-                eprintln!(
+                diagnostic!(
                     "error: --size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
                      byte sizes"
                 );
@@ -329,7 +345,7 @@ fn main() -> ExitCode {
         return match print_plan(&printed) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("error: {error}");
+                diagnostic!("error: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -338,7 +354,7 @@ fn main() -> ExitCode {
     // could be written must not decide whether storage is attached, detached
     // or cleaned up: the exit status is the execution's.
     if let Err(error) = print_stdout(&printed) {
-        eprintln!("warning: writing the plan failed: {error}; continuing with {verb}");
+        diagnostic!("warning: writing the plan failed: {error}; continuing with {verb}");
     }
 
     #[cfg(target_os = "linux")]
@@ -351,14 +367,14 @@ fn main() -> ExitCode {
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e}");
+                diagnostic!("error: {e}");
                 ExitCode::FAILURE
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("execution requires Linux; plan printed above (--plan)");
+        diagnostic!("execution requires Linux; plan printed above (--plan)");
         ExitCode::from(3)
     }
 }
