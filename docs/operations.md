@@ -567,8 +567,9 @@ Execution (Linux, root) then:
 1. opens `/run/maki-attach` through verified root-owned directory descriptors,
    takes its private `attach.lock`, and, unless a device is pinned, allocates
    the lowest unused `/dev/nbdN` from sysfs. Automatic selection skips connected
-   devices and devices whose root or partitions have holders or direct mounts
-   in the helper's mount namespace. Unreadable or inconsistent observations
+   devices, devices whose root or partitions have holders or direct mounts
+   in the helper's mount namespace, and devices that another volume's
+   attachment record names. Unreadable or inconsistent observations
    refuse allocation; the helper checks the selected device again before
    connecting it;
 2. records the requested attachment and a random connection identifier before
@@ -601,6 +602,28 @@ An atomic replacement binds the volume UUID, socket, mountpoint, VG, LV,
 optional administrator LVM pins, device, random connection identifier, and
 either the pre-activation recovery intent or the complete post-activation
 mapping proof.
+
+A record can outlive its kernel connection: a helper killed between publishing
+the record and connecting, or between disconnecting and retiring it, leaves a
+record whose device has no backend, holder or mount. The device stays that
+volume's until its next attach replaces the record, or its next cleanup,
+detach or recover retires it. Every attach therefore reads all records under
+the lock before choosing a device: automatic selection skips a device that
+another volume's record names, a pinned `nbd_device` that another volume's
+record names is refused, and a `<volume>.nbd` entry that cannot be read refuses
+the attach and names the file, because it could name any device.
+
+If a recorded device is found connected under another identity all the same
+(an NBD client started outside the helper, or two volumes left sharing a
+device by a helper from before this rule), every verb of the recorded volume
+refuses without changing anything and keeps the record: sysfs shows what holds
+the device, not under which connection it was set up. Detach the volume or
+disconnect the client that uses the device now, then run
+`maki-attach cleanup --volume <volume>`, which finds the device without a
+backend and retires the record. If the device's present user has to stay up,
+confirm independently that nothing is mounted at the recorded mountpoint and
+that no device-mapper mapping of the recorded VG exists, and only then remove
+`/run/maki-attach/<volume>.nbd` by hand.
 
 `maki-attach detach` takes the same lock and compares the requested attachment
 with that record and the live `/sys/block/nbdN/backend` before unmounting or

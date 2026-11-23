@@ -7,7 +7,13 @@
 //! only, with NBD device allocation, mount-identity verification and
 //! reverse rollback on failure.
 
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -16,9 +22,18 @@ use maki_privileged::plan::{plan_attach, plan_detach, plan_grow, GrowRequest};
 
 mod failed_start;
 
-fn usage() -> ExitCode {
-    eprintln!(
-        "usage:
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
+const USAGE: &str = "usage:
   maki-attach attach --volume <v> [--config <attach.toml>] [--nbd-device /dev/nbdN]
                      [--vg <vg>] [--lv <lv>] [--mountpoint <dir>] [--socket <path>]
                      [--uuid <volume-uuid>] [--fs-uuid <xfs-uuid>] [--init-sentinel] [--plan]
@@ -28,11 +43,35 @@ fn usage() -> ExitCode {
   maki-attach recover-failed-start --volume <v> [--plan] (systemd ExecStopPost hook)
   maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
+  maki-attach --help | --version
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
-requires the volume UUID (config or --uuid); --plan prints the plan without it."
-    );
+requires the volume UUID (config or --uuid); --plan prints the plan without it.";
+
+/// Misuse: the usage on stderr, status 2.
+fn usage() -> ExitCode {
+    diagnostic!("{USAGE}");
     ExitCode::from(2)
+}
+
+/// Write `text` to stdout and flush it.
+///
+/// `print!` panics when the write fails, and the panic replaces the
+/// helper's exit status with 101. A reader that has gone (`| head -3`) has
+/// what it wanted, so a closed pipe is not an error; any other failure is
+/// returned for the caller to report.
+fn print_stdout(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Print a `--plan` preview, which is all that such a run produces: a plan
+/// that could not be written is its failure.
+fn print_plan(text: &str) -> Result<(), String> {
+    print_stdout(text).map_err(|error| format!("writing the plan failed: {error}"))
 }
 
 fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a OsStr> {
@@ -72,6 +111,14 @@ fn validate_arguments(args: &[OsString]) -> Result<(), String> {
             "--plan" => false,
             "--init-sentinel" if verb == "attach" => false,
             "--size-bytes" if verb == "grow" => true,
+            // The former relative option is refused with its reason: a retry
+            // after a partial failure could not tell whether its increase
+            // had already been applied.
+            "--add-bytes" if verb == "grow" => {
+                return Err("relative growth is unsupported; use --size-bytes with the \
+                            absolute desired LV size and reuse it on retry"
+                    .into());
+            }
             "--nbd-device" | "--vg" | "--lv" | "--mountpoint" | "--socket" | "--uuid"
             | "--fs-uuid"
                 if !matches!(verb, "verify" | "recover-failed-start") =>
@@ -113,8 +160,30 @@ fn main() -> ExitCode {
     // exit status.
     maki_privileged::logging::install_default_logging();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Asking for help or the version is not misuse (BUG-112). Either is
+    // answered only as the sole argument, before the arguments are
+    // validated and before any configuration or attachment state is looked
+    // at; anywhere else it is refused like any other unknown argument.
+    if let [only] = args.as_slice() {
+        let answer = match only.to_str() {
+            Some("--help" | "-h" | "help") => Some(format!("{USAGE}\n")),
+            Some("--version" | "-V") => {
+                Some(format!("maki-attach {}\n", env!("CARGO_PKG_VERSION")))
+            }
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            return match print_stdout(&answer) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    diagnostic!("error: writing the output failed: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
     if let Err(error) = validate_arguments(&args) {
-        eprintln!("error: {error}");
+        diagnostic!("error: {error}");
         return usage();
     }
     let Some(verb) = args.first().and_then(|verb| verb.to_str()) else {
@@ -129,7 +198,7 @@ fn main() -> ExitCode {
         return match failed_start::run(&volume, plan_only) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("error: {error}");
+                diagnostic!("error: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -141,38 +210,55 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from(config::default_path(&volume)));
     if verb == "verify" {
         if let Err(error) = config::check_volume_name(&volume) {
-            eprintln!("error: {error}");
+            diagnostic!("error: {error}");
             return ExitCode::from(2);
         }
         // Workload gates use only the root-controlled config. An argument
         // cannot replace its filesystem pin or any stored attachment identity.
         if let Err(error) = config::check_abs_path("config", &config_path.to_string_lossy()) {
-            eprintln!("error: {error}");
+            diagnostic!("error: {error}");
             return ExitCode::from(2);
         }
         if plan_only {
-            println!("# verify volume {volume}: PLAN ONLY; no live evidence has been checked");
-            println!("Require trusted config {} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.", config_path.display());
-            println!("Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.");
-            println!("Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.");
-            return ExitCode::SUCCESS;
+            let preview = format!(
+                "# verify volume {volume}: PLAN ONLY; no live evidence has been checked\n\
+                 Require trusted config {} with volume_uuid and fs_uuid, and existing trusted attachment state and lock.\n\
+                 Check the connected backend identifier, complete persisted mapping proof and complete read/write XFS mount in this namespace.\n\
+                 Read the pinned XFS UUID and volume sentinel; recheck kernel identity around reads. No write probe or repair.\n",
+                config_path.display()
+            );
+            return match print_plan(&preview) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    diagnostic!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            };
         }
         #[cfg(target_os = "linux")]
         {
             return match maki_privileged::exec::verify(&volume, &config_path) {
                 Ok(()) => {
-                    println!("verified current storage attachment for volume {volume}");
+                    // The gate's answer is the exit status: a confirmation
+                    // that cannot be written does not withdraw it.
+                    if let Err(error) = print_stdout(&format!(
+                        "verified current storage attachment for volume {volume}\n"
+                    )) {
+                        diagnostic!(
+                            "warning: volume {volume} was verified, but writing the confirmation failed: {error}"
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
-                    eprintln!("error: {error}");
+                    diagnostic!("error: {error}");
                     ExitCode::FAILURE
                 }
             };
         }
         #[cfg(not(target_os = "linux"))]
         {
-            eprintln!("verification requires Linux");
+            diagnostic!("verification requires Linux");
             return ExitCode::from(3);
         }
     }
@@ -191,7 +277,7 @@ fn main() -> ExitCode {
         match loaded {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("error: {e}");
+                diagnostic!("error: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -218,7 +304,7 @@ fn main() -> ExitCode {
     let request = match request {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error: {e}");
+            diagnostic!("error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -227,10 +313,6 @@ fn main() -> ExitCode {
         "attach" => plan_attach(&request),
         "detach" | "recover" | "cleanup" => plan_detach(&request),
         "grow" => {
-            if args.iter().any(|arg| arg == "--add-bytes") {
-                eprintln!("error: relative growth is unsupported; use --size-bytes with the absolute desired LV size and reuse it on retry");
-                return ExitCode::from(2);
-            }
             // Plain decimal digits only: `u64::from_str` accepts a leading
             // `+`, which turned an intended relative "+N" into an absolute
             // target that an existing larger LV already met (BUG-116).
@@ -244,7 +326,7 @@ fn main() -> ExitCode {
             // LVM refuses a byte size that is not sector aligned, so such a
             // target would fail on every attempt, retries included.
             if target % 512 != 0 {
-                eprintln!(
+                diagnostic!(
                     "error: --size-bytes {target} is not a multiple of 512; LVM refuses unaligned \
                      byte sizes"
                 );
@@ -266,28 +348,41 @@ fn main() -> ExitCode {
         _ => return usage(),
     };
 
+    let mut printed = String::new();
     if verb == "recover" {
-        println!("# recover disconnected volume {}; require an absent backend and unchanged persisted kernel identities before each conditional cleanup step", request.volume);
+        printed += &format!("# recover disconnected volume {}; require an absent backend and unchanged persisted kernel identities before each conditional cleanup step\n", request.volume);
         // Recovery consumes the detach identity but never disconnects NBD.
         // Print only the conditional upper-layer cleanup it can execute.
         for (index, step) in plan.steps.iter().take(2).enumerate() {
-            println!("{}. {step} (only if still present)", index + 1);
+            printed += &format!("{}. {step} (only if still present)\n", index + 1);
         }
     } else if verb == "cleanup" {
-        println!("# cleanup volume {}; no trusted record is success; owned connected backend follows detach; known absent backend follows recovery; foreign or unreadable backend is preserved", request.volume);
+        printed += &format!("# cleanup volume {}; no trusted record is success; owned connected backend follows detach; known absent backend follows recovery; foreign or unreadable backend is preserved\n", request.volume);
         for (index, step) in plan.steps.iter().enumerate() {
             let condition = if index < 2 {
                 "only if still present in the selected detach or recovery path"
             } else {
                 "only for the owned connected backend detach path"
             };
-            println!("{}. {step} ({condition})", index + 1);
+            printed += &format!("{}. {step} ({condition})\n", index + 1);
         }
     } else {
-        print!("{plan}");
+        printed = plan.to_string();
     }
     if plan_only {
-        return ExitCode::SUCCESS;
+        return match print_plan(&printed) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                diagnostic!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // Before execution the plan is an audit copy of what follows. Whether it
+    // could be written must not decide whether storage is attached, detached
+    // or cleaned up: the exit status is the execution's.
+    if let Err(error) = print_stdout(&printed) {
+        diagnostic!("warning: writing the plan failed: {error}; continuing with {verb}");
     }
 
     #[cfg(target_os = "linux")]
@@ -300,14 +395,14 @@ fn main() -> ExitCode {
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e}");
+                diagnostic!("error: {e}");
                 ExitCode::FAILURE
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("execution requires Linux; plan printed above (--plan)");
+        diagnostic!("execution requires Linux; plan printed above (--plan)");
         ExitCode::from(3)
     }
 }

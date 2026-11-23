@@ -334,6 +334,100 @@ fn takeover_requires_admin_exact_fence_and_current_root_and_revokes_old_writer()
     assert_eq!(read(&reopened), b"ciphertext-current");
 }
 
+fn run_with_stdout(args: &[&str], stdout: std::process::Stdio) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(args)
+        .env("RUST_BACKTRACE", "0")
+        .stdout(stdout)
+        .output()
+        .unwrap()
+}
+
+/// `println!` panicked on the record: with a stdout reader that had gone,
+/// an inspection exited 101, and so did a takeover that had already moved
+/// the fence. The reader has what it wanted; the command's status stands.
+#[test]
+fn a_closed_stdout_fails_neither_an_inspection_nor_a_completed_takeover() {
+    let closed_pipe = || -> std::process::Stdio {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer.into()
+    };
+    let fixture = Fixture::new();
+    let old = fixture.create();
+    write(&old, b"ciphertext-current");
+    let before = inspect(fixture.writer.as_ref());
+
+    let inspected = run_with_stdout(&["volume", "witness", fixture.path(false)], closed_pipe());
+    let stderr = String::from_utf8_lossy(&inspected.stderr);
+    assert_eq!(inspected.status.code(), Some(0), "{stderr}");
+    assert!(inspected.stderr.is_empty(), "{stderr}");
+    assert_eq!(inspect(fixture.writer.as_ref()), before);
+
+    let taken = run_with_stdout(
+        &[
+            "volume",
+            "takeover",
+            fixture.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ],
+        closed_pipe(),
+    );
+    let stderr = String::from_utf8_lossy(&taken.stderr);
+    assert_eq!(taken.status.code(), Some(0), "{stderr}");
+    assert!(taken.stderr.is_empty(), "{stderr}");
+    let after = inspect(fixture.writer.as_ref());
+    assert_eq!(after.phase, Phase::Released);
+    assert_eq!(after.fence, before.fence + 1);
+    assert!(old.check_freshness().is_err());
+}
+
+/// A record that cannot be written (a full destination) fails an inspection,
+/// whose output is its result. A takeover has already moved the fence, and
+/// the same approval would be refused on a retry: it reports the failure and
+/// still succeeds, like `volume create`.
+#[test]
+fn an_unwritable_record_fails_an_inspection_but_not_a_completed_takeover() {
+    let full = || -> std::process::Stdio {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap()
+            .into()
+    };
+    let fixture = Fixture::new();
+    let old = fixture.create();
+    let before = inspect(fixture.writer.as_ref());
+
+    let inspected = run_with_stdout(&["volume", "witness", fixture.path(false)], full());
+    let stderr = String::from_utf8_lossy(&inspected.stderr);
+    assert_eq!(inspected.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: writing the output failed"),
+        "{stderr}"
+    );
+
+    let taken = run_with_stdout(
+        &[
+            "volume",
+            "takeover",
+            fixture.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ],
+        full(),
+    );
+    let stderr = String::from_utf8_lossy(&taken.stderr);
+    assert_eq!(taken.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("warning: volume takeover completed, but writing its result failed"),
+        "{stderr}"
+    );
+    assert_eq!(inspect(fixture.writer.as_ref()).fence, before.fence + 1);
+    drop(old);
+}
+
 #[test]
 fn restore_requires_approved_snapshot_root_and_advances_epoch_without_lowering_generation() {
     let fixture = Fixture::new();

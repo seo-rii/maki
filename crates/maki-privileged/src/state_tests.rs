@@ -348,3 +348,91 @@ fn a_released_attach_lock_is_free_while_a_forked_child_holds_its_descriptor() {
         drop((probe, child));
     }
 }
+
+/// Allocation asks which devices other volumes' records name. The lock, a
+/// temporary record of a killed write and the asking volume's own record are
+/// not such records.
+#[test]
+fn recorded_devices_of_other_volumes_are_listed_by_device() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let _lock = state.lock().unwrap();
+    assert!(state.devices_of_other_volumes("db").unwrap().is_empty());
+    let mut entry = record();
+    state.write(&entry).unwrap();
+    entry.volume = "minio".into();
+    entry.device = "/dev/nbd7".into();
+    state.write(&entry).unwrap();
+    std::fs::write(
+        fixture
+            .0
+            .join("state/.pg.4242.maki-11111111-2222-4333-8444-555555555555.tmp"),
+        b"{\"version\":1,\"vol",
+    )
+    .unwrap();
+
+    let devices = |volume: &str| {
+        state
+            .devices_of_other_volumes(volume)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        devices("db"),
+        [
+            ("/dev/nbd3".to_string(), "pg".to_string()),
+            ("/dev/nbd7".to_string(), "minio".to_string()),
+        ]
+    );
+    assert_eq!(
+        devices("pg"),
+        [("/dev/nbd7".to_string(), "minio".to_string())]
+    );
+    // The listing follows the held descriptor, not the directory's path.
+    std::fs::rename(fixture.0.join("state"), fixture.0.join("moved")).unwrap();
+    assert_eq!(
+        devices("minio"),
+        [("/dev/nbd3".to_string(), "pg".to_string())]
+    );
+}
+
+/// A `<volume>.nbd` entry that is not a readable trusted record could name
+/// any device: the listing fails and names it instead of leaving it out.
+#[test]
+fn an_unreadable_record_fails_the_listing_and_is_named() {
+    for (name, content, mode) in [
+        ("pg.nbd", b"/dev/nbd3\n".to_vec(), 0o600),
+        ("pg.nbd", serde_json::to_vec(&record()).unwrap(), 0o640),
+        ("minio.nbd", serde_json::to_vec(&record()).unwrap(), 0o600),
+        ("pg vol.nbd", serde_json::to_vec(&record()).unwrap(), 0o600),
+        (".nbd", Vec::new(), 0o600),
+    ] {
+        let fixture = Fixture::new();
+        let state = fixture.state().unwrap();
+        let path = fixture.0.join("state").join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let error = state.devices_of_other_volumes("db").unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("/{name}\"")),
+            "{name:?}: {error}"
+        );
+    }
+    // A symlink and a directory under a record's name are refused too.
+    for obstruct in ["symlink", "directory"] {
+        let fixture = Fixture::new();
+        let state = fixture.state().unwrap();
+        state.write(&record()).unwrap();
+        let path = fixture.0.join("state/minio.nbd");
+        if obstruct == "symlink" {
+            symlink("pg.nbd", &path).unwrap();
+        } else {
+            std::fs::create_dir(&path).unwrap();
+        }
+        assert!(
+            state.devices_of_other_volumes("db").is_err(),
+            "accepted a {obstruct} as a record"
+        );
+    }
+}

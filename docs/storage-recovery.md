@@ -111,8 +111,12 @@ conditional checks; it does not discover or certify live identities.
 
 This path requires LVM2 support for `fullreport`, `--devices`, UUID selection,
 and complete activation mode. Unsupported options or report fields fail
-closed. The candidate inventory is limited to 64 devices and subprocess
-reports to 64 KiB. Every candidate needs a recognized, unambiguous label:
+closed. The candidate inventory is limited to 64 devices (the NBD device and
+its partitions), the volume group to 64 logical volumes, hidden ones included,
+and subprocess reports to 64 KiB. A larger inventory is refused before
+anything is activated; the recorded mapping proof holds every device and
+mapping within these limits.
+Every candidate needs a recognized, unambiguous label:
 blank spare partitions and unreadable or unclassified candidates are refused.
 In particular, `blkid` exit 2 cannot establish that a device is safely empty.
 The [blkid CLI implementation](https://github.com/util-linux/util-linux/blob/v2.38.1/misc-utils/blkid.c#L479)
