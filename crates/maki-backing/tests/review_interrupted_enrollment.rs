@@ -19,6 +19,9 @@
 //! refused by a zero file-size limit.
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -652,7 +655,7 @@ fn witness_init_whose_state_write_failed_can_be_run_again() {
 /// only safe way out, and the directory stays as it was.
 #[test]
 fn an_empty_witness_state_is_refused_with_its_causes_and_the_way_out() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir::tempdir().unwrap();
     drop(StateStore::create(dir.path(), IDENTITY).unwrap());
     std::fs::OpenOptions::new()
         .write(true)
@@ -701,7 +704,7 @@ fn an_empty_witness_state_is_refused_with_its_causes_and_the_way_out() {
 /// by rerunning `init`, which would reset its fence to zero.
 #[test]
 fn control_an_enrolled_authority_whose_state_was_truncated_is_never_initialized_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir::tempdir().unwrap();
     let mut store = StateStore::create(dir.path(), IDENTITY).unwrap();
     let expected = inspect_store(&mut store);
     let claimed = store
@@ -749,7 +752,7 @@ fn control_an_enrolled_authority_whose_state_was_truncated_is_never_initialized_
 fn control_init_writes_over_a_staged_state_left_behind() {
     use std::os::unix::fs::PermissionsExt;
     for staged in [&[][..], b"MAKIRW02 and then not a record at all"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir::tempdir().unwrap();
         let next = dir.path().join("remote.next");
         std::fs::write(&next, staged).unwrap();
         std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600)).unwrap();
