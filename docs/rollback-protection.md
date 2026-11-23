@@ -367,8 +367,9 @@ complete recovery plan.
    secret material through its separate recovery process.
 2. Stop application writers and their supervisors. Follow the stopped sequence
    in [key rotation](key-rotation.md#rotate-a-credential-while-retaining-the-encryption-key):
-   detach while the daemon is available, obtain the explicit drain
-   acknowledgement, then stop the daemon. Keep automatic restart disabled for
+   unmount while the daemon is running, obtain the explicit drain
+   acknowledgement, then stop the lifecycle target and wait for every unit to
+   become inactive. Keep automatic restart disabled for
    the maintenance window and confirm that no process holds the volume. A
    live copy of the arena and manifest slots is not an atomic backup.
 3. Copy the complete protected backing tree while it is stopped and record
