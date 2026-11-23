@@ -105,6 +105,10 @@ group = "maki-admin"
 install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml
 ```
 
+Every loader refuses a configuration that its group or others can write, that
+a user other than root or the loading process's user owns, a symlink, or a file
+with a second hard link; `install` creates exactly the accepted file
+([configuration file](../configuration.md#configuration-file)).
 The [configuration reference](../configuration.md) explains every section.
 The `[security]` defaults (locked secret buffers, no core dumps) apply
 without being written; the production profile additionally sets

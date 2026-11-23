@@ -1,10 +1,13 @@
 //! BUG-052: successful write-only runs must not claim successful read checks.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::Command;
 
 fn run(ops: &str, percent: Option<&str>, json: bool) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &config,
         format!(
             r#"

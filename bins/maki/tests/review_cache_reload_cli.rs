@@ -1,5 +1,8 @@
 #![cfg(unix)]
 //! BUG-051: the documented TTL reload is reachable through the real CLI.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use serde_json::{json, Value};
 use std::process::Command;
 
@@ -7,7 +10,7 @@ async fn reload(flags: &[&str]) -> Value {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let config = dir.path().join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &config,
         format!(
             r#"

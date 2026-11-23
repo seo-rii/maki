@@ -343,7 +343,8 @@ Recommended layout:
 └── minio.nbd
 ```
 
-Recommended permissions:
+Recommended ownership and permissions (the volume configuration rule below
+is enforced):
 
 ```text
 /etc/maki
@@ -376,6 +377,22 @@ root:root                 0700
 /run/maki-attach/*
 root:root                 0600
 ```
+
+A volume configuration decides where plaintext goes: the provider and its
+endpoints, TLS trust, credential references, the backing root and the rollback
+witness. Every loader (the data-plane daemon, `maki` and `maki-benchmark`)
+MUST open it without following a final symlink and MUST refuse, before parsing
+it, anything but a regular file with exactly one link, owned by root or by the
+user the loading process runs as, with no group or other write permission. The
+checks MUST describe the opened descriptor that is then read. Group and other
+read MAY be granted: a configuration holds credential references, never
+secrets (§9). The recommended `root:maki 0640` is accepted by root and by the
+daemon user, which reads it through its group; a file owned by the daemon user
+is refused by commands run as root. The directory holding it SHOULD be
+root-owned and not writable by others. This is the witness configuration's
+owner and mode rule plus the single link; secret files (§9) have the same
+owner rule and a stricter mode rule. Non-Unix hosts check only that the file
+is regular.
 
 The NBD Unix Domain Socket:
 

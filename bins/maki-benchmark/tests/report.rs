@@ -1,13 +1,16 @@
 //! A machine-readable performance run must describe its workload, verify reads,
 //! and reject invalid requests before creating or touching a volume.
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::{Command, Output};
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().replace('\\', "/");
     let config = dir.path().join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &config,
         format!(
             r#"
@@ -120,7 +123,7 @@ fn direct_io_must_fit_at_every_slot_before_the_volume_is_created() {
         .unwrap()
         .replace("[volume]", "[volume]\ndevice_block_size = 512")
         + "\n[nbd]\nminimum_io = 4096\nmaximum_io = 4096\n[limits]\nmax_plaintext_bytes = 4096\n";
-    std::fs::write(&path, config).unwrap();
+    volume_config::write(&path, config).unwrap();
 
     let output = run(&path, &["--fua"], &["4", "1536"]);
     assert_eq!(output.status.code(), Some(2));
@@ -145,7 +148,7 @@ fn existing_volume_geometry_still_bounds_a_changed_config() {
     let superblock = dir.path().join("vol/superblock.a");
     let original = std::fs::read(&superblock).unwrap();
     let raw = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(
+    volume_config::write(
         &config,
         raw.replace("max_virtual_size = \"1MiB\"", "max_virtual_size = \"4MiB\"")
             + "\n[nbd]\nmaximum_io = \"2MiB\"\n",

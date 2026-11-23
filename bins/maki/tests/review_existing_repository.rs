@@ -1,4 +1,7 @@
 //! Inspect/check must open an existing repository without creating a missing root.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -48,7 +51,7 @@ fn missing_root(command: &str, deep: bool) {
     let parent = directory.path().join("missing-parent");
     let root = parent.join("volume");
     let path = directory.path().join("config.toml");
-    std::fs::write(&path, config(&root)).unwrap();
+    volume_config::write(&path, config(&root)).unwrap();
     let result = run(&path, command, deep);
     assert_eq!(result.status.code(), Some(1));
     assert!(!root.exists(), "{command} created a missing repository");
@@ -76,7 +79,7 @@ fn new_volume_creation_and_existing_volume_inspection_still_work() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("new-parent/volume");
     let path = directory.path().join("config.toml");
-    std::fs::write(&path, config(&root)).unwrap();
+    volume_config::write(&path, config(&root)).unwrap();
     for (command, deep) in [
         ("create", false),
         ("inspect", false),
@@ -99,7 +102,7 @@ fn a_regular_file_is_refused_without_modifying_it() {
     let root: PathBuf = directory.path().join("volume-file");
     std::fs::write(&root, b"not a directory").unwrap();
     let path = directory.path().join("config.toml");
-    std::fs::write(&path, config(&root)).unwrap();
+    volume_config::write(&path, config(&root)).unwrap();
     for (command, deep) in [("inspect", false), ("check", false), ("check", true)] {
         assert_eq!(run(&path, command, deep).status.code(), Some(1));
         assert_eq!(std::fs::read(&root).unwrap(), b"not a directory");

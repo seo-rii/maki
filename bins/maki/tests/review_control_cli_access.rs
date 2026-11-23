@@ -9,6 +9,9 @@
 //!   blocked `maki drain` on the running daemon. Control commands need only
 //!   the socket address, so they parse the configuration without the
 //!   attach-time validation.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use serde_json::Value;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -30,7 +33,7 @@ max_ciphertext_size = 4384
 
 fn config(dir: &Path, socket: &Path, extra: &str) -> std::path::PathBuf {
     let path = dir.join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &path,
         format!(
             "{VALID}[backing]\nroot = {:?}\n[control]\nsocket = {:?}\n{extra}",

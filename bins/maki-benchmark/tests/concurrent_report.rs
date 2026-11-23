@@ -1,8 +1,11 @@
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::process::{Command, Output};
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("volume.toml");
-    std::fs::write(
+    volume_config::write(
         &config,
         format!(
             r#"
@@ -128,7 +131,7 @@ fn real_concurrency_random_mixed_fua_and_periodic_flush_are_verified_and_reporte
 fn oracle_budget_is_rejected_before_backing_creation() {
     let (directory, config) = fixture();
     let raw = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(
+    volume_config::write(
         &config,
         raw.replace(
             "max_virtual_size = \"1MiB\"",

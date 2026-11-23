@@ -2,6 +2,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -48,7 +51,7 @@ fn maximum_length_name_attaches_writes_and_returns_official_status() {
     let name = "v".repeat(64);
     let raw = config(&directory.path().join("volume"), &socket, &name);
     let path = directory.path().join("volume.toml");
-    std::fs::write(&path, &raw).unwrap();
+    volume_config::write(&path, &raw).unwrap();
     daemon::create_volume_from_config_str(&raw).unwrap();
     let adapter = NbdAdapter::open_config(path.to_str().unwrap()).unwrap();
     adapter.pwrite(&vec![0x72; 4096], 0, true).unwrap();
@@ -84,7 +87,7 @@ fn an_overlong_name_is_rejected_before_attach_opens_the_backing() {
     let root = directory.path().join("missing-volume");
     let socket = directory.path().join("control.sock");
     let path = directory.path().join("volume.toml");
-    std::fs::write(&path, config(&root, &socket, &"v".repeat(65_536))).unwrap();
+    volume_config::write(&path, config(&root, &socket, &"v".repeat(65_536))).unwrap();
     let error = match NbdAdapter::open_config(path.to_str().unwrap()) {
         Ok(_) => panic!("an overlong volume name attached"),
         Err(error) => error,
