@@ -118,8 +118,17 @@ live on this filesystem; do not split WAL onto unencrypted storage.
 
 ## 5. Register the PostgreSQL unit
 
-Debian runs clusters as `postgresql@<version>-<cluster>.service`. Create the
-cluster on the mounted volume once the first attach has succeeded:
+Debian runs clusters as `postgresql@<version>-<cluster>.service`. Installing
+the `postgresql-15` package normally creates an empty default cluster
+`15/main` under `/var/lib/postgresql`, on the unencrypted host filesystem, and
+`pg_createcluster` refuses a cluster name that already has a configuration
+(`Error: cluster configuration already exists`). Check with `pg_lsclusters`
+first. Either install `postgresql-common`, set `create_main_cluster = false`
+in its `/etc/postgresql-common/createcluster.conf` and only then install
+`postgresql-15`, or, after confirming that the default cluster holds no data,
+remove it with `pg_dropcluster --stop 15 main`.
+
+Create the cluster on the mounted volume once the first attach has succeeded:
 
 ```bash
 (
@@ -135,7 +144,10 @@ pg_createcluster -d /srv/postgres/15/main 15 main -- --data-checksums
 
 This block stops at the first failure. The identity gate must succeed before
 creating the data directory, so an unattached mountpoint cannot receive the
-cluster's files on the host filesystem.
+cluster's files on the host filesystem. Afterwards `pg_lsclusters` must show
+`/srv/postgres/15/main` as the data directory of `15 main`; any other
+directory there means the next step would register a cluster that is not on
+the volume.
 
 Then install the drop-in
 [`postgresql.service.d/10-maki.conf`](../../examples/postgres-local/postgresql.service.d/10-maki.conf)
