@@ -44,10 +44,11 @@ ignored tests, with one libtest thread per suite:
 The `rollback` profile selects separate suites for the experimental Linux
 rollback backing. The host needs a writable directory on a filesystem other
 than that of its temporary backing directory (the fixtures try `/dev/shm`,
-`/run/user/<uid>`, `/var/tmp`, `/tmp`, `TMPDIR` and `/run`); without one the
-tests print that they are skipped and pass, so check the suite logs for skip
-notices. This test witness is deliberately volatile and is not an example of
-production witness provisioning.
+`/run/user/<uid>`, `/var/tmp`, `/tmp`, `TMPDIR` and `/run`). The runner sets
+`MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1` for these suites, so without one they
+fail; elsewhere such a test prints that it is skipped and passes. This test
+witness is deliberately volatile and is not an example of production witness
+provisioning.
 
 | Package / suite | Checked behavior |
 | --- | --- |

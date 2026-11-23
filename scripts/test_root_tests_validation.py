@@ -247,7 +247,8 @@ class RootRunner(unittest.TestCase):
         self.script(self.tools / "sudo", SUDO.format(python=sys.executable, log=str(self.logs["sudo"])))
         self.compile()
         environment = {"PATH": f"{self.tools}{os.pathsep}{os.environ['PATH']}",
-                       "MAKI_FIXTURE_MARKER": "inherited", "RUST_BACKTRACE": "0"}
+                       "MAKI_FIXTURE_MARKER": "inherited", "RUST_BACKTRACE": "0",
+                       "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM": "1"}
         for patch in (mock.patch.dict(os.environ, environment),
                       mock.patch.object(runner, "owned_by", return_value=set())):
             patch.start()
@@ -325,6 +326,7 @@ class RootRunner(unittest.TestCase):
             self.assertEqual(environment["PATH"], os.environ["PATH"])
             self.assertEqual(environment["TMPDIR"], scratch)
             self.assertEqual(environment["RUST_BACKTRACE"], "0")
+            self.assertEqual(environment["MAKI_TEST_REQUIRE_OTHER_FILESYSTEM"], "1")
             self.assertNotIn("MAKI_FIXTURE_MARKER", environment)
             # Fixture users must be able to search the scratch directory.
             self.assertEqual(run["scratch"], 0o755)

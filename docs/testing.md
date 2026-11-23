@@ -714,12 +714,14 @@ Linux storage fixtures place the backing on the normal temporary filesystem and
 the witness in the first of `/dev/shm`, `/run/user/<uid>`, `/var/tmp`, `/tmp`,
 `TMPDIR` and `/run` that is on another filesystem (a different device
 identity); where there is none, each such test prints that it is skipped and
-why. This fixture is deliberately not a persistent witness deployment. Tests
-cover old whole-image rejection, page authentication, immutable predecessor
-retention, namespace sync boundaries and open handles, witness failures and
-reopen durability, full-capacity acknowledged-write recovery, cache/overlay
-freshness, concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256
-encoding vectors cover the witness record, manifest and page domains.
+why, or fails when `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1` is set, as CI and the
+background runner's `rollback` profile set it. This fixture is deliberately not
+a persistent witness deployment. Tests cover old whole-image rejection, page
+authentication, immutable predecessor retention, namespace sync boundaries and
+open handles, witness failures and reopen durability, full-capacity
+acknowledged-write recovery, cache/overlay freshness, concurrent checkpoint/FUA
+and v3 discard/rewrite. Fixed SHA-256 encoding vectors cover the witness
+record, manifest and page domains.
 
 The file model adds 1,600 deterministic operations against independent working
 and durable byte images, plus capacity reuse and unlink/handle-lifetime checks.

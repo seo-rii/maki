@@ -74,6 +74,33 @@ class BackgroundStorageTests(unittest.TestCase):
         self.assertTrue(all(value["expected_tests"] == 1 for value in manifest.values()))
         self.assertEqual(sum(command[0] == "cargo" for command in calls), 2)
 
+    def test_rollback_suites_fail_instead_of_skipping_without_a_second_filesystem(self):
+        # The suites run without --show-output: a skip notice would never
+        # reach the round log, and a skipped test counts as passed.
+        for profile, required in (("rollback", "1"), ("storage", None)):
+            with self.subTest(profile=profile):
+                directory = self.root / profile
+                directory.mkdir()
+                observed = directory / "observed"
+                executable = directory / "fixture"
+                executable.write_text(
+                    f"#!{sys.executable}\nimport os, pathlib\n"
+                    f"pathlib.Path({str(observed)!r}).write_text("
+                    "repr(os.environ.get('MAKI_TEST_REQUIRE_OTHER_FILESYSTEM')))\n"
+                    "print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                    "0 filtered out; finished in 0.0s')\n")
+                executable.chmod(0o700)
+                self.runner.save_json(directory / "config.json", {
+                    "rounds": 1, "max_seconds": 10, "suite_timeout": 5,
+                    "revision": "fixture", "source": str(directory), "profile": profile,
+                })
+                environment = {key: value for key, value in os.environ.items()
+                               if key != "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM"}
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        mock.patch.object(self.runner, "prepare", return_value={"fixture": executable}):
+                    self.assertEqual(self.runner.worker(directory), 0)
+                self.assertEqual(observed.read_text(), repr(required))
+
     def test_unknown_profile_cannot_silently_run_the_default_suites(self):
         with mock.patch.object(self.runner, "run_child") as child:
             with self.assertRaisesRegex(ValueError, "profile"):

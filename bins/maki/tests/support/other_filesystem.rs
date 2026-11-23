@@ -7,9 +7,19 @@
 //! `/run/user/<uid>`, `/var/tmp`, `/tmp`, `TMPDIR` and `/run` whose device
 //! differs from that of the path it is given. With none, it prints that the
 //! calling test is skipped and why, and returns `None`; the test returns.
+//!
+//! A skipped test still passes, and a run that does not show the output of
+//! passing tests (`cargo test` without `--show-output`, the background
+//! runner) never shows the notice. Where a second filesystem belongs to the
+//! environment, `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1` turns the missing
+//! filesystem into a failure instead: CI and the background runner's
+//! rollback profile set it.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+/// Set to `1`, a missing second filesystem fails the test.
+pub const REQUIRE: &str = "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM";
 
 fn candidates() -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from("/dev/shm")];
@@ -45,13 +55,13 @@ fn unreachable(directory: &Path) -> Option<String> {
         })
 }
 
-fn make(reference: &Path, reachable: bool) -> Option<tempfile::TempDir> {
+fn make(reference: &Path, reachable: bool, candidates: &[PathBuf]) -> Option<tempfile::TempDir> {
     let device = std::fs::metadata(reference)
         .unwrap_or_else(|error| panic!("{}: {error}", reference.display()))
         .dev();
     let mut refused = Vec::new();
-    for candidate in candidates() {
-        let made = std::fs::canonicalize(&candidate)
+    for candidate in candidates {
+        let made = std::fs::canonicalize(candidate)
             .and_then(|base| Ok((std::fs::metadata(&base)?.dev(), base)))
             .map_err(|error| error.to_string())
             .and_then(|(found, base)| {
@@ -72,11 +82,17 @@ fn make(reference: &Path, reachable: bool) -> Option<tempfile::TempDir> {
             Err(reason) => refused.push(format!("{}: {reason}", candidate.display())),
         }
     }
-    eprintln!(
-        "{}: skipped: no temporary directory on a filesystem other than that of {} ({})",
-        std::thread::current().name().unwrap_or("test"),
+    let reason = format!(
+        "no temporary directory on a filesystem other than that of {} ({})",
         reference.display(),
         refused.join("; ")
+    );
+    if std::env::var_os(REQUIRE).is_some_and(|value| value == "1") {
+        panic!("{reason}, and {REQUIRE}=1 requires one");
+    }
+    eprintln!(
+        "{}: skipped: {reason}",
+        std::thread::current().name().unwrap_or("test")
     );
     None
 }
@@ -85,12 +101,19 @@ fn make(reference: &Path, reachable: bool) -> Option<tempfile::TempDir> {
 /// `None` after printing why the test is skipped.
 #[allow(dead_code)] // not every test target uses both
 pub fn tempdir(reference: &Path) -> Option<tempfile::TempDir> {
-    make(reference, false)
+    make(reference, false, &candidates())
 }
 
 /// [`tempdir`] where every user may search down from `/`, for a fixture a
 /// command run as another user opens.
 #[allow(dead_code)] // not every test target uses both
 pub fn reachable_tempdir(reference: &Path) -> Option<tempfile::TempDir> {
-    make(reference, true)
+    make(reference, true, &candidates())
+}
+
+/// [`tempdir`] over `candidates` instead of the usual ones, for the test of
+/// this helper.
+#[allow(dead_code)] // only the helper's own test uses it
+pub fn tempdir_among(reference: &Path, candidates: &[PathBuf]) -> Option<tempfile::TempDir> {
+    make(reference, false, candidates)
 }
