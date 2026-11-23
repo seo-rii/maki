@@ -1,8 +1,12 @@
 //! `[security.memory_budget]` admission reads the daemon's whole mount
 //! table before it finds the cgroup-v2 mount, so ordinary host state
-//! elsewhere in the namespace must not change its verdict. Linux prints a
-//! mount whose source string is empty (`mount -t tmpfs '' /dir`, a FUSE
-//! mount with an empty `fsname`) as an empty field: `- tmpfs  rw,...`.
+//! elsewhere in the namespace must not change its verdict:
+//!
+//! - a mount whose source string is empty (`mount -t tmpfs '' /dir`, a FUSE
+//!   mount with an empty `fsname`), which Linux prints as an empty field:
+//!   `- tmpfs  rw,...`;
+//! - a mount table larger than 1 MiB, as on a host with a few thousand
+//!   mounts (container hosts, many snap or loop mounts).
 //!
 //! Each scenario runs in a child process inside a private mount namespace
 //! (`unshare(CLONE_NEWNS)` plus recursive private propagation), so its
@@ -10,7 +14,11 @@
 //! without the extra mounts. The children join a private, empty cgroup-v2
 //! group created for the test and removed afterwards, so that admission
 //! gets past the membership check and parses the table, as it does for a
-//! daemon in a service cgroup. Without root, a private mount namespace or a
+//! daemon in a service cgroup. Where the hierarchy has the memory
+//! controller, the group's `memory.max` is set to the configured budget, so
+//! admission runs to its end, including the final recheck of the table;
+//! elsewhere it stops at the missing controller files, after the table has
+//! been read and parsed. Without root, a private mount namespace or a
 //! writable cgroup-v2 hierarchy, or where admission stops before the table,
 //! the test prints why and checks nothing.
 
@@ -24,6 +32,9 @@ use std::process::Command;
 
 const MODE: &str = "MAKI_REVIEW_MOUNT_TABLE_MODE";
 const GROUP: &str = "MAKI_REVIEW_MOUNT_TABLE_GROUP";
+
+/// The configured `max_bytes`.
+const BUDGET_BYTES: u64 = 1 << 30;
 
 const CONFIG: &str = r#"
 config_schema_version = 1
@@ -128,6 +139,23 @@ fn child(mode: &str) {
                 "the kernel prints the empty source as an empty field"
             );
         }
+        "large" => {
+            // Bind mounts with long names, checked in batches, until the
+            // table is larger than 1 MiB.
+            let source = scratch.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let name = "m".repeat(200);
+            let mut count = 0;
+            while std::fs::read("/proc/self/mountinfo").unwrap().len() <= (1 << 20) + (64 << 10) {
+                for _ in 0..256 {
+                    let target = scratch.path().join(format!("{name}{count}"));
+                    std::fs::create_dir(&target).unwrap();
+                    mount(&c_path(&source), &target, c"", libc::MS_BIND).unwrap();
+                    count += 1;
+                }
+            }
+            println!("bind mounts: {count}");
+        }
         other => panic!("unknown mode {other}"),
     }
     println!("OUTCOME: {}", outcome());
@@ -154,7 +182,13 @@ impl Group {
         let group = mount.join(name);
         std::fs::create_dir(&group)
             .map_err(|e| format!("cannot create a cgroup-v2 group under {mount:?}: {e}"))?;
-        Ok(Self(group))
+        let group = Self(group);
+        let limit = group.0.join("memory.max");
+        if limit.exists() {
+            std::fs::write(&limit, BUDGET_BYTES.to_string())
+                .map_err(|e| format!("cannot set {limit:?}: {e}"))?;
+        }
+        Ok(group)
     }
 }
 
@@ -204,6 +238,9 @@ fn run(test: &str, mode: &str, group: &Group) -> Result<String, String> {
     };
     if let Some(reason) = field("SKIP: ") {
         return Err(reason);
+    }
+    if let Some(count) = field("bind mounts: ") {
+        println!("{mode}: {count} bind mounts");
     }
     Ok(field("OUTCOME: ").unwrap_or_else(|| {
         panic!(
@@ -257,5 +294,13 @@ fn empty_source_mounts_do_not_change_memory_budget_admission() {
     compare(
         "empty_source_mounts_do_not_change_memory_budget_admission",
         "empty-source",
+    );
+}
+
+#[test]
+fn large_mount_tables_do_not_change_memory_budget_admission() {
+    compare(
+        "large_mount_tables_do_not_change_memory_budget_admission",
+        "large",
     );
 }
