@@ -58,13 +58,19 @@ pub trait CryptoProvider: Send + Sync {
     /// does not use. The probe must reach the provider that binds the id, so
     /// the foreign id is chosen where the id goes on the wire, not by the
     /// caller: the random-prefix wrapper, which translates the id, forwards
-    /// the probe with the context it sends below, and the other wrapping
-    /// layers of this crate forward it unchanged. This default, for a
-    /// provider that receives the id itself, decrypts under
-    /// `<compatibility id>.selftest-probe`. Under a wrapper from another
-    /// crate, which has this default, a random-prefix wrapper below receives
-    /// an ordinary decrypt under a foreign id and refuses it; that refusal is
-    /// not field evidence, so the self-test fails closed.
+    /// the probe with the context it sends below, and `BatchScheduler` and
+    /// `CheckedProvider` forward the probe as they receive it (the scheduler
+    /// under the caller's deadline, the checker with its result checks).
+    /// This default, for a provider that receives the id itself, decrypts
+    /// under `<compatibility id>.selftest-probe`. `EndpointSet` and the
+    /// validation view of one of its endpoints keep the default, so the
+    /// probe reaches their endpoints as an ordinary decrypt under the
+    /// foreign id: in the stacks the daemon builds they sit below the
+    /// random-prefix wrapper, where the id is the one on the wire. Above a
+    /// random-prefix wrapper, a layer with this default (a wrapper from
+    /// another crate, say) hands the wrapper an ordinary decrypt under a
+    /// foreign id, which it refuses; that refusal is not field evidence, so
+    /// the self-test fails closed.
     #[doc(hidden)]
     async fn decrypt_compatibility_probe(
         &self,
