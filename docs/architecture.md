@@ -65,6 +65,28 @@ them through filesystem permissions and ownership. Non-Linux development
 backends retain pathname validation and do not provide this single-link check;
 the supported data plane is Linux-only.
 
+A process running as root (an offline check, inspect, creation or remote
+administration command) creates each file and directory below the backing
+root for the owner of the directory it creates it in, when that owner is not
+root, so a lock file or manifest slot it recreates in the daemon user's tree
+stays openable by the daemon. A new file is created unnamed (`O_TMPFILE`),
+given away and synced with fsync before it is linked under its name; on a
+filesystem without unnamed files it is created under its name and given away
+before anything is written to it. A directory cannot be created unnamed: after
+`mkdirat`, the directory its name holds is given away only while it is empty
+and root's, whichever root process made it, so nothing that holds an entry or
+belongs to another user changes owner. An entry that already exists is opened
+as it is and never changes owner, and a refused owner change removes what was
+created. A crash between creating an entry and giving it away (a directory, or
+a file created under its name) leaves an empty root-owned entry that later
+runs open as it is, and the entries they create in such a directory are
+root's too. The backing root itself, when `FileBacking::new` creates it,
+belongs to the user that runs the process. The local witness directory
+follows the same rule, and its record is never published from a file another
+user may hold open: a leftover `anchor.next` is removed first, and a file
+that a user other than root or the record's owner puts back under that name
+meanwhile is refused.
+
 Volume, rollback, witness, attach and control-socket directory locks are
 `flock` locks on descriptors opened close-on-exec. Such a lock belongs to the
 open file description, which every child process forked by any thread shares

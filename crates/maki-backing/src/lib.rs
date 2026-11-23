@@ -232,4 +232,12 @@ pub trait Backing: Send + Sync + 'static {
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         Ok(None)
     }
+
+    /// The owner of directory `dir` ("" = root) where the backing has Unix
+    /// ownership; `None` where it has none (in-memory and non-Unix
+    /// backings, and views that do not forward it).
+    fn directory_owner(&self, dir: &str) -> io::Result<Option<FileOwner>> {
+        let _ = dir;
+        Ok(None)
+    }
 }
