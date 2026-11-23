@@ -1724,13 +1724,19 @@ caller's budget.
 
 Wherever the budget runs out (before the first attempt, during backoff, while
 waiting for endpoint admission or an RPC slot, or with an RPC in flight), the
-operation MUST end with the last error an endpoint returned for it before the
-deadline, keeping that error's class, or with a retryable deadline error when
-no endpoint failed it. A result that arrives after the deadline MUST NOT be
-returned. Every operation that ends this way (with batching, every caller)
-MUST count exactly once in `maki_crypto_deadline_exceeded_total`, whatever
-error it returned. An endpoint's own timeout, including a nested dispatcher's
-deadline, is that endpoint's failure, not the operation's deadline.
+operation MUST end with the last error an endpoint returned before the deadline
+for the RPC batch in progress (one batch of items with its retries and
+failovers), keeping that error's class, or with a retryable deadline error when
+no endpoint failed that batch. An operation sent as several RPC batches, one
+after another, reports only the current one: an earlier batch that has since
+succeeded does not explain why the operation is late. A batch scheduler caller
+reports the RPC batch that was in progress at its own deadline in the provider
+call serving it (its coalesced batch or its own re-send). A result that arrives
+at or after the deadline, including a failure, MUST NOT be returned. Every
+operation that ends this way (with batching, every caller) MUST count exactly
+once in `maki_crypto_deadline_exceeded_total`, whatever error it returned. An
+endpoint's own timeout, including a nested dispatcher's deadline, is that
+endpoint's failure, not the operation's deadline.
 
 ---
 

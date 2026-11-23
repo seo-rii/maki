@@ -312,20 +312,27 @@ leaves. For bounded-error calls, one caller budget covers admission, coalescing,
 the slot wait, and the provider response; dispatch does not restart it.
 
 Every deadline exit answers the same way: the last error an endpoint returned
-for the operation before the deadline, with that error's class, or the
-deadline error when no endpoint failed it, and one count in
-`maki_crypto_deadline_exceeded_total` whatever the error. The dispatcher's own
+before the deadline for the RPC batch in progress (one batch of items with its
+retries and failovers), with that error's class, or the deadline error when no
+endpoint failed that batch, and one count in
+`maki_crypto_deadline_exceeded_total` whatever the error. A call larger than
+the endpoints' common batch limit is sent as several RPC batches, one after
+another, and reports only the current one, since an earlier batch that has
+since succeeded does not explain why the call is late. The dispatcher's own
 exits (before the first pass, at the top of a pass, right after a failed RPC,
 in admission, with an RPC in flight) share one path. A scheduler caller's
-budget starts before queueing, so it usually runs out before the
-dispatcher's, while the shared RPC is still running. Each scheduler caller
-therefore has an observer, which its queued group carries into the provider
-call that serves it as a task-local: the dispatcher records its latest
-endpoint error (without the not-sent mark) and its own deadline exits there,
-and a caller that leaves on its own timer returns that error. A dispatcher
-hides the observer from its endpoints, so a nested set reports to the outer
-set only through its result: its expiry is a failure of that peer, counted by
-the nested set and not as the outer operation's deadline.
+budget starts before queueing, so it usually runs out before the dispatcher's,
+while the shared RPC is still running. Each scheduler caller therefore has an
+observer, which its queued group carries into the provider call that serves it
+(the coalesced batch or a per-request re-send) as a task-local. The dispatcher
+records there the latest endpoint error of its RPC batch in progress (without
+the not-sent mark), cleared when the next batch starts, and its own deadline
+exits. The observer records nothing at or after the caller's deadline, so a
+caller that leaves on its own timer returns what the dispatcher had seen before
+that deadline, whichever task runs first. A dispatcher hides the observer from
+its endpoints, so a nested set reports to the outer set only through its
+result: its expiry is a failure of that peer, counted by the nested set and not
+as the outer operation's deadline.
 
 The dispatcher validates quarantined endpoints in background tasks, never on
 the request path. Each admitted call owns a circuit-breaker permit for its

@@ -16,9 +16,12 @@
 //!   `max_operation_time` is an absolute wall-clock deadline for
 //!   `bounded-error`: it bounds backoff *and* cancels an in-flight RPC
 //!   (review M-010). Wherever it expires, the operation returns the last
-//!   endpoint error received before it, with that error's class, or the
-//!   deadline error when no endpoint failed it, and counts once in
-//!   `deadline_exceeded_total`;
+//!   endpoint error that the request in progress received before it, with
+//!   that error's class, or the deadline error when no endpoint failed that
+//!   request, and counts once in `deadline_exceeded_total`. A request is one
+//!   RPC batch with its retries and failovers: an operation sent as several
+//!   requests reports only the current one, and a scheduler caller the
+//!   request in progress at its own deadline;
 //! - a provider that is not `retry_safe` is never sent the same request
 //!   twice: after an RPC may have been sent, no retry and no failover
 //!   happens (review M-010). An attempt whose error the transport marked
@@ -764,9 +767,9 @@ impl EndpointSet {
     /// wherever the deadline expired: before the first pass, at the top of
     /// a pass, right after a failed RPC, in admission or with an RPC in
     /// flight. The operation counts as a deadline whatever it returns, and
-    /// returns the last endpoint error received before the deadline, with
-    /// that error's own class, or the deadline error when no endpoint
-    /// failed this dispatch.
+    /// returns the last endpoint error this request received before the
+    /// deadline, with that error's own class, or the deadline error when no
+    /// endpoint failed this request.
     fn expire(&self, last_error: Option<CryptoError>) -> CryptoError {
         self.metrics
             .deadline_exceeded

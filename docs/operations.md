@@ -1022,10 +1022,12 @@ Unsynced records enter this gauge when they become durable.
 
 `maki_crypto_deadline_exceeded_total` counts crypto encrypt/decrypt calls that
 ended because their `bounded-error` deadline expired, whatever error they
-returned. Such a call returns the last error an endpoint gave it before the
-deadline, with that error's own class, or `operation deadline exceeded` when
-no endpoint failed it, so alert on this counter rather than on the error
-text. With batching enabled it counts scheduler callers: queue admission,
+returned. Such a call returns the last error an endpoint gave before the
+deadline for the RPC batch in progress (one batch of items with its retries and
+failovers; a call sent as several RPC batches reports only the current one),
+with that error's own class, or `operation deadline exceeded` when no endpoint
+failed that batch, so alert on this counter rather than on the error text.
+With batching enabled it counts scheduler callers: queue admission,
 coalescing, batch-slot waits and RPC time share each caller's budget. Two
 expired callers in one coalesced RPC contribute two; a caller contributes only
 once even if the dispatcher also observes the deadline. Success, errors that
