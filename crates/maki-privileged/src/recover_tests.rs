@@ -821,3 +821,111 @@ fn the_workload_gate_refuses_records_with_other_empty_fields() {
         assert!(gate(extra).is_err(), "{extra:?}");
     }
 }
+
+/// Preflight admits a volume group on up to 64 candidate devices (the NBD
+/// device and 63 partitions) holding up to 64 logical volumes. The proof
+/// taken after activation has to hold every one of them, the trusted record
+/// has to store it, and the later observers have to accept the same
+/// topology. Here every LV spans every partition PV and carries a name as
+/// long as device-mapper allows, the largest record an admitted VG produces.
+#[test]
+fn the_largest_inventory_preflight_admits_is_proven_and_recorded() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let sysfs = fixture.0.join("sys");
+    let block = |name: &str, number: String| {
+        for directory in ["holders", "slaves"] {
+            std::fs::create_dir_all(sysfs.join(name).join(directory)).unwrap();
+        }
+        std::fs::write(sysfs.join(name).join("dev"), number).unwrap();
+    };
+    let partition = |index: usize| {
+        let name = format!("nbd3p{index}");
+        block(&name, format!("43:{}\n", 48 + index));
+        std::fs::write(sysfs.join(&name).join("partition"), format!("{index}\n")).unwrap();
+        name
+    };
+    block("nbd3", "43:48\n".into());
+    let partitions: Vec<_> = (1..=63).map(partition).collect();
+    for index in 0..64 {
+        let lv = if index == 0 {
+            "data".to_string()
+        } else {
+            format!("{:x<116}", format!("lv{index}_"))
+        };
+        let kernel = format!("dm-{index}");
+        block(&kernel, format!("253:{index}\n"));
+        std::fs::create_dir_all(sysfs.join(&kernel).join("dm")).unwrap();
+        std::fs::write(
+            sysfs.join(&kernel).join("dm/name"),
+            format!("vg_maki_pg-{lv}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sysfs.join(&kernel).join("dm/uuid"),
+            format!("LVM-aaaaaabbbbccccddddeeeeffffgggggg{index:06}iiiijjjjkkkkllllmmmmnnnnnn\n"),
+        )
+        .unwrap();
+        for partition in &partitions {
+            std::fs::write(sysfs.join(&kernel).join("slaves").join(partition), "").unwrap();
+            std::fs::write(sysfs.join(partition).join("holders").join(&kernel), "").unwrap();
+        }
+    }
+    let mut record = BoundDeviceRecord {
+        version: 1,
+        volume: "pg".into(),
+        attachment: (&request()).into(),
+        device: "/dev/nbd3".into(),
+        connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),
+        recovery: None,
+        recovery_intent: None,
+    };
+
+    let proof = recover::capture(&record, b"", &sysfs)
+        .expect("the proof holds what preflight admits: 64 devices and 64 logical volumes");
+    record.recovery = Some(proof);
+    let encoded = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        encoded["recovery"]["nodes"].as_array().map(Vec::len),
+        Some(128)
+    );
+    state.write(&record).unwrap();
+    assert_eq!(state.read("pg").unwrap(), Some(record.clone()));
+    assert!(
+        recover::observe(&record, b"", &sysfs).unwrap().vg_active,
+        "recovery accepts the recorded topology"
+    );
+
+    // A 65th candidate device is more than preflight admits, and more than
+    // the proof is sized for.
+    partition(64);
+    assert!(recover::capture(&record, b"", &sysfs).is_err());
+}
+
+/// The same inventory is taken when an activation outlived the helper: the
+/// persisted intent names all 64 LVs, and recovery has to see every one of
+/// their mappings before it deactivates them and retires the record.
+#[test]
+fn an_interrupted_64_lv_activation_is_recovered_from_its_intent() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = inventory_system(&fixture, 64, false);
+    system.inner.fake.process_death_after_activation = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = execute_with(&plan_attach(&request()), Some(&state), &mut system);
+    }));
+    assert!(death.is_err(), "fixture must stop after activation");
+    system.inner.fake.process_death_after_activation = false;
+    let record = state.read("pg").unwrap().unwrap();
+    assert!(record.recovery.is_none() && record.recovery_intent.is_some());
+    assert!(system.inner.sysfs.join("dm-63").exists());
+    // The backend went away with the helper; the 64 mappings remain.
+    system.inner.fake.backends.clear();
+    system.inner.fake.steps.clear();
+
+    cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
+
+    assert_eq!(system.inner.fake.steps, ["lvm-deactivate"]);
+    assert!(!system.inner.sysfs.join("dm-63").exists());
+    assert!(state.read("pg").unwrap().is_none());
+}

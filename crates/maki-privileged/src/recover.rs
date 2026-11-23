@@ -86,14 +86,23 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// The inventory holds every node of a topology that preflight admits: its
+/// candidate devices and one mapping for each logical volume. A smaller
+/// bound would let preflight activate a volume group whose proof, and whose
+/// cleanup from the persisted intent, is then refused.
+const MAX_NODES: usize = lvm_preflight::MAX_DEVICES + lvm_preflight::MAX_LVS;
+
+/// One node's holders or slaves: every mapping on a device, or every device
+/// (or lower mapping) under a mapping.
 fn names(directory: &Path) -> io::Result<Vec<String>> {
+    let limit = lvm_preflight::MAX_DEVICES.max(lvm_preflight::MAX_LVS);
     let mut result = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let name = entry?
             .file_name()
             .into_string()
             .map_err(|_| invalid("invalid kernel block name"))?;
-        if result.len() >= 64 {
+        if result.len() >= limit {
             return Err(invalid("recovery topology exceeds the supported bound"));
         }
         result.push(name);
@@ -134,7 +143,7 @@ fn inventory(record: &BoundDeviceRecord, sysfs: &Path) -> io::Result<Vec<BlockId
         } else {
             continue;
         };
-        if nodes.len() >= 64 {
+        if nodes.len() >= MAX_NODES {
             return Err(invalid("recovery topology exceeds the supported bound"));
         }
         nodes.push(BlockIdentity {
