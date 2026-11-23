@@ -284,6 +284,14 @@ pub(crate) enum GcRemoval {
     /// The candidate could not be opened or examined, for the reason held.
     /// Nothing about it was changed.
     Unreadable(io::Error),
+    /// The candidate passed examination, and a step that changes it alone
+    /// (its rename, an unlink in it, the sync of its directory, its
+    /// removal) failed, for the reason held. `tombstone` says whether it is
+    /// now under its tombstone name.
+    Unfinished {
+        tombstone: bool,
+        error: io::Error,
+    },
 }
 
 /// `OpenOptions` that never follow a symlink at the final component and

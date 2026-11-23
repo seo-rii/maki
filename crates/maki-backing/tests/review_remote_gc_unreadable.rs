@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
-use maki_backing::remote_gc::GcUnreadable;
+use maki_backing::remote_gc::{GcUnfinished, GcUnreadable};
 use maki_backing::remote_witness::{
     namespace, Action, CanonicalState, Record, Request, Role, Rpc, StateStore,
 };
@@ -395,6 +395,18 @@ fn gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink() {
         .expect("a tombstone GC cannot empty must not end the pass");
     assert!(report.removed.is_empty());
     assert_eq!(namespaces(root.path()).len(), 1);
+    // Reported under its tombstone name with the step and the OS error,
+    // apart from the entries GC could not examine.
+    assert_eq!(
+        report.unfinished,
+        [GcUnfinished {
+            name: tombstone.clone(),
+            error: "unlinking rollback.arena: Permission denied (os error 13)".into(),
+        }]
+    );
+    assert_eq!(report.counts.unfinished, 1);
+    assert!(report.skipped_unreadable.is_empty());
+    assert!(!report.details_truncated);
     // Nothing more is removed from it than the failing step allowed.
     assert_eq!(contents(&root.path().join(&tombstone)), kept);
 
@@ -473,6 +485,15 @@ fn gc_reclaims_past_a_namespace_it_cannot_rename() {
     let report = RollbackBacking::collect_remote(root.path(), writer.as_ref())
         .expect("a namespace GC cannot rename must not end the pass");
     assert!(report.removed.is_empty());
+    assert_eq!(
+        report.unfinished,
+        [GcUnfinished {
+            name: stuck.clone(),
+            error: "renaming the namespace to its tombstone: Operation not permitted (os error 1)"
+                .into(),
+        }]
+    );
+    assert_eq!(report.counts.unfinished, 1);
     assert_eq!(contents(&root.path().join(&stuck)), kept);
     assert!(entries(root.path(), ".remote-gc-").is_empty());
 
@@ -600,6 +621,43 @@ fn the_automatic_pass_logs_the_namespaces_it_could_not_examine() {
             && events[0].contains("error=opening rollback.arena: Is a directory (os error 21)"),
         "{events:#?}"
     );
+}
+
+#[test]
+fn the_automatic_pass_logs_the_namespaces_it_could_not_finish_retiring() {
+    const TEST: &str = "the_automatic_pass_logs_the_namespaces_it_could_not_finish_retiring";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    let stuck = namespaces(root.path()).pop().unwrap();
+    set_mode(&root.path().join(&stuck), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, &root.path().join(&stuck)) else {
+        set_mode(&root.path().join(&stuck), 0o700);
+        return;
+    };
+    let tombstone = format!(".remote-gc-{stuck}");
+
+    // The pass that renames it, and every later one, says so.
+    for _ in 0..2 {
+        let (backing, events) =
+            logged(|| RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+        commit(&backing, b"attached");
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(
+            events[0].starts_with("WARN maki_backing::rollback::remote ")
+                && events[0].contains("automatic remote GC could not finish retiring")
+                && events[0].contains("count=1")
+                && events[0].contains(&format!("namespace={tombstone}"))
+                && events[0]
+                    .contains("error=unlinking rollback.arena: Permission denied (os error 13)"),
+            "{events:#?}"
+        );
+    }
+
+    drop(modes);
+    set_mode(&root.path().join(&tombstone), 0o700);
 }
 
 /// The authority of a writer whose activation was accepted, and which then
