@@ -2,8 +2,9 @@
 //!
 //! Volume lifecycle (`volume create/inspect`, `check`) works everywhere;
 //! runtime commands (`status`, `metrics`, `checkpoint`, `drain`, `reload`) talk to
-//! the daemon control socket (Unix). `attach`/`detach`/`grow` delegate to
-//! the privileged helper.
+//! the daemon control socket (Unix). `attach`/`detach`/`grow` are not run
+//! here: `maki` prints the command for the privileged helper `maki-attach`
+//! and exits 3.
 
 // Output goes through `diagnostic!` and the stdout helpers below: the
 // `print!` family panics when a write fails (a closed pipe, a full disk),
@@ -33,7 +34,7 @@ const USAGE: &str = "usage:
     control commands take --socket <path> in place of <config.toml>, e.g.
     --socket /run/maki-control/<volume>/control.sock for maki-admin members,
     and --timeout <seconds> (default 60; 600 for checkpoint and drain)
-  maki attach|detach|grow ...          delegated to maki-attach (privileged)
+  maki attach|detach|grow ...          not run here: prints the privileged maki-attach command to run (exit 3)
   maki --help | --version";
 
 /// `eprintln!` that cannot panic. The macro panics when the write fails,
