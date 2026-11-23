@@ -166,6 +166,15 @@ jobs:
         run: |
           python3 -B -m unittest scripts.test_docs_links -v
           python3 -B scripts/check_docs_links.py
+      # Every suite above runs with -B. An interpreter that one of them
+      # starts without it compiles scripts/*.py into the checkout.
+      - name: Python suites leave no bytecode in the checkout (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e scripts/__pycache__ ]; then
+            ls -l scripts/__pycache__ >&2
+            exit 1
+          fi
 
   latest-stable:
     # The baseline is reproducible; new stable warnings are checked separately.

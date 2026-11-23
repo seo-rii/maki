@@ -16,6 +16,7 @@ ETCD_GATE = ROOT / "crates" / "maki-witness" / "tests" / "etcd_ha.rs"
 ETCD_CFG = '#[cfg(all(unix, feature = "etcd-qualification"))]'
 DAEMON = ROOT / "crates" / "maki-nbdkit" / "src" / "daemon.rs"
 PLUGIN_STEP = "nbdkit plugin build (cdylib + plugin_init symbol)"
+BYTECODE_STEP = "Python suites leave no bytecode in the checkout (Linux)"
 FAKE_STEP = 'release build refuses provider = "fake"'
 # What `maki volume create` prints for provider = "fake" without the feature.
 FAKE_REFUSAL = ('error: config invalid: provider "fake" is not compiled into this build '
@@ -132,6 +133,32 @@ class ReleaseGateContract(unittest.TestCase):
         gate = ETCD_GATE.read_text()
         self.assertIn(f"{ETCD_CFG}\nmod quorum {{", gate)
         self.assertNotIn("#[cfg(unix)]\nmod quorum", gate)
+
+
+class PythonSuites(unittest.TestCase):
+    def pull_request_job(self):
+        """The always-on `pr` job without its comments."""
+        workflow = WORKFLOW.read_text()
+        job = workflow[workflow.index("\n  pr:\n"):workflow.index("\n  latest-stable:\n")]
+        return "".join(line for line in job.splitlines(keepends=True)
+                       if not line.lstrip().startswith("#"))
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_bytecode_gate_follows_the_suites_and_rejects_a_cache_directory(self):
+        job = self.pull_request_job()
+        gate = job.index(f"      - name: {BYTECODE_STEP}\n        if: runner.os == 'Linux'\n")
+        self.assertLess(job.rindex("python3 -B -m unittest"), gate)
+        with tempfile.TemporaryDirectory(prefix="maki-ci-gate-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            result = run_step(BYTECODE_STEP, root, {})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            cache = root / "scripts" / "__pycache__"
+            cache.mkdir()
+            (cache / "campaign_io.cpython-311.opt-1.pyc").write_bytes(b"fixture")
+            result = run_step(BYTECODE_STEP, root, {})
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("campaign_io.cpython-311.opt-1.pyc", result.stderr)
 
 
 @unittest.skipUnless(os.name == "posix", "the nightly steps run in bash on Linux runners")
