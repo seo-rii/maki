@@ -249,7 +249,7 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
     Ok(disk)
 }
 
-fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
+fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
     if disk
         .list("")?
         .iter()
@@ -261,7 +261,7 @@ fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
 }
 
 /// Called with both root operation and enrollment locks held.
-fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
     require_empty_remote_root(disk)?;
     let marker = disk.open(MARKER, true)?;
     marker.write_at(0, REMOTE_MAGIC)?;
@@ -816,3 +816,7 @@ impl RollbackBacking {
 #[cfg(test)]
 #[path = "remote_load_tests.rs"]
 mod load_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "remote_creation_tests.rs"]
+mod creation_tests;
