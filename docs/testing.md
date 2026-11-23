@@ -50,7 +50,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 
 | Tier | Trigger | Platform | Enforcement |
 |---|---|---|---|
-| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block |
+| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block; on Ubuntu the root-only test targets also run as root |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
@@ -77,7 +77,40 @@ without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
 The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
 fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
-campaigns remain opt-in host qualification steps.
+campaigns remain opt-in host qualification steps. The job runs every
+`scripts/test_*.py` (`scripts/test_ci_gate_validation.py` fails for a module
+the workflow would not run) and fails when those suites leave
+`scripts/__pycache__` in the checkout.
+
+The workspace tests run as the unprivileged runner user. Tests that give a
+fixture to another user, run a binary as the daemon user, enter a private
+mount namespace or set the immutable flag print why they are skipped there
+and pass. The Linux baseline therefore runs
+`python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked`
+next. The script reuses the compilation of the workspace run as the runner
+user and starts only the test executables in its `ROOT_TARGETS` list as root
+through `sudo -n`, each with a scratch `TMPDIR` under `/tmp` that other users
+can search and that it removes afterwards. It fails when root is not
+available (nothing is compiled or skipped), when a test that ran as root
+still reports that it needs root, and when the run leaves an entry owned by
+root in the checkout or the build tree. `--open-build-tree` lets the fixture
+user (uid 65534) reach the built `maki` and `maki-check` binaries below a
+`0750` home directory for the duration of the run.
+`scripts/test_root_tests_validation.py` fails for a test source that probes
+its privilege (`geteuid`, a "needs root" notice, `chown`, `unshare`) and is
+neither in `ROOT_TARGETS` nor classified in that test as not needing root, so
+a new root-only test cannot be left out. Run the same command without
+`--open-build-tree` locally as root or as a user with passwordless `sudo`.
+
+Root does not make every host capable. The memory-budget mount-table tests
+reach the final admission check only where root can create a group in a
+single cgroup-v2 hierarchy with the memory controller; elsewhere they compare
+earlier verdicts, which they print, or skip with a notice. The
+immutable-snapshot restore test needs a filesystem under `/tmp` that accepts
+the immutable flag, and the mount-namespace tests need a kernel that lets
+root unshare one; otherwise they print why they skip. The script repeats
+every skip notice at the end of its output, and a run with notices is not
+evidence for the cases they name.
 
 The independent `systemd-lifecycle` job builds the actual `maki-attach` hook
 and runs `scripts/systemd-lifecycle-validation.py` on its disposable runner.
