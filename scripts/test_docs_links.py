@@ -709,6 +709,50 @@ class DocumentationLinks(unittest.TestCase):
         self.assertEqual(broken_links(self.root),
                          ["README.md:5: outside.md", "README.md:11: after.md"])
 
+    def test_tab_after_a_container_margin_advances_only_to_the_next_tab_stop(self):
+        # A tab ends at the next multiple of four columns of the whole line,
+        # so after a margin it can add fewer than four columns: each of these
+        # lines is a paragraph, not indented code.
+        cases = {
+            "quote": ("> \t[quoted](missing.md)\n", "README.md:1: missing.md"),
+            "quote and space": (">  \t[quoted](missing.md)\n", "README.md:1: missing.md"),
+            "bullet continuation": ("- item\n\n  \t[continued](missing.md)\n", "README.md:3: missing.md"),
+            "ordered continuation": ("1. Step one\n\n   \tSee the [guide](missing-guide.md).\n",
+                                     "README.md:3: missing-guide.md"),
+            "quote in a list": ("1. item\n\n   > \t[nested](missing.md)\n", "README.md:3: missing.md"),
+            "list in a quote": ("> 1. item\n>\n>    \t[nested](missing.md)\n", "README.md:3: missing.md"),
+        }
+        for name, (text, expected) in cases.items():
+            with self.subTest(name):
+                self.write("README.md", text)
+                self.assertEqual(broken_links(self.root), [expected])
+
+    def test_blocks_after_a_container_margin_ending_at_a_tab_use_its_columns(self):
+        self.write("README.md", "> \t# Quoted title\n\n"
+                   "[heading](#quoted-title) [absent](#absent)\n\n"
+                   "- item\n\n  \t```\n  [fenced](inside.md)\n  \t```\n[after](missing-fence.md)\n\n"
+                   "> \t<div>\n> [raw](inside.md)\n> </div>\n\n[after](missing-html.md)\n")
+        self.assertEqual(broken_links(self.root), [
+            "README.md:3: #absent (missing anchor)", "README.md:10: missing-fence.md",
+            "README.md:16: missing-html.md",
+        ])
+
+    def test_tabs_reaching_four_columns_after_a_container_margin_start_indented_code(self):
+        cases = {
+            "quote with two tabs": "> \t\t[code](literal.md)\n",
+            "quote taking part of a tab": ">\t\t[code](literal.md)\n",
+            "bullet with spaces and a tab": "- item\n\n    \t[code](literal.md)\n",
+            "ordered with two tabs": "1. Step one\n\n   \t\t[code](literal.md)\n",
+            "quote in a list on a tab stop": "- item\n\n  > \t[code](literal.md)\n",
+            "quote in a list with a space": "- item\n\n  >  \t[code](literal.md)\n",
+            "list in a quote on a tab stop": "> - item\n>\n>   \t[code](literal.md)\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.write("README.md", text + "\n[after](missing.md)\n")
+                line = text.count("\n") + 2
+                self.assertEqual(broken_links(self.root), [f"README.md:{line}: missing.md"])
+
     def test_multiline_code_masks_links_references_and_anchors_only_in_its_paragraph(self):
         self.write("README.md", 'Text ``example `\n[shown](inside.md) [x][label] <a id="inside">\n'
                    'end`` [real](outside.md)\n\n[anchor](#inside)\n'

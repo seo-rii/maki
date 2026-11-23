@@ -2,6 +2,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -42,7 +45,7 @@ lock_memory = false
         socket.to_str().unwrap()
     );
     let path = directory.join(format!("{name}.toml"));
-    std::fs::write(&path, &raw).unwrap();
+    volume_config::write(&path, &raw).unwrap();
     daemon::create_volume_from_config_str(&raw).unwrap();
     path
 }

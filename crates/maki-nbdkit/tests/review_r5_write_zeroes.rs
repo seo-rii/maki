@@ -14,6 +14,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_nbdkit::adapter::NbdAdapter;
 
 const UNIT: usize = 4096;
@@ -63,7 +66,7 @@ impl Fixture {
             &directory.path().join("control.sock"),
         );
         let config_path = directory.path().join("volume.toml");
-        std::fs::write(&config_path, &raw).unwrap();
+        volume_config::write(&config_path, &raw).unwrap();
         if discard {
             maki_nbdkit::daemon::create_volume_with_discard_from_config_str(&raw).unwrap();
         } else {

@@ -220,7 +220,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let raw = match std::fs::read_to_string(&options.config_path) {
+    // The configuration names the provider, its endpoints and the
+    // credentials sent to them: only a file no other user can write or
+    // substitute is loaded (SPEC §8).
+    let raw = match maki_nbdkit::config_file::read_volume_config(&options.config_path) {
         Ok(raw) => raw,
         Err(error) => {
             eprintln!("error: {}: {error}", options.config_path.display());

@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
@@ -85,7 +88,7 @@ mode = \"read\"
         config(&root, &socket)
     );
     let config_path = dir.path().join("vol.toml");
-    std::fs::write(&config_path, &raw).unwrap();
+    volume_config::write(&config_path, &raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
 
     let adapter = NbdAdapter::open_config(config_path.to_str().unwrap()).unwrap();
@@ -157,7 +160,7 @@ fn missing_control_socket_directory_fails_attach() {
         .into_owned();
     let raw = config(&root, &socket);
     let config_path = dir.path().join("vol.toml");
-    std::fs::write(&config_path, &raw).unwrap();
+    volume_config::write(&config_path, &raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
 
     let err = NbdAdapter::open_config(config_path.to_str().unwrap())
@@ -186,7 +189,7 @@ mode = \"off\"
         config(&root, &socket)
     );
     let config_path = dir.path().join("vol.toml");
-    std::fs::write(&config_path, &raw).unwrap();
+    volume_config::write(&config_path, &raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
     let adapter = NbdAdapter::open_config(config_path.to_str().unwrap()).unwrap();
     let client = Client::new(&socket);

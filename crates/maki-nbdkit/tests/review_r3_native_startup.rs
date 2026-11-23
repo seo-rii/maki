@@ -7,6 +7,9 @@
 #[path = "support/native_plugin.rs"]
 mod native_plugin;
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
@@ -63,7 +66,7 @@ root = {root:?}
 socket = {control:?}
 "#
         );
-        std::fs::write(&config, &raw).unwrap();
+        volume_config::write(&config, &raw).unwrap();
         maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
         Self {
             dir,
@@ -261,7 +264,7 @@ fn invalid_configuration_exits_without_ready_or_a_client() {
         return;
     }
     let fixture = Fixture::new();
-    std::fs::write(&fixture.config, "not valid TOML").unwrap();
+    volume_config::write(&fixture.config, "not valid TOML").unwrap();
     let (notify, notify_path) = fixture.notify();
     let mut server = Server::start(&fixture, Some(&notify_path));
     server.wait_failure_without_ready(&notify);
@@ -291,7 +294,7 @@ fn provider_selftest_failure_exits_without_ready() {
     let raw = std::fs::read_to_string(&fixture.config)
         .unwrap()
         .replace("test-profile-v1", "different-profile");
-    std::fs::write(&fixture.config, raw).unwrap();
+    volume_config::write(&fixture.config, raw).unwrap();
     let (notify, path) = fixture.notify();
     let mut server = Server::start(&fixture, Some(&path));
     server.wait_failure_without_ready(&notify);
@@ -437,7 +440,7 @@ fn review_f08_socket_mismatch_fails_before_ready_and_recovery() {
     let fixture = Fixture::new();
     let configured = fixture.dir.path().join("configured.sock");
     let raw = std::fs::read_to_string(&fixture.config).unwrap();
-    std::fs::write(
+    volume_config::write(
         &fixture.config,
         format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
     )
@@ -458,7 +461,7 @@ fn review_f08_matching_explicit_socket_becomes_ready() {
     let fixture = Fixture::new();
     let configured = fixture.dir.path().join("nbd.sock");
     let raw = std::fs::read_to_string(&fixture.config).unwrap();
-    std::fs::write(
+    volume_config::write(
         &fixture.config,
         format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
     )
@@ -480,7 +483,7 @@ fn review_f08_unrelated_configured_socket_does_not_prove_this_listener() {
     let configured = fixture.dir.path().join("other-process.sock");
     let _other_listener = std::os::unix::net::UnixListener::bind(&configured).unwrap();
     let raw = std::fs::read_to_string(&fixture.config).unwrap();
-    std::fs::write(
+    volume_config::write(
         &fixture.config,
         format!("{raw}\n[nbd]\nsocket = {configured:?}\n"),
     )

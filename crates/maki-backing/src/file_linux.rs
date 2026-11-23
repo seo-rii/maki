@@ -588,6 +588,29 @@ fn visit_names(
     Ok(())
 }
 
+/// A directory's sorted entry names for `Backing::list`, each exactly as
+/// stored. A name that is not UTF-8 fails the listing, unless
+/// `skip_non_utf8` leaves it out; it is never converted lossily, which
+/// could return a name that opens a different entry.
+fn utf8_names(directory: &File, skip_non_utf8: bool) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    visit_names(directory, |name| {
+        match name.to_str() {
+            Some(name) => names.push(name.to_owned()),
+            None if skip_non_utf8 => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not UTF-8",
+                ))
+            }
+        }
+        Ok(())
+    })?;
+    names.sort();
+    Ok(names)
+}
+
 /// A namespace's entries for retirement, which must account for each one:
 /// a name that is not UTF-8 fails the scan, so the namespace is kept.
 fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
@@ -945,43 +968,11 @@ impl Backing for FileBacking {
     }
 
     fn list(&self, path: &str) -> io::Result<Vec<String>> {
-        let directory = self.directory.directory(path, false)?;
-        let fd = open_at(&directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.into_raw_fd();
-        // SAFETY: fdopendir takes ownership on success; on failure we close fd.
-        let raw = unsafe { libc::fdopendir(fd) };
-        if raw.is_null() {
-            let error = io::Error::last_os_error();
-            drop(unsafe { File::from_raw_fd(fd) });
-            return Err(error);
-        }
-        let stream = DirectoryStream(raw);
-        let mut names = Vec::new();
-        loop {
-            // SAFETY: stream is private to this call. Clear this thread's errno
-            // to distinguish end-of-directory from an error; copy d_name before
-            // the next readdir, which may invalidate its storage.
-            unsafe { *libc::__errno_location() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    return Err(error);
-                }
-                break;
-            }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if name != c"." && name != c".." {
-                let name = name.to_str().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "directory entry name is not UTF-8",
-                    )
-                })?;
-                names.push(name.to_owned());
-            }
-        }
-        names.sort();
-        Ok(names)
+        utf8_names(&self.directory.directory(path, false)?, false)
+    }
+
+    fn list_skipping_non_utf8(&self, path: &str) -> io::Result<Vec<String>> {
+        utf8_names(&self.directory.directory(path, false)?, true)
     }
 
     fn sync_dir(&self, path: &str) -> io::Result<()> {

@@ -12,6 +12,7 @@ use maki_format::allocation::AllocationMap;
 use maki_format::canary::KeyCanary;
 use maki_format::catalog::ShardCatalog;
 use maki_format::checkpoint::CheckpointState;
+use maki_format::durable_proof::DurableProof;
 use maki_format::geometry::Geometry;
 use maki_format::superblock::Superblock;
 use maki_test_support::crash_backing::FaultOp;
@@ -100,6 +101,104 @@ fn retry_preserves_the_durable_copy_for_every_metadata_type() {
             restart,
         );
     }
+}
+
+/// What a power loss keeps of a tearing record write: its new header (magic,
+/// version, generation) over the old payload, so the copy fails its CRC.
+const TORN_HEADER: usize = 20;
+
+/// A failed store leaves its generation readable but volatile on one side;
+/// after a restart the retry targets the other side, which holds the last
+/// acknowledged copy. A power loss that tears the retry's write (still dirty)
+/// and drops every unproven write must leave an acknowledged generation:
+/// only the preserve step, which rewrites and syncs the readable side before
+/// the target is touched, makes that hold. With one acknowledged side, the
+/// readable side is a new file whose name was never synced either. Returns
+/// what was lost, if anything.
+fn torn_retry_after_restart_loses<T: AbRecord>(
+    mut record: T,
+    acknowledged_sides: u64,
+) -> Option<String> {
+    let name = std::any::type_name::<T>();
+    let (readable, acknowledged): (&'static str, &'static str) = match acknowledged_sides {
+        1 => ("m.b", "m.a"),
+        2 => ("m.a", "m.b"),
+        _ => unreachable!(),
+    };
+    let backing = CrashableBacking::new();
+    let mut ab = AbStore::new("m.a", "m.b");
+    record.set_generation(0);
+    for _ in 0..acknowledged_sides {
+        ab.store(&backing, &mut record).unwrap();
+    }
+    backing.sync_dir("").unwrap();
+    let last_acknowledged = record.generation();
+
+    fail_sync(&backing, readable);
+    assert!(ab.store(&backing, &mut record).is_err());
+    ab = AbStore::new("m.a", "m.b");
+    record = ab.load::<T>(&backing).unwrap().unwrap();
+    assert_eq!(record.generation(), last_acknowledged + 1, "{name}");
+    assert_eq!(ab.next_target_path::<T>(&backing).unwrap(), acknowledged);
+
+    // The retry's target write is still in the page cache when power fails.
+    backing.set_lenient_sync_failures(true);
+    fail_sync(&backing, acknowledged);
+    assert!(ab.store(&backing, &mut record).is_err());
+    backing.set_fault_hook(None);
+    backing.crash_keep_torn_prefix(acknowledged, TORN_HEADER);
+
+    let generation = ab.load::<T>(&backing).unwrap().map(|r| r.generation());
+    (generation < Some(last_acknowledged)).then(|| {
+        format!(
+            "{name}, {acknowledged_sides} acknowledged side(s): generation \
+             {last_acknowledged} was acknowledged, {generation:?} is left"
+        )
+    })
+}
+
+#[test]
+fn torn_retry_after_restart_keeps_an_acknowledged_copy_of_every_metadata_type() {
+    let mut lost = Vec::new();
+    for sides in [1, 2] {
+        // Allocation and discard maps are both `AllocationMap` records.
+        lost.extend(torn_retry_after_restart_loses(
+            AllocationMap::new(16384),
+            sides,
+        ));
+        lost.extend(torn_retry_after_restart_loses(ShardCatalog::new(), sides));
+        lost.extend(torn_retry_after_restart_loses(
+            CheckpointState::default(),
+            sides,
+        ));
+        lost.extend(torn_retry_after_restart_loses(
+            DurableProof::initial(Uuid::from_u128(1)),
+            sides,
+        ));
+        lost.extend(torn_retry_after_restart_loses(
+            KeyCanary {
+                generation: 0,
+                volume_uuid: Uuid::from_u128(1),
+                unit_index: 0,
+                ciphertext: vec![7; 540],
+            },
+            sides,
+        ));
+        lost.extend(torn_retry_after_restart_loses(
+            Superblock {
+                generation: 0,
+                volume_uuid: Uuid::from_u128(1),
+                provider_type: "fake".into(),
+                crypto_compatibility_id: "test-profile-v1".into(),
+                key_identity: "k".into(),
+                geometry: Geometry::compute(512, 512, 512, 540, 512 * 1024, 512 * 64).unwrap(),
+                format_version: 1,
+                created_unix: 0,
+            },
+            sides,
+        ));
+    }
+    assert!(lost.is_empty(), "{lost:#?}");
 }
 
 #[test]

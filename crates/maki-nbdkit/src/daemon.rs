@@ -906,7 +906,21 @@ async fn dispatch_endpoint_set(
                             data: canary.ciphertext,
                         }],
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| match error {
+                        // The validated endpoints authenticated this canary
+                        // under the volume context at attach, so its
+                        // refusal proves another key, like a wrong
+                        // plaintext below. Any other failure only shows a
+                        // failed exchange and is validated again later.
+                        maki_crypto::CryptoError::Integrity(reason) => {
+                            maki_crypto::CryptoError::ProviderFatal(format!(
+                                "quarantined endpoint does not match the volume key canary: \
+                                 {reason}"
+                            ))
+                        }
+                        other => other,
+                    })?;
                 if plain[0].data.expose()
                     != maki_format::canary::canary_plaintext(&context.volume_uuid, unit)
                 {

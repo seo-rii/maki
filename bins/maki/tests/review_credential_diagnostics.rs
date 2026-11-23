@@ -1,4 +1,7 @@
 //! BUG-127: semantic validation must not echo rejected credential fields.
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use maki_format::config::parse_config;
 
 const SECRET: &str = "AUDIT_SECRET_20261016_0123456789abcdef";
@@ -16,7 +19,7 @@ fn assert_safe_diagnostic(document: String, diagnosis: &str) {
     let debug = format!("{error:?}");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    std::fs::write(&path, &document).unwrap();
+    volume_config::write(&path, &document).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_maki"))
         .args(["volume", "inspect"])
         .arg(&path)

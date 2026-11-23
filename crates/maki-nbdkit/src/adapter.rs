@@ -118,7 +118,8 @@ impl NbdAdapter {
         }
     }
 
-    /// Full daemon path: parse + validate config, build backing/provider,
+    /// Full daemon path: read the config through the checked reader
+    /// ([`crate::config_file`]), parse + validate it, build backing/provider,
     /// run recovery + self-test, start the control socket, return a serving
     /// adapter.
     pub fn open_config(path: &str) -> Result<Self, AdapterError> {
@@ -138,7 +139,9 @@ impl NbdAdapter {
         native: bool,
         progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
     ) -> Result<Self, AdapterError> {
-        let raw = std::fs::read_to_string(path)
+        // The configuration decides where plaintext goes: only a file no
+        // other user can write or substitute is loaded (SPEC §8).
+        let raw = crate::config_file::read_volume_config(std::path::Path::new(path))
             .map_err(|e| AdapterError::new(EINVAL, format!("config {path}: {e}")))?;
         let config = daemon::parse_and_validate(&raw)
             .map_err(|e| AdapterError::new(EINVAL, e.to_string()))?;

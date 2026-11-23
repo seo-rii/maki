@@ -6,10 +6,13 @@ use std::time::Duration;
 use crate::error::CryptoError;
 use crate::types::{CiphertextUnit, CryptoCapabilities, CryptoContext, PlaintextUnit};
 
-// A private argument seals just the validation hook. Third-party providers
-// can implement CryptoProvider, but cannot exempt their output from scanning.
+// A private argument seals just the validation and self-test hooks.
+// Third-party providers can implement CryptoProvider, but cannot exempt their
+// output from scanning or answer the self-test's probe differently from an
+// ordinary decrypt.
 pub(crate) mod private {
     pub struct ValidationCaller;
+    pub struct SelfTestCaller;
 }
 
 /// A local or remote cryptographic provider.
@@ -49,4 +52,30 @@ pub trait CryptoProvider: Send + Sync {
         context: &CryptoContext,
         items: &[CiphertextUnit],
     ) -> Result<Vec<PlaintextUnit>, CryptoError>;
+
+    /// The attach self-test's compatibility-id probe (SPEC §18): decrypt
+    /// `items`, made under `context`, under a compatibility id the volume
+    /// does not use. The probe must reach the provider that binds the id, so
+    /// the foreign id is chosen where the id goes on the wire, not by the
+    /// caller: the random-prefix wrapper, which translates the id, forwards
+    /// the probe with the context it sends below, and the other wrapping
+    /// layers of this crate forward it unchanged. This default, for a
+    /// provider that receives the id itself, decrypts under
+    /// `<compatibility id>.selftest-probe`. Under a wrapper from another
+    /// crate, which has this default, a random-prefix wrapper below receives
+    /// an ordinary decrypt under a foreign id and refuses it; that refusal is
+    /// not field evidence, so the self-test fails closed.
+    #[doc(hidden)]
+    async fn decrypt_compatibility_probe(
+        &self,
+        _caller: private::SelfTestCaller,
+        context: &CryptoContext,
+        items: &[CiphertextUnit],
+    ) -> Result<Vec<PlaintextUnit>, CryptoError> {
+        self.decrypt_batch(
+            &crate::selftest::foreign_compatibility_context(context),
+            items,
+        )
+        .await
+    }
 }

@@ -838,8 +838,10 @@ fn scan_journal_with_proof(
         .filter(|_| checkpoint_sequence != 0 && !matches!(&replay, ReplayRecords::ScanOnly(_)))
         .map(|_| CheckpointEvidence::new(checkpoint_sequence, 0, MAX_CHECKPOINT_UNITS));
 
+    // Only segment names matter here, and they are ASCII: any other entry,
+    // one whose name is not UTF-8 included, is ignored.
     let mut names: Vec<(u64, String)> = backing
-        .list(layout::JOURNAL_DIR)?
+        .list_skipping_non_utf8(layout::JOURNAL_DIR)?
         .into_iter()
         .filter_map(|n| layout::parse_journal_segment(&n).map(|i| (i, n)))
         .collect();

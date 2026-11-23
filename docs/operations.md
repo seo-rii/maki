@@ -936,6 +936,25 @@ If the helper has already been upgraded while a legacy attachment is live,
 missing trusted state requires independently verified manual cleanup. Pinning
 the NBD device is not a migration shortcut.
 
+The November 2026 configuration-file check refuses a volume configuration that
+another user could change or substitute
+([configuration file](configuration.md#configuration-file)): a daemon started
+on one fails attach, and every `maki` command refuses it. Before upgrading,
+list the files it would refuse, then replace each listed file with a
+`root:maki 0640` copy of its contents (`install` replaces the name, so a
+symlink or second link is gone afterwards):
+
+```bash
+find /etc/maki/volumes -name '*.toml' \
+    \( -type l -o -links +1 -o -perm /022 -o ! -user root \) -print
+cp --dereference /etc/maki/volumes/<volume>.toml /root/<volume>.toml.copy
+install -m 0640 -o root -g maki /root/<volume>.toml.copy /etc/maki/volumes/<volume>.toml
+```
+
+Review the copied contents before installing them. A listed file owned by the
+daemon user is still accepted by the daemon, but not by `maki` commands run as
+root.
+
 Removing the package (`apt remove maki`) is refused by its `prerm` while any
 trusted attachment record exists or a `maki@`, `maki-attach@`,
 `maki-recover@` or `maki-workload@` unit is active: the helper being removed is what the
@@ -1143,6 +1162,13 @@ calls, not Engine or NBD requests, which may issue several crypto calls.
   daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
+- A volume configuration that is a symlink, has a second hard link, is owned
+  by a user other than root and the loading process's user, or is writable by
+  its group or others is refused before it is parsed, by the daemon (attach
+  fails), by every `maki` command that reads it and by `maki-benchmark`; the
+  error names the file and the problem. Install it `root:maki 0640`
+  ([configuration file](configuration.md#configuration-file)); a file owned
+  by the daemon user is accepted only by processes running as that user.
 - Volume directories are created `0700` and their files `0600`; a `file`
   credential must be a regular file with no group or other permission bits
   (for example `0600` or `0400`), owned by root

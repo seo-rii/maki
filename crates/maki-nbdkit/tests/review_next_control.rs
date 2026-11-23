@@ -6,6 +6,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/volume_config.rs"]
+mod volume_config;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
@@ -60,7 +63,7 @@ fn shutdown_terminates_live_sessions_and_releases_the_volume_lock() {
         .into_owned();
     let raw = config(&root, &socket);
     let config_path = dir.path().join("vol.toml");
-    std::fs::write(&config_path, &raw).unwrap();
+    volume_config::write(&config_path, &raw).unwrap();
     maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
 
     let adapter = NbdAdapter::open_config(config_path.to_str().unwrap()).unwrap();
@@ -144,7 +147,7 @@ mod retained_adapter {
                 socket.display()
             );
             let config = directory.path().join("volume.toml");
-            std::fs::write(&config, &raw).unwrap();
+            super::volume_config::write(&config, &raw).unwrap();
             daemon::create_volume_from_config_str(&raw).unwrap();
             Self {
                 _directory: directory,
