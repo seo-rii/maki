@@ -14,6 +14,9 @@
 //! retired namespace whose lifetime lock cannot be opened keeps its files.
 #![cfg(target_os = "linux")]
 
+#[path = "support/shared_dir.rs"]
+mod shared_dir;
+
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -642,8 +645,15 @@ fn gc_as_the_daemon_reclaims_past_the_namespace_a_killed_root_takeover_left() {
         eprintln!("{KILLED_TAKEOVER}: skipped: acting as root and as the daemon user needs root");
         return;
     }
-    let top = tempfile::tempdir().unwrap();
-    set_mode(top.path(), 0o755);
+    // The daemon user works below `top`: it must be reachable from `/`
+    // whatever `TMPDIR` is.
+    let top = match shared_dir::tempdir() {
+        Ok(top) => top,
+        Err(reason) => {
+            eprintln!("{KILLED_TAKEOVER}: skipped: {reason}");
+            return;
+        }
+    };
     // The daemon user's backing root, as `install -d -o maki -g maki -m 0700`.
     let root = top.path().join("root");
     std::fs::create_dir(&root).unwrap();

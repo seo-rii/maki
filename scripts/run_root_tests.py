@@ -66,6 +66,9 @@ ROOT_TARGETS = (
     "crates/maki-crypto-local/tests/review_secret_file_owner.rs",
     "crates/maki-nbdkit/tests/review_volume_config_file.rs",
     "crates/maki-witness/tests/review_tls_key_owner.rs",
+    # A root-run takeover killed at its fchown, then attaches and GC as the
+    # daemon user (the test re-executes itself as uid 65534).
+    "crates/maki-backing/tests/review_remote_gc_unreadable.rs",
     # A private mount namespace (and a cgroup for the memory budget), a
     # read-only bind mount, the immutable flag.
     "crates/maki-backing/tests/review_restore_read_only_source.rs",

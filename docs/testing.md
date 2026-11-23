@@ -94,8 +94,9 @@ can search and that it removes afterwards. It fails when root is not
 available (nothing is compiled or skipped), when a test that ran as root
 still reports that it needs root, and when the run leaves an entry owned by
 root in the checkout or the build tree. `--open-build-tree` lets the fixture
-user (uid 65534) reach the built `maki` and `maki-check` binaries below a
-`0750` home directory for the duration of the run.
+user (uid 65534) reach the built `maki` and `maki-check` binaries, and the
+test executables that re-execute themselves as that user, below a `0750`
+home directory for the duration of the run.
 `scripts/test_root_tests_validation.py` fails for a test source that probes
 its privilege (`geteuid`, a "needs root" notice, `chown`, `unshare`) and is
 neither in `ROOT_TARGETS` nor classified in that test as not needing root, so
