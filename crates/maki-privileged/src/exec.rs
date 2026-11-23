@@ -6,6 +6,7 @@
 //! probe parsers so it is testable everywhere; this module only gathers
 //! facts and runs commands.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -51,7 +52,10 @@ pub enum ExecError {
     Step { step: String, message: String },
     #[error("{0}")]
     Verify(#[from] crate::verify::MountVerifyError),
-    #[error("no free /dev/nbdN device (all connected/in use or module not loaded)")]
+    #[error(
+        "no free /dev/nbdN device (all connected, in use or named by an attach record, or module \
+         not loaded)"
+    )]
     NoFreeDevice,
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -215,6 +219,8 @@ fn read_mountinfo() -> io::Result<Vec<u8>> {
 /// Lowest unused `/dev/nbdN` in sysfs and the current mount namespace.
 /// Connections, root/partition holders and direct mounts occupy a device.
 /// Call with the attach lock held; observation failures refuse allocation.
+/// This is the kernel's view only: an attach also leaves out every device
+/// that another volume's trusted record names.
 pub fn allocate_nbd_device() -> Result<String, ExecError> {
     allocation::allocate(Path::new("/sys/class/block"), Path::new(MOUNTINFO))
 }
@@ -821,6 +827,12 @@ trait System {
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
     fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
+    /// A free device that is none of `reserved`, the devices other volumes'
+    /// trusted records name. An implementation that knows only `allocate`
+    /// cannot look past a reserved device; the executor refuses that answer.
+    fn allocate_excluding(&mut self, _reserved: &BTreeSet<String>) -> Result<String, ExecError> {
+        self.allocate()
+    }
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation>;
 }
@@ -914,6 +926,14 @@ impl System for LinuxSystem {
         allocate_nbd_device()
     }
 
+    fn allocate_excluding(&mut self, reserved: &BTreeSet<String>) -> Result<String, ExecError> {
+        allocation::allocate_excluding(
+            Path::new("/sys/class/block"),
+            Path::new(MOUNTINFO),
+            reserved,
+        )
+    }
+
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         nbd_backend_at(Path::new("/sys/block"), device)
     }
@@ -921,6 +941,19 @@ impl System for LinuxSystem {
     fn detach_observation(&self, record: &BoundDeviceRecord) -> io::Result<DetachObservation> {
         crate::detach::observe(record, &read_mountinfo()?, Path::new("/sys/class/block"))
     }
+}
+
+/// The refusal of every verb that finds the recorded device connected under
+/// an identity other than the recorded one. Nothing is changed and the record
+/// is kept: no observation shows whose the device's present users are.
+fn other_identity(record: &BoundDeviceRecord, refused: &str) -> ExecError {
+    identity_error(format!(
+        "{device} is recorded for volume {volume} but is connected under another identity; \
+         refusing {refused} and keeping the attach record. Detach the volume or disconnect the \
+         NBD client that uses {device} now, then run `maki-attach cleanup --volume {volume}`",
+        device = record.device,
+        volume = record.volume,
+    ))
 }
 
 fn verify_connection(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
@@ -955,11 +988,7 @@ fn verify_detach_state(
 ) -> Result<(bool, DetachObservation), ExecError> {
     let connected = match system.backend(&record.device)? {
         Some(identifier) if identifier == record.connection_id => true,
-        Some(_) => {
-            return Err(identity_error(
-                "recorded NBD device has a different backend identity",
-            ))
-        }
+        Some(_) => return Err(other_identity(record, "to act on the attachment")),
         None => false,
     };
     let observed = if record.recovery.is_some() || record.recovery_intent.is_some() {
@@ -1199,15 +1228,24 @@ fn execute_with_options(
         )
     });
     let mut record = None;
+    // The devices other volumes' trusted records name, by device. A record
+    // can outlive its connection, and its device then shows no backend,
+    // holder or mount: only the records, read under the attach lock every
+    // writer holds, show that it is still that volume's.
+    let mut reserved = BTreeMap::new();
     if connects || disconnects || grows {
         let state = state.ok_or_else(|| identity_error("attach state lock is required"))?;
         let prior = state.read(&plan.volume)?;
         if connects {
             if let Some(prior) = &prior {
-                if system.backend(&prior.device)?.is_some() {
-                    return Err(identity_error(
-                        "recorded device is still connected; detach or verify its stale state before attaching",
-                    ));
+                match system.backend(&prior.device)? {
+                    None => {}
+                    Some(identifier) if identifier == prior.connection_id => {
+                        return Err(identity_error(
+                            "recorded device is still connected; detach or verify its stale state before attaching",
+                        ))
+                    }
+                    Some(_) => return Err(other_identity(prior, "to attach")),
                 }
                 // A missing NBD backend is not proof the volume is fully
                 // detached: a crashed daemon can leave a live mount, an active
@@ -1224,6 +1262,8 @@ fn execute_with_options(
                     ));
                 }
             }
+            // This volume's own record is judged above and replaced below.
+            reserved = state.devices_of_other_volumes(&plan.volume)?;
         } else {
             let prior = prior.ok_or_else(|| identity_error(format!(
                 "no trusted attach record at {}; legacy device-only records are not imported, and a pinned device cannot bypass verification",
@@ -1258,8 +1298,15 @@ fn execute_with_options(
         }
     }
     if plan.needs_device_allocation() {
+        // Only an attach takes a device: it holds the lock under which the
+        // records were read, and publishes its own before connecting.
+        if !connects {
+            return Err(identity_error(
+                "only an attach allocates an NBD device; this plan connects none",
+            ));
+        }
         system.run_step(&PlannedStep::ModprobeNbd, None)?;
-        let device = system.allocate()?;
+        let device = system.allocate_excluding(&reserved.keys().cloned().collect())?;
         tracing::info!("maki-attach: allocated {device}");
         plan.bind_device(&device);
         println!("# bound NBD device: {device}");
@@ -1280,6 +1327,16 @@ fn execute_with_options(
         // An automatic device becomes concrete only after loading the module.
         crate::config::check_vg_device(&attachment.vg_name, &device)
             .map_err(|error| identity_error(error.to_string()))?;
+        // A pinned device never went through allocation, and an allocated
+        // one is checked again: another volume's record keeps its device.
+        if let Some(owner) = reserved.get(&device) {
+            return Err(identity_error(format!(
+                "{device} is named by the attach record of volume {owner}; refusing to attach \
+                 volume {volume} on it. If that attachment is gone, run `maki-attach cleanup \
+                 --volume {owner}` first; otherwise use another nbd_device",
+                volume = plan.volume,
+            )));
+        }
         if system.backend(&device)?.is_some() {
             return Err(identity_error("requested NBD device is already connected"));
         }
@@ -1569,9 +1626,7 @@ fn cleanup_with(
             execute_with_options(plan, Some(state), system, true)
         }
         None => recover_with(plan, state, system),
-        Some(_) => Err(identity_error(
-            "recorded NBD device has a foreign backend; refusing cleanup",
-        )),
+        Some(_) => Err(other_identity(&record, "cleanup")),
     }
 }
 

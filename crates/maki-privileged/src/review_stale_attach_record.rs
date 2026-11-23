@@ -367,6 +367,9 @@ impl System for Host {
     fn allocate(&mut self) -> Result<String, ExecError> {
         super::allocate(&self.sysfs, &self.mountinfo)
     }
+    fn allocate_excluding(&mut self, reserved: &BTreeSet<String>) -> Result<String, ExecError> {
+        super::allocate_excluding(&self.sysfs, &self.mountinfo, reserved)
+    }
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         nbd_backend_at(&self.sysfs, device)
     }

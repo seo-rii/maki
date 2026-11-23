@@ -4,6 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+/// The cases below observe the kernel only: no trusted record names a device.
+fn choose(sysfs: &Path, mountinfo: &[u8]) -> Result<String, ExecError> {
+    super::choose(sysfs, mountinfo, &BTreeSet::new())
+}
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -222,4 +227,35 @@ fn review_auto_allocation_refuses_records_with_other_empty_fields() {
     ] {
         assert!(choose(&fixture.0, mounts.as_bytes()).is_err(), "{mounts:?}");
     }
+}
+
+/// A trusted record can outlive its connection, so the device it names
+/// shows nothing in sysfs or the mount table and is still not free.
+#[test]
+fn devices_named_by_trusted_records_are_not_free() {
+    let fixture = Fixture::new();
+    let reserved =
+        |devices: &[&str]| -> BTreeSet<String> { devices.iter().map(|d| d.to_string()).collect() };
+    assert_eq!(
+        super::choose(&fixture.0, b"", &reserved(&["/dev/nbd2"])).unwrap(),
+        "/dev/nbd3"
+    );
+    // A record that names a later or an absent device reserves only that.
+    assert_eq!(
+        super::choose(&fixture.0, b"", &reserved(&["/dev/nbd3", "/dev/nbd9"])).unwrap(),
+        "/dev/nbd2"
+    );
+    assert!(matches!(
+        super::choose(&fixture.0, b"", &reserved(&["/dev/nbd2", "/dev/nbd3"])),
+        Err(ExecError::NoFreeDevice)
+    ));
+    // The device after a recorded one is still held to every observation.
+    let mounts = fixture.0.join("mountinfo");
+    std::fs::write(&mounts, "91 20 43:48 / /srv/old rw - xfs /dev/nbd3 rw\n").unwrap();
+    assert!(matches!(
+        allocate_excluding(&fixture.0, &mounts, &reserved(&["/dev/nbd2"])),
+        Err(ExecError::NoFreeDevice)
+    ));
+    std::fs::write(fixture.0.join("nbd3/dev"), "not-a-device").unwrap();
+    assert!(super::choose(&fixture.0, b"", &reserved(&["/dev/nbd2"])).is_err());
 }
