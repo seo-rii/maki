@@ -268,11 +268,22 @@ maki detach
 maki status
 maki metrics
 
+maki checkpoint
+maki drain
+
 maki reload
 maki check
 
 maki grow
 ```
+
+`maki checkpoint` and `maki drain` are control-socket commands: `checkpoint`
+requests a graceful checkpoint, and `drain` closes I/O admission, waits for
+the requests in progress, then flushes and checkpoints. `maki attach`,
+`maki detach` and `maki grow` do not perform the operation: `maki` prints the
+`maki-attach` command to run (the same verb and arguments) on standard error
+and exits with status 3. The operation runs only when the operator runs that
+privileged helper (§6).
 
 Normal status and runtime configuration operations are performed over the daemon control socket:
 

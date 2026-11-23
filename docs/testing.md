@@ -157,6 +157,13 @@ against the distribution's `nbdkit-plugin.h` and compares every field offset
 and `NBDKIT_*` constant the shim depends on. The same test runs under WSL
 when the header is installed there, and skips with a message otherwise.
 
+The last step of the `nightly-gates` job builds `maki` alone in release mode
+and requires `maki volume create` to refuse a configuration with
+`provider = "fake"`: the command must fail with `provider "fake" is not
+compiled into this build` and leave no `superblock.a`. The workspace test run
+cannot show this, because feature unification compiles the fake provider into
+`maki-nbdkit` for that crate's own tests.
+
 ## Test model
 
 ### Opt-in discard validation

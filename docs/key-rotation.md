@@ -294,7 +294,12 @@ offline `maki check <config.toml> --deep` checks stored structure and checksums;
 decrypt or authenticate the database and cannot replace those checks.
 
 The [2026-09-19 three-host qualification](qualification/credential-rotation-key-migration-validation-2026-09-19.md)
-exercised this stopped sequence with bearer and mTLS client credentials, two
+exercised a stopped rotation in the order its report records: writers held
+stopped, the trusted attachment cleaned up, an explicit drain acknowledgement
+received, then the daemon stopped. The attachment was therefore cleaned up
+before the acknowledgement, not by the lifecycle-target stop after it as in
+step 4 of the [credential rotation](#rotate-a-credential-while-retaining-the-encryption-key)
+above. The run used bearer and mTLS client credentials, two
 reference-provider hosts, actual kernel NBD/LVM/XFS, trusted attach/verify,
 SQLite external acknowledgements, and a DB-native restore into a distinct K2
 volume. It also proved old-credential refusal, unchanged superblock/canary

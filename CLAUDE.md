@@ -24,9 +24,10 @@ cargo test --workspace --release --locked -- --ignored
 cargo test -p maki-core --locked --test phase3 -- --nocapture
 ```
 
-Unix-only suites (control socket, `statvfs`, privileged executor, process
-hardening) are skipped on Windows; run them on Linux (CI, or WSL from this
-machine) before claiming a change is verified. `review_*.rs` test files are
+The Unix-only suites (control socket, `statvfs`; `cfg(unix)`) and the
+Linux-only ones (privileged executor, process hardening;
+`target_os = "linux"`) are skipped on Windows; run them on Linux (CI, or WSL
+from this machine) before claiming a change is verified. `review_*.rs` test files are
 the regression suites for the 2026-09-02 external review; their scope and the
 status of every finding live in `docs/review-remediation.md`.
 
