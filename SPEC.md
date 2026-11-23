@@ -2030,7 +2030,8 @@ exclude adapter work before Engine entry. `maki_journal_sync_seconds` measures
 explicit storage barriers, including failures and background/inline barriers;
 automatic segment-roll syncs remain inside overall request duration. Existing
 `maki_flush_seconds` and `maki_fua_seconds` retain successful storage-only sample
-semantics. Latency series expose sum/count/max; monitoring samples need not be
+semantics. These latency series expose sum/count/max, and
+`maki_crypto_latency_seconds` sum/count; monitoring samples need not be
 transactional across independent counters.
 
 High-cardinality identifiers such as LBA and request IDs MUST NOT be used as metric labels.

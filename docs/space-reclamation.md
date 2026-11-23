@@ -112,12 +112,16 @@ post-recovery reclamation.
 
 The scan skips every unit with a remaining overlay version, including a newer
 tombstone hiding an intermediate write reservation. Normal checkpointing handles
-that newer version later. A failed punch or data sync leaves the cursor unchanged
-for retry and is logged; it never fails the checkpoint, so `maki drain` and a
-clean shutdown still succeed while punching keeps failing (for example ENOSPC
-splitting an extent on a full filesystem). The stalled scan is then no longer
-pending work: the worker does not rerun it on its own, and the next checkpoint
-that runs for other reasons, or the next attach, retries it. Unsupported
+that newer version later. A failed punch or data sync is logged and never fails
+the checkpoint, so `maki drain` and a clean shutdown still succeed while
+punching keeps failing (for example ENOSPC splitting an extent on a full
+filesystem). The scan remembers the earliest failed batch and moves on, so
+later batches and shards are still reclaimed. When it reaches the end it starts
+again from that batch as a deferred scan, which is no longer pending work: the
+worker does not rerun it back to back, but waits one checkpoint interval
+(30 seconds) and then retries it by itself, with no new write needed. A
+checkpoint that runs meanwhile for other reasons, or the next attach, retries
+it too. Unsupported
 punching completes the hint without releasing physical blocks. Each attach starts
 a new scan, so previously punched holes can be visited again. Recovery itself
 still performs no physical release while replaying journal records.
@@ -146,7 +150,9 @@ requires over 75% allocated-block reduction, and verifies retained neighbors,
 reopening, and rewriting.
 `review_discard_reclaim_retry.rs` covers idle checkpoint and worker progress after
 replay, failed-release retry without failing the checkpoint or spinning the worker, preservation of newer write reservations, and the
-per-checkpoint scan bound. The real-file suite also checks that an idle checkpoint
+per-checkpoint scan bound. `review_reclamation_progress.rs` covers progress past a
+failed batch or shard and the idle worker's interval-spaced retry without new
+writes. The real-file suite also checks that an idle checkpoint
 after recovery releases over 75% of blocks for the 126-of-128-slot discard case.
 
 The complete workspace tests, formatting check, and strict all-target Clippy
