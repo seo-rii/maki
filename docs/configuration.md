@@ -975,7 +975,8 @@ space.
 The serving endpoint set is bound to the selected provider plaintext unit:
 `volume.crypto_unit_size + crypto.random_prefix_bytes`. Encrypt inputs and
 decrypt results must match that size even when the provider profile advertises
-other supported sizes. Decrypt batching uses the selected logical plaintext
+other supported sizes, and the set reports that size alone to the layers above
+it. Decrypt batching uses the selected logical plaintext
 size; actual ciphertext bytes still count toward memory and dispatch admission
 limits. A larger unused supported size does not prevent a smaller volume from
 using its valid batch limit.
@@ -994,8 +995,9 @@ provider call never carries a unit twice. A single request with a repeated unit
 number is rejected before queue admission. So is a request with a unit that the
 dispatcher or the random-prefix wrapper refuses before sending anything: an
 empty ciphertext (a damaged slot can record one), a ciphertext above the
-provider's maximum, or plaintext of a size the provider does not accept. Such a
-request fails alone. A rejection the provider itself returns for a coalesced
+provider's maximum, or plaintext of a size the provider does not accept or
+that is not the selected unit. Such a request fails alone.
+A rejection the provider itself returns for a coalesced
 call reaches each request separately only when the provider is `retry_safe`
 (each request is then re-sent alone); otherwise it reaches every request in
 the call. Each lane keeps up to `limits.max_crypto_inflight_batches`
