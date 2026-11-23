@@ -77,7 +77,14 @@ the superblock or delete `canary.a`/`canary.b` to bypass a mismatch.
    daemon and I/O admission remain available. Confirm unmount succeeded before
    continuing; a prior `sync` does not remove unmount's need for writeback.
    Do not stop the attach unit yet: the later target stop will deactivate the
-   VG and disconnect NBD after the acknowledgement. If unmount fails, keep
+   VG and disconnect NBD after the acknowledgement. The drained daemon no
+   longer serves LVM's reads by then, so that stop depends on cleanup's
+   single-mapping fallback and completes only on the one-LV topology. If the
+   VG holds an additional LV, run `sudo maki-attach detach --volume example`
+   here instead of unmounting by hand: the command (not a stop of the attach
+   unit) unmounts, deactivates the VG and disconnects NBD, and leaves the
+   daemon running for step 3
+   ([planned stop](operations.md#privileged-helper)). If unmount fails, keep
    admission open and resolve it before rotating;
    [disconnected storage recovery](storage-recovery.md) has additional limits.
 

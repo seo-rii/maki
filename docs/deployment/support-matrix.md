@@ -143,7 +143,7 @@ identity of each layer before and after every change.
 | Topology on `/dev/nbdN` | Status | Notes |
 |---|---|---|
 | Whole device as one PV → one VG → one XFS data LV | **Campaign passed** | The qualified topology; pin `fs_uuid` and `[lvm_identity]` |
-| Same VG with an additional LV (for example a sidecar LV) | **Campaign passed** (attach and fail-closed cleanup) | Attach and detach work. The narrow dead-`nbdkit` cleanup fallback applies only to a single mapping, so recovery of a multi-LV VG needs operator diagnosis |
+| Same VG with an additional LV (for example a sidecar LV) | **Campaign passed** (attach and fail-closed cleanup) | Attach and detach work while the daemon serves reads. The narrow cleanup fallback for a dead or drained daemon applies only to a single mapping, so recovery of a multi-LV VG needs operator diagnosis, and a planned stop that takes a `maki drain` acknowledgement must detach before draining ([planned stop](../operations.md#privileged-helper)) |
 | PV on a partition of the NBD device | Not qualified; packaged growth refused before mutation | Partitions are inventoried and mixed whole-device/partition PVs are refused; read [LVM activation checks](../storage-recovery.md#checking-lvm-before-activation) first |
 | VG that also spans other block devices | **Refused** | The filesystem must be stored only on the NBD device Maki connected |
 | LVM cache (`cachevol`) layouts | **Refused** at activation | |

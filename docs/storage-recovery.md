@@ -20,7 +20,8 @@ mutation and preserves the record. Use explicit `detach` for planned connected
 maintenance and explicit `recover` when diagnosing a known disconnected
 attachment.
 
-When nbdkit dies but its kernel NBD client remains connected, `cleanup` may use
+When nbdkit dies but its kernel NBD client remains connected, or `maki drain`
+has closed the daemon's admission to reads, `cleanup` may use
 the completed post-activation proof after normal `vgchange -an` exits nonzero.
 This fallback accepts only a single target mapping: the original proof and the
 current kernel inventory must each contain the same one top-level DM target,
@@ -32,7 +33,10 @@ never uses force, deferred removal, or retry options.
 
 This path belongs only to convergent `cleanup`. Explicit `detach` and `recover`,
 pre-activation intent, multi-LV/internal thin/cache/RAID mappings, open targets,
-or changed identity remain fail closed with the trusted record intact.
+or changed identity remain fail closed with the trusted record intact. For a
+planned stop this means that a VG outside the single-mapping topology is
+detached before `maki drain`, not after
+([planned stop](operations.md#privileged-helper)).
 
 Before recovery, stop database writers and their supervisors, prevent automatic
 restarts, and stop containers that use the volume. Run recovery from the host

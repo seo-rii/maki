@@ -285,7 +285,9 @@ After stopping workloads and unmounting their filesystems, use `maki drain` to
 obtain an explicit durability acknowledgement before stopping nbdkit. The
 plugin's unload callback cannot return an error to nbdkit; a zero process exit
 status alone does not acknowledge a successful drain. The packaged service's
-stop path is not a substitute for this administrative check.
+stop path is not a substitute for this administrative check. A drained daemon
+refuses reads as well, which limits how a kernel attachment that is still
+connected can be detached; see the [privileged helper](#privileged-helper).
 
 ### Logging
 
@@ -435,6 +437,11 @@ including writes still waiting for encryption, then flushes and checkpoints.
 Success returns `checkpoint_sequence`; repeated drains return the same
 acknowledgement. `status` and `metrics` remain available, and the daemon retains
 the volume lock until shutdown. Reattach to resume I/O.
+
+The reads it refuses include the ones LVM makes on the exported PV, so after a
+drain `vgchange -an` can no longer read the VG's metadata from the device. The
+[privileged helper](#privileged-helper) section says what that leaves of
+detach and cleanup.
 
 `status` includes `io_state` (`running`, `draining`, `failed`, or `drained`) and
 `drain_error`. A failed drain returns an error to the CLI, preserves the engine
@@ -616,7 +623,9 @@ recovery path. A foreign or unreadable backend fails before mutation and keeps
 the record. Re-run cleanup after a partial successful effect; each selected
 path re-observes storage identity before its next change.
 
-If a dead nbdkit server leaves its recorded kernel connection present, only
+If the daemon stops serving reads while its recorded kernel connection is
+present (a dead nbdkit server, or a daemon after `maki drain`, which refuses
+every read), only
 `cleanup` has a narrow fallback for the resulting LVM read failure. It first
 runs the normal `vgchange -an`; only an exited command with a nonzero status may
 continue. The completed post-activation proof must contain one recorded target
@@ -632,6 +641,15 @@ thin/cache/RAID mappings, open or changed targets, backend changes, and command
 timeouts do not enter this fallback. They retain the trusted record and require
 operator diagnosis. This limit keeps direct device-mapper mutation within the
 single-LV topology qualified on the disposable GCE host.
+
+After `maki drain` these limits decide how the attachment comes down. The
+cleanup that the target stop runs finishes a single-LV attachment through the
+fallback. An explicit `maki-attach detach` stops at the failed `vgchange -an`
+and keeps the record; run `maki-attach cleanup` instead. On a VG with an
+additional LV or an internal mapping the fallback is refused as it is after a
+server death (the proof lists every mapping attach activated), and the VG
+stays active on a daemon that will not serve LVM's reads again. Detach such a
+volume before draining it (see the planned stop below).
 
 Detach retries observe current mountinfo and sysfs state before each step.
 An already completed unmount or VG deactivation is skipped. A remaining mount
@@ -767,6 +785,15 @@ application through its own shutdown interface, unmount its verified filesystem
 while the daemon is running, then run `maki drain` and require success before
 stopping the target. If unmount fails, keep admission open and resolve that
 failure; a successful drain cannot substitute for a successful unmount.
+The target stop after a drain has to deactivate the VG while the daemon
+refuses LVM's reads: it depends on the cleanup fallback above, which covers
+only the qualified one-LV topology. With an additional LV in the VG, close
+whatever uses it and run `maki-attach detach --volume pg` (the command, not a
+stop of the attach unit) before `maki drain`, in place of the manual unmount:
+the helper unmounts, deactivates the whole VG and disconnects NBD while the
+daemon still serves reads, and leaves the daemon running. `maki drain` then
+returns its acknowledgement as before, and the target stop finds no
+attachment record left to clean up.
 
 The target stop orders the workload before attach cleanup; successful cleanup
 requests daemon shutdown without waiting inside the attach stop job. The
@@ -978,7 +1005,9 @@ the separate process in [durable recovery](durable-recovery.md).
 
 1. Stop database writers and close database connections through the application
    shutdown interface. Unmount the verified filesystem while engine admission
-   is open, then require a successful `maki drain` acknowledgement. Stop
+   is open, then require a successful `maki drain` acknowledgement (a VG with
+   an additional LV is detached before the drain instead; see the
+   [planned stop](#privileged-helper)). Stop
    `maki-workload@<volume>.target` and wait until the workload, attach and daemon
    units are inactive. Run `maki check` before capture.
 2. Capture the complete volume backing, volume TOML and root-owned attach TOML.
