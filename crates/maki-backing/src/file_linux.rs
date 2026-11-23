@@ -940,12 +940,14 @@ impl Directory {
                 // root's or its filesystem's (no write permission on the
                 // root, a read-only or full filesystem, an append-only root,
                 // an I/O error) and ends the pass, except the namespace's own
-                // immutable or append-only flag, which concerns it alone.
+                // immutable or append-only flag, which concerns it alone when
+                // the root carries neither.
                 // Nothing has been renamed either way.
                 return if error.kind() == io::ErrorKind::AlreadyExists {
                     Ok(GcRemoval::Unrecognized)
                 } else if error.raw_os_error() == Some(libc::EPERM)
                     && immutable_or_append_only(&directory)
+                    && !immutable_or_append_only(&self.0)
                 {
                     Ok(unfinished(
                         false,

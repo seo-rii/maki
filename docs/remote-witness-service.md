@@ -591,8 +591,8 @@ until it is removed.
 A namespace that passed examination and whose retirement stopped at a step
 that changes it alone is kept as that step left it and listed under
 `unfinished`, and GC goes on to the next entry. The step is renaming it to
-its tombstone when its own directory is immutable or append-only, which
-changes nothing
+its tombstone when its own directory is immutable or append-only and the
+root is neither, which changes nothing
 (`renaming the immutable or append-only namespace directory to its tombstone: Operation not permitted (os error 1)`),
 or, once the durable tombstone exists, unlinking one of its files, syncing
 its directory or removing it (for a directory the daemon user may read but
