@@ -447,6 +447,14 @@ impl System for FakeSystem {
         Ok("/dev/nbd3".into())
     }
 
+    /// Silent, like every fake, except in the child that gives the executor
+    /// an unread stdout: there the line goes through the real writer.
+    fn announce_bound_device(&mut self, device: &str) {
+        if std::env::var_os(UNREAD_STDOUT_CHILD).is_some() {
+            LinuxSystem.announce_bound_device(device);
+        }
+    }
+
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
         let probe = self.backend_probes.get() + 1;
         self.backend_probes.set(probe);

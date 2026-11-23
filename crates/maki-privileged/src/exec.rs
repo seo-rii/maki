@@ -818,6 +818,9 @@ trait System {
     fn lv_size(&self, _vg: &str, _lv: &str) -> Result<u64, ExecError> {
         Err(identity_error("logical volume size cannot be observed"))
     }
+    /// Tell the operator which device the plan's `auto` became. Only the
+    /// real system prints.
+    fn announce_bound_device(&mut self, _device: &str) {}
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
     fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
@@ -828,6 +831,13 @@ trait System {
 struct LinuxSystem;
 
 impl System for LinuxSystem {
+    fn announce_bound_device(&mut self, device: &str) {
+        // Not `println!`, which panics when the write fails: this comes
+        // after the NBD module is loaded and before the device is
+        // connected, and a stdout nobody reads must not end the attach here.
+        let _ = writeln!(io::stdout().lock(), "# bound NBD device: {device}");
+    }
+
     fn lvm_preflight(
         &mut self,
         record: &BoundDeviceRecord,
@@ -1262,7 +1272,7 @@ fn execute_with_options(
         let device = system.allocate()?;
         tracing::info!("maki-attach: allocated {device}");
         plan.bind_device(&device);
-        println!("# bound NBD device: {device}");
+        system.announce_bound_device(&device);
     }
     if connects {
         let device = plan
