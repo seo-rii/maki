@@ -15,7 +15,13 @@
 //! - `stall` retries without an attempt limit or deadline (§35);
 //!   `max_operation_time` is an absolute wall-clock deadline for
 //!   `bounded-error`: it bounds backoff *and* cancels an in-flight RPC
-//!   (review M-010);
+//!   (review M-010). Wherever it expires, the operation returns the last
+//!   endpoint error that the request in progress received before it, with
+//!   that error's class, or the deadline error when no endpoint failed that
+//!   request, and counts once in `deadline_exceeded_total`. A request is one
+//!   RPC batch with its retries and failovers: an operation sent as several
+//!   requests reports only the current one, and a scheduler caller the
+//!   request in progress at its own deadline;
 //! - a provider that is not `retry_safe` is never sent the same request
 //!   twice: after an RPC may have been sent, no retry and no failover
 //!   happens (review M-010). An attempt whose error the transport marked
@@ -115,6 +121,10 @@ impl DispatchMetrics {
         self.failovers.load(Ordering::SeqCst)
     }
 
+    /// Operations (encrypt or decrypt calls on this set) that ended because
+    /// their deadline expired, whatever error they returned: the last
+    /// endpoint error or the deadline error. Each counts once. A nested
+    /// set's expiry is a failure of that peer, counted by the nested set.
     pub fn deadline_exceeded_total(&self) -> u64 {
         self.deadline_exceeded.load(Ordering::SeqCst)
     }
@@ -505,9 +515,109 @@ pub(crate) fn deadline_error() -> CryptoError {
     CryptoError::Retryable(DEADLINE_MESSAGE.to_string())
 }
 
-/// Recognize reported deadline outcomes for scheduler caller metrics.
-pub(crate) fn is_deadline_error(err: &CryptoError) -> bool {
-    matches!(err, CryptoError::Retryable(m) if m == DEADLINE_MESSAGE)
+/// The operation's own deadline passed before the awaited future finished.
+/// [`EndpointSet::expire`] turns it into the operation's result.
+struct Expired;
+
+/// What the dispatcher serving one batch scheduler call had seen before the
+/// caller's deadline.
+#[derive(Default)]
+pub(crate) struct DispatchReport {
+    /// The last endpoint error of the request in progress, without the
+    /// not-sent mark (the scheduler cannot tell whether a later attempt
+    /// was sent, and dropping the mark is always safe).
+    pub(crate) last_error: Option<CryptoError>,
+    /// The dispatcher ended the call at its own deadline.
+    pub(crate) deadline_expired: bool,
+}
+
+/// One scheduler caller's view of the dispatcher serving its request. The
+/// caller's own budget usually runs out while the shared RPC still runs; it
+/// then leaves with the error this dispatcher would have returned at the
+/// caller's deadline (SPEC §35).
+#[derive(Clone, Default)]
+pub(crate) struct DispatchObserver(Arc<ObservedDispatch>);
+
+#[derive(Default)]
+struct ObservedDispatch {
+    report: parking_lot::Mutex<DispatchReport>,
+    /// The caller's deadline, on the caller's clock: the dispatcher's clock
+    /// may count from another epoch (the daemon gives each its own). The
+    /// dispatcher can run past it before the caller's timer task runs; what
+    /// it reports from then on (a failure, the start of the next RPC batch)
+    /// came too late to be the caller's answer and is not recorded, so that
+    /// answer does not depend on which task runs first. Its own deadline
+    /// exit then changes nothing either: the caller's budget has run out
+    /// and counts.
+    deadline: Option<(Arc<dyn Clock>, Duration)>,
+}
+
+impl DispatchObserver {
+    /// The observer of a caller whose budget ends at `deadline` on `clock`
+    /// (`None`: no deadline).
+    pub(crate) fn until(clock: Arc<dyn Clock>, deadline: Option<Duration>) -> Self {
+        Self(Arc::new(ObservedDispatch {
+            report: parking_lot::Mutex::default(),
+            deadline: deadline.map(|deadline| (clock, deadline)),
+        }))
+    }
+
+    /// The observer of the scheduler caller this task runs, or a fresh one
+    /// that nobody reads.
+    pub(crate) fn current() -> Self {
+        DISPATCH_OBSERVERS
+            .try_with(|observers| observers.as_ref().and_then(|all| all.first().cloned()))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn take(&self) -> DispatchReport {
+        std::mem::take(&mut *self.0.report.lock())
+    }
+
+    fn update(&self, update: impl Fn(&mut DispatchReport)) {
+        if let Some((clock, deadline)) = &self.0.deadline {
+            if clock.now() >= *deadline {
+                return;
+            }
+        }
+        update(&mut self.0.report.lock());
+    }
+}
+
+tokio::task_local! {
+    /// Set by the batch scheduler around a caller's operation (its queued
+    /// group picks the observer up there) and around each provider call it
+    /// makes, with the observers of every caller that call serves. A
+    /// dispatcher hides them from its own endpoints with `None`: a nested
+    /// set reports to the outer set through its result only.
+    static DISPATCH_OBSERVERS: Option<Vec<DispatchObserver>>;
+}
+
+/// Run `call` so that the outermost dispatcher it reaches reports to
+/// `observers`.
+pub(crate) async fn observe_dispatch<F: Future>(
+    observers: Vec<DispatchObserver>,
+    call: F,
+) -> F::Output {
+    DISPATCH_OBSERVERS.scope(Some(observers), call).await
+}
+
+fn report_dispatch(update: impl Fn(&mut DispatchReport)) {
+    // Outside any scope (no scheduler) there is nobody to tell.
+    let _ = DISPATCH_OBSERVERS.try_with(|observers| {
+        for observer in observers.iter().flatten() {
+            observer.update(&update);
+        }
+    });
+}
+
+/// The latest endpoint failure of this request: what a deadline exit
+/// returns.
+fn record_failure(last_error: &mut Option<CryptoError>, err: CryptoError) {
+    report_dispatch(|report| report.last_error = Some(err.duplicate().maybe_sent()));
+    *last_error = Some(err);
 }
 
 impl EndpointSet {
@@ -679,17 +789,21 @@ impl EndpointSet {
         &self,
         deadline: Option<Duration>,
     ) -> Result<&CryptoCapabilities, CryptoError> {
-        self.until_deadline(deadline, self.common_caps()).await?
+        match self.until_deadline(deadline, self.common_caps()).await {
+            Ok(caps) => caps,
+            Err(Expired) => Err(self.expire(None)),
+        }
     }
 
     /// One absolute budget covers every await. If polling was delayed, both
     /// futures can be ready; even synchronous work in the operation's poll
-    /// can take us past the deadline after checking the timer.
+    /// can take us past the deadline after checking the timer. A result
+    /// that arrives at or after the deadline is discarded.
     async fn until_deadline<T>(
         &self,
         deadline: Option<Duration>,
         operation: impl std::future::Future<Output = T>,
-    ) -> Result<T, CryptoError> {
+    ) -> Result<T, Expired> {
         let Some(deadline) = deadline else {
             return Ok(operation.await);
         };
@@ -705,10 +819,22 @@ impl EndpointSet {
                 }
             }
         }
+        Err(Expired)
+    }
+
+    /// Every deadline exit of an operation ends here, exactly once,
+    /// wherever the deadline expired: before the first pass, at the top of
+    /// a pass, right after a failed RPC, in admission or with an RPC in
+    /// flight. The operation counts as a deadline whatever it returns, and
+    /// returns the last endpoint error this request received before the
+    /// deadline, with that error's own class, or the deadline error when no
+    /// endpoint failed this request.
+    fn expire(&self, last_error: Option<CryptoError>) -> CryptoError {
         self.metrics
             .deadline_exceeded
             .fetch_add(1, Ordering::SeqCst);
-        Err(deadline_error())
+        report_dispatch(|report| report.deadline_expired = true);
+        last_error.unwrap_or_else(deadline_error)
     }
 
     pub fn metrics(&self) -> &DispatchMetrics {
@@ -871,7 +997,7 @@ impl EndpointSet {
         bytes: u64,
         deadline: Option<Duration>,
         first_rpc: bool,
-    ) -> Result<Option<EndpointAdmission>, CryptoError> {
+    ) -> Result<Option<EndpointAdmission>, Expired> {
         let admit = async {
             let _turn = self.admission_gate.lock().await;
             loop {
@@ -1043,6 +1169,9 @@ impl EndpointSet {
         let mut attempted = false;
         let mut pass = 0u32;
         let mut last_error: Option<CryptoError> = None;
+        // A scheduler caller leaving at its own deadline reports what this
+        // request has seen (another request's failures are not its cause).
+        report_dispatch(|report| report.last_error = None);
         // The previous actual RPC survives retry-pass boundaries. A newly
         // recovered endpoint is still a failover from the last peer called.
         let mut last_endpoint: Option<Arc<Endpoint>> = None;
@@ -1064,10 +1193,7 @@ impl EndpointSet {
             }
             if let Some(dl) = deadline {
                 if self.clock.now() >= dl {
-                    self.metrics
-                        .deadline_exceeded
-                        .fetch_add(1, Ordering::SeqCst);
-                    return Err(last_error.unwrap_or_else(deadline_error));
+                    return Err(self.expire(last_error));
                 }
             }
 
@@ -1085,9 +1211,7 @@ impl EndpointSet {
                     Ok(Some(admission)) => admission,
                     Ok(None) => break,
                     // The deadline expired while waiting for admission.
-                    // Report the last endpoint failure, as the other
-                    // deadline exits do; with none, the deadline itself.
-                    Err(deadline_exceeded) => return Err(last_error.unwrap_or(deadline_exceeded)),
+                    Err(Expired) => return Err(self.expire(last_error)),
                 };
                 let endpoint = admission.endpoint.clone();
                 let Some(probe) = endpoint.breaker.acquire() else {
@@ -1132,13 +1256,15 @@ impl EndpointSet {
                 }
                 last_endpoint = Some(endpoint.clone());
                 attempted = true;
-                let call = self.call_endpoint(&endpoint, context, &request, caps);
+                // A nested set reports to this one through its result only.
+                let call = DISPATCH_OBSERVERS
+                    .scope(None, self.call_endpoint(&endpoint, context, &request, caps));
                 match self.until_deadline(deadline, call).await {
-                    Err(expired) => {
+                    Err(Expired) => {
                         // Our timer canceled the RPC. Its delivery is unknown;
                         // dropping the probe returns its slot without a verdict.
                         *sent = true;
-                        return Err(expired);
+                        return Err(self.expire(last_error));
                     }
                     Ok(Ok(response)) => {
                         probe.on_success();
@@ -1159,10 +1285,10 @@ impl EndpointSet {
                                 } else {
                                     probe.on_failure();
                                 }
-                                last_error = Some(err);
+                                record_failure(&mut last_error, err);
                                 if let Some(dl) = deadline {
                                     if self.clock.now() >= dl {
-                                        return Err(last_error.unwrap());
+                                        return Err(self.expire(last_error));
                                     }
                                 }
                                 if !retry_safe && !unsent {
@@ -1211,10 +1337,10 @@ impl EndpointSet {
                                 if !peer_left {
                                     return Err(err);
                                 }
-                                last_error = Some(err);
+                                record_failure(&mut last_error, err);
                                 if let Some(dl) = deadline {
                                     if self.clock.now() >= dl {
-                                        return Err(last_error.unwrap());
+                                        return Err(self.expire(last_error));
                                     }
                                 }
                             }

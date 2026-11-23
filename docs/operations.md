@@ -1039,14 +1039,21 @@ published checkpoint, in bytes including record headers. Repeated writes to
 one unit count once per journal record. A TRIM tombstone counts its header.
 Unsynced records enter this gauge when they become durable.
 
-With batching enabled, `maki_crypto_deadline_exceeded_total` counts completed
-scheduler encrypt/decrypt calls that return an operation-deadline error.
-Queue admission, coalescing, batch-slot waits and RPC time share that caller's
-budget. Two expired callers in one coalesced RPC contribute two; a caller
-contributes only once even if the dispatcher also observes the deadline.
-Success, other errors and caller cancellation do not increment it. Without a
-scheduler, the metric uses the dispatcher's deadline counter. These are crypto
-calls, not Engine or NBD requests, which may issue several crypto calls.
+`maki_crypto_deadline_exceeded_total` counts crypto encrypt/decrypt calls that
+ended because their `bounded-error` deadline expired, whatever error they
+returned. Such a call returns the last error an endpoint gave before the
+deadline for the RPC batch in progress (one batch of items with its retries and
+failovers; a call sent as several RPC batches reports only the current one),
+with that error's own class, or `operation deadline exceeded` when no endpoint
+failed that batch, so alert on this counter rather than on the error text.
+With batching enabled it counts scheduler callers: queue admission,
+coalescing, batch-slot waits and RPC time share each caller's budget. Two
+expired callers in one coalesced RPC contribute two; a caller contributes only
+once even if the dispatcher also observes the deadline. Success, errors that
+end a call before its deadline and caller cancellation do not increment it.
+Without a scheduler, the metric uses the dispatcher's deadline counter. These
+are crypto calls, not Engine or NBD requests, which may issue several crypto
+calls.
 
 ## Failure handling
 

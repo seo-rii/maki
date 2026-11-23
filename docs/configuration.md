@@ -548,7 +548,12 @@ that point counts as sent, as does a later unit of an HTTP per-item mapping
 once an earlier unit was sent. With
 `availability_policy = "bounded-error"`, `max_operation_time` is an absolute
 wall-clock deadline: backoff never sleeps past it and an expired caller receives
-an error. A shared RPC remains active while it still has a live caller.
+the last error an endpoint returned before the deadline for the RPC batch in
+progress (one batch of items with its retries and failovers; a call sent as
+several RPC batches reports only the current one), with that error's class, or
+`operation deadline exceeded` when no endpoint failed that batch; either way
+it counts once in `maki_crypto_deadline_exceeded_total`. A shared RPC
+remains active while it still has a live caller.
 Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
 cross-endpoint check succeeds against a validated endpoint.

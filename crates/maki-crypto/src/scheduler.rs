@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 use crate::clock::Clock;
+use crate::endpoint::{deadline_error, observe_dispatch, DispatchObserver};
 use crate::error::CryptoError;
 use crate::flow::{DualPermit, DualSemaphore};
 use crate::provider::{
@@ -132,9 +133,11 @@ impl SchedulerStats {
         self.coalesced_batches.load(Ordering::SeqCst)
     }
 
-    /// Completed encrypt/decrypt callers that received an operation deadline
-    /// error, including admission, coalescing and slot waits. Each caller is
-    /// counted once even when several callers share the same provider RPC.
+    /// Completed encrypt/decrypt callers whose operation deadline expired,
+    /// whatever error they returned: their own budget (admission,
+    /// coalescing, slot waits and the RPC) ran out, or the dispatcher
+    /// serving them ended the call at its deadline. Each caller is counted
+    /// once even when several callers share the same provider RPC.
     pub fn deadline_exceeded_total(&self) -> u64 {
         self.deadline_exceeded.load(Ordering::SeqCst)
     }
@@ -165,6 +168,8 @@ struct Group<I, O> {
     /// over because the group does not fit the current batch (BUG-153).
     enqueued_at: Duration,
     reply: Reply<O>,
+    /// What the dispatcher serving this group has seen.
+    observer: DispatchObserver,
     /// Queue capacity, released when the group is dispatched.
     _pending: PendingCharge,
 }
@@ -254,6 +259,7 @@ type ResendSafe = Arc<
 struct RetryGroup<I, O> {
     items: Vec<I>,
     reply: Reply<O>,
+    observer: DispatchObserver,
 }
 
 async fn retry_caller_closed<I, O>(pending: &mut VecDeque<RetryGroup<I, O>>) {
@@ -300,7 +306,7 @@ async fn run_retries<I: Send + 'static, O: Send + 'static>(
                 _ = reply.closed() => None,
                 result = async {
                     let _call = InflightCall::enter(stats, len, false);
-                    call(context, group.items).await
+                    observe_dispatch(vec![group.observer], call(context, group.items)).await
                 } => Some(result),
             };
             if let Some((_, result)) = result {
@@ -484,6 +490,8 @@ impl<I: UnitIndexed + Send + 'static, O: Send + 'static> Lane<I, O> {
             logical_bytes,
             enqueued_at: self.clock.now(),
             reply: reply_tx,
+            // The submitting caller's, set by `BatchScheduler::with_deadline`.
+            observer: DispatchObserver::current(),
             _pending: PendingCharge {
                 stats: stats.clone(),
                 items: count,
@@ -634,10 +642,12 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
         let context = batch[0].context.clone();
         let mut lengths = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
+        let mut observers = Vec::with_capacity(batch.len());
         let mut all_items = Vec::with_capacity(items);
         for g in batch {
             lengths.push(g.items.len());
             replies.push(g.reply);
+            observers.push(g.observer);
             all_items.extend(g.items);
             // `_pending` drops here: the group left the queue.
         }
@@ -656,7 +666,7 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
                 _ = all_replies_closed(replies.iter_mut()) => None,
                 result = async {
                     let _call = InflightCall::enter(stats.clone(), items, coalesced);
-                    call(context.clone(), all_items).await
+                    observe_dispatch(observers.clone(), call(context.clone(), all_items)).await
                 } => Some(result),
             };
             let Some((all_items, result)) = result else {
@@ -693,9 +703,11 @@ async fn run_lane<I: UnitIndexed + Send + 'static, O: Send + 'static>(
             let pending = lengths
                 .into_iter()
                 .zip(replies)
-                .map(|(len, reply)| RetryGroup {
+                .zip(observers)
+                .map(|((len, reply), observer)| RetryGroup {
                     items: input.by_ref().take(len).collect(),
                     reply,
+                    observer,
                 })
                 .collect();
             run_retries(context, pending, call, stats, inflight, slot).await;
@@ -893,45 +905,49 @@ impl BatchScheduler {
     /// Start the caller's budget before its first queue-admission wait.
     /// Expiry drops the submit future; the lane then removes that group or
     /// abandons an RPC whose final caller has expired (BUG-012 / BUG-013).
+    /// The operation runs with this caller's dispatch observer, which its
+    /// queued group carries to the dispatcher that serves it.
     async fn with_deadline<T>(
         &self,
         operation: impl std::future::Future<Output = Result<T, CryptoError>>,
     ) -> Result<T, CryptoError> {
-        let result = match self.max_operation_time() {
-            Some(limit) => {
-                let deadline = self.clock.now().saturating_add(limit);
+        let deadline = self
+            .max_operation_time()
+            .map(|limit| self.clock.now().saturating_add(limit));
+        // The observer records nothing at or after the deadline: a failure
+        // the dispatcher sees then arrived too late for this caller.
+        let observer = DispatchObserver::until(self.clock.clone(), deadline);
+        let operation = observe_dispatch(vec![observer.clone()], operation);
+        // `None`: the caller's own budget ran out first.
+        let result = match deadline {
+            Some(deadline) => {
                 let remaining = deadline.saturating_sub(self.clock.now());
                 if remaining.is_zero() {
-                    Err(crate::endpoint::deadline_error())
+                    None
                 } else {
                     tokio::select! {
                         biased;
-                        _ = self.clock.sleep(remaining) => Err(crate::endpoint::deadline_error()),
-                        result = operation => {
-                            // The timer may wake on a later tick. Check the clock
-                            // after the operation's final poll, as the dispatcher does.
-                            if self.clock.now() < deadline {
-                                result
-                            } else {
-                                Err(crate::endpoint::deadline_error())
-                            }
-                        }
+                        _ = self.clock.sleep(remaining) => None,
+                        // The timer may wake on a later tick. Check the clock
+                        // after the operation's final poll, as the dispatcher does.
+                        result = operation => (self.clock.now() < deadline).then_some(result),
                     }
                 }
             }
-            None => operation.await,
+            None => Some(operation.await),
         };
+        let report = observer.take();
         // The caller owns this outcome, whether its queue timer or the inner
-        // dispatcher's timer expired first. Ordinary cancellation never
-        // reaches this point and must not be counted as a timeout (BUG-154).
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(crate::endpoint::is_deadline_error)
-        {
+        // dispatcher's timer expired first, and whatever error it returns.
+        // Ordinary cancellation never reaches this point and must not be
+        // counted as a timeout (BUG-154).
+        if result.is_none() || report.deadline_expired {
             self.stats.deadline_exceeded.fetch_add(1, Ordering::SeqCst);
         }
-        result
+        // Leave as the dispatcher serving this request would have at the
+        // deadline: with the last endpoint error of the request then in
+        // progress, or the deadline error if none failed it.
+        result.unwrap_or_else(|| Err(report.last_error.unwrap_or_else(deadline_error)))
     }
 }
 
