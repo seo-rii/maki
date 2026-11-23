@@ -1,5 +1,7 @@
-"""The scheduled job must run every ignored release gate to completion."""
+"""The scheduled job must run every ignored release gate to completion, and
+the pull-request job every script test module."""
 
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -142,6 +144,23 @@ class PythonSuites(unittest.TestCase):
         job = workflow[workflow.index("\n  pr:\n"):workflow.index("\n  latest-stable:\n")]
         return "".join(line for line in job.splitlines(keepends=True)
                        if not line.lstrip().startswith("#"))
+
+    def test_the_pull_request_job_runs_every_script_test_module(self):
+        # Most modules run because their name matches a discovery pattern
+        # and the rest are named: a module that does neither would never run.
+        job = self.pull_request_job()
+        self.assertNotIn("continue-on-error", job)
+        patterns = re.findall(r"python3 -B -m unittest discover -s scripts -p '([^']+)'", job)
+        named = set(re.findall(r"python3 -B -m unittest scripts\.(test_\w+)", job))
+        modules = sorted(path.stem for path in (ROOT / "scripts").glob("test_*.py"))
+        self.assertGreater(len(modules), 20)
+        self.assertEqual(
+            [module for module in modules if module not in named and not any(
+                fnmatch.fnmatchcase(module + ".py", pattern) for pattern in patterns)],
+            [], "name these modules in a Linux step of the pr job, or rename them to match "
+                f"one of {patterns}")
+        self.assertEqual(sorted(named - set(modules)), [],
+                         "the workflow names script test modules that do not exist")
 
     @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
     def test_bytecode_gate_follows_the_suites_and_rejects_a_cache_directory(self):
