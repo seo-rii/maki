@@ -138,6 +138,12 @@ The Maki volume UUID
 .BI \-\-fs-uuid " uuid"
 The expected XFS filesystem UUID
 .RB ( fs_uuid ).
+.SH EXIT STATUS
+Zero indicates success. A failed action returns 1. Invalid command usage,
+including a malformed option value, returns 2 and prints no plan. Without
+Linux, an action run without
+.B \-\-plan
+returns 3.
 .SH SEE ALSO
 .BR maki (8),
 .BR maki-check (8)
