@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn recovery_notifications_require_progress_and_are_rate_limited() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::short_dir::tempdir().unwrap();
         let path = dir.path().join("progress.sock");
         let receiver = UnixDatagram::bind(&path).unwrap();
         receiver.set_nonblocking(true).unwrap();
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_failed_extension_permanently_prevents_readiness() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::short_dir::tempdir().unwrap();
         let path = dir.path().join("missing.sock");
         let notifier = RecoveryNotifier::new(Some(path.clone().into_os_string()));
         notifier.progress_at(PROGRESS_INTERVAL);
@@ -325,7 +325,7 @@ mod tests {
         volume.flush().unwrap();
         drop(volume);
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::short_dir::tempdir().unwrap();
         let path = dir.path().join("progress.sock");
         let receiver = UnixDatagram::bind(&path).unwrap();
         receiver.set_nonblocking(true).unwrap();
@@ -419,13 +419,13 @@ mod tests {
             assert!(notify_ready(Some(OsStr::new(bad))).is_err());
         }
         assert!(notify_ready(Some(OsStr::new(&format!("@{}", "x".repeat(108))))).is_err());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::short_dir::tempdir().unwrap();
         assert!(notify_ready(Some(dir.path().join("missing.sock").as_os_str())).is_err());
     }
 
     #[test]
     fn notification_uses_path_and_abstract_unix_datagram_addresses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::short_dir::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
         let pathname = UnixDatagram::bind(&path).unwrap();
         notify_ready(Some(path.as_os_str())).unwrap();

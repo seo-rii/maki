@@ -6,6 +6,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io::{Seek, SeekFrom, Write};
 use std::process::{Command, Output};
 
@@ -56,7 +59,8 @@ struct Volume {
 }
 
 fn setup(name: &str, key_name: &str) -> Volume {
-    let dir = tempfile::tempdir().unwrap();
+    // Short: some tests bind the control socket in this directory.
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().replace('\\', "/");
     let config_path = dir
         .path()

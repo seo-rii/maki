@@ -9,6 +9,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_format::config::{parse_config, ByteSize};
 use maki_nbdkit::adapter::{NbdAdapter, EINVAL};
 
@@ -49,7 +52,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = short_dir::tempdir().unwrap();
         let root = directory.path().join("volume");
         let socket = directory.path().join("control.sock");
         let raw = config(

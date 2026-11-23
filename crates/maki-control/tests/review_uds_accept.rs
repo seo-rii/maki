@@ -3,6 +3,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,7 +40,7 @@ impl ControlBackend for Fake {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accept_errors_do_not_kill_the_control_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let listener = bind_control_socket(&path, None).unwrap();
     let server = tokio::spawn(serve(listener, Arc::new(Fake)));

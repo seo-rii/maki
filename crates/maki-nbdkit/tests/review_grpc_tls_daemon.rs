@@ -4,6 +4,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -152,7 +155,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         Self {
-            directory: tempfile::tempdir().unwrap(),
+            directory: short_dir::tempdir().unwrap(),
         }
     }
 

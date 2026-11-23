@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
@@ -34,7 +37,7 @@ impl ControlBackend for Fake {
 
 #[tokio::test]
 async fn bind_sets_mode_replaces_stale_socket_and_cleans_up() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
@@ -63,7 +66,7 @@ async fn bind_sets_mode_replaces_stale_socket_and_cleans_up() {
 
 #[tokio::test]
 async fn bind_refuses_missing_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("missing").join("control.sock");
     let err = bind_control_socket(&path, None).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -71,7 +74,7 @@ async fn bind_refuses_missing_directory() {
 
 #[tokio::test]
 async fn unknown_group_is_an_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let err = bind_control_socket(&path, Some("maki-no-such-group-xyz")).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
@@ -81,7 +84,7 @@ async fn unknown_group_is_an_error() {
 
 #[tokio::test]
 async fn failed_group_setup_does_not_replace_existing_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     std::fs::write(&path, b"stale").unwrap();
 
@@ -92,7 +95,7 @@ async fn failed_group_setup_does_not_replace_existing_path() {
 
 #[tokio::test]
 async fn publication_failure_leaves_no_temporary_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     std::fs::create_dir(&path).unwrap();
 
@@ -127,7 +130,7 @@ async fn bind_applies_the_configured_group() {
     let name = unsafe { std::ffi::CStr::from_ptr(group.gr_name) }
         .to_str()
         .unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
 
     let listener = bind_control_socket(&path, Some(name)).unwrap();
@@ -143,7 +146,7 @@ async fn bind_applies_the_configured_group() {
 async fn bind_supports_a_maximum_length_filesystem_socket_path() {
     use std::os::unix::ffi::OsStrExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     // Linux sun_path holds 108 bytes, including its terminating NUL. Use a
     // one-byte filename so any intermediate directory would exceed it.
     let padding = 107 - dir.path().as_os_str().as_bytes().len() - 3;

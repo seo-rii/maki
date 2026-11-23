@@ -7,6 +7,10 @@
 //! Timing uses tokio's paused clock (deterministic auto-advance), except
 //! the Unix-socket backlog test, which needs real I/O.
 
+#[cfg(unix)]
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -181,7 +185,7 @@ async fn concurrent_mutating_verbs_are_refused_with_busy() {
 async fn extra_sessions_wait_in_the_backlog_until_a_slot_frees() {
     use maki_control::uds::{bind_control_socket, serve_with_limits};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let listener = bind_control_socket(&path, None).unwrap();
     let limits = ControlLimits {

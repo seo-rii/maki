@@ -9,6 +9,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
@@ -54,7 +57,7 @@ fn open_live_session(socket: &str) -> (UnixStream, String) {
 
 #[test]
 fn shutdown_terminates_live_sessions_and_releases_the_volume_lock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().into_owned();
     let socket = dir
         .path()
@@ -114,7 +117,7 @@ mod retained_adapter {
 
     impl Fixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = super::short_dir::tempdir().unwrap();
             let root = directory.path().join("volume");
             let socket = directory.path().join("control.sock");
             let raw = format!(

@@ -2,6 +2,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Barrier;
@@ -10,7 +13,7 @@ use maki_control::uds::bind_control_socket;
 
 #[tokio::test]
 async fn a_live_control_socket_is_not_replaced() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let first = bind_control_socket(&socket, None).unwrap();
     let second = bind_control_socket(&socket, None);
@@ -26,7 +29,7 @@ async fn a_live_control_socket_is_not_replaced() {
 
 #[tokio::test]
 async fn old_listener_drop_preserves_a_successor_inode() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let old = bind_control_socket(&socket, None).unwrap();
     std::fs::remove_file(&socket).unwrap();
@@ -42,7 +45,7 @@ async fn old_listener_drop_preserves_a_successor_inode() {
 
 #[tokio::test]
 async fn a_stale_socket_is_reclaimed() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     drop(UnixListener::bind(&socket).unwrap());
     assert!(socket.exists());
@@ -54,7 +57,7 @@ async fn a_stale_socket_is_reclaimed() {
 
 #[test]
 fn concurrent_binders_publish_exactly_one_live_listener() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let start = Barrier::new(2);
     let listeners = std::thread::scope(|scope| {
@@ -83,7 +86,7 @@ fn concurrent_binders_publish_exactly_one_live_listener() {
 
 #[tokio::test]
 async fn old_listener_drop_preserves_a_replacement_regular_file() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let old = bind_control_socket(&socket, None).unwrap();
     std::fs::remove_file(&socket).unwrap();
@@ -98,7 +101,7 @@ async fn a_full_listener_backlog_is_still_a_live_address() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     // SAFETY: this listening socket is live; a short backlog keeps the
@@ -164,7 +167,7 @@ async fn a_full_listener_backlog_is_still_a_live_address() {
 /// (`superblock.a`, a shard) destroyed it. Only a dead socket is reclaimed.
 #[tokio::test]
 async fn a_regular_file_at_the_address_is_not_replaced() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let path = directory.path().join("superblock.a");
     std::fs::write(&path, b"volume metadata").unwrap();
 
@@ -180,7 +183,7 @@ async fn a_regular_file_at_the_address_is_not_replaced() {
 
 #[tokio::test]
 async fn a_symlink_at_the_address_is_not_replaced() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let target = directory.path().join("target");
     std::fs::write(&target, b"kept").unwrap();
     let path = directory.path().join("control.sock");

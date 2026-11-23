@@ -3,6 +3,10 @@
 //! refuse plaintext transports to non-loopback hosts, and prove the shipped
 //! production sample is attachable as written.
 
+#[cfg(unix)]
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_format::config::{is_loopback_host, parse_config, parse_endpoint_url, VolumeConfig};
 
 const SAMPLE: &str = include_str!("../../../packaging/examples/postgres-prod.toml");
@@ -766,7 +770,7 @@ fn control_and_nbd_sockets_must_differ() {
 #[cfg(unix)]
 #[test]
 fn socket_aliases_use_the_actual_parent_directory_before_binding() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("other/sub")).unwrap();
     std::os::unix::fs::symlink(root.join("other/sub"), root.join("link")).unwrap();
