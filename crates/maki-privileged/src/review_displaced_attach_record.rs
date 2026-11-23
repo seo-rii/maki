@@ -440,6 +440,65 @@ fn a_holder_that_is_not_a_mapping_keeps_the_record() {
     }
 }
 
+/// A device-mapper holder is attributed by its uuid. Only an LVM mapping of
+/// another VG is shown not to be the recorded attachment's: a crypt,
+/// multipath or partition mapping, a mapping without a uuid or one whose
+/// uuid is cut short could have been set up on the recorded VG's device.
+#[test]
+fn a_mapping_holder_that_is_not_another_volume_groups_keeps_the_record() {
+    for uuid in [
+        "",
+        "CRYPT-LUKS2-0f7c2b1a3d4e4f5a8b6c7d8e9f0a1b2c-nbd3_crypt",
+        "mpath-360000000000000000e00000000010001",
+        "part1-mpath-360000000000000000e00000000010001",
+        "LVM-bbbbbbbbbbccccddddeeeeffffgggggg",
+    ] {
+        let (mut host, state, stale, pg) = displaced(Holds::Proof, By::Client);
+        let mapping = host.sysfs.join("dm-9");
+        for directory in ["dm", "slaves", "holders"] {
+            std::fs::create_dir_all(mapping.join(directory)).unwrap();
+        }
+        std::fs::write(mapping.join("dm/name"), "held\n").unwrap();
+        std::fs::write(mapping.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+        std::fs::write(mapping.join("dev"), "253:9\n").unwrap();
+        std::fs::write(mapping.join("slaves/nbd3"), "").unwrap();
+        std::fs::write(host.nbd("/dev/nbd3").join("holders/dm-9"), "").unwrap();
+
+        assert_kept(
+            &mut host,
+            &state,
+            &stale,
+            &pg,
+            "dm-9 holds /dev/nbd3 and is not an LVM mapping of another volume group",
+            &format!("uuid {uuid:?}"),
+        );
+    }
+
+    // An internal mapping of another VG, a thin pool's data LV say, is that
+    // VG's like any other of its mappings.
+    let (mut host, state, _stale, pg) = displaced(Holds::Proof, By::Client);
+    let mapping = host.sysfs.join("dm-9");
+    for directory in ["dm", "slaves", "holders"] {
+        std::fs::create_dir_all(mapping.join(directory)).unwrap();
+    }
+    std::fs::write(mapping.join("dm/name"), "vg_other-pool_tdata\n").unwrap();
+    std::fs::write(
+        mapping.join("dm/uuid"),
+        format!(
+            "LVM-{}{}-tdata\n",
+            DB.vg_uuid.replace('-', ""),
+            DB.lv_uuid.replace('-', "")
+        ),
+    )
+    .unwrap();
+    std::fs::write(mapping.join("dev"), "253:9\n").unwrap();
+    std::fs::write(mapping.join("slaves/nbd3"), "").unwrap();
+    std::fs::write(host.nbd("/dev/nbd3").join("holders/dm-9"), "").unwrap();
+    cleanup_with(&plan_detach(&pg), &state, &mut host).unwrap();
+    assert!(host.commands.is_empty(), "{:?}", host.commands);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
 /// A mount at the recorded mountpoint, whatever its source, and a mount of
 /// a mapping of the recorded VG anywhere.
 #[test]
