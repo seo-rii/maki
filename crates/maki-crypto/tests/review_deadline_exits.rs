@@ -10,14 +10,19 @@
 //! did not count the expiry, and with batching the deadline counter missed
 //! every caller that received an endpoint error at its deadline.
 //!
-//! Every exit now returns the last endpoint error the operation received
-//! before its deadline, with that error's own class, or the deadline error
-//! when no endpoint failed it, and every operation that ended because its
-//! own deadline ran out counts once in `deadline_exceeded_total`, whatever
-//! it returned. A nested set's expiry is a failure of that peer: the nested
+//! Every exit now returns the last endpoint error that the request in
+//! progress received before the deadline, with that error's own class, or
+//! the deadline error when no endpoint failed that request. A request is one
+//! RPC batch with its retries and failovers: a call the set splits into
+//! several requests reports the current one, and a scheduler caller the
+//! request serving it; a failure that arrives at or after the caller's
+//! deadline is not its answer. Every operation that ended because its own
+//! deadline ran out counts once in `deadline_exceeded_total`, whatever it
+//! returned. A nested set's expiry is a failure of that peer: the nested
 //! set counts it, and neither the outer set nor a scheduler caller does.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +38,7 @@ use maki_crypto::{
 };
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::ManualClock;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 const UNIT: u32 = 256;
@@ -392,6 +398,53 @@ async fn an_operation_with_no_time_left_never_reaches_an_endpoint() {
     assert_eq!(only.encrypt_calls(), 0);
 }
 
+/// The set sends a call of two items as two RPC requests of one item, one
+/// after the other. The first request fails and its retry succeeds; the
+/// second is still running at the deadline. An endpoint failed this call,
+/// but not the request in progress: an earlier request that has since
+/// succeeded does not explain why the call is late, so it ends with the
+/// deadline error. A scheduler caller reports the same way
+/// (`scheduler_callers_report_only_the_dispatch_in_progress`).
+#[tokio::test]
+async fn a_split_call_reports_only_the_request_in_progress() {
+    let clock = Arc::new(ManualClock::new());
+    let only = scripted(
+        FakeCryptoProvider::new(UNIT).with_max_batch(1, u64::from(UNIT)),
+        vec![Step::Fail, Step::Serve, Step::Hang],
+    );
+    let set = set_of(
+        vec![("only", only.clone())],
+        DispatchConfig {
+            retry: RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            ..cfg()
+        },
+        clock.clone(),
+    );
+    let task = tokio::spawn({
+        let set = set.clone();
+        async move {
+            set.encrypt_batch(&ctx(COMPAT), &[pt(1, UNIT), pt(2, UNIT)])
+                .await
+                .map(drop)
+        }
+    });
+    settle().await;
+    // The first request failed and backs off for at most 10 ms.
+    assert_eq!(only.steps_left(), 2);
+    clock.advance(Duration::from_millis(10));
+    settle().await;
+    assert_eq!(only.steps_left(), 0, "the second request is not in flight");
+    assert_eq!(only.inner.encrypt_calls(), 1, "the retry did not succeed");
+    assert!(!task.is_finished());
+    clock.advance(DEADLINE - Duration::from_millis(10));
+    settle().await;
+    assert_deadline_error(finished(task).await);
+    assert_eq!(set.metrics().deadline_exceeded_total(), 1);
+}
+
 // ---------- through the batch scheduler ----------
 
 /// The serving stack: scheduler, optional random-prefix wrapper, set.
@@ -546,12 +599,40 @@ enum Step {
     Reject,
     Serve,
     Hang,
+    /// Wait until the test opens the endpoint's gate, then take this step.
+    Gated(Box<Step>),
 }
 
 /// An endpoint that answers each encrypt call with the next step.
 struct Scripted {
     inner: FakeCryptoProvider,
     steps: Mutex<VecDeque<Step>>,
+    gate: Notify,
+    /// Gated calls that got past the gate.
+    opened: AtomicUsize,
+}
+
+fn scripted(inner: FakeCryptoProvider, steps: Vec<Step>) -> Arc<Scripted> {
+    Arc::new(Scripted {
+        inner,
+        steps: Mutex::new(steps.into()),
+        gate: Notify::new(),
+        opened: AtomicUsize::new(0),
+    })
+}
+
+impl Scripted {
+    fn open(&self) {
+        self.gate.notify_one();
+    }
+
+    fn opened(&self) -> usize {
+        self.opened.load(Ordering::SeqCst)
+    }
+
+    fn steps_left(&self) -> usize {
+        self.steps.lock().unwrap().len()
+    }
 }
 
 #[async_trait]
@@ -565,7 +646,12 @@ impl CryptoProvider for Scripted {
         context: &CryptoContext,
         items: &[PlaintextUnit],
     ) -> Result<Vec<CiphertextUnit>, CryptoError> {
-        let step = self.steps.lock().unwrap().pop_front();
+        let mut step = self.steps.lock().unwrap().pop_front();
+        if let Some(Step::Gated(next)) = step {
+            self.gate.notified().await;
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            step = Some(*next);
+        }
         match step.expect("unscripted call") {
             Step::Fail => Err(failure()),
             Step::Reject => Err(CryptoError::NonRetryableRequest(
@@ -573,6 +659,7 @@ impl CryptoProvider for Scripted {
             )),
             Step::Serve => self.inner.encrypt_batch(context, items).await,
             Step::Hang => std::future::pending().await,
+            Step::Gated(_) => unreachable!("one gate per call"),
         }
     }
 
@@ -593,10 +680,10 @@ impl CryptoProvider for Scripted {
 #[tokio::test]
 async fn scheduler_callers_report_only_the_dispatch_in_progress() {
     let clock = Arc::new(ManualClock::new());
-    let only = Arc::new(Scripted {
-        inner: FakeCryptoProvider::new(UNIT).with_max_batch(1, u64::from(UNIT)),
-        steps: Mutex::new([Step::Fail, Step::Serve, Step::Hang].into()),
-    });
+    let only = scripted(
+        FakeCryptoProvider::new(UNIT).with_max_batch(1, u64::from(UNIT)),
+        vec![Step::Fail, Step::Serve, Step::Hang],
+    );
     let set = set_of(
         vec![("only", only.clone())],
         DispatchConfig {
@@ -641,6 +728,148 @@ async fn scheduler_callers_report_only_the_dispatch_in_progress() {
     assert_eq!(set.metrics().deadline_exceeded_total(), 0);
 }
 
+/// A scheduler caller whose task also reports how many gated calls of
+/// `gated` had got past the gate when the caller left.
+fn spawn_watched(
+    scheduler: Arc<BatchScheduler>,
+    unit: u64,
+    gated: Arc<Scripted>,
+) -> JoinHandle<(Result<(), CryptoError>, usize)> {
+    tokio::spawn(async move {
+        let result = scheduler
+            .encrypt_batch(&ctx(COMPAT), &[pt(unit, UNIT)])
+            .await;
+        (result.map(drop), gated.opened())
+    })
+}
+
+async fn left(task: JoinHandle<(Result<(), CryptoError>, usize)>) -> Result<(), CryptoError> {
+    assert!(
+        task.is_finished(),
+        "the caller did not leave at its deadline"
+    );
+    let (result, opened) = task.await.unwrap();
+    assert_eq!(
+        opened, 1,
+        "the gated call did not return before the caller's task ran"
+    );
+    result
+}
+
+/// The caller's batch is dispatched 40 ms into its 100 ms budget, so the
+/// dispatcher's own deadline is 40 ms after the caller's. The first
+/// endpoint's failure reaches the dispatcher at or after the caller's
+/// deadline, before the caller's task has run (the gate wakes the
+/// dispatcher before the clock wakes the caller). It arrived too late to be
+/// the caller's answer: nothing had failed the request before the
+/// deadline, so the caller leaves with the deadline error, as the
+/// dispatcher discards a result that arrives at its own deadline.
+#[tokio::test]
+async fn a_failure_after_a_scheduler_callers_deadline_is_not_its_answer() {
+    for delivered in [DEADLINE, DEADLINE + Duration::from_millis(20)] {
+        let clock = Arc::new(ManualClock::new());
+        let first = scripted(
+            FakeCryptoProvider::new(UNIT),
+            vec![Step::Gated(Box::new(Step::Fail))],
+        );
+        let second = scripted(FakeCryptoProvider::new(UNIT), vec![Step::Hang]);
+        let set = set_of(
+            vec![("first", first.clone()), ("second", second.clone())],
+            cfg(),
+            clock.clone(),
+        );
+        let scheduler = Arc::new(BatchScheduler::new(
+            set.clone(),
+            SchedulerConfig {
+                target_items: 8,
+                max_wait: Duration::from_millis(40),
+                max_inflight_batches: 1,
+                ..SchedulerConfig::default()
+            },
+            clock.clone(),
+        ));
+        let caller = spawn_watched(scheduler.clone(), 1, first.clone());
+        settle().await;
+        clock.advance(Duration::from_millis(40));
+        settle().await;
+        assert_eq!(first.steps_left(), 0, "the first RPC is not in flight");
+        first.open();
+        clock.set(delivered);
+        settle().await;
+        assert_eq!(second.steps_left(), 0, "the dispatcher did not fail over");
+        let result = left(caller).await;
+        assert_deadline_error(result);
+        assert_eq!(scheduler.stats().deadline_exceeded_total(), 1);
+        assert_eq!(
+            set.metrics().deadline_exceeded_total(),
+            0,
+            "delivered={delivered:?}: the dispatcher's own deadline has not passed"
+        );
+    }
+}
+
+/// The two callers' coalesced batch is sent as two RPC requests of one
+/// item. The first request fails, and its retry is still in flight at the
+/// callers' deadline, so that failure is their answer. The retry then
+/// succeeds and the second request starts, at or after the deadline and
+/// before the callers' tasks have run: that does not erase the answer.
+#[tokio::test]
+async fn a_request_started_after_a_scheduler_callers_deadline_keeps_its_answer() {
+    for delivered in [DEADLINE, DEADLINE + Duration::from_millis(20)] {
+        let clock = Arc::new(ManualClock::new());
+        let only = scripted(
+            FakeCryptoProvider::new(UNIT).with_max_batch(1, u64::from(UNIT)),
+            vec![Step::Fail, Step::Gated(Box::new(Step::Serve)), Step::Hang],
+        );
+        let set = set_of(
+            vec![("only", only.clone())],
+            DispatchConfig {
+                retry: RetryPolicy {
+                    initial_delay: Duration::from_millis(10),
+                    max_delay: Duration::from_millis(10),
+                },
+                ..cfg()
+            },
+            clock.clone(),
+        );
+        let scheduler = Arc::new(BatchScheduler::new(
+            set.clone(),
+            SchedulerConfig {
+                target_items: 8,
+                max_wait: Duration::from_millis(40),
+                max_inflight_batches: 1,
+                ..SchedulerConfig::default()
+            },
+            clock.clone(),
+        ));
+        let callers = [
+            spawn_watched(scheduler.clone(), 1, only.clone()),
+            spawn_watched(scheduler.clone(), 2, only.clone()),
+        ];
+        settle().await;
+        // Dispatch; the first request fails and backs off for at most 10 ms.
+        clock.advance(Duration::from_millis(40));
+        settle().await;
+        clock.advance(Duration::from_millis(10));
+        settle().await;
+        assert_eq!(only.steps_left(), 1, "the retry is not in flight");
+        only.open();
+        clock.set(delivered);
+        settle().await;
+        assert_eq!(only.steps_left(), 0, "the second request did not start");
+        assert_eq!(scheduler.stats().coalesced_batches_total(), 1);
+        for caller in callers {
+            assert_endpoint_error(left(caller).await);
+        }
+        assert_eq!(
+            scheduler.stats().deadline_exceeded_total(),
+            2,
+            "delivered={delivered:?}"
+        );
+        assert_eq!(set.metrics().deadline_exceeded_total(), 0);
+    }
+}
+
 /// A request-specific rejection of a coalesced batch re-sends each request
 /// alone. Each retry fails on the first endpoint and its failover never
 /// answers: each caller leaves at its deadline with its own retry's
@@ -648,14 +877,11 @@ async fn scheduler_callers_report_only_the_dispatch_in_progress() {
 #[tokio::test]
 async fn scheduler_callers_resent_alone_report_their_own_dispatch() {
     let clock = Arc::new(ManualClock::new());
-    let scripted = |steps: Vec<Step>| {
-        Arc::new(Scripted {
-            inner: FakeCryptoProvider::new(UNIT),
-            steps: Mutex::new(steps.into()),
-        })
-    };
-    let first = scripted(vec![Step::Reject, Step::Fail, Step::Fail]);
-    let second = scripted(vec![Step::Hang, Step::Hang]);
+    let first = scripted(
+        FakeCryptoProvider::new(UNIT),
+        vec![Step::Reject, Step::Fail, Step::Fail],
+    );
+    let second = scripted(FakeCryptoProvider::new(UNIT), vec![Step::Hang, Step::Hang]);
     let set = set_of(
         vec![("first", first.clone()), ("second", second.clone())],
         cfg(),
