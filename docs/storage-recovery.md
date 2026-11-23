@@ -75,6 +75,14 @@ access, or workload start. A record with neither the proof nor the new intent
 retains the legacy fail-closed behavior. Topologies over the bounded record or
 inventory limits are rejected.
 
+LVM reads the volume group from the NBD device to run that command, so a
+connected intent can be consumed only while the daemon still serves the
+device. The packaged attach unit's failed-start hook therefore consumes it
+before the recovery coordinator stops the daemon. When the daemon stopped
+serving first, cleanup refuses, keeps the record and the mapping, and the
+operations guide gives the
+[manual step](operations.md#interrupted-activation-after-the-daemon-stopped).
+
 ## Checking LVM before activation
 
 After connecting the recorded NBD backend, attach checks its kernel device

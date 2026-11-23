@@ -3,9 +3,29 @@
 //! workload. systemd supplies the *main* (ExecStart) process's exit status here.
 //! A cancelled oneshot start can also have a failed main-process status, so the
 //! hook additionally requires the manager's original start job to be running.
+//!
+//! On that evidence the hook queues the recovery coordinator and then, while
+//! the daemon is still running, finishes the one rollback the coordinator
+//! cannot do after it stopped the daemon: that of an LVM activation whose
+//! helper died before it recorded the mapping.
 
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(any(target_os = "linux", test))]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+
+/// How long the hook waits for processes the failed start left in the unit's
+/// control group, and how long the rollback may then take. Together they
+/// must stay well inside the unit's `TimeoutStopSec`, which bounds this hook,
+/// and inside the coordinator's `JobTimeoutSec`, which includes waiting for it.
+#[cfg(any(target_os = "linux", test))]
+const SETTLE_WAIT: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "linux", test))]
+const ROLLBACK_BUDGET: Duration = Duration::from_secs(30);
 
 fn failed_main_process(result: Option<&str>, code: Option<&str>, status: Option<&str>) -> bool {
     if !matches!(
@@ -55,6 +75,129 @@ fn running_start_job(jobs: &str, unit: &str) -> bool {
         && fields.next().is_none()
 }
 
+/// The control group directory of this process on the unified hierarchy, if
+/// it is `unit`'s own. `proc_cgroup` is the text of `/proc/self/cgroup`.
+#[cfg(any(target_os = "linux", test))]
+fn unit_cgroup(proc_cgroup: &str, unit: &str) -> Option<PathBuf> {
+    let path = proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::/"))?;
+    if path
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+        || path.rsplit('/').next() != Some(unit)
+    {
+        return None;
+    }
+    Some(PathBuf::from("/sys/fs/cgroup").join(path))
+}
+
+/// Whether a `cgroup.procs` listing names a process other than `own`. `None`
+/// when the listing is not what the kernel writes, or does not contain `own`.
+#[cfg(any(target_os = "linux", test))]
+fn other_processes(cgroup_procs: &str, own: u32) -> Option<bool> {
+    let mut found_own = false;
+    let mut others = false;
+    for line in cgroup_procs.lines() {
+        if !line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        match line.parse::<u32>().ok()? {
+            pid if pid == own => found_own = true,
+            _ => others = true,
+        }
+    }
+    found_own.then_some(others)
+}
+
+/// Wait until this hook is the only process left in the attach unit's control
+/// group. systemd starts ExecStopPost as soon as the failed helper is gone,
+/// while a command it had started (a `vgchange` that defers signals until it
+/// has finished activating) can still be running; with `KillMode=control-group`
+/// it stays in this group. Rolling back around a command that is still
+/// changing the same devices would race it, so anything but a settled group,
+/// including one that cannot be read, leaves the cleanup to the coordinator.
+#[cfg(target_os = "linux")]
+fn unit_settled(unit: &str, wait: Duration) -> bool {
+    let Some(listing) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|text| unit_cgroup(&text, unit))
+        .map(|directory| directory.join("cgroup.procs"))
+    else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        let others = std::fs::read_to_string(&listing)
+            .ok()
+            .and_then(|text| other_processes(&text, std::process::id()));
+        match others {
+            Some(false) => return true,
+            Some(true) if started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The detach plan `maki-attach cleanup --volume <volume>` would run: the
+/// trusted default configuration when it exists, built-in defaults otherwise.
+#[cfg(target_os = "linux")]
+fn detach_plan(volume: &str) -> Result<maki_privileged::plan::Plan, String> {
+    use maki_privileged::config::{self, AttachConfig, AttachOverrides};
+    let path = PathBuf::from(config::default_path(volume));
+    let config = if path.exists() {
+        maki_privileged::exec::load_trusted_config(&path)?
+    } else {
+        AttachConfig::default()
+    };
+    let request = config
+        .into_existing_request(volume, AttachOverrides::default(), false)
+        .map_err(|error| error.to_string())?;
+    Ok(maki_privileged::plan::plan_detach(&request))
+}
+
+/// A line for the journal. `eprintln!` panics when the write fails, and
+/// nothing here may end the hook before it returns its result.
+#[cfg(target_os = "linux")]
+fn report(message: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "maki-attach: {message}");
+}
+
+/// Roll back an LVM activation the failed helper did not live to record,
+/// while the daemon still serves the device. The coordinator is already
+/// queued and runs its cleanup whatever happens here, so every failure is
+/// only reported.
+#[cfg(target_os = "linux")]
+fn finish_interrupted_activation(volume: &str, attach: &str) {
+    if !unit_settled(attach, SETTLE_WAIT) {
+        report(format_args!(
+            "processes of the failed start are still running, or the control group of {attach} \
+             cannot be read; leaving all cleanup to the recovery coordinator"
+        ));
+        return;
+    }
+    let outcome = detach_plan(volume).and_then(|plan| {
+        maki_privileged::exec::finish_interrupted_activation(
+            &plan,
+            Instant::now() + ROLLBACK_BUDGET,
+        )
+        .map_err(|error| error.to_string())
+    });
+    match outcome {
+        Ok(true) => report(format_args!(
+            "rolled back the interrupted LVM activation of volume {volume}"
+        )),
+        Ok(false) => {}
+        Err(error) => report(format_args!(
+            "could not roll back an interrupted LVM activation of volume {volume}: {error}; \
+             the recovery coordinator retries cleanup after it stopped the daemon"
+        )),
+    }
+}
+
 pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
     maki_privileged::config::check_instance_name(volume).map_err(|error| error.to_string())?;
     let result = std::env::var("SERVICE_RESULT").ok();
@@ -70,7 +213,10 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
     if plan_only {
         return crate::print_plan(&format!(
             "# would schedule {unit} only if the manager still has the original attach start job running\n\
-             # coordinator stops workloads before identity-checked cleanup\n"
+             # coordinator stops workloads before identity-checked cleanup\n\
+             # would then roll back an interrupted LVM activation (a record holding only the \
+             activation intent, on its own connection) while the daemon still serves the \
+             device: scoped VG deactivation, then NBD disconnect; never unmounts\n"
         ));
     }
     #[cfg(target_os = "linux")]
@@ -102,16 +248,17 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
             return Ok(());
         }
 
-        // Never run cleanup here. The coordinator first stops registered
-        // workloads, then cleans up, and starts a new lifecycle only on success.
-        // Waiting for its job would deadlock: it is ordered after this hook.
-        // The original start job remains installed until ExecStopPost ends, so
-        // the coordinator's Conflicts= stop job must replace it. This is not an
-        // atomic compare-and-replace: an operator stop between the read above
-        // and this enqueue can still be replaced. Deliberately interrupting
-        // recovery requires masking the coordinator before stopping it and the
-        // workload target. Do not use replace-irreversibly here.
-        let status = Command::new("/usr/bin/systemctl")
+        // Never run the general cleanup here. The coordinator first stops
+        // registered workloads, then cleans up, and starts a new lifecycle only
+        // on success. Waiting for its job would deadlock: it is ordered after
+        // this hook. The original start job remains installed until
+        // ExecStopPost ends, so the coordinator's Conflicts= stop job must
+        // replace it. This is not an atomic compare-and-replace: an operator
+        // stop between the read above and this enqueue can still be replaced.
+        // Deliberately interrupting recovery requires masking the coordinator
+        // before stopping it and the workload target. Do not use
+        // replace-irreversibly here.
+        let scheduled = Command::new("/usr/bin/systemctl")
             .args([
                 "--no-ask-password",
                 "--no-block",
@@ -120,13 +267,23 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
                 &unit,
             ])
             .status()
-            .map_err(|error| format!("cannot schedule failed-start recovery: {error}"))?;
-        if !status.success() {
-            return Err(
-                "failed-start recovery job was not accepted; inspect the stopped lifecycle".into(),
-            );
-        }
-        Ok(())
+            .map_err(|error| format!("cannot schedule failed-start recovery: {error}"))
+            .and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(
+                        "failed-start recovery job was not accepted; inspect the stopped lifecycle"
+                            .into(),
+                    )
+                }
+            });
+        // Queue first, roll back second: if this process is killed or runs
+        // into the stop timeout below, the coordinator is already on its way.
+        // Its stop of the daemon is ordered after this unit's stop job, which
+        // cannot finish before this hook does, so the daemon is still serving.
+        finish_interrupted_activation(volume, &attach);
+        scheduled
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -136,9 +293,69 @@ pub(super) fn run(volume: &str, plan_only: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{failed_main_process, running_start_job};
+    use super::{
+        failed_main_process, other_processes, running_start_job, unit_cgroup, ROLLBACK_BUDGET,
+        SETTLE_WAIT,
+    };
+    use std::path::Path;
 
     const ATTACH: &str = "maki-attach@recovery-fixture.service";
+
+    #[test]
+    fn only_the_attach_units_own_unified_control_group_is_inspected() {
+        let own = format!("/system.slice/system-maki\\x2dattach.slice/{ATTACH}");
+        assert_eq!(
+            unit_cgroup(&format!("0::{own}\n"), ATTACH).as_deref(),
+            Some(Path::new(&format!("/sys/fs/cgroup{own}")))
+        );
+        for listing in [
+            String::new(),
+            // A legacy or hybrid hierarchy has no usable unified entry.
+            format!("1:name=systemd:{own}\n"),
+            "0::/\n".into(),
+            // Another unit's group, a session scope, or a sub-group.
+            "0::/system.slice/maki-attach@other.service\n".into(),
+            "0::/user.slice/user-0.slice/session-3.scope\n".into(),
+            format!("0::{own}/payload\n"),
+            format!("0::/system.slice/../{ATTACH}\n"),
+            format!("0::/system.slice//{ATTACH}\n"),
+            format!("0::{ATTACH}\n"),
+        ] {
+            assert_eq!(unit_cgroup(&listing, ATTACH), None, "{listing:?}");
+        }
+    }
+
+    #[test]
+    fn a_control_group_is_settled_only_when_this_hook_is_alone_in_it() {
+        assert_eq!(other_processes("4242\n", 4242), Some(false));
+        assert_eq!(other_processes("17\n4242\n", 4242), Some(true));
+        assert_eq!(other_processes("4242\n4243\n", 4242), Some(true));
+        // Evidence that is empty, malformed or about other processes only
+        // is not proof of a settled group.
+        for listing in ["", "17\n", "4242 \n", "+4242\n", "pid\n4242\n"] {
+            assert_eq!(other_processes(listing, 4242), None, "{listing:?}");
+        }
+    }
+
+    /// The unit's stop timeout bounds this hook, and the coordinator's job
+    /// timeout includes the wait for it. The rollback gives up long before
+    /// either: a command the deadline ends is killed within about two
+    /// seconds more.
+    #[test]
+    fn the_rollback_budget_fits_the_packaged_timeouts() {
+        let seconds = |unit: &str, key: &str| -> u64 {
+            unit.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key}"))
+                .parse()
+                .unwrap()
+        };
+        let attach = include_str!("../../../packaging/systemd/maki-attach@.service");
+        let recovery = include_str!("../../../packaging/systemd/maki-recover@.service");
+        let budget = (SETTLE_WAIT + ROLLBACK_BUDGET).as_secs();
+        assert!(2 * budget <= seconds(attach, "TimeoutStopSec="));
+        assert!(4 * budget <= seconds(recovery, "JobTimeoutSec="));
+    }
 
     #[test]
     fn failed_main_processes_require_manager_job_confirmation() {

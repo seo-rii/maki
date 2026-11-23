@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -233,12 +234,38 @@ impl TrustedState {
         Ok(Self { directory, owner })
     }
 
-    pub fn lock(&self) -> io::Result<StateLock> {
+    fn lock_file(&self) -> io::Result<File> {
         let name = CString::new("attach.lock").unwrap();
         let file = openat(&self.directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
         private_regular_file(&file, self.owner)?;
+        Ok(file)
+    }
+
+    pub fn lock(&self) -> io::Result<StateLock> {
+        let file = self.lock_file()?;
         file.lock()?;
         Ok(StateLock(file))
+    }
+
+    /// Take the lock, but give up at `deadline` rather than queue behind
+    /// another helper for as long as that one runs.
+    pub fn lock_until(&self, deadline: Instant) -> io::Result<StateLock> {
+        let file = self.lock_file()?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(StateLock(file)),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the attach lock is held by another helper",
+                    ));
+                }
+            }
+        }
     }
 
     /// Verification joins the same exclusive lock without creating a file.

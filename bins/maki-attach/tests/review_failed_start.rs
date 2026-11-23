@@ -35,6 +35,26 @@ fn failed_start_plan_uses_the_workload_coordinator_without_configuration() {
     }
 }
 
+/// `maki-recover@` stops the daemon before its cleanup, and an activation
+/// whose helper died before recording the mapping can only be deactivated
+/// through LVM, which reads the volume group from the NBD device. The hook
+/// therefore finishes that rollback itself, while the daemon still serves it.
+#[test]
+fn failed_start_plan_finishes_an_interrupted_activation_before_the_daemon_stops() {
+    let output = plan("timeout", "killed", "TERM");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("roll back an interrupted LVM activation"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("while the daemon still serves the device"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("never unmounts"), "{stdout}");
+}
+
 #[test]
 fn successful_main_or_unknown_result_plans_do_not_restart() {
     for (result, code, status) in [

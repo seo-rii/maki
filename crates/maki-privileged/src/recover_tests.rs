@@ -331,6 +331,81 @@ fn connected_detach_rechecks_the_backend_before_intent_deactivation() {
     assert_eq!(state.read("pg").unwrap(), Some(record));
 }
 
+/// The hook's rollback carries no unmount step at all. Even an observer that
+/// reported a mount for an activation intent (the production one refuses
+/// that state outright) could only stop it.
+#[test]
+fn the_failed_start_rollback_has_no_unmount_to_run() {
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.mounted = true;
+
+    let result = finish_interrupted_activation_with(&plan_detach(&req), &state, &mut system.fake);
+
+    assert!(result.is_err(), "{result:?}");
+    assert!(system.fake.steps.is_empty(), "{:?}", system.fake.steps);
+    assert!(system.fake.mounted && system.fake.vg_active);
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    system.fake.mounted = false;
+    assert!(finish_interrupted_activation_with(&plan_detach(&req), &state, &mut system).unwrap());
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    assert_eq!(system.fake.scoped_lvm_deactivations, 1);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+/// The hook must neither queue behind another volume's helper when it has
+/// nothing to do, nor hold up the coordinator beyond its deadline when it has.
+#[test]
+fn the_failed_start_rollback_queues_for_the_attach_lock_only_with_an_intent() {
+    let (_fixture, state, req, mut system) = attached();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    let busy = state.lock().unwrap();
+    let patient = || Instant::now() + Duration::from_secs(3);
+    let started = Instant::now();
+
+    // A complete attachment, then no record at all: not this path's.
+    assert!(!finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    state.remove("pg").unwrap();
+    assert!(!finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(system.fake.steps.is_empty());
+
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    drop(busy);
+    let busy = state.lock().unwrap();
+    let started = Instant::now();
+    let soon = started + Duration::from_millis(150);
+    let error = finish_interrupted_activation_by(&plan, &state, &mut system, soon).unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Io(error) if error.kind() == io::ErrorKind::TimedOut),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(system.fake.steps.is_empty());
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    drop(busy);
+    assert!(finish_interrupted_activation_by(&plan, &state, &mut system, patient()).unwrap());
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
 #[test]
 fn connected_detach_cleans_a_verified_partial_activation() {
     let (fixture, state, req, mut system) = activation_crashed();
@@ -507,6 +582,39 @@ fn cleanup_does_not_fallback_when_lvm_did_not_return_a_nonzero_status() {
 
     assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
     assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+/// A `vgchange` that a signal terminated never reported whether it could
+/// deactivate the volume group, and may have stopped halfway. Only LVM's own
+/// nonzero exit lets cleanup remove the mapping directly; the next cleanup
+/// runs LVM again.
+#[test]
+fn cleanup_does_not_fallback_when_lvm_was_killed_by_a_signal() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.signalled_at = Some("lvm-deactivate");
+
+    let error = cleanup_with(&plan_detach(&req), &state, &mut system).unwrap_err();
+
+    assert!(error.to_string().contains("status None"), "{error}");
+    assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
+    assert!(system.fake.vg_active, "the mapping was removed directly");
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    // LVM exits this time: nonzero enters the fallback as before.
+    system.fake.signalled_at = None;
+    system.fake.nonzero_at = Some("lvm-deactivate");
+    system.fake.steps.clear();
+    cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+    assert_eq!(
+        system.fake.steps,
+        ["lvm-deactivate", "dm-proof-deactivate", "nbd-disconnect"]
+    );
+    assert!(state.read("pg").unwrap().is_none());
 }
 
 #[test]

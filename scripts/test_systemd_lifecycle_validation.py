@@ -174,6 +174,37 @@ class SystemdLifecycleFixtureTests(unittest.TestCase):
             self.verify_events("exit-once", (*first, *retry), "active")
         self.verify_events("exit-once", (*first, "daemon-ready", *retry), "active")
 
+    def test_daemon_outlives_the_attach_units_stop_phase(self):
+        # The failed-start hook queues the coordinator and then rolls back an
+        # interrupted activation, for which LVM needs the daemon serving.
+        failed = (*READY_DAEMON, "attach-start")
+        recovered = ("cleanup-recover", "cleanup-complete", *READY_DAEMON,
+                     "attach-start", "attach-ready", "workload-start")
+        for mode in ("exit-once", "timeout-once", "kill-once"):
+            with self.subTest(mode=mode):
+                self.verify_events(mode, (*failed, "stop-post-end", "daemon-stop", *recovered), "active")
+                with self.assertRaisesRegex(AssertionError, "stop phase"):
+                    self.verify_events(mode, (*failed, "daemon-stop", "stop-post-end", *recovered), "active")
+        stopped = (*READY_DAEMON, "attach-start", "attach-ready", "workload-start",
+                   "workload-stop", "cleanup-stop", "cleanup-complete")
+        self.verify_events("normal-stop", (*stopped, "stop-post-end", "daemon-stop"), "inactive")
+        with self.assertRaisesRegex(AssertionError, "stop phase"):
+            self.verify_events("normal-stop", (*stopped, "daemon-stop", "stop-post-end"), "inactive")
+
+    def test_stop_phase_marker_follows_the_real_hook(self):
+        units = fixture.fixture_units("mkci_fixture", Path("/tmp/private"), Path("/tmp/helper"))
+        post = [line for line in units[fixture.names("mkci_fixture")["attach"]].splitlines()
+                if line.startswith("ExecStopPost=")]
+        self.assertEqual(len(post), 2)
+        self.assertIn("recover-failed-start --volume mkci_fixture", post[0])
+        self.assertTrue(post[1].endswith(' "actor" "/tmp/private" stop-post-end'), post[1])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "mode").write_text("exit-once")
+            self.assertEqual(fixture.actor(directory, "stop-post-end"), 0)
+            self.assertEqual([record["event"] for record in
+                              fixture.Fixture.events(Mock(directory=directory))], ["stop-post-end"])
+
     def test_workload_requires_readiness_from_its_own_attachment(self):
         for trace in (
             ("attach-start", "cleanup-recover", "cleanup-complete",

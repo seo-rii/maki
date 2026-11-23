@@ -298,6 +298,31 @@ impl Drop for PausedChild {
     }
 }
 
+/// The failed-start hook must not queue behind another volume's helper for
+/// as long as that one runs: its lock attempt ends at its deadline, and
+/// succeeds once the lock is free.
+#[test]
+fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let held = state.lock().unwrap();
+    let started = Instant::now();
+    let error = state
+        .lock_until(started + Duration::from_millis(150))
+        .err()
+        .expect("the lock is held");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(held);
+    let lock = state.lock_until(Instant::now()).unwrap();
+    assert!(
+        state.lock_until(Instant::now()).is_err(),
+        "a bounded attempt took a lock that is held"
+    );
+    drop(lock);
+}
+
 /// The attach lock is a `flock` on `attach.lock`, which belongs to the open
 /// file description. A command forked meanwhile shares that description until
 /// its `exec`; when releasing only closed the helper's descriptor, the next
