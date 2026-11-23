@@ -15,6 +15,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/shared_dir.rs"]
+mod shared_dir;
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -99,15 +102,22 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A directory every user can search, holding a copy of the binary that
-    /// every user can run (the build tree may sit below a private home).
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// A directory every user can reach, holding a copy of the binary that
+    /// every user can run (the build tree may sit below a private home, and
+    /// so may `TMPDIR`). `None`, after saying why `test` is skipped, where
+    /// no such directory can be made.
+    fn new(test: &str) -> Option<Self> {
+        let dir = match shared_dir::tempdir() {
+            Ok(dir) => dir,
+            Err(reason) => {
+                eprintln!("{test}: skipped: {reason}");
+                return None;
+            }
+        };
         let binary = dir.path().join("maki-witness");
         std::fs::copy(env!("CARGO_BIN_EXE_maki-witness"), &binary).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { dir, binary }
+        Some(Self { dir, binary })
     }
 
     fn write(&self, loader: &Loader, owner: u32, mode: u32) -> PathBuf {
@@ -174,7 +184,11 @@ fn a_configuration_owned_by_another_user_is_refused_by_every_loader() {
         return;
     }
     let _serial = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let Some(fixture) =
+        Fixture::new("a_configuration_owned_by_another_user_is_refused_by_every_loader")
+    else {
+        return;
+    };
     for loader in loaders() {
         // The owner can make any mode writable again, so none is safe.
         for mode in [0o644, 0o600, 0o400] {
@@ -195,7 +209,9 @@ fn root_owned_and_own_configurations_still_load() {
         return;
     }
     let _serial = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = Fixture::new();
+    let Some(fixture) = Fixture::new("root_owned_and_own_configurations_still_load") else {
+        return;
+    };
     for loader in loaders() {
         // A root-owned file, readable by the service user, is the usual
         // layout; a service user may also load a file it owns. Group and

@@ -1,6 +1,9 @@
 //! BUG-061: an existing outer COW capacity is immutable configuration geometry.
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use maki_backing::remote_witness::{Phase, StateStore};
 use maki_backing::{Backing, RollbackBacking};
 use maki_format::config::VolumeConfig;
@@ -244,7 +247,7 @@ struct Remote {
 impl Remote {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir().unwrap();
+        let witness = private_dir::tempdir().unwrap();
         let tls = tempfile::tempdir().unwrap();
         let key = write_key(directory.path());
         let server_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
