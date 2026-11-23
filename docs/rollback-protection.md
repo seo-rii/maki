@@ -125,6 +125,22 @@ old backing attach.
 
 ### Resume interrupted initial enrollment
 
+Which command continues an interrupted `maki volume create` depends on how far
+it got. Creation writes the format marker as `rollback.format.next`, syncs it,
+renames it to `rollback.format` and syncs the directory, and it asks the
+authority for a claim only after the marker and the binding are durable. A
+backing root without `rollback.format` (it holds `remote.enroll.lock`,
+`remote.operation.lock` and possibly `rollback.format.next`) is a creation
+that published nothing and claimed nothing, whether it was killed, lost power
+or failed on a full disk: run `maki volume create` again as before. An older
+binary wrote the marker in place; a root in which it left `rollback.format`
+empty or partly written beside nothing but those lock files is completed by
+`volume create` the same way. Nothing has to be removed by hand, and
+`resume-enrollment` refuses such a root with a message that says to create
+the volume again. Once `rollback.format` holds the marker, `volume create`
+refuses the root (`remote enrollment requires an empty backing`) and the
+procedure below continues it.
+
 Keep the volume detached and automatic restarts disabled. Preserve the failed
 backing and inspect the independently managed authority:
 

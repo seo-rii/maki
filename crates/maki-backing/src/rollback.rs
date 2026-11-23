@@ -33,6 +33,9 @@ const PAGE: u64 = 4096;
 const MAX_CAPACITY: u64 = 1 << 30;
 const MAX_ENTRIES: usize = 4096;
 const MARKER: &str = "rollback.format";
+/// The remote format marker while a creation writes it, before it is renamed
+/// into place (`remote::initialize_remote_root`).
+const MARKER_NEXT: &str = "rollback.format.next";
 const MAGIC: &[u8] = b"MAKI-WITNESS-COW-V1\n";
 const LOCK: &str = "rollback.lock";
 const ENROLL_LOCK: &str = "remote.enroll.lock";
@@ -273,7 +276,7 @@ impl RollbackBacking {
         if remote {
             matches!(
                 name,
-                MARKER | ENROLL_LOCK | gc::OPERATION_LOCK | enrollment::FILE
+                MARKER | MARKER_NEXT | ENROLL_LOCK | gc::OPERATION_LOCK | enrollment::FILE
             ) || gc::namespace_fence(name.strip_prefix(gc::TOMBSTONE).unwrap_or(name)).is_some()
         } else {
             matches!(name, MARKER | ARENA | LOCK) || MANIFESTS.contains(&name)

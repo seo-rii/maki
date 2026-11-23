@@ -231,12 +231,18 @@ fn create_killed_before_the_marker_is_written_can_be_completed() {
             && left.iter().any(|name| name == "remote.operation.lock"),
         "{left:?}"
     );
+    // The marker it was writing is not under its published name.
+    assert!(
+        !left.iter().any(|name| name == "rollback.format"),
+        "{left:?}"
+    );
     let refusals = documented_commands(&root);
     assert!(
         refusals.is_empty(),
         "a creation killed before its marker was written is stranded with {left:?}: {refusals:?}"
     );
     assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+    assert!(!root.join("rollback.format.next").exists());
 }
 
 #[test]
@@ -258,6 +264,8 @@ fn create_whose_marker_write_failed_can_be_retried() {
         "the marker write must have failed: {failed:?}"
     );
     let left = entries(&root);
+    // The failed command removed the marker it could not write.
+    assert_eq!(left, ["remote.enroll.lock", "remote.operation.lock"]);
     let refusals = documented_commands(&root);
     assert!(
         refusals.is_empty(),
@@ -299,6 +307,93 @@ fn create_completes_a_root_whose_marker_was_created_and_never_written() {
             .unwrap();
         assert_eq!(&bytes, b"kept");
     }
+}
+
+/// A creation stages the marker as `rollback.format.next` and renames it
+/// into place once it is synced. Whatever an interrupted creation left
+/// under that name is written again, never published as it is.
+#[test]
+fn create_completes_a_root_that_holds_only_a_staged_marker() {
+    assert!(RollbackBacking::owns_host_entry(
+        "rollback.format.next",
+        true
+    ));
+    for staged in [&[][..], &MARKER[..11], b"anything else at all, and longer"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = locked_root(dir.path());
+        std::fs::write(root.join("rollback.format.next"), staged).unwrap();
+        let (writer, _) = authority();
+        RollbackBacking::create_remote(&root, writer, CAPACITY)
+            .unwrap_or_else(|error| panic!("staged {staged:?}: {error}"));
+        assert_eq!(std::fs::read(root.join("rollback.format")).unwrap(), MARKER);
+        assert!(!root.join("rollback.format.next").exists());
+    }
+}
+
+/// Enrollment recovery continues a published root. For one whose creation
+/// stopped earlier it says which command does, and changes nothing.
+#[test]
+fn enrollment_recovery_sends_an_unpublished_root_back_to_creation() {
+    type Plant = fn(&Path);
+    let unpublished: [Plant; 3] = [
+        |_| {},
+        |root| std::fs::write(root.join("rollback.format.next"), b"").unwrap(),
+        |root| std::fs::write(root.join("rollback.format"), b"").unwrap(),
+    ];
+    for plant in unpublished {
+        let dir = tempfile::tempdir().unwrap();
+        let root = locked_root(dir.path());
+        plant(&root);
+        let before = entries(&root);
+        let (_, admin) = authority();
+        let record = inspect(admin.as_ref());
+        let error =
+            RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+                .err()
+                .unwrap();
+        assert!(
+            error.to_string().contains("create the volume again"),
+            "{before:?}: {error}"
+        );
+        assert_eq!(entries(&root), before);
+        assert_eq!(inspect(admin.as_ref()), record);
+    }
+    // Anything else keeps its own refusal: a root that holds more than an
+    // interrupted creation leaves,
+    let dir = tempfile::tempdir().unwrap();
+    let root = locked_root(dir.path());
+    std::fs::write(root.join("rollback.format"), b"").unwrap();
+    std::fs::write(root.join("notes"), b"operator").unwrap();
+    let (_, admin) = authority();
+    let record = inspect(admin.as_ref());
+    let error = RollbackBacking::recover_enrollment_remote(&root, admin, CAPACITY, &record)
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "not a remote rollback backing");
+    // and a root without a marker under an authority that is claimed, which
+    // no creation that stopped before its marker can have done.
+    let dir = tempfile::tempdir().unwrap();
+    let root = locked_root(dir.path());
+    std::fs::write(root.join("rollback.format"), b"").unwrap();
+    let (writer, admin) = authority();
+    let released = inspect(admin.as_ref());
+    let claimed = writer
+        .call(&Request {
+            operation_id: [1; 16],
+            expected: Some(released),
+            action: Action::Claim,
+            authorization: Some(
+                maki_backing::remote_witness::SessionAuthorization::from_bytes([9; 32]),
+            ),
+        })
+        .unwrap();
+    assert_eq!(claimed.phase, Phase::Claimed);
+    let error =
+        RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &claimed)
+            .err()
+            .unwrap();
+    assert_eq!(error.to_string(), "not a remote rollback backing");
+    assert_eq!(inspect(admin.as_ref()), claimed);
 }
 
 /// Once the marker is published the root is a remote backing whose

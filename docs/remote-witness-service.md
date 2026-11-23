@@ -519,9 +519,11 @@ investigation.
 
 If activation actually succeeded, use exact-current takeover and inspect the
 selected state. This command does not reset it or automatically finish inner
-volume initialization that stopped after outer activation. See
+volume initialization that stopped after outer activation. A creation that
+stopped before it published `rollback.format` claimed nothing and is not
+resumed this way: run `maki volume create` again. See
 [enrollment recovery](rollback-protection.md#resume-interrupted-initial-enrollment)
-for the compatibility and initialization limits.
+for both cases and the compatibility and initialization limits.
 
 ## Retire old writer namespaces
 
