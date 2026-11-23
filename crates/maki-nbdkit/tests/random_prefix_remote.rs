@@ -13,8 +13,8 @@ use tokio::sync::oneshot;
 const LOGICAL_UNIT: usize = 1024;
 const PREFIX: usize = 32;
 const RAW_UNIT: usize = LOGICAL_UNIT + PREFIX;
-const MAX_CIPHERTEXT: usize = RAW_UNIT + 28;
-const RAW_BATCH_BYTES: usize = 2 * RAW_UNIT;
+/// AES-GCM-SIV's 12-byte nonce and 16-byte tag.
+const GCM_SIV_OVERHEAD: usize = 28;
 const BASE_PROFILE: &str = "prefix-test-v1";
 const OUTER_PROFILE: &str = "maki-random-prefix-v1:32:prefix-test-v1";
 
@@ -38,6 +38,13 @@ struct WsFixture {
 
 impl WsFixture {
     async fn start(seed: u8) -> Self {
+        Self::serve(seed, RAW_UNIT, true).await
+    }
+
+    /// A WebSocket endpoint running AES-GCM-SIV for `unit`-byte plaintext.
+    /// Without `binds_profile` it decrypts under its own profile whatever
+    /// profile a request names, while the volume declares context binding.
+    async fn serve(seed: u8, unit: usize, binds_profile: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -48,7 +55,7 @@ impl WsFixture {
             let mut keys = MapKeySource::new();
             keys.insert("fixture", vec![seed; 32]);
             let provider = Arc::new(
-                AesGcmSivProvider::new(&keys, "fixture", RAW_UNIT as u32, BASE_PROFILE).unwrap(),
+                AesGcmSivProvider::new(&keys, "fixture", unit as u32, BASE_PROFILE).unwrap(),
             );
             ready_tx.send(()).unwrap();
             let mut connections = tokio::task::JoinSet::new();
@@ -74,7 +81,11 @@ impl WsFixture {
                         let context = CryptoContext {
                             volume_uuid: request["volume"].as_str().unwrap().parse().unwrap(),
                             format_version: request["format"].as_u64().unwrap() as u32,
-                            crypto_compatibility_id: request["profile"].as_str().unwrap().into(),
+                            crypto_compatibility_id: if binds_profile {
+                                request["profile"].as_str().unwrap().into()
+                            } else {
+                                BASE_PROFILE.into()
+                            },
                         };
                         let mut captured = Vec::new();
                         for item in request["items"].as_array().unwrap() {
@@ -187,6 +198,25 @@ impl Drop for WsFixture {
 }
 
 fn config(root: &str, first: &WsFixture, second: &WsFixture) -> String {
+    config_for(root, &[first, second], PREFIX)
+}
+
+/// A volume served by `endpoints` ("first", "second", ...) with a `prefix`-byte
+/// random prefix (zero disables it).
+fn config_for(root: &str, endpoints: &[&WsFixture], prefix: usize) -> String {
+    let raw_unit = LOGICAL_UNIT + prefix;
+    let max_ciphertext = raw_unit + GCM_SIV_OVERHEAD;
+    let raw_batch_bytes = 2 * raw_unit;
+    let endpoints: String = endpoints
+        .iter()
+        .zip(["first", "second"])
+        .map(|(endpoint, name)| {
+            format!(
+                "[[crypto.websocket.endpoint]]\nname = \"{name}\"\nurl = \"{}\"\n",
+                endpoint.url
+            )
+        })
+        .collect();
     format!(
         r#"config_schema_version = 1
 [volume]
@@ -198,33 +228,26 @@ shard_logical_size = "64KiB"
 [crypto]
 provider = "remote-websocket"
 crypto_compatibility_id = "{BASE_PROFILE}"
-random_prefix_bytes = {PREFIX}
+random_prefix_bytes = {prefix}
 availability_policy = "bounded-error"
 max_operation_time = "2s"
 [crypto.capabilities]
-supported_plaintext_sizes = [{RAW_UNIT}]
-max_ciphertext_size = {MAX_CIPHERTEXT}
+supported_plaintext_sizes = [{raw_unit}]
+max_ciphertext_size = {max_ciphertext}
 integrity = "contractual"
 context_binding = "contractual"
 [crypto.batch]
 target_items = 4
-target_bytes = "{RAW_BATCH_BYTES}"
+target_bytes = "{raw_batch_bytes}"
 max_items = 4
-max_bytes = "{RAW_BATCH_BYTES}"
+max_bytes = "{raw_batch_bytes}"
 [crypto.websocket]
 timeout = "1s"
 max_frame_bytes = "2MiB"
-[[crypto.websocket.endpoint]]
-name = "first"
-url = "{}"
-[[crypto.websocket.endpoint]]
-name = "second"
-url = "{}"
-[backing]
+{endpoints}[backing]
 root = "{root}"
 journal_emergency_reserve_bytes = "0B"
-"#,
-        first.url, second.url
+"#
     )
 }
 
@@ -431,4 +454,113 @@ async fn daemon_refuses_mismatched_remote_endpoint_key_before_io() {
     )
     .await
     .expect("mismatched-endpoint fixture or connection cleanup hung");
+}
+
+/// Attach a fresh volume served by `endpoints` WebSocket endpoints with a
+/// `prefix`-byte random prefix. Returns the attach error, if any, and the
+/// foreign profiles the endpoints were asked to decrypt under.
+async fn attach_for_compatibility_probe(
+    prefix: usize,
+    endpoints: usize,
+    binds_profile: bool,
+) -> (Option<String>, Vec<String>) {
+    let mut fixtures = Vec::new();
+    for _ in 0..endpoints {
+        fixtures.push(WsFixture::serve(0x6d, LOGICAL_UNIT + prefix, binds_profile).await);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory
+        .path()
+        .join("volume")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let raw = config_for(&root, &fixtures.iter().collect::<Vec<_>>(), prefix);
+    maki_nbdkit::daemon::create_volume_from_config_str(&raw).unwrap();
+    let cfg = maki_nbdkit::daemon::parse_and_validate(&raw).unwrap();
+    let error = match maki_nbdkit::daemon::attach_from_config(&cfg).await {
+        Ok(engine) => {
+            drop(engine);
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    let mut foreign: Vec<String> = fixtures
+        .iter()
+        .flat_map(|fixture| {
+            fixture
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.op == "decrypt" && r.profile != BASE_PROFILE)
+                .map(|r| r.profile.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    foreign.sort();
+    foreign.dedup();
+    for fixture in fixtures {
+        fixture.stop().await;
+    }
+    (error, foreign)
+}
+
+/// The attach self-test's compatibility-id probe reaches the endpoints
+/// through the random-prefix wrapper the daemon serves with. With one
+/// endpoint the engine self-tests the served stack (scheduler, wrapper,
+/// dispatcher); with two, each endpoint is also self-tested behind its own
+/// wrapper first. Either way the verdict and the probe on the wire are those
+/// of the same volume without a prefix.
+async fn exercise_compatibility_probe(binds_profile: bool) {
+    for endpoints in [1, 2] {
+        let (plain_error, plain_probes) =
+            attach_for_compatibility_probe(0, endpoints, binds_profile).await;
+        let (prefixed_error, prefixed_probes) =
+            attach_for_compatibility_probe(PREFIX, endpoints, binds_profile).await;
+        let case = format!("{endpoints} endpoint(s), binds profile: {binds_profile}");
+        for (prefix, error) in [(0, plain_error), (PREFIX, prefixed_error)] {
+            match (binds_profile, error) {
+                (true, None) => {}
+                (true, Some(error)) => {
+                    panic!("{case}, prefix {prefix}: a bound endpoint was refused: {error}")
+                }
+                (false, Some(error)) => assert!(
+                    error.contains("compatibility id") && error.contains("original plaintext"),
+                    "{case}, prefix {prefix}: unexpected refusal: {error}"
+                ),
+                (false, None) => panic!(
+                    "{case}, prefix {prefix}: an endpoint that ignores the profile was \
+                     certified as context-bound"
+                ),
+            }
+        }
+        assert!(
+            !plain_probes.is_empty(),
+            "{case}: the compatibility-id probe never reached an endpoint without a prefix"
+        );
+        assert_eq!(
+            prefixed_probes, plain_probes,
+            "{case}: the endpoints must receive the probe they receive without a prefix"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_refuses_an_endpoint_ignoring_the_profile_with_or_without_prefix() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        exercise_compatibility_probe(false),
+    )
+    .await
+    .expect("compatibility-probe fixture or connection cleanup hung");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_probes_a_binding_endpoint_alike_with_or_without_prefix() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        exercise_compatibility_probe(true),
+    )
+    .await
+    .expect("compatibility-probe fixture or connection cleanup hung");
 }
