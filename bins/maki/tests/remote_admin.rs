@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use maki_backing::remote_witness::{
-    Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
+    namespace, Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
 };
 use maki_backing::{Backing, RollbackBacking};
 use maki_witness::{Client, ClientOptions, Principal, Server, ServerOptions, TlsFiles};
@@ -646,6 +646,68 @@ fn gc_keeps_live_revoked_writer_and_reclaims_it_after_drop() {
     assert_eq!(report["counts"]["removed"], 1);
     assert_eq!(report["counts"]["skipped_live"], 0);
     assert_eq!(report["details_truncated"], false);
+}
+/// A stale namespace GC cannot examine is kept and does not end the pass:
+/// `maki volume gc` names it with the reason, and the automatic pass after
+/// an activation says in the log what it left behind.
+#[test]
+fn gc_reports_a_namespace_it_cannot_examine_and_reclaims_the_rest() {
+    let f = Fixture::new();
+    drop(f.create());
+    // A quiescent stale namespace holding a directory where its arena file
+    // belongs, whose name sorts before the created one: whoever runs GC
+    // cannot open that arena as a file.
+    let mut session = [0; 16];
+    session[15] = 1;
+    let odd = namespace(1, session);
+    std::fs::create_dir(f.root.join(&odd)).unwrap();
+    std::fs::write(f.root.join(&odd).join("rollback.lock"), b"").unwrap();
+    std::fs::create_dir(f.root.join(&odd).join("rollback.arena")).unwrap();
+    let namespaces = || {
+        let mut names: Vec<String> = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("remote-0"))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let before = inspect(f.writer.as_ref());
+    let takeover = success(&[
+        "volume",
+        "takeover",
+        f.path(true),
+        &before.fence.to_string(),
+        &root_hex(&before),
+    ]);
+    let current = inspect(f.writer.as_ref()).current.unwrap().namespace;
+    assert_eq!(
+        namespaces(),
+        [odd.clone(), current],
+        "the automatic pass must retire the predecessor"
+    );
+    let log = String::from_utf8_lossy(&takeover.stderr);
+    assert!(
+        log.contains("WARN") && log.contains(&odd) && log.contains("Is a directory"),
+        "the automatic pass must log the namespace it kept and why: {log}"
+    );
+
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unreadable = report["skipped_unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1, "{report}");
+    assert_eq!(unreadable[0]["name"], odd.as_str());
+    let error = unreadable[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("rollback.arena") && error.contains("Is a directory"),
+        "{error}"
+    );
+    assert_eq!(report["counts"]["skipped_unreadable"], 1);
+    assert_eq!(report["counts"]["skipped_unrecognized"], 0);
+    assert_eq!(report["counts"]["removed"], 0);
+    assert_eq!(report["details_truncated"], false);
+    assert!(f.root.join(&odd).join("rollback.arena").is_dir());
 }
 struct LoseClaims(Arc<dyn Rpc>);
 impl Rpc for LoseClaims {
