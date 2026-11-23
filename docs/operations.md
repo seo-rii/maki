@@ -502,15 +502,16 @@ and systemd's [notification protocol](https://github.com/systemd/systemd/blob/v2
 volume UUID, the mountpoint, VG and LV names, an optional pinned NBD device and
 an optional expected XFS UUID. The production profile also provides the complete
 PV UUID set, VG UUID and configured target-LV UUID in `[lvm_identity]`.
-Every executing verb (attach, detach, cleanup, recover, grow, verify) reads
-this file only when it is a root-owned regular file with one link, not
+Every executing verb (attach, detach, cleanup, recover, grow, verify, and
+the `recover-failed-start` hook) reads this file only when it is a root-owned regular file with one link, not
 writable by group or others, below root-owned directories with the same
 restriction: the helper runs as root on what it says. `--plan` reads any file.
 For attach, detach, recover, cleanup and grow, command-line flags override the
 NBD device, NBD socket, VG, LV, mountpoint, volume UUID and XFS UUID, and
 `--init-sentinel` (attach only) turns the sentinel option on, never off.
-`device_block_size` and the LVM pins come from the file only, and `verify`
-accepts no override.
+`device_block_size` and the LVM pins come from the file only. `verify` and
+`recover-failed-start` accept no override, and `recover-failed-start` reads
+only the default path (it refuses `--config`).
 Every value is checked before it reaches a system utility: option-like values,
 relative or non-canonical paths, non-canonical pinned devices (`/dev/nbd01`)
 and malformed UUIDs are rejected with exit code 2 and no plan is printed.
