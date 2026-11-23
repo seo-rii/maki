@@ -418,8 +418,9 @@ fn gc_reclaims_past_a_tombstone_whose_files_it_cannot_unlink() {
 }
 
 const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+const FS_APPEND_FL: libc::c_int = 0x20;
 
-fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
+fn set_flag(path: &Path, flag: libc::c_int, on: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let file = std::fs::File::open(path)?;
     let mut flags: libc::c_int = 0;
@@ -428,10 +429,10 @@ fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
         if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
             return Err(io::Error::last_os_error());
         }
-        if immutable {
-            flags |= FS_IMMUTABLE_FL;
+        if on {
+            flags |= flag;
         } else {
-            flags &= !FS_IMMUTABLE_FL;
+            flags &= !flag;
         }
         if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) != 0 {
             return Err(io::Error::last_os_error());
@@ -440,12 +441,25 @@ fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn set_immutable(path: &Path, immutable: bool) -> io::Result<()> {
+    set_flag(path, FS_IMMUTABLE_FL, immutable)
+}
+
 /// Clears the immutable flag again on drop.
 struct Immutable(PathBuf);
 
 impl Drop for Immutable {
     fn drop(&mut self) {
         let _ = set_immutable(&self.0, false);
+    }
+}
+
+/// Clears the append-only flag again on drop.
+struct AppendOnly(PathBuf);
+
+impl Drop for AppendOnly {
+    fn drop(&mut self) {
+        let _ = set_flag(&self.0, FS_APPEND_FL, false);
     }
 }
 
@@ -500,6 +514,104 @@ fn gc_reclaims_past_a_namespace_it_cannot_rename() {
     drop(immutable);
     let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
     assert_eq!(report.removed, [stuck]);
+}
+
+/// Renaming a namespace inside the root needs write permission on the root,
+/// not on the namespace. A rename that fails because of the root or its
+/// filesystem (here a root the daemon user may not write) is no namespace's
+/// own problem: it ends the pass, as it did, and names the namespace,
+/// instead of listing every candidate as unfinished and succeeding.
+#[test]
+fn a_rename_the_root_refuses_ends_the_pass() {
+    const TEST: &str = "a_rename_the_root_refuses_ends_the_pass";
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+    // Two quiescent abandoned forks, which a pass would retire.
+    let mut stale = Vec::new();
+    for last in [1, 2] {
+        let mut session = [0; 16];
+        session[15] = last;
+        let name = namespace(1, session);
+        std::fs::create_dir(root.path().join(&name)).unwrap();
+        std::fs::write(root.path().join(&name).join("rollback.lock"), b"").unwrap();
+        stale.push(name);
+    }
+    let mode = std::fs::metadata(root.path()).unwrap().mode();
+    set_mode(root.path(), 0o500);
+    let Some(modes) = ModesApply::unless_writable(TEST, root.path()) else {
+        set_mode(root.path(), mode);
+        return;
+    };
+
+    let result = RollbackBacking::collect_remote(root.path(), writer.as_ref());
+    drop(modes);
+    set_mode(root.path(), mode);
+    let error = match result {
+        Ok(report) => panic!(
+            "the pass completed: unfinished {:?}, removed {:?}",
+            report.unfinished, report.removed
+        ),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(
+        error
+            .to_string()
+            .starts_with(&format!("GC stopped while retiring {}: ", stale[0])),
+        "{error}"
+    );
+    for name in &stale {
+        assert!(root.path().join(name).join("rollback.lock").is_file());
+    }
+    assert!(entries(root.path(), ".remote-gc-").is_empty());
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, stale);
+}
+
+/// An append-only root refuses every rename out of it with the same EPERM
+/// an immutable namespace gets. It is the root's flag, not the namespace's:
+/// the pass ends.
+#[test]
+fn an_append_only_root_ends_the_pass() {
+    const TEST: &str = "an_append_only_root_ends_the_pass";
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("{TEST}: skipped: setting the append-only flag needs root");
+        return;
+    }
+    let writer = authority();
+    let root = tempfile::tempdir().unwrap();
+    let created = RollbackBacking::create_remote(root.path(), writer.clone(), CAPACITY).unwrap();
+    commit(&created, b"created");
+    drop(created);
+    drop(RollbackBacking::open_remote(root.path(), writer.clone()).unwrap());
+    let stale = first_stale_name();
+    std::fs::create_dir(root.path().join(&stale)).unwrap();
+    std::fs::write(root.path().join(&stale).join("rollback.lock"), b"").unwrap();
+    if let Err(error) = set_flag(root.path(), FS_APPEND_FL, true) {
+        eprintln!("{TEST}: skipped: the filesystem refuses the append-only flag ({error})");
+        return;
+    }
+    let append_only = AppendOnly(root.path().to_owned());
+
+    let error = RollbackBacking::collect_remote(root.path(), writer.as_ref())
+        .expect_err("a rename an append-only root refuses must end the pass");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(
+        error
+            .to_string()
+            .starts_with(&format!("GC stopped while retiring {stale}: ")),
+        "{error}"
+    );
+    assert!(root.path().join(&stale).join("rollback.lock").is_file());
+
+    drop(append_only);
+    let report = RollbackBacking::collect_remote(root.path(), writer.as_ref()).unwrap();
+    assert_eq!(report.removed, [stale]);
 }
 
 /// What GC may delete is decided against the authority's current
