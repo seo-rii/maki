@@ -261,6 +261,12 @@ Administrative CLI:
 ```text
 maki volume create
 maki volume inspect
+maki volume witness
+maki volume gc
+maki volume snapshot
+maki volume takeover
+maki volume restore
+maki volume resume-enrollment
 
 maki attach
 maki detach
@@ -284,6 +290,21 @@ the requests in progress, then flushes and checkpoints. `maki attach`,
 `maki-attach` command to run (the same verb and arguments) on standard error
 and exits with status 3. The operation runs only when the operator runs that
 privileged helper (§6).
+
+The `maki volume` commands after `inspect` administer a backing protected by
+a remote witness (§21) and, except `witness`, need Linux. They do not use the
+control socket: each reads the volume configuration and contacts the witness
+itself. `witness` inspects the authority without claiming a writer, `gc`
+reclaims quiescent writer namespaces, and `snapshot` copies the committed
+state of a stopped volume to a backup directory. `takeover` moves the current
+state to a new writer namespace under a higher fence, which fences out the
+writer that held it, `restore` makes a snapshot the current state, and
+`resume-enrollment` recovers an initial enrollment whose activation never
+completed. These three need administrator credentials and an approval of the
+authority's exact current state: its fence and current root (`restore` also
+the snapshot's root), or for `resume-enrollment` its fence and storage
+identity. The [remote witness service guide](docs/remote-witness-service.md)
+gives the procedures.
 
 Normal status and runtime configuration operations are performed over the daemon control socket:
 
