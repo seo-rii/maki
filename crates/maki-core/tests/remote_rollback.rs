@@ -1,6 +1,9 @@
 //! Real remote-authority fencing must guard paths that serve no backing bytes.
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,7 +38,7 @@ struct Fixture {
 impl Fixture {
     fn create() -> (Self, Volume, Arc<RollbackBacking>) {
         let root = tempfile::tempdir().unwrap();
-        let authority = tempfile::tempdir().unwrap();
+        let authority = private_dir::tempdir().unwrap();
         let store = Arc::new(Mutex::new(
             StateStore::create(authority.path(), [1; 16]).unwrap(),
         ));

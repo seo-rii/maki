@@ -1,4 +1,8 @@
 #![cfg(target_os = "linux")]
+
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use maki_backing::remote_witness::StateStore;
 use maki_nbdkit::daemon::{build_backing, create_volume_from_config_str, parse_and_validate};
 use maki_witness::{certificate_fingerprint, Principal, Role, Server, ServerOptions, TlsFiles};
@@ -40,7 +44,7 @@ impl Drop for Service {
 #[test]
 fn configured_remote_volume_uses_authenticated_service_and_refuses_offline_fallback() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir().unwrap();
+    let witness = private_dir::tempdir().unwrap();
     let tls = tempfile::tempdir().unwrap();
     let server_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let writer_key = rcgen::generate_simple_self_signed(vec!["writer".into()]).unwrap();

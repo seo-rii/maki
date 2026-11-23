@@ -10,6 +10,9 @@
 //! without it these tests print why they are skipped (as in CI).
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -393,7 +396,7 @@ fn root_takeover_and_reopen_create_the_writer_namespace_for_the_daemon() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let state = private_dir::tempdir().unwrap();
     let store = Arc::new(Mutex::new(
         StateStore::create(state.path(), [1; 16]).unwrap(),
     ));

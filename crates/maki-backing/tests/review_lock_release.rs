@@ -9,6 +9,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -103,7 +106,7 @@ fn a_closed_rollback_backing_reopens_while_a_forked_child_holds_its_descriptors(
 
 #[test]
 fn a_closed_remote_witness_store_reopens_while_a_forked_child_holds_its_descriptor() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir::tempdir().unwrap();
     let store = StateStore::create(dir.path(), [1; 16]).unwrap();
     let child = PausedChild::fork();
     drop(store);
