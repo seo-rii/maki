@@ -7,10 +7,18 @@
 //!
 //! The test re-runs itself in a private mount namespace, so the tmpfs mounts
 //! it adds never reach the host, and compares `memory::verify` with and
-//! without them. Where a mount namespace or a tmpfs mount is not permitted
-//! (unprivileged CI), it prints why and checks nothing.
+//! without them. Both runs join a private, empty cgroup-v2 group created
+//! for the test and removed afterwards: admission refuses a process in the
+//! root of the hierarchy before it reads the mount table, and comparing
+//! that refusal with itself would check nothing. Without root, a private
+//! mount namespace, a tmpfs mount or a writable cgroup-v2 hierarchy, or
+//! where admission still stops before the table, the test prints why and
+//! checks nothing.
 
 #![cfg(target_os = "linux")]
+
+#[path = "support/scratch_cgroup.rs"]
+mod scratch_cgroup;
 
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
@@ -18,8 +26,14 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use scratch_cgroup::Group;
+
 const MODE: &str = "MAKI_REVIEW_MOUNTINFO_MODE";
+const GROUP: &str = "MAKI_REVIEW_MOUNTINFO_GROUP";
 const TEST: &str = "unrelated_mount_path_bytes_do_not_change_memory_budget_admission";
+
+/// The configured `max_bytes`.
+const BUDGET_BYTES: u64 = 1 << 30;
 
 const CONFIG: &str = r#"
 config_schema_version = 1
@@ -87,6 +101,8 @@ fn unmount_all(paths: &[PathBuf]) {
 
 /// Child half, already inside the private mount namespace.
 fn child(mode: &str) {
+    let group = std::env::var_os(GROUP).expect("the parent names the cgroup");
+    scratch_cgroup::enter(Path::new(&group)).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let mut mounted = Vec::new();
     if mode == "foreign" {
@@ -118,11 +134,12 @@ fn child(mode: &str) {
 
 /// Run the child half in a fresh mount namespace whose mounts do not
 /// propagate to the host. `Err` is the reason the host does not permit it.
-fn run_in_private_namespace(mode: &str) -> Result<String, String> {
+fn run_in_private_namespace(mode: &str, group: &Group) -> Result<String, String> {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-        .env(MODE, mode);
+        .env(MODE, mode)
+        .env(GROUP, group.path());
     // SAFETY: runs in the forked child before exec and only makes raw
     // system calls on static strings.
     unsafe {
@@ -167,18 +184,38 @@ fn unrelated_mount_path_bytes_do_not_change_memory_budget_admission() {
         child(&mode);
         return;
     }
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("{TEST}: skipped: a private mount namespace and cgroup need root");
+        return;
+    }
+    let group = match Group::create("path-bytes", BUDGET_BYTES) {
+        Ok(group) => group,
+        Err(reason) => {
+            eprintln!("{TEST}: skipped: {reason}");
+            return;
+        }
+    };
     let mut outcomes = Vec::new();
     for mode in ["plain", "foreign"] {
-        match run_in_private_namespace(mode) {
+        match run_in_private_namespace(mode, &group) {
             Ok(outcome) => outcomes.push(outcome),
             Err(reason) => {
-                eprintln!("skipped: {reason}");
+                eprintln!("{TEST}: skipped: {reason}");
                 return;
             }
         }
     }
+    drop(group);
     println!("without the extra mounts: {}", outcomes[0]);
     println!("with the extra mounts:    {}", outcomes[1]);
+    if scratch_cgroup::stops_before_the_cgroup(&outcomes[0]) {
+        eprintln!(
+            "{TEST}: skipped: admission does not get past the mount table here: {}",
+            outcomes[0]
+        );
+        return;
+    }
     assert_eq!(
         outcomes[0], outcomes[1],
         "mounts unrelated to the cgroup-v2 hierarchy changed the memory-budget admission"
