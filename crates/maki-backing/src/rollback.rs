@@ -22,6 +22,8 @@ mod arena_read_tests;
 mod enrollment;
 pub mod gc;
 #[cfg(all(test, target_os = "linux"))]
+mod local_creation_tests;
+#[cfg(all(test, target_os = "linux"))]
 mod local_load_tests;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
@@ -33,8 +35,8 @@ const PAGE: u64 = 4096;
 const MAX_CAPACITY: u64 = 1 << 30;
 const MAX_ENTRIES: usize = 4096;
 const MARKER: &str = "rollback.format";
-/// The remote format marker while a creation writes it, before it is renamed
-/// into place (`remote::initialize_remote_root`).
+/// The format marker while a creation writes it, before it is renamed into
+/// place (`publish_marker`).
 const MARKER_NEXT: &str = "rollback.format.next";
 const MAGIC: &[u8] = b"MAKI-WITNESS-COW-V1\n";
 const LOCK: &str = "rollback.lock";
@@ -284,7 +286,7 @@ impl RollbackBacking {
                     | enrollment::FILE_NEXT
             ) || gc::namespace_fence(name.strip_prefix(gc::TOMBSTONE).unwrap_or(name)).is_some()
         } else {
-            matches!(name, MARKER | ARENA | LOCK) || MANIFESTS.contains(&name)
+            matches!(name, MARKER | MARKER_NEXT | ARENA | LOCK) || MANIFESTS.contains(&name)
         }
     }
 
@@ -297,7 +299,12 @@ impl RollbackBacking {
     }
 
     /// Enroll an empty backing and a previously unused independent witness.
-    /// Interrupted enrollment is deliberately not resumed implicitly.
+    ///
+    /// A creation that stopped before it published the witness anchor, its
+    /// last step, is completed by running it again: nothing could open that
+    /// volume, so nothing was acknowledged. What it may find is checked by
+    /// `require_unpublished_local`; anything else is refused as before, and
+    /// there is no other implicit enrollment.
     pub fn create(root: &Path, witness: &Path, capacity_bytes: u64) -> io::Result<Self> {
         validate_capacity(capacity_bytes)?;
         if !cfg!(target_os = "linux") {
@@ -310,19 +317,20 @@ impl RollbackBacking {
         // Creation of directories is authorized only on this explicit path.
         let witness_dir = FileBacking::new(witness)?;
         independent_paths(root, witness)?;
+        Self::create_backing(Arc::new(disk), Arc::new(witness_dir), capacity_bytes)
+    }
+
+    // One creation path for the real backing and the executable crash model.
+    fn create_backing(
+        disk: Arc<dyn Backing>,
+        witness: Arc<dyn Backing>,
+        capacity_bytes: u64,
+    ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        if disk.list("")?.iter().any(|name| name != LOCK) || !witness_dir.list("")?.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "rollback enrollment requires empty backing and witness directories",
-            ));
-        }
-        let marker = disk.open(MARKER, true)?;
-        marker.write_at(0, MAGIC)?;
-        marker.sync_data()?;
-        disk.sync_dir("")?;
+        require_unpublished_local(disk.as_ref(), witness.as_ref())?;
+        publish_marker(disk.as_ref(), MAGIC)?;
         let arena = disk.open(ARENA, true)?;
-        reserve_storage(&disk, arena.as_ref(), capacity_bytes)?;
+        reserve_storage(disk.as_ref(), arena.as_ref(), capacity_bytes)?;
         let manifest = Manifest {
             format: 1,
             identity: *uuid::Uuid::new_v4().as_bytes(),
@@ -333,14 +341,21 @@ impl RollbackBacking {
             files: BTreeMap::new(),
         };
         let bytes = manifest.encode()?;
-        write_manifest(&disk, 0, &bytes)?;
+        write_manifest(disk.as_ref(), 0, &bytes)?;
         disk.sync_dir("")?;
-        let witness = FileWitness::create(
+        let witness = FileWitness::create_backing(
             witness,
             manifest.identity,
             digest(b"maki.rollback.manifest.v1\0", &bytes),
         )?;
-        Ok(Self::assemble(disk, arena, witness, disk_lock, manifest, 0))
+        Ok(Self::assemble_witness(
+            disk,
+            arena,
+            Witness::Local(witness),
+            disk_lock,
+            manifest,
+            0,
+        ))
     }
 
     /// Open only the exact manifest selected by the existing witness.
@@ -352,6 +367,13 @@ impl RollbackBacking {
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
+        Self::open_witnessed(disk, || FileWitness::open(witness))
+    }
+
+    fn open_witnessed(
+        disk: Arc<dyn Backing>,
+        witness: impl FnOnce() -> io::Result<FileWitness>,
+    ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
         let marker = disk.open(MARKER, false)?;
         let mut magic = vec![0; MAGIC.len()];
@@ -362,7 +384,7 @@ impl RollbackBacking {
         if magic != MAGIC {
             return Err(invalid("unsupported rollback format"));
         }
-        let witness = FileWitness::open(witness)?;
+        let witness = witness()?;
         let anchor = witness.anchor();
         let mut selected = None;
         let mut storage_error = None;
@@ -483,24 +505,6 @@ impl RollbackBacking {
         ))
     }
 
-    fn assemble(
-        disk: FileBacking,
-        arena: Arc<dyn BackingFile>,
-        witness: FileWitness,
-        disk_lock: Box<dyn VolumeLock>,
-        manifest: Manifest,
-        slot: usize,
-    ) -> Self {
-        Self::assemble_witness(
-            Arc::new(disk),
-            arena,
-            Witness::Local(witness),
-            disk_lock,
-            manifest,
-            slot,
-        )
-    }
-
     fn assemble_witness(
         disk: Arc<dyn Backing>,
         arena: Arc<dyn BackingFile>,
@@ -573,6 +577,133 @@ fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -
         file.sync_all()?;
     }
     disk.sync_dir("")
+}
+
+/// Publish the format marker `magic`. Called with the root's creation
+/// locks held.
+///
+/// The marker is written and synced under its staging name, renamed into
+/// place, and the directory is synced, so `rollback.format` never names an
+/// empty or torn marker, whatever kills this process, cuts the power or
+/// fails in between. Until the rename nothing is published and the creation
+/// can simply be run again. A staged marker that a failed write or sync
+/// left is never synced as it is: it is truncated and written again through
+/// a new descriptor first.
+fn publish_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<()> {
+    let staged = (|| {
+        let marker = disk.open(MARKER_NEXT, true)?;
+        marker.set_len(0)?;
+        marker.write_at(0, magic)?;
+        marker.set_len(magic.len() as u64)?;
+        marker.sync_data()
+    })();
+    if let Err(error) = staged {
+        // Leave the root as this run found it where that still works. A
+        // staged marker that stays does no harm: the next creation accepts
+        // and rewrites it.
+        let _ = disk.remove(MARKER_NEXT);
+        return Err(error);
+    }
+    disk.rename(MARKER_NEXT, MARKER)?;
+    disk.sync_dir("")
+}
+
+/// Whether `rollback.format` was created and never completely written: it
+/// is empty or a torn copy of `magic`, each byte the marker's or still
+/// zero. The marker itself is not.
+fn unwritten_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<bool> {
+    let marker = disk.open(MARKER, false)?;
+    let len = marker.len()?;
+    if len > magic.len() as u64 {
+        return Ok(false);
+    }
+    let mut bytes = vec![0; len as usize];
+    marker.read_at(0, &mut bytes)?;
+    Ok(bytes != magic
+        && bytes
+            .iter()
+            .zip(magic)
+            .all(|(byte, expected)| *byte == 0 || byte == expected))
+}
+
+/// Refuse a local backing and witness directory in which a creation has
+/// published anything, or which hold anything a creation does not write.
+///
+/// The witness may hold only its lock and a staged anchor: a creation
+/// publishes the anchor last, renaming it into place, so an `anchor` that
+/// is present (an empty one too, which earlier releases installed before
+/// writing the record, and which is also what a truncated anchor looks
+/// like) is never created over. The backing may hold its lock, the marker
+/// (staged, published, or created and never written by an earlier
+/// release), the arena and the two manifest slots, but no slot may hold a
+/// committed manifest: one that decodes with a generation above zero or
+/// that names any file or entry. A creation writes only the empty
+/// generation-0 manifest, and a slot it reserved and has not written, or
+/// was cut writing, holds zeros or does not decode. A backing whose slots
+/// hold nothing that decodes as a committed manifest names no data that
+/// any witness could select, so a creation over it loses nothing, while a
+/// volume that committed anything is refused whatever the witness
+/// directory holds, an empty one included (a witness that is not mounted).
+/// The marker refuses anything but this format.
+fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::Result<()> {
+    let refused = || {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "rollback enrollment requires empty backing and witness directories",
+        )
+    };
+    for name in disk.list("")? {
+        let unpublished = match name.as_str() {
+            LOCK | MARKER_NEXT | ARENA => true,
+            MARKER => {
+                let marker = disk.open(MARKER, false)?;
+                let mut bytes = vec![0; MAGIC.len()];
+                let complete = marker.len()? == MAGIC.len() as u64 && {
+                    marker.read_at(0, &mut bytes)?;
+                    bytes == MAGIC
+                };
+                complete || unwritten_marker(disk, MAGIC)?
+            }
+            slot if MANIFESTS.contains(&slot) => !holds_committed_manifest(disk, slot)?,
+            _ => false,
+        };
+        if !unpublished {
+            return Err(refused());
+        }
+    }
+    if witness
+        .list("")?
+        .iter()
+        .any(|name| !FileWitness::left_by_an_unpublished_creation(name))
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// Whether the manifest slot `name` holds a manifest that names volume
+/// data: one that decodes with a generation above zero, or with any file or
+/// entry. A slot shorter than its header, with a zero length, or whose
+/// bytes do not decode names nothing.
+fn holds_committed_manifest(disk: &dyn Backing, name: &str) -> io::Result<bool> {
+    let file = disk.open(name, false)?;
+    let size = file.len()?;
+    if size < 8 {
+        return Ok(false);
+    }
+    let mut header = [0; 8];
+    file.read_at(0, &mut header)?;
+    let len = u64::from_le_bytes(header);
+    if len == 0 || len > manifest_bound(MAX_CAPACITY) - 8 || len > size - 8 {
+        return Ok(false);
+    }
+    let mut bytes = vec![0; len as usize];
+    file.read_at(8, &mut bytes)?;
+    Ok(
+        serde_json::from_slice::<Manifest>(&bytes).is_ok_and(|manifest| {
+            manifest.generation != 0 || !manifest.entries.is_empty() || !manifest.files.is_empty()
+        }),
+    )
 }
 
 fn write_manifest(disk: &dyn Backing, slot: usize, bytes: &[u8]) -> io::Result<()> {

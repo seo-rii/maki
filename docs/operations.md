@@ -96,6 +96,9 @@ durable before it accepts writes; empty the root instead to start over.
 A backing with a remote rollback witness is continued differently, without
 emptying its root: see
 [interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
+A backing with a local witness whose creation stopped before it published
+the witness anchor is completed by running `volume create` again
+([local rollback creation](rollback-protection.md#local-configuration-and-creation)).
 
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing

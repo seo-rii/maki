@@ -254,6 +254,26 @@ run before the first start. An existing raw or protected backing is refused;
 there is no implicit enrollment, in-place conversion or automatic witness
 recreation.
 
+Creation publishes the witness anchor last, and until then nothing can open
+the volume, so nothing was acknowledged. A creation that is killed, loses
+power or fails on its way (a full disk while it reserves the arena, for
+example) is completed by running `maki volume create` again, with nothing
+to remove by hand. The format marker and the anchor are each written under
+a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
+into place, so neither name ever holds an empty or torn file. `create` then
+accepts a backing directory that holds only what a creation writes (the
+lock, the marker, the arena and the two manifest slots) as long as no
+manifest slot holds a committed manifest, and a witness directory that holds
+only `witness.lock` and `anchor.next`. It never creates over a backing that
+committed anything, whatever the witness directory holds, so a witness mount
+that is missing (an empty directory in its place) cannot get a used volume
+recreated, and it never writes over an `anchor`. Earlier releases created
+the anchor empty before writing it: an empty `anchor` that such a release
+left is refused by `create` and by the daemon, which say that the creation
+did not complete or the witness lost its state. If the volume was never
+attached, remove that empty file and run `maki volume create` again;
+otherwise restore the witness directory.
+
 The packaged daemon uses `ProtectSystem=strict`. For this example, add a
 per-instance systemd drop-in to `maki@protected.service`:
 

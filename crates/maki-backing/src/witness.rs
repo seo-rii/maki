@@ -57,9 +57,24 @@ impl FileWitness {
             .any(|file| relative.starts_with(file))
     }
 
+    /// Whether `name` is an entry that a creation leaves in the witness
+    /// directory before it publishes the anchor: the lock, and the record
+    /// under its temporary name, which nothing reads.
+    pub(crate) fn left_by_an_unpublished_creation(name: &str) -> bool {
+        [LOCK_FILE, TEMP_FILE].contains(&name)
+    }
+
     pub fn create(path: &Path, identity: [u8; 16], root: [u8; 32]) -> io::Result<Self> {
         validate_identity(&identity)?;
-        let backing: Arc<dyn Backing> = Arc::new(FileBacking::new(path)?);
+        Self::create_backing(Arc::new(FileBacking::new(path)?), identity, root)
+    }
+
+    pub(crate) fn create_backing(
+        backing: Arc<dyn Backing>,
+        identity: [u8; 16],
+        root: [u8; 32],
+    ) -> io::Result<Self> {
+        validate_identity(&identity)?;
         let lock = backing.try_lock(LOCK_FILE)?;
         if backing.exists(ANCHOR_FILE)? {
             return Err(io::Error::new(
@@ -73,13 +88,17 @@ impl FileWitness {
             generation: 0,
             root,
         };
-        // FileBacking's confined rename replaces an existing target. Install
-        // an empty target only after the locked non-existence check; a crash
-        // here leaves invalid enrollment rather than a silently usable anchor.
-        let target = backing.open(ANCHOR_FILE, true)?;
-        target.set_len(0)?;
-        target.sync_data()?;
-        publish_anchor(backing.as_ref(), &anchor)?;
+        // The first record is published like every later one: written and
+        // synced under the temporary name, renamed into place, and the
+        // directory synced. A creation that a kill, a power loss or a
+        // failure stops before the rename leaves no anchor (the next one
+        // removes what it left under the temporary name), and one that got
+        // past it left the complete record. No anchor is replaced, so there
+        // is no owner to keep: in a directory another user owns, a root
+        // process creates the record for that user (`FileBacking`).
+        write_temporary(backing.as_ref(), &encode(&anchor), None)?;
+        backing.rename(TEMP_FILE, ANCHOR_FILE)?;
+        backing.sync_dir("")?;
 
         Ok(Self {
             backing,
@@ -104,7 +123,7 @@ impl FileWitness {
         Self::open_backing(backing)
     }
 
-    fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
+    pub(crate) fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
         let lock = backing.try_lock(LOCK_FILE)?;
         let anchor = read_anchor(backing.as_ref())?;
         // A prior process may have observed rename success and directory-sync
@@ -332,7 +351,18 @@ fn running_as_root() -> bool {
 
 fn read_anchor(backing: &dyn Backing) -> io::Result<Anchor> {
     let file = backing.open(ANCHOR_FILE, false)?;
-    if file.len()? != ENCODED_LEN as u64 {
+    let len = file.len()?;
+    if len == 0 {
+        // Never completed by this release, which publishes the anchor whole.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the witness anchor is empty: either a volume create of an earlier release did not \
+             complete, or this witness lost its state. Only if the volume was never attached, \
+             remove the empty anchor and run volume create again, which refuses a backing that \
+             holds committed data; otherwise restore the witness directory",
+        ));
+    }
+    if len != ENCODED_LEN as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid witness anchor length",
@@ -353,6 +383,15 @@ fn encode(anchor: &Anchor) -> [u8; ENCODED_LEN] {
     let checksum = checksum(&bytes[..BODY_LEN]);
     bytes[BODY_LEN..].copy_from_slice(&checksum);
     bytes
+}
+
+/// [`decode`] of a record of any length, for the crate's crash models.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn decode_anchor(bytes: &[u8]) -> io::Result<Anchor> {
+    let bytes: &[u8; ENCODED_LEN] = bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid witness anchor length"))?;
+    decode(bytes)
 }
 
 fn decode(bytes: &[u8; ENCODED_LEN]) -> io::Result<Anchor> {

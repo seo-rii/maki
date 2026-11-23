@@ -145,8 +145,40 @@ fn create_again(root: &Path, witness: &Path, interrupted: &std::process::Output)
     });
     commit(&created, b"kept");
     drop(created);
+    // Nothing is left under a temporary name.
+    assert!(!root.join("rollback.format.next").exists());
+    assert!(!witness.join("anchor.next").exists());
     let reopened = RollbackBacking::open(root, witness).unwrap();
     assert_eq!(read(&reopened), b"kept");
+}
+
+/// Earlier releases created the marker and then wrote it. A backing in
+/// which one left it empty or torn, beside nothing but the lock, is
+/// completed like an empty one; so is a marker staged by this release.
+#[test]
+fn create_completes_a_backing_whose_marker_was_never_written() {
+    assert!(RollbackBacking::owns_host_entry(
+        "rollback.format.next",
+        false
+    ));
+    const MARKER: &[u8] = b"MAKI-WITNESS-COW-V1\n";
+    let mut torn = MARKER.to_vec();
+    torn[7..].fill(0);
+    for (name, bytes) in [
+        ("rollback.format", &[][..]),
+        ("rollback.format", &torn[..]),
+        ("rollback.format.next", &MARKER[..4]),
+    ] {
+        let (root, witness) = directories();
+        std::fs::write(root.path().join("rollback.lock"), b"").unwrap();
+        std::fs::write(root.path().join(name), bytes).unwrap();
+        let unchanged = std::process::Command::new("true").output().unwrap();
+        create_again(root.path(), witness.path(), &unchanged);
+        assert_eq!(
+            std::fs::read(root.path().join("rollback.format")).unwrap(),
+            MARKER
+        );
+    }
 }
 
 #[test]
@@ -249,24 +281,50 @@ fn control_create_refuses_a_used_backing_beside_an_empty_witness_directory() {
     assert_eq!(read(&reopened), b"committed");
 }
 
-/// An anchor that is empty is what an earlier release's interrupted
-/// creation left, and also what a witness whose anchor was truncated looks
-/// like. `create` never writes over an anchor, and `open` refuses it.
+/// An anchor that is empty is what an earlier release's creation left when
+/// it was cut after installing it, and also what a witness whose anchor
+/// was truncated looks like. `create` never writes over an anchor, and
+/// `open` refuses it and says what to do. The way out it gives, removing
+/// the empty anchor, completes a volume that was never written, and still
+/// refuses one that committed data.
 #[test]
 fn control_create_and_open_refuse_a_witness_that_holds_an_empty_anchor() {
-    let (root, witness) = directories();
-    std::fs::write(witness.path().join("witness.lock"), b"").unwrap();
-    std::fs::write(witness.path().join("anchor"), b"").unwrap();
-    let before = entries(witness.path());
-    assert!(RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err());
-    assert_eq!(entries(witness.path()), before);
-    assert_eq!(
-        std::fs::metadata(witness.path().join("anchor"))
+    for committed in [false, true] {
+        let (root, witness) = directories();
+        let backing = RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap();
+        if committed {
+            commit(&backing, b"committed");
+        }
+        drop(backing);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(witness.path().join("anchor"))
+            .unwrap();
+        let before = (entries(root.path()), entries(witness.path()));
+        assert!(RollbackBacking::create(root.path(), witness.path(), CAPACITY).is_err());
+        assert_eq!((entries(root.path()), entries(witness.path())), before);
+        assert_eq!(
+            std::fs::metadata(witness.path().join("anchor"))
+                .unwrap()
+                .len(),
+            0
+        );
+        let error = RollbackBacking::open(root.path(), witness.path())
+            .err()
             .unwrap()
-            .len(),
-        0
-    );
-    assert!(RollbackBacking::open(root.path(), witness.path()).is_err());
+            .to_string();
+        assert!(
+            error.contains("the witness anchor is empty")
+                && error.contains("did not complete")
+                && error.contains("lost its state")
+                && error.contains("never attached"),
+            "{error}"
+        );
+        std::fs::remove_file(witness.path().join("anchor")).unwrap();
+        let created = RollbackBacking::create(root.path(), witness.path(), CAPACITY);
+        assert_eq!(created.is_ok(), !committed, "committed: {committed}");
+    }
 }
 
 /// Only a backing that holds what a creation leaves is completed: an entry
