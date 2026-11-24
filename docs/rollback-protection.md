@@ -161,10 +161,16 @@ itself. A `remote.enrollment` for another authority or capacity is refused by
 both commands and left as it is, with a message that says to create the
 volume with that creation's authority and capacity or to use an empty backing
 root. A staged file that the command cannot write again from the start (a
-link, a directory, a FIFO or a file with a second name under
-`rollback.format.next` or `remote.enrollment.next`) is refused by both
-commands before they change anything, with a message that names it: remove
-it and run the command again. An older
+link, a directory, a FIFO, a file with a second name, or a file that another
+user owns and this one cannot open, under `rollback.format.next` or
+`remote.enrollment.next`) is refused by both commands before they change
+anything, with a message that names it and gives the system's answer: remove
+it and run the command again. A command run as root leaves a file of the
+last kind when it is killed between creating the staged file under its name
+and giving it to the directory's owner, on a filesystem without unnamed
+temporary files; the daemon user's `volume create` used to fail on it once,
+remove it and continue on the next run, and now names it until it is
+removed. An older
 binary wrote the binding in place, and a `remote.enrollment` it left empty or
 incomplete cannot be told apart from a damaged binding. In a root whose
 `rollback.format` holds the marker, `resume-enrollment` refuses it as invalid

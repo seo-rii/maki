@@ -283,8 +283,8 @@ enum Occupied {
     /// marker that is complete or foreign.
     NotEmpty,
     /// A staged name that holds something a creation cannot write again
-    /// from the start.
-    NotReplaceable(&'static str),
+    /// from the start, with what opening it answered.
+    NotReplaceable(&'static str, io::Error),
     /// A published binding for another authority or capacity.
     AnotherCreation,
     /// A published binding that cannot be read.
@@ -295,7 +295,9 @@ impl Occupied {
     fn refusal(&self) -> io::Error {
         match self {
             Self::NotEmpty | Self::UnreadableBinding => input(NOT_EMPTY),
-            Self::NotReplaceable(name) => not_replaceable(name),
+            Self::NotReplaceable(name, cause) => {
+                not_replaceable(name, cause, "remove it, or use an empty backing root")
+            }
             Self::AnotherCreation => input(ANOTHER_CREATION),
         }
     }
@@ -306,10 +308,11 @@ const ANOTHER_CREATION: &str = "this backing root holds the binding of an interr
     for another authority or capacity: create the volume with that creation's authority and \
     capacity, or use an empty backing root";
 
-fn not_replaceable(name: &str) -> io::Error {
+/// `way_out` is what continues the root for the command that refuses it.
+fn not_replaceable(name: &str, cause: &io::Error, way_out: &str) -> io::Error {
     input(format!(
-        "this backing root holds {name}, which is not a regular file that can be written again: \
-         remove it, or use an empty backing root"
+        "this backing root holds {name}, which is not a regular file that can be written again \
+         ({cause}): {way_out}"
     ))
 }
 
@@ -319,9 +322,36 @@ fn not_replaceable(name: &str) -> io::Error {
 /// A link, a directory, a FIFO or a file with a second name would fail the
 /// attempt when it opens the entry, after it has published what comes
 /// before, and then fail every later one the same way.
-fn replaceable(disk: &dyn Backing, name: &str) -> bool {
-    disk.open(name, false).is_ok()
+///
+/// Returns what opening the entry answered when the answer is about the
+/// entry: its kind, its links, or the right to open it. Any other failure
+/// (an I/O error, no descriptor left) says nothing about the entry and is
+/// the caller's error as it is; a good file must not be called unwritable
+/// for it.
+fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
+    match disk.open(name, false) {
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+            ) || error
+                .raw_os_error()
+                .is_some_and(|code| ENTRY_KIND_ERRORS.contains(&code)) =>
+        {
+            Ok(Some(error))
+        }
+        Err(error) => Err(error),
+    }
 }
+
+/// What the system answers an open for an entry that is not a file to open:
+/// a symbolic link, a directory, a FIFO or socket nobody reads.
+#[cfg(unix)]
+const ENTRY_KIND_ERRORS: [i32; 4] = [libc::ELOOP, libc::EISDIR, libc::ENXIO, libc::ENOTDIR];
+#[cfg(not(unix))]
+const ENTRY_KIND_ERRORS: [i32; 0] = [];
 
 fn examine_remote_root(
     disk: &dyn Backing,
@@ -352,8 +382,10 @@ fn examine_remote_root(
         }
     }
     staged.sort_unstable();
-    if let Some(name) = staged.into_iter().find(|name| !replaceable(disk, name)) {
-        return Ok(Err(Occupied::NotReplaceable(name)));
+    for name in staged {
+        if let Some(cause) = unwritable(disk, name)? {
+            return Ok(Err(Occupied::NotReplaceable(name, cause)));
+        }
     }
     Ok(match (binding, creation) {
         (true, Some(creation)) => match Enrollment::load(disk) {
@@ -402,14 +434,21 @@ fn initialize_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> 
 /// enrollment locks held.
 fn republish_root(disk: &dyn Backing, identity: [u8; 16], capacity: u64) -> io::Result<()> {
     let bound = disk.exists(enrollment::FILE)?;
+    // Only this one name is looked for: an entry whose name is not UTF-8 is
+    // not it, and is no reason to refuse a root that recovery continues.
     if !bound
         && disk
-            .list("")?
+            .list_skipping_non_utf8("")?
             .iter()
             .any(|name| name == enrollment::FILE_NEXT)
-        && !replaceable(disk, enrollment::FILE_NEXT)
     {
-        return Err(not_replaceable(enrollment::FILE_NEXT));
+        if let Some(cause) = unwritable(disk, enrollment::FILE_NEXT)? {
+            return Err(not_replaceable(
+                enrollment::FILE_NEXT,
+                &cause,
+                "remove it and resume again",
+            ));
+        }
     }
     let marker = disk.open(MARKER, false)?;
     marker.write_at(0, REMOTE_MAGIC)?;
@@ -451,6 +490,9 @@ fn unpublished(root: &Path, expected: &Record, capacity: u64, error: io::Error) 
                 .to_string()
         }
         Ok(Err(Occupied::NotEmpty)) | Err(_) => return error,
+        Ok(Err(Occupied::NotReplaceable(name, cause))) => {
+            not_replaceable(name, &cause, "remove it and create the volume again").to_string()
+        }
         Ok(Err(occupied)) => occupied.refusal().to_string(),
     };
     io::Error::new(error.kind(), message)
