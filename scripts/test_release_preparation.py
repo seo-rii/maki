@@ -389,6 +389,104 @@ class ReleasePreparationTests(unittest.TestCase):
         self.git("fetch", "--quiet", "--unshallow")
         self.assertEqual(self.print_version().stdout.strip(), complete_version)
 
+    def source_without_history(self, destination):
+        """The committed tree as a source archive unpacks it: no `.git`."""
+        shutil.copytree(self.repo, destination, ignore=shutil.ignore_patterns(".git", destination.parent.name))
+        return destination
+
+    def test_source_tree_below_another_repository_is_refused_before_output_or_building(self):
+        # A source archive unpacked inside another checkout: Git finds the
+        # outer repository, whose HEAD, history and Cargo.toml are not this
+        # source's. Its version must never be printed or built for it.
+        outer = self.repo
+        inner = self.source_without_history(outer / "third_party" / "maki-0.1.0")
+        (outer / "Cargo.toml").write_text('[workspace.package]\nversion = "9.9.9"\n')
+        self.git("commit", "-qam", "test: the outer repository has its own version")
+        self.assertEqual(self.print_version().stdout.strip(), f"9.9.9~rc+rev2.git{self.git('rev-parse', 'HEAD')[:12]}")
+        self.environment["RUSTC"] = "compiler-must-not-be-probed"
+        for tracked in (False, True):
+            with self.subTest(inner_tree_is_tracked_by_the_outer_repository=tracked):
+                if tracked:
+                    self.repo = outer
+                    self.git("add", "third_party")
+                    self.git("commit", "-qm", "test: vendor the source")
+                self.repo = inner
+                result = self.print_version(succeeds=False)
+                self.assertIn("is not the top level of a Git checkout", result.stderr)
+                self.assertIn(str(inner), result.stderr)
+                self.assertIn(str(outer), result.stderr)
+                self.assertNotIn("9.9.9", result.stderr)
+                output, result = self.prepare("never-created/candidate", succeeds=False)
+                self.assertIn("is not the top level of a Git checkout", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(output.parent.exists())
+                self.assertFalse(self.cargo_trace.exists())
+
+    def test_source_archive_without_history_says_where_its_version_is_recorded(self):
+        # Nothing above the unpacked tree is a repository, whatever the
+        # directory these tests run in.
+        self.environment["GIT_CEILING_DIRECTORIES"] = str(self.work)
+        self.repo = self.source_without_history(self.work / "unpacked" / "maki-0.1.0")
+        self.environment["RUSTC"] = "compiler-must-not-be-probed"
+        result = self.print_version(succeeds=False)
+        output, prepared = self.prepare("never-created/candidate", succeeds=False)
+        for stderr in (result.stderr, prepared.stderr):
+            self.assertIn(f"{self.repo} is not a Git checkout", stderr)
+            self.assertIn("no history", stderr)
+            # Where the version of a published archive is to be found.
+            self.assertIn("package.version", stderr)
+            self.assertIn("manifest", stderr)
+            self.assertIn("docs/releasing.md", stderr)
+            self.assertNotIn("fatal:", stderr)
+            self.assertNotIn("Traceback", stderr)
+        self.assertEqual(prepared.stdout, "")
+        self.assertFalse(output.parent.exists())
+        self.assertFalse(self.cargo_trace.exists())
+
+    def test_linked_worktree_and_symlinked_checkout_are_their_own_top_level(self):
+        version = self.print_version().stdout.strip()
+        linked = self.work / "linked"
+        self.git("worktree", "add", "--quiet", "--detach", str(linked))
+        alias = self.work / "alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        for checkout in (linked, alias):
+            with self.subTest(checkout=checkout.name):
+                self.repo = checkout
+                self.assertEqual(self.print_version().stdout.strip(), version)
+
+    def test_documented_rebuild_from_a_source_archive_carries_the_recorded_version(self):
+        # docs/releasing.md: the archive has no history, so the version and
+        # the source epoch come from the manifest published beside it.
+        output, _ = self.prepare()
+        manifest = json.loads((output / "manifest.json").read_text())
+        release = self.work / "release"
+        release.mkdir()
+        shutil.copyfile(output / manifest["source"]["filename"], release / "maki-0.1.0-rc.1-source.tar.gz")
+        shutil.copyfile(output / "manifest.json", release / "maki-0.1.0-rc.1-debian12-amd64-manifest.json")
+        (release / "SHA256SUMS").write_text("".join(
+            f"{hashlib.sha256((release / name).read_bytes()).hexdigest()}  {name}\n"
+            for name in sorted(path.name for path in release.iterdir())))
+        section = (ROOT / "docs/releasing.md").read_text().split(
+            "\n## Rebuilding from a published source archive\n", 1)[1].split("\n## ", 1)[0]
+        block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+        self.cargo_trace.unlink()
+        self.environment["GIT_CEILING_DIRECTORIES"] = str(self.work)
+        result = subprocess.run(["bash", "-c", block], cwd=release, env=self.environment,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = json.loads(self.cargo_trace.read_text())
+        self.assertEqual(trace["cwd"], str(release / "maki-0.1.0"))
+        self.assertEqual(trace["epoch"], str(manifest["source"]["source_date_epoch"]))
+        package = release / "maki.deb"
+        version = subprocess.check_output(["dpkg-deb", "--field", str(package), "Version"], text=True).strip()
+        self.assertEqual(version, manifest["package"]["version"])
+        # The same artifacts, version and epoch: the package builder writes
+        # the candidate's package again.
+        self.assertEqual(hashlib.sha256(package.read_bytes()).hexdigest(), manifest["package"]["sha256"])
+        # The archive itself cannot say its version.
+        self.repo = release / "maki-0.1.0"
+        self.assertIn("is not a Git checkout", self.print_version(succeeds=False).stderr)
+
     def test_unchanged_hint_preserves_the_index_but_does_not_hide_local_edits(self):
         self.git("update-index", "--assume-unchanged", "Cargo.toml")
         self.print_version()
