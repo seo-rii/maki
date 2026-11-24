@@ -750,6 +750,25 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
     }
 }
 
+/// Refuse a device for a connection outside any attachment unless it shows
+/// no connection and no trusted record (`reserved`) names it.
+fn raw_device_is_free(
+    sysfs: &Path,
+    device: &str,
+    reserved: &BTreeMap<String, String>,
+) -> Result<(), ExecError> {
+    let _ = (sysfs, device, reserved);
+    todo!("raw_device_is_free")
+}
+
+/// Whether `device` is connected under `identifier` (`true`) or shows no
+/// connection (`false`); any other backend, or none that can be read, is
+/// an error.
+fn raw_backend_is(sysfs: &Path, device: &str, identifier: &str) -> Result<bool, ExecError> {
+    let _ = (sysfs, device, identifier);
+    todo!("raw_backend_is")
+}
+
 /// The command ran to its own end and reported failure. A command that a
 /// signal terminated has no exit status: it never said whether it could do
 /// its work, and may have stopped halfway through it.

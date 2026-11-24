@@ -77,6 +77,85 @@ fn nbd_steps_address_the_validated_kernel_index() {
     }
 }
 
+/// A fake `/sys/block` with one directory per `(device, pid, backend)`.
+fn raw_sysfs(fixture: &Fixture, devices: &[(&str, bool, Option<&str>)]) -> PathBuf {
+    let sysfs = fixture.0.join("block");
+    for (name, pid, backend) in devices {
+        let directory = sysfs.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        if *pid {
+            std::fs::write(directory.join("pid"), "4242\n").unwrap();
+        }
+        if let Some(backend) = backend {
+            std::fs::write(directory.join("backend"), format!("{backend}\n")).unwrap();
+        }
+    }
+    sysfs
+}
+
+/// `nbd-connect` takes only a device that shows no connection and that no
+/// trusted record names: a raw connection must never take another
+/// attachment's device, connected or not.
+#[test]
+fn a_raw_connection_takes_only_a_free_device_no_record_names() {
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            (
+                "nbd5",
+                true,
+                Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"),
+            ),
+            ("nbd6", true, None),
+            ("nbd7", false, None),
+            ("nbd8", false, Some("")),
+        ],
+    );
+    let reserved = BTreeMap::from([("/dev/nbd7".to_string(), "db".to_string())]);
+    for free in ["/dev/nbd4", "/dev/nbd8"] {
+        raw_device_is_free(&sysfs, free, &reserved).unwrap();
+    }
+    for (device, why) in [
+        ("/dev/nbd5", "already connected"),
+        ("/dev/nbd6", "backend identifier"),
+        ("/dev/nbd7", "volume db"),
+    ] {
+        let error = raw_device_is_free(&sysfs, device, &reserved).unwrap_err();
+        assert!(error.to_string().contains(why), "{device}: {error}");
+    }
+}
+
+/// `nbd-disconnect` disconnects only the connection it names: a device that
+/// shows no connection needs nothing, and any other backend, or one that
+/// cannot be read, is refused.
+#[test]
+fn a_raw_disconnect_touches_only_its_own_connection() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd5", true, Some(OURS)),
+            ("nbd6", true, None),
+            (
+                "nbd7",
+                true,
+                Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"),
+            ),
+        ],
+    );
+    for absent in ["/dev/nbd4", "/dev/nbd9"] {
+        assert!(!raw_backend_is(&sysfs, absent, OURS).unwrap(), "{absent}");
+    }
+    assert!(raw_backend_is(&sysfs, "/dev/nbd5", OURS).unwrap());
+    for device in ["/dev/nbd6", "/dev/nbd7"] {
+        assert!(raw_backend_is(&sysfs, device, OURS).is_err(), "{device}");
+    }
+}
+
 /// A step whose kernel answer could not be read stays an I/O error of its
 /// kind (a timeout is still a timeout), never a plain refusal: the callers
 /// decide from the device's backend identifier what is connected.
