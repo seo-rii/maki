@@ -338,14 +338,36 @@ jobs:
           grep -qx 'ExecStart=/usr/sbin/nbdkit \\' /usr/lib/systemd/system/maki@.service
           systemd-analyze verify maki@ci.service maki-attach@ci.service \
             maki-recover@ci.service maki-workload@ci.target
+          # rpm cannot stop a transaction from %preun: under an attachment
+          # `dnf remove maki` used to keep Maki and erase nbdkit-server, lvm2,
+          # xfsprogs and kmod as unused dependencies. The package's entry in
+          # /etc/dnf/protected.d makes dnf refuse, before it changes anything,
+          # to remove Maki or what it requires, and to install the nbdkit
+          # metapackage in its place. Reinstalling is not refused.
           echo '{}' > /run/maki-attach/ci.nbd
+          if dnf remove -y maki > "$RUNNER_TEMP/remove" 2>&1; then exit 1; fi
+          grep -q 'removing the following protected packages: maki' "$RUNNER_TEMP/remove"
+          if dnf remove -y lvm2 > "$RUNNER_TEMP/remove-lvm2" 2>&1; then exit 1; fi
+          grep -q 'broken dependencies for the following protected packages: maki' "$RUNNER_TEMP/remove-lvm2"
+          if dnf install -y --allowerasing nbdkit > "$RUNNER_TEMP/metapackage" 2>&1; then exit 1; fi
+          grep -q 'conflicts with nbdkit provided by' "$RUNNER_TEMP/metapackage"
+          dnf reinstall -y -q "$package"
+          rpm -q maki nbdkit-server lvm2 xfsprogs kmod
+          for unwanted in nbdkit nbdkit-selinux; do
+            if rpm -q "$unwanted"; then exit 1; fi
+          done
+          rpm -V maki
+          # rpm -e is how the package is removed, and %preun still refuses it
+          # under an attachment record.
           if rpm -e maki; then
             echo "the package was removed under an attachment record" >&2; exit 1
           fi
           rpm -q maki
           rm /run/maki-attach/ci.nbd
+          if dnf remove -y maki > "$RUNNER_TEMP/remove-idle" 2>&1; then exit 1; fi
           rpm -e maki
           if rpm -q maki; then exit 1; fi
+          test ! -e /etc/dnf/protected.d/maki.conf
 
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))

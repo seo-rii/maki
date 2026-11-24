@@ -1176,6 +1176,11 @@ trusted attachment record exists or a `maki@`, `maki-attach@`,
 lifecycle needs to detach. A failed `systemctl` query refuses the removal too. Drain and deactivate every volume first. Upgrades
 are not blocked and no maintainer script starts, stops or restarts a service
 ([package behaviour](../packaging/debian/README.md#removal-and-upgrade-behaviour)).
+On RHEL 9 the RPM is removed with `rpm -e maki`, which its `%preun` refuses
+in the same cases. `dnf remove maki` is always refused: rpm cannot stop a
+transaction from `%preun`, so the package is protected from dnf, which would
+otherwise keep Maki and erase its dependencies
+([RHEL 9 removal](getting-started/installation-rhel.md#upgrading-and-removal)).
 
 The [2026-09-19 package qualification](qualification/package-topology-migration-validation-2026-09-19.md)
 installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
