@@ -54,7 +54,13 @@ most `nbd.maximum_io` (nbdkit's emulation wrote the whole range in one
 oversized write and failed, R5-036). When the client allows trimming and the
 volume was created with `--discard`, the complete units inside the range are
 discarded instead and only partial edge units are written; otherwise zeros are
-written and encrypted like any data. Fast zero is not offered.
+written and encrypted like any data. A fast zero request
+(`NBD_CMD_FLAG_FAST_ZERO`) is always refused with `ENOTSUP` and changes
+nothing. The export advertises fast zero all the same: nbdkit asserts, rather
+than checks, that a fast zero request was advertised, so without the flag one
+such request can abort the server, and the NBD protocol allows a server that
+advertises it to refuse every one. The Linux NBD driver neither reads that
+flag nor sends such a request.
 
 After a complete unit is discarded, reads return zero. A normal discard may
 remain volatile; FLUSH and FUA use the same durable journal proof as writes.

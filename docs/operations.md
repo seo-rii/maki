@@ -73,7 +73,8 @@ is disabled. See [space reclamation](space-reclamation.md) for format selection,
 partial-unit behavior and checkpoint ordering. WRITE_ZEROES is native and
 chunked to `nbd.maximum_io`, so a zero request of any length succeeds; on a
 `--discard` volume whole units may be discarded when the client allows it.
-Fast zero is not advertised.
+Fast zero is advertised, and every fast zero request is refused with `ENOTSUP`
+([why](space-reclamation.md)).
 
 ## Volume lifecycle
 
