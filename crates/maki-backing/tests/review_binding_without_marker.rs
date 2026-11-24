@@ -348,7 +348,22 @@ fn control_a_staged_entry_that_cannot_be_written_again_is_refused_and_left() {
             let (writer, admin) = authority();
             assert_create_refuses(&root, &writer, &admin, NOT_A_FILE, &context);
             assert_create_refuses(&root, &writer, &admin, staged, &context);
+            assert_create_refuses(
+                &root,
+                &writer,
+                &admin,
+                "remove it, or use an empty backing root",
+                &context,
+            );
+            // Recovery has no marker to continue from: it names the entry
+            // and the command that continues the root once it is removed.
             assert_recovery_refuses(&root, &admin, NOT_A_FILE, &context);
+            assert_recovery_refuses(
+                &root,
+                &admin,
+                "remove it and create the volume again",
+                &context,
+            );
             assert!(!root.join("rollback.format").exists(), "{context}");
             assert_eq!(
                 std::fs::symlink_metadata(&entry).unwrap().file_type(),
@@ -389,8 +404,37 @@ fn control_recovery_refuses_a_staged_binding_that_cannot_be_written_again() {
         let (_, admin) = authority();
         assert_recovery_refuses(&root, &admin, NOT_A_FILE, what);
         assert_recovery_refuses(&root, &admin, STAGED_BINDING, what);
+        // The way out it names is one that works for this root: an empty
+        // backing root is none once the authority may be claimed.
+        assert_recovery_refuses(&root, &admin, "remove it and resume again", what);
+        let record = inspect(admin.as_ref());
+        let refusal =
+            RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(!refusal.contains("empty backing root"), "{what}: {refusal}");
         assert_eq!(std::fs::read(&outside).unwrap(), b"not a staged file");
     }
+}
+
+/// Recovery looks in the root for the one name it is about to write. An
+/// entry whose name is not UTF-8 is not that name and does not stop it.
+#[test]
+fn recovery_is_not_stopped_by_an_entry_whose_name_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = private_dir::tempdir().unwrap();
+    let root = root_with(dir.path(), &[("rollback.format", MARKER)]);
+    let stray = root.join(std::ffi::OsStr::from_bytes(b"stray-\xff\xfe"));
+    std::fs::write(&stray, b"operator").unwrap();
+    let (_, admin) = authority();
+    let record = inspect(admin.as_ref());
+    RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
+        .map(drop)
+        .unwrap_or_else(|error| panic!("volume resume-enrollment: {error}"));
+    assert_eq!(std::fs::read(root.join(BINDING)).unwrap(), binding());
+    assert!(inspect(admin.as_ref()).current.is_some());
+    assert_eq!(std::fs::read(&stray).unwrap(), b"operator");
 }
 
 /// A binding for another authority or another capacity is not this

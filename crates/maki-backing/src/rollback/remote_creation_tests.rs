@@ -370,6 +370,38 @@ fn enrollment_recovery_makes_the_marker_durable_before_it_writes_over_a_staged_b
     complete_binding(&machine, "recovery died at the binding's rename");
 }
 
+/// A staged file is refused when it is not a file the command can write
+/// again. A staged file that fails to open for a reason that has nothing to
+/// do with what it is (too many open files, an I/O error) is not that: the
+/// command fails with the cause and does not tell anyone to remove a good
+/// file. Nothing is published either way.
+#[test]
+fn a_staged_file_that_fails_to_open_for_an_unrelated_reason_is_not_called_unwritable() {
+    use crate::rollback::review_restore::crash_backing::FaultOp;
+    for name in [
+        super::super::MARKER_NEXT,
+        super::super::enrollment::FILE_NEXT,
+    ] {
+        for errno in [libc::EMFILE, libc::EIO] {
+            let machine = binding_without_marker(super::super::enrollment::FILE_NEXT, true);
+            let before = machine.process().list("").unwrap();
+            machine.set_fault_hook(Some(Arc::new(move |op| {
+                matches!(op, FaultOp::Open { path, create: false } if *path == name)
+                    .then(|| io::Error::from_raw_os_error(errno))
+            })));
+            let error = attempt_binding(&machine).err().unwrap();
+            machine.set_fault_hook(None);
+            assert_eq!(error.raw_os_error(), Some(errno), "{name}: {error}");
+            assert!(!error.to_string().contains("remove it"), "{name}: {error}");
+            assert!(!published(&machine), "{name}");
+            let mut after = machine.process().list("").unwrap();
+            after.retain(|entry| before.contains(entry));
+            assert_eq!(after, before, "{name}");
+            complete_binding(&machine, &format!("{name} failed to open with {errno}"));
+        }
+    }
+}
+
 /// A binding that recovery finds and accepts is readable, which does not
 /// make its bytes durable: another process may just have written it. Until
 /// recovery has written and synced those bytes again, it must not sync the
