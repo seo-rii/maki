@@ -1,9 +1,9 @@
 """The runner's denial checks must prove the permission boundary, not any failure.
 
 The unrelated-user socket and unprivileged disconnect fragments come from the
-runner. sudo, nbdinfo, nbd-client and the ownership check are fixtures that
-print what the real tools report; no socket, device, or privileged operation
-is used.
+runner. sudo, nbdinfo, the maki-attach helper and the ownership check are
+fixtures that print what the real tools report; no socket, device, or
+privileged operation is used.
 """
 import os
 import pathlib
@@ -15,7 +15,12 @@ import unittest
 
 SCRIPT = pathlib.Path(__file__).with_name("privileged-linux-validation.sh")
 SOCKET_PASS = "PASS: unrelated user is denied by the runtime-directory boundary"
-DISCONNECT_PASS = "PASS: unprivileged NBD disconnect ioctl is denied"
+DISCONNECT_PASS = "PASS: the kernel denies an unprivileged NBD disconnect"
+DISCONNECT = "nbd-disconnect --nbd-device /dev/nbd15 --identifier maki-privval-fixture"
+# What the helper reports when the kernel refuses the request for lack of
+# CAP_SYS_ADMIN.
+DENIED = ('error: step "disconnect nbd15 over netlink" failed: the kernel refused '
+          "NBD_CMD_DISCONNECT for nbd15: Operation not permitted (os error 1)")
 URI = "nbd+unix:///?socket=/run/maki/privval-1000-42/nbd.sock"
 
 SUDO = r'''#!/bin/sh
@@ -57,7 +62,7 @@ class UnprivilegedDenialProbes(unittest.TestCase):
         cls.socket_probe = source[start:source.index(marker, start) + len(marker)]
         start = source.index('pass "kernel NBD attach and 512 MiB geometry"\n')
         start = source.index("\n", start) + 1
-        marker = 'pass "unprivileged NBD disconnect ioctl is denied"'
+        marker = 'pass "the kernel denies an unprivileged NBD disconnect"'
         cls.disconnect_probe = source[start:source.index(marker, start) + len(marker)]
 
     def setUp(self):
@@ -67,7 +72,7 @@ class UnprivilegedDenialProbes(unittest.TestCase):
         (self.root / "run").mkdir()
         self.binary = self.root / "bin"
         self.binary.mkdir()
-        for name, text in (("sudo", SUDO), ("nbdinfo", TOOL), ("nbd-client", TOOL)):
+        for name, text in (("sudo", SUDO), ("nbdinfo", TOOL), ("maki-attach", TOOL)):
             path = self.binary / name
             path.write_text(text)
             path.chmod(0o700)
@@ -83,6 +88,7 @@ nbd_uri="$URI"
 device=/dev/nbd15
 nbd_target=nbd15
 nbd_connection_id=maki-privval-fixture
+attach_bin="$FIXTURE/bin/maki-attach"
 # The real check proves the live kernel backend is still this run's own.
 test_nbd_action() {
     [[ "$*" == check ]] || { printf 'fixture: unexpected ownership action: %s\n' "$*" >&2; return 99; }
@@ -100,7 +106,7 @@ test_nbd_action() {
         return self.run_probe(self.socket_probe, URI, **kwargs)
 
     def disconnect(self, **kwargs):
-        return self.run_probe(self.disconnect_probe, "-d nbd15", **kwargs)
+        return self.run_probe(self.disconnect_probe, DISCONNECT, **kwargs)
 
     def assert_passed(self, result, marker):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -144,45 +150,38 @@ test_nbd_action() {
         self.assert_rejected(self.socket(stdout="protocol: newstyle-fixed without TLS\n",
                                          status=0), SOCKET_PASS)
 
-    def test_kernel_disconnect_denials_pass(self):
-        for stdout, stderr in (
-                # Netlink: the kernel's EPERM is reported without an errno.
-                ("", "Error: Failed to disconnect device, check dmsg\n\nExiting."),
-                # ioctl: NBD_DISCONNECT without CAP_SYS_ADMIN.
-                ("disconnect, ", "Error: Ioctl failed: Operation not permitted\n\nExiting."),
-                # ioctl: a device node the invoking user cannot open.
-                ("", "Error: Cannot open NBD: Permission denied\n"
-                     "Please ensure the 'nbd' module is loaded.\nExiting.")):
-            with self.subTest(stderr=stderr):
-                result = self.disconnect(stdout=stdout, stderr=stderr)
-                self.assert_passed(result, DISCONNECT_PASS)
-                self.assertTrue((self.root / "owned-backend").exists())
+    def test_the_kernels_refusal_is_denial_evidence(self):
+        result = self.disconnect(stderr="maki-attach: disconnect nbd15 over netlink\n" + DENIED)
+        self.assert_passed(result, DISCONNECT_PASS)
+        self.assertTrue((self.root / "owned-backend").exists())
 
     def test_disconnect_usage_and_setup_errors_are_not_denial_evidence(self):
         for status, stderr in (
-                (1, "Error: Invalid nbd device target\n\nExiting."),
-                (1, "nbd-client version 3.27.1\n"
-                    "Usage: nbd-client -name|-N name host [port] nbd_device\n"
-                    "Or   : nbd-client -d nbd_device"),
-                (1, "Error: Couldn't resolve the nbd netlink family, make sure the nbd module "
-                    "is loaded and your nbd driver supports the netlink interface.\nExiting."),
-                (1, "Error: Cannot open NBD: No such file or directory\n"
-                    "Please ensure the 'nbd' module is loaded.\nExiting."),
-                (127, "bash: line 1: nbd-client: command not found"),
-                # Permission denied for the client executable, not the device.
-                (126, "bash: line 1: /usr/sbin/nbd-client: Permission denied"),
+                (2, "error: --identifier has the form of an attach record's connection "
+                    "identifier (maki-<uuid>)"),
+                (2, "error: unsupported argument\nusage:"),
+                (1, 'error: step "disconnect nbd15 over netlink" failed: cannot look up the '
+                    "kernel's nbd netlink family: the nbd module is not loaded or has no "
+                    "netlink interface"),
+                (1, "error: step \"nbd-identity\" failed: /dev/nbd15 is connected under "
+                    "another identifier (\"x\"); refusing to touch it"),
+                # Another errno is not the permission boundary.
+                (1, 'error: step "disconnect nbd15 over netlink" failed: the kernel refused '
+                    "NBD_CMD_DISCONNECT for nbd15: Invalid argument (os error 22)"),
+                (127, "bash: line 1: maki-attach: command not found"),
+                # Permission denied for the helper executable, not the request.
+                (126, "bash: line 1: /fixture/maki-attach: Permission denied"),
                 (1, "")):
             with self.subTest(stderr=stderr):
                 result = self.disconnect(stderr=stderr, status=status)
                 self.assert_rejected(result, DISCONNECT_PASS, stderr.splitlines()[0] if stderr else None)
 
     def test_denial_text_with_a_lost_backend_fails(self):
-        result = self.disconnect(stderr="Error: Ioctl failed: Operation not permitted\n\nExiting.",
-                                 disconnects=True)
+        result = self.disconnect(stderr=DENIED, disconnects=True)
         self.assert_rejected(result, DISCONNECT_PASS)
 
     def test_successful_unprivileged_disconnect_fails(self):
-        result = self.disconnect(stdout="disconnect, sock, done\n", status=0, disconnects=True)
+        result = self.disconnect(status=0, disconnects=True)
         self.assert_rejected(result, DISCONNECT_PASS)
 
 
