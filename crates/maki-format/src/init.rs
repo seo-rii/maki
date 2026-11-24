@@ -103,7 +103,10 @@ fn continue_creation(
     }
     // Start over inside the backing: the new volume has a new identity, and
     // records of the interrupted one (its durable proof) would not match it.
-    for name in [layout::SHARD_CATALOG_A].into_iter().chain(CREATION_FILES) {
+    for name in [layout::SHARD_CATALOG_A, layout::SUPERBLOCK_NEXT]
+        .into_iter()
+        .chain(CREATION_FILES)
+    {
         match backing.remove(name) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -125,9 +128,10 @@ fn continue_creation(
 }
 
 /// What a creation writes at the root of the backing before its superblock.
-const CREATION_ROOT: [&str; 5] = [
+const CREATION_ROOT: [&str; 6] = [
     layout::VOLUME_LOCK,
     layout::SHARD_CATALOG_A,
+    layout::SUPERBLOCK_NEXT,
     layout::DATA_DIR,
     layout::JOURNAL_DIR,
     layout::CHECKPOINT_DIR,
@@ -144,9 +148,10 @@ const CREATION_FILES: [&str; 5] = [
 
 /// Whether `backing` holds nothing but what [`create_volume`] leaves when it
 /// stops before its superblock, its commit point: no superblock copy, and
-/// no entry other than the lock, the first shard-catalog copy, the three
-/// layout directories, the durable proof, the initial checkpoint state and
-/// the journal's durable mark, still empty. An empty backing qualifies.
+/// no entry other than the lock, the first shard-catalog copy, the staged
+/// first superblock copy, the three layout directories, the durable proof,
+/// the initial checkpoint state and the journal's durable mark, still
+/// empty. An empty backing qualifies.
 ///
 /// A volume that was ever attached holds a superblock copy; one that
 /// acknowledged a write also holds a journal segment or a shard, and a
@@ -219,8 +224,21 @@ fn create_volume_with_metadata_version(
     // different UUID over this volume's metadata (BUG-039).
     let _volume_lock = backing.try_lock(layout::VOLUME_LOCK)?;
     if backing.exists(layout::SUPERBLOCK_A)? || backing.exists(layout::SUPERBLOCK_B)? {
+        // A superblock file that holds no superblock is not a volume to
+        // report as present, and never one to initialize again: a release
+        // that created the first copy before writing it can have left it,
+        // and so can damage to both copies of a volume that holds data.
         return Err(FormatError::AlreadyExists(
-            "volume superblock already present".to_string(),
+            if load_volume_superblock(backing).is_ok() {
+                "volume superblock already present".to_string()
+            } else {
+                "a superblock file is present but holds no valid superblock: either a volume \
+                 create of an earlier release stopped while it wrote the first copy, or this \
+                 volume's superblock copies are damaged. Only if the volume was never attached, \
+                 empty the backing root and create it again; otherwise restore the root from a \
+                 backup"
+                    .to_string()
+            },
         ));
     }
     // The rest of an earlier volume's root-level metadata is refused too: a
@@ -313,13 +331,30 @@ fn create_volume_with_metadata_version(
     // readable copy that is not durable (or only copy A): the root is then a
     // volume this function refuses, and writable recovery makes both copies
     // durable before anything else (`persist_volume_superblock`).
+    //
+    // The first copy has no other to fall back on, so it is never written
+    // under its own name: it is written and synced as `superblock.next` and
+    // renamed into place. `superblock.a` therefore never names an empty or
+    // torn copy, whatever kills this process, cuts the power or fails in
+    // between: the root holds a superblock or no superblock file. The
+    // second copy's store then rewrites and syncs the first and syncs the
+    // directory before it touches its own side (the preserve-first rule).
     superblock.generation = 0;
     let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
     let mut envelope = VolumeSuperblock {
         superblock,
         metadata_version,
     };
-    sb_ab.store(backing, &mut envelope)?; // side A, gen 1
+    {
+        use crate::ab::AbRecord;
+        envelope.set_generation(1);
+        let first = AbRecord::encode(&envelope);
+        let staged = backing.open(layout::SUPERBLOCK_NEXT, true)?;
+        staged.set_len(first.len() as u64)?;
+        staged.write_at(0, &first)?;
+        staged.sync_data()?;
+        backing.rename(layout::SUPERBLOCK_NEXT, layout::SUPERBLOCK_A)?; // side A, gen 1
+    }
     sb_ab.store(backing, &mut envelope)?; // side B, gen 2
     backing.sync_dir("")?;
 

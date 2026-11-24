@@ -266,9 +266,10 @@ started with: `create` opens the pair against its witness, which
 authenticates the manifest and every committed page, and continues only
 if what it then finds is nothing but an unfinished creation, that is, no
 superblock copy and no entry other than what a creation writes before its
-superblock (the volume lock, the first shard-catalog copy, the empty
-`data`, `journal` and `checkpoint` directories with the durable proof,
-the initial checkpoint state and a durable mark that is still empty). It
+superblock (the volume lock, the first shard-catalog copy, a staged
+`superblock.next`, the empty `data`, `journal` and `checkpoint`
+directories with the durable proof, the initial checkpoint state and a
+durable mark that is still empty). It
 removes those files and initializes the volume anew, with a new volume
 UUID. A volume that was ever attached holds a superblock copy, so it is
 never continued this way, and damage cannot make one look unfinished: a

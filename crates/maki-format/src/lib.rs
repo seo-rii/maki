@@ -32,6 +32,9 @@ pub mod layout {
     pub const VOLUME_LOCK: &str = "volume.lock";
     pub const SUPERBLOCK_A: &str = "superblock.a";
     pub const SUPERBLOCK_B: &str = "superblock.b";
+    /// The first superblock copy of a creation while it is written, before
+    /// it is renamed to [`SUPERBLOCK_A`]. Nothing reads it.
+    pub const SUPERBLOCK_NEXT: &str = "superblock.next";
     pub const SHARD_CATALOG_A: &str = "shard-catalog.a";
     pub const SHARD_CATALOG_B: &str = "shard-catalog.b";
     /// Provider/key-bound canary (see `canary`), established at first attach.
@@ -46,9 +49,10 @@ pub mod layout {
     /// Every volume metadata file at the root of the backing except
     /// [`VOLUME_LOCK`]. Volume creation refuses a root that holds any of
     /// them, so a new root-level file must be listed here.
-    pub const ROOT_METADATA: [&str; 6] = [
+    pub const ROOT_METADATA: [&str; 7] = [
         SUPERBLOCK_A,
         SUPERBLOCK_B,
+        SUPERBLOCK_NEXT,
         SHARD_CATALOG_A,
         SHARD_CATALOG_B,
         KEY_CANARY_A,

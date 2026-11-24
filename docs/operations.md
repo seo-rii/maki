@@ -91,14 +91,25 @@ volume's shards would otherwise be adopted and served by the new one, and a
 root that still holds an earlier volume's `superblock.*`, `shard-catalog.*` or
 `canary.*` (a stale key canary would otherwise fail the first attach as a key
 mismatch). A leftover `volume.lock` is accepted.
-The superblock copies are written last, once everything else is durable: a
-creation interrupted before it writes a superblock copy leaves a root that is
-not a volume, and `volume create` refuses any files the interrupted run left in
-the layout directories until the root is emptied. Once a copy is readable, a
+The superblock copies are written last, once everything else is durable, and
+the first one is written and synced under a temporary name (`superblock.next`)
+and renamed into place, so a superblock file never holds anything but a
+superblock. A creation interrupted before a superblock copy exists leaves a
+root that is not a volume, and `volume create` refuses the files the
+interrupted run left (in the layout directories, `shard-catalog.a`,
+`superblock.next`) until the root is emptied. Once a copy exists, a
 retried `volume create` reports `volume superblock already present`: the root
 is a complete volume, except that a failed or killed creation may have left
 that copy only in the page cache. The first attach makes both superblock copies
 durable before it accepts writes; empty the root instead to start over.
+A superblock file that holds no valid superblock is a third state. This
+release does not produce it; an earlier one created the first copy before
+writing it, so a creation it stopped there left an empty or partly written
+`superblock.a`, and damage to both copies of a used volume looks the same.
+`volume create` refuses such a root with both causes and never initializes it
+again, and the daemon, `check` and `volume inspect` report `no valid
+superblock`. Only if the volume was never attached, empty the root and create
+it again; otherwise restore the root from a backup.
 A backing with a remote rollback witness is continued differently, without
 emptying its root: see
 [interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
