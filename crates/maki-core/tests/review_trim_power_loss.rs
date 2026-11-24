@@ -21,8 +21,11 @@ use uuid::Uuid;
 
 use maki_backing::Backing;
 use maki_core::engine::{AttachError, CheckpointPolicy, Engine, EngineOptions};
+use maki_core::volume::VolumeOptions;
 use maki_format::geometry::Geometry;
 use maki_format::init;
+use maki_format::journal::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE};
+use maki_format::layout;
 use maki_format::superblock::Superblock;
 use maki_test_support::crash_backing::{FaultHook, FaultOp};
 use maki_test_support::fake_provider::FakeCryptoProvider;
@@ -30,9 +33,26 @@ use maki_test_support::{CrashableBacking, ReferenceBlockModel};
 
 const UNIT: u32 = 512;
 const DEVICE_UNITS: u64 = 48;
-/// A tiny journal and shard: rolls, checkpoints and reclamation all happen
+/// Tiny shards, eight units each, and a tiny journal segment that holds
+/// three write records: rolls, checkpoints and reclamation all happen
 /// constantly, not only when asked.
 const SHARD_BYTES: u64 = 8 * UNIT as u64;
+const SEGMENT_BYTES: u64 =
+    SEGMENT_HEADER_SIZE as u64 + 3 * (RECORD_HEADER_SIZE as u64 + UNIT as u64 + 8);
+
+/// The highest journal segment index on the backing: the active segment's,
+/// once a session has appended. A session numbers the segments it creates
+/// consecutively and a checkpoint never deletes the active one, so the
+/// difference between two readings within a session is the number of
+/// automatic rolls in between.
+fn newest_segment(backing: &CrashableBacking) -> Option<u64> {
+    backing
+        .list(layout::JOURNAL_DIR)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| layout::parse_journal_segment(name))
+        .max()
+}
 
 fn superblock() -> Superblock {
     Superblock {
@@ -66,6 +86,9 @@ async fn try_attach(backing: &Arc<CrashableBacking>) -> Result<Engine, AttachErr
             checkpoint: CheckpointPolicy {
                 emergency_reserve_bytes: 0,
                 ..Default::default()
+            },
+            volume: VolumeOptions {
+                journal_segment_size: SEGMENT_BYTES,
             },
             ..EngineOptions::default()
         },
@@ -137,7 +160,8 @@ fn sync_faults(seed: u64, permille: u32, log: Arc<Mutex<Vec<String>>>) -> FaultH
     })
 }
 
-async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
+/// Returns how often the workloads rolled the journal.
+async fn sweep(seed: u64, cycles: usize, fault_permille: u32) -> u64 {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x51_7CC1_B727).wrapping_add(7));
     let backing = Arc::new(CrashableBacking::new().with_tearing(128));
     let mut model = ReferenceBlockModel::new(UNIT as usize, DEVICE_UNITS);
@@ -147,6 +171,7 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
     let mut engine = try_attach(&backing).await.unwrap();
     let history = |log: &Arc<Mutex<Vec<String>>>| log.lock().join("\n  ");
 
+    let mut rolls = 0;
     for cycle in 0..cycles {
         if fault_permille > 0 {
             backing.set_fault_hook(Some(sync_faults(
@@ -155,6 +180,8 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
                 log.clone(),
             )));
         }
+        // The session's first segment, read after its first write.
+        let mut first_segment = None;
         for _ in 0..rng.random_range(8..40) {
             let count = rng.random_range(1..=4u64);
             let first = rng.random_range(0..DEVICE_UNITS - count + 1);
@@ -166,6 +193,9 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
                         .flat_map(|u| image(u, stamp))
                         .collect();
                     let result = engine.write(off(first), &data, fua).await;
+                    if first_segment.is_none() {
+                        first_segment = newest_segment(&backing);
+                    }
                     log.lock().push(format!(
                         "write {first}..{} stamp {stamp} fua={fua} -> {:?}",
                         first + count,
@@ -262,6 +292,9 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
         }
 
         backing.set_fault_hook(None);
+        if let (Some(first), Some(last)) = (first_segment, newest_segment(&backing)) {
+            rolls += last - first;
+        }
         engine.stop_checkpoint_worker().await;
         drop(engine);
         let what = if rng.random_bool(0.7) {
@@ -305,22 +338,32 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) {
             maybe.superseded.remove(&unit);
         }
     }
+    rolls
 }
 
 #[tokio::test]
 async fn writes_and_trims_survive_power_loss_and_restart_cycles() {
     let _serial = maki_test_support::failpoints::test_lock();
     for seed in 0..24 {
-        sweep(seed, 6, 0).await;
+        // A sweep that stops rolling the journal still passes, and proves
+        // much less.
+        assert!(
+            sweep(seed, 6, 0).await > 0,
+            "seed {seed}: the workload never rolled the journal"
+        );
     }
 }
 
 #[tokio::test]
 async fn writes_and_trims_with_sync_failures_never_show_foreign_data() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut rolls = 0;
     for seed in 0..24 {
-        sweep(1000 + seed, 6, 120).await;
+        rolls += sweep(1000 + seed, 6, 120).await;
     }
+    // A failed sync can stop a workload before its first roll, so only the
+    // sweep as a whole is held to it.
+    assert!(rolls > 0, "no workload rolled the journal");
 }
 
 #[tokio::test]
