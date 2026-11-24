@@ -22,8 +22,18 @@ ROOT = runner.ROOT
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 STEP = """      - name: root-only tests (Linux)
         if: runner.os == 'Linux'
+        env:
+          MAKI_TEST_REQUIRE_NBD: "1"
         run: python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked
 """
+# The kernel NBD test runs in the root step only: it skips without root, and
+# with the variable set the unprivileged run would fail it.
+NBD_MODULE = """      - name: load the NBD kernel module (Linux)
+        if: runner.os == 'Linux'
+"""
+REQUIRED_TOOLS = ("MAKI_TEST_REQUIRE_NBDKIT", "MAKI_TEST_REQUIRE_NBD_HEADERS")
+# What the root runner passes on to the tests it starts as root.
+REQUIRED_ENVIRONMENT = ("MAKI_TEST_REQUIRE_NBD", *REQUIRED_TOOLS)
 WORKSPACE_TESTS = "        run: python scripts/run_cargo_tests.py --workspace --locked\n"
 
 # How a test finds out, or says, that it lacks a privilege:
@@ -183,6 +193,29 @@ class RootOnlyTargetsAreNotForgotten(unittest.TestCase):
         self.assertLess(pull_request.index(WORKSPACE_TESTS), pull_request.index(STEP))
         self.assertEqual(workflow.count("scripts/run_root_tests.py"), 1)
 
+    def test_the_root_step_has_the_nbd_module_and_every_job_requires_the_nbd_tools(self):
+        workflow = WORKFLOW.read_text()
+        jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", workflow))
+        pull_request = jobs["pr"]
+        # The module is loaded (or the step fails) before the root step, which
+        # alone requires kernel NBD.
+        self.assertIn(NBD_MODULE, pull_request)
+        module = pull_request.index(NBD_MODULE)
+        self.assertLess(pull_request.index(WORKSPACE_TESTS), module)
+        self.assertLess(module, pull_request.index(STEP))
+        step = pull_request[module:pull_request.index(STEP)]
+        self.assertIn("sudo modprobe nbd", step)
+        self.assertIn("test -d /sys/module/nbd", step)
+        self.assertEqual(workflow.count("MAKI_TEST_REQUIRE_NBD:"), 1)
+        # Every job that runs the tests installs nbdkit and the UAPI headers,
+        # and the workflow makes their absence a failure, as it does for a
+        # missing second filesystem.
+        environment = workflow[workflow.index("\nenv:\n"):workflow.index("\njobs:\n")]
+        for name in REQUIRED_TOOLS:
+            self.assertIn(f'  {name}: "1"\n', environment)
+        for job in ("pr", "latest-stable"):
+            self.assertRegex(jobs[job], r"apt-get install -y -q nbdkit [^\n]*\blinux-libc-dev\b")
+
 
 TEST_BINARY = '''#!{python} -B
 import json, os, stat, sys
@@ -248,7 +281,8 @@ class RootRunner(unittest.TestCase):
         self.compile()
         environment = {"PATH": f"{self.tools}{os.pathsep}{os.environ['PATH']}",
                        "MAKI_FIXTURE_MARKER": "inherited", "RUST_BACKTRACE": "0",
-                       "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM": "1"}
+                       "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM": "1",
+                       **{name: "1" for name in REQUIRED_ENVIRONMENT}}
         for patch in (mock.patch.dict(os.environ, environment),
                       mock.patch.object(runner, "owned_by", return_value=set())):
             patch.start()
@@ -327,6 +361,8 @@ class RootRunner(unittest.TestCase):
             self.assertEqual(environment["TMPDIR"], scratch)
             self.assertEqual(environment["RUST_BACKTRACE"], "0")
             self.assertEqual(environment["MAKI_TEST_REQUIRE_OTHER_FILESYSTEM"], "1")
+            for name in REQUIRED_ENVIRONMENT:
+                self.assertEqual(environment[name], "1", name)
             self.assertNotIn("MAKI_FIXTURE_MARKER", environment)
             # Fixture users must be able to search the scratch directory.
             self.assertEqual(run["scratch"], 0o755)
