@@ -690,7 +690,7 @@ class RpmManifest(unittest.TestCase):
         self.assertEqual(manifest["package"]["release"], "1")
         self.assertEqual(manifest["package"]["sha256"], sha256(self.package))
         self.assertIn("nbdkit-server", manifest["package"]["requires"])
-        self.assertEqual(manifest["package"]["conflicts"], ["nbdkit-selinux"])
+        self.assertEqual(sorted(manifest["package"]["conflicts"]), ["nbdkit", "nbdkit-selinux"])
         self.assertEqual(manifest["build_host"]["architecture"], "x86_64")
         self.assertIn("rustc 1.94.0", manifest["toolchain"]["rustc"])
         if shutil.which("sha256sum"):

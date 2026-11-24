@@ -53,10 +53,23 @@ class RhelInstallationGuide(unittest.TestCase):
 
     def test_guide_and_package_readme_quote_the_spec_conflicts(self):
         expected = ", ".join(spec_tag("Conflicts"))
-        self.assertEqual(expected, "nbdkit-selinux")
+        self.assertEqual(expected, "nbdkit-selinux, nbdkit")
         for path in (GUIDE, RPM_README):
             with self.subTest(path=path.name):
                 self.assertEqual(re.findall(r"^Conflicts: (.+)$", path.read_text(), re.M), [expected])
+
+    def test_guide_and_package_readme_say_how_the_package_is_removed(self):
+        # rpm cannot stop a transaction from %preun: dnf is told not to
+        # remove the package, and rpm removes it.
+        for path in (GUIDE, RPM_README):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertIn("/etc/dnf/protected.d/maki.conf", text)
+                self.assertIn("rpm -e maki", text)
+        self.assertIn("rpm -e maki", commands(GUIDE))
+        for command in commands(GUIDE):
+            with self.subTest(command=command):
+                self.assertNotRegex(command, r"^(?:sudo )?(?:dnf|yum|microdnf) .*\b(?:remove|erase)\b")
 
     def test_packages_come_from_baseos_and_appstream_only(self):
         dnf = [command for command in commands(GUIDE) if re.match(r"(?:sudo )?dnf\b", command)]

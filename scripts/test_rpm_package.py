@@ -189,9 +189,40 @@ class RpmPackageTests(unittest.TestCase):
 
     def test_package_conflicts_with_the_nbdkit_selinux_module(self):
         # nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, which the
-        # targeted policy lets systemd neither execute nor transition from;
-        # the nbdkit metapackage would bring it back after installation.
-        self.assertEqual(query(self.build(), "[%{CONFLICTS}\n]").split(), ["nbdkit-selinux"])
+        # targeted policy lets systemd neither execute nor transition from.
+        # Only the nbdkit metapackage requires the module, and only where
+        # selinux-policy-targeted is installed: with the module alone refused
+        # and Maki protected, `dnf install --allowerasing nbdkit` satisfies
+        # the metapackage by replacing the host's SELinux policy.
+        self.assertEqual(sorted(query(self.build(), "[%{CONFLICTS}\n]").split()), ["nbdkit", "nbdkit-selinux"])
+        self.assertEqual(set(query(self.build(), "[%{CONFLICTVERSION}\n]").split()), set(),
+                         "every version of both is refused")
+
+    def test_dnf_is_told_not_to_remove_the_package(self):
+        # A failing %preun keeps Maki, but rpm goes on with the rest of the
+        # transaction: `dnf remove maki` under an attachment erased
+        # nbdkit-server, lvm2, xfsprogs and kmod as unused dependencies, and
+        # `dnf --allowerasing` installed what conflicts with Maki beside it.
+        # dnf refuses a transaction that removes a protected package, or one
+        # of its dependencies, before it changes anything.
+        package = self.build()
+        installed = payload(package, self.work / "root") / "etc/dnf/protected.d/maki.conf"
+        self.assertEqual(installed.read_bytes(), (ROOT / "packaging/rpm/dnf-protected.conf").read_bytes())
+        # As dnf reads a protected.d file: a package name per line, blank
+        # lines and lines that start with `#` skipped.
+        names = [line.strip() for line in installed.read_text().splitlines()
+                 if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(names, [query(package, "%{NAME}")])
+        self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o644)
+        # The file is what an operator finds behind dnf's refusal.
+        for needed in ("rpm -e maki", "maki-workload@", "dnf autoremove"):
+            self.assertIn(needed, installed.read_text())
+        flags = dict(line.split("\t") for line in
+                     query(package, "[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]").splitlines())
+        # %config(noreplace), like systemd's own entry: an administrator's
+        # edit is kept by upgrades.
+        self.assertEqual({name: value for name, value in flags.items() if "c" in value},
+                         {"/etc/dnf/protected.d/maki.conf": "cn"})
 
     def test_package_owns_runtime_artifacts_but_not_live_configuration(self):
         package = self.build()
@@ -213,7 +244,10 @@ class RpmPackageTests(unittest.TestCase):
         for kind in ("sysusers.d", "tmpfiles.d"):
             self.assertEqual((root / "usr/lib" / kind / "maki.conf").read_bytes(),
                              (ROOT / "packaging" / kind / "maki.conf").read_bytes())
-        self.assertFalse((root / "etc").exists(), "the package owns nothing below /etc")
+        # Nothing below /etc/maki, which belongs to the operator; the one
+        # file outside /usr is dnf's.
+        self.assertEqual(sorted(path.relative_to(root).as_posix() for path in (root / "etc").rglob("*")
+                                if not path.is_dir()), ["etc/dnf/protected.d/maki.conf"])
 
     def test_daemon_unit_runs_the_distribution_nbdkit_by_absolute_path(self):
         root = payload(self.build(), self.work / "root")
@@ -576,9 +610,11 @@ class SameFilesAsTheDebianPackage(unittest.TestCase):
         deb = {name: entry for name, entry in tree(self.deb_root).items() if entry[0] == "file"}
         rpm = {name: entry for name, entry in tree(self.rpm_root).items() if entry[0] == "file"}
         # Format-specific records: Debian's changelog of the package itself;
-        # RHEL has no /usr/share/common-licenses for the notice to point to.
+        # RHEL has no /usr/share/common-licenses for the notice to point to,
+        # and dnf, unlike apt, goes on with a removal that %preun refused.
         self.assertEqual(sorted(set(deb) - set(rpm)), ["usr/share/doc/maki/changelog.Debian.gz"])
-        self.assertEqual(sorted(set(rpm) - set(deb)), ["usr/share/licenses/maki/LICENSE"])
+        self.assertEqual(sorted(set(rpm) - set(deb)),
+                         ["etc/dnf/protected.d/maki.conf", "usr/share/licenses/maki/LICENSE"])
         unit = "usr/lib/systemd/system/maki@.service"
         for name in sorted(set(deb) & set(rpm)):
             with self.subTest(name=name):

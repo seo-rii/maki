@@ -383,9 +383,45 @@ class RhelUserspaceJob(unittest.TestCase):
                       script)
         self.assertIn("grep -q 'conflicts with nbdkit-selinux' \"$RUNNER_TEMP/selinux\"\n", script)
         self.assertLess(install, script.index("--assumeno nbdkit-selinux"))
-        record = script.index("/run/maki-attach/")
+        record = script.index("echo '{}' > /run/maki-attach/ci.nbd\n")
         self.assertLess(record, script.index("rpm -e maki"))
         self.assertRegex(script, r"if rpm -e maki; then[^\n]*\n[^\n]*exit 1")
+        # rpm cannot stop a transaction from %preun. Under the record dnf
+        # must refuse, before it changes anything, to remove Maki, to remove
+        # what it requires, and to put the nbdkit metapackage in its place;
+        # the checks that follow fail if the runtime was erased after all.
+        refusals = [
+            ('if dnf remove -y maki > "$RUNNER_TEMP/remove" 2>&1; then exit 1; fi\n',
+             "grep -q 'removing the following protected packages: maki' \"$RUNNER_TEMP/remove\"\n"),
+            ('if dnf remove -y lvm2 > "$RUNNER_TEMP/remove-lvm2" 2>&1; then exit 1; fi\n',
+             "grep -q 'broken dependencies for the following protected packages: maki' "
+             "\"$RUNNER_TEMP/remove-lvm2\"\n"),
+            ('if dnf install -y --allowerasing nbdkit > "$RUNNER_TEMP/metapackage" 2>&1; then exit 1; fi\n',
+             "grep -q 'conflicts with nbdkit provided by' \"$RUNNER_TEMP/metapackage\"\n"),
+        ]
+        position = record
+        for attempt, reason in refusals:
+            with self.subTest(attempt=attempt):
+                # Each refusal is checked for its reason on the next line.
+                self.assertRegex(script, re.escape(attempt) + r"\s*" + re.escape(reason))
+                self.assertLess(position, script.index(attempt))
+                position = script.index(attempt)
+        intact = script.index("rpm -q maki nbdkit-server lvm2 xfsprogs kmod\n")
+        self.assertLess(position, intact)
+        self.assertLess(intact, script.index("rpm -V maki\n", intact))
+        self.assertLess(script.index("rpm -V maki\n", intact), script.index("if rpm -e maki; then"))
+        self.assertEqual(script.count("for unwanted in nbdkit nbdkit-selinux; do\n"), 2,
+                         "neither may be installed before or after the refused transactions")
+        # An upgrade or reinstallation is never refused, also under the record.
+        reinstall = script.index('dnf reinstall -y -q "$package"\n')
+        self.assertLess(record, reinstall)
+        self.assertLess(reinstall, script.index("rm /run/maki-attach/ci.nbd\n"))
+        # Without a record dnf still refuses and rpm removes the package,
+        # with its entry in /etc/dnf/protected.d.
+        idle = script.index('if dnf remove -y maki > "$RUNNER_TEMP/remove-idle" 2>&1; then exit 1; fi\n')
+        self.assertLess(script.index("rm /run/maki-attach/ci.nbd\n"), idle)
+        removal = script.index("rpm -e maki\n", idle)
+        self.assertLess(removal, script.index("test ! -e /etc/dnf/protected.d/maki.conf\n"))
 
 
 if __name__ == "__main__":
