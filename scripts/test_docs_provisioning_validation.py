@@ -96,6 +96,26 @@ elif name == "blkid":
     print(os.environ["BOOTSTRAP_UUID"])
 '''
 
+# One program under the names the quick start's creation block runs. It logs
+# its command line, prints its stage and fails at the stage named by FAIL_AT;
+# as `runuser` it accepts only `-u maki -- <command>` and runs the command.
+QUICKSTART_TOOL = r'''#!@BASH@
+name=${0##*/}
+echo "$name $*" >> "$TOOL_LOG"
+case "$name" in
+    runuser)
+        [[ "$1" == -u && "$2" == maki && "$3" == -- && $# -gt 3 ]] ||
+            { echo "runuser: unexpected arguments: $*" >&2; exit 64; }
+        shift 3
+        exec "$@"
+        ;;
+    install) stage=install ;;
+    maki) if [[ "$1" == volume ]]; then stage=$2; else stage=$1; fi ;;
+esac
+echo "$stage"
+[[ "$stage" != "$FAIL_AT" ]] || exit 42
+'''
+
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires Bash")
 class ProvisioningContract(unittest.TestCase):
@@ -200,20 +220,30 @@ class ProvisioningContract(unittest.TestCase):
     def test_quickstart_create_block_stops_at_each_failed_command(self):
         text = (ROOT / "docs/getting-started/quickstart.md").read_text()
         blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
-        block, = [block for block in blocks if "sudo -u maki maki volume create" in block]
+        block, = [block for block in blocks if "maki volume create" in block]
         commands = ["install", "create", "inspect", "check"]
-        fixture = """
-stage() { echo "$1"; if [[ "$1" == "$FAIL_AT" ]]; then return 42; fi; }
-install() { stage install; }
-sudo() { shift 2; "$@"; }
-maki() { if [[ "$1" == volume ]]; then stage "$2"; else stage "$1"; fi; }
-"""
-        for index, failed in enumerate([*commands, "none"]):
-            with self.subTest(failed=failed):
-                result = subprocess.run(["bash", "-c", fixture + block], capture_output=True,
-                                        text=True, timeout=5, env=dict(os.environ, FAIL_AT=failed))
-                self.assertEqual(result.returncode, 0 if failed == "none" else 42, result.stderr)
-                self.assertEqual(result.stdout.splitlines(), commands[:index + 1])
+        # The block runs as written, with only these programs to find: what
+        # the package installs (`maki`) and what its dependencies bring
+        # (`install` from coreutils, `runuser` from util-linux). A command
+        # from any other package, such as sudo, is "command not found".
+        with tempfile.TemporaryDirectory(prefix="maki-quickstart-") as directory:
+            tools = Path(directory)
+            bash = shutil.which("bash")
+            for name in ("install", "maki", "runuser"):
+                (tools / name).write_text(QUICKSTART_TOOL.replace("@BASH@", bash))
+                (tools / name).chmod(0o700)
+            for index, failed in enumerate([*commands, "none"]):
+                with self.subTest(failed=failed):
+                    log = tools / f"{failed}.log"
+                    result = subprocess.run(
+                        [bash, "-c", block], capture_output=True, text=True, timeout=5,
+                        env={"PATH": directory, "FAIL_AT": failed, "TOOL_LOG": str(log)})
+                    self.assertEqual(result.returncode, 0 if failed == "none" else 42, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), commands[:index + 1])
+                    if index:
+                        # The volume is created as the daemon user.
+                        self.assertIn("runuser -u maki -- maki volume create "
+                                      "/etc/maki/volumes/demo.toml", log.read_text().splitlines())
 
     def test_quickstart_uses_the_shared_checked_procedure(self):
         text = (ROOT / "docs/getting-started/quickstart.md").read_text()

@@ -2,8 +2,9 @@
 
 A refusal a guide quotes is a string in the sources, the tier table of the
 testing guide describes steps of the workflow, a layout lists directories,
-and the release pages describe what the release workflow tags. Each test
-reads both sides, so that neither changes alone.
+the release pages describe what the release workflow tags, and a command a
+guide runs must exist on a host that has only the package's dependencies.
+Each test reads both sides, so that neither changes alone.
 """
 
 from pathlib import Path
@@ -74,6 +75,59 @@ class QuotedRefusals(DocumentTest):
         self.assertIn("`remote enrollment requires an empty backing`", before)
         self.assertIn("unclaimed", before)
         self.assertIn("claimed the authority", after)
+
+
+class DaemonUserCommands(DocumentTest):
+    """The guides run as root and reach another user with `runuser`.
+
+    Neither package depends on sudo, and a minimal Debian 12 or RHEL 9
+    installation has none; `runuser` comes with util-linux, which both
+    packages require.
+    """
+
+    maxDiff = None
+
+    def guides(self):
+        """Every maintained guide; dated reports and records keep their text."""
+        pages = [ROOT / "README.md", ROOT / "SECURITY.md", ROOT / "CONTRIBUTING.md", ROOT / "SPEC.md"]
+        pages += sorted((ROOT / "docs").rglob("*.md"))
+        pages += sorted((ROOT / "packaging").rglob("*.md")) + sorted((ROOT / "packaging").rglob("*.8"))
+        pages += sorted((ROOT / "examples").rglob("*.md"))
+        return [page for page in pages
+                if "qualification" not in page.parts and not page.name.startswith("review-")]
+
+    def test_no_guide_switches_user_through_sudo(self):
+        guides = self.guides()
+        for expected in ("docs/getting-started/quickstart.md", "docs/operations.md",
+                         "docs/deployment/postgres.md", "docs/rollback-protection.md",
+                         "docs/remote-witness-service.md", "README.md"):
+            self.assertIn(ROOT / expected, guides)
+        found = [f"{page.relative_to(ROOT)}:{number}: {line.strip()}"
+                 for page in guides
+                 for number, line in enumerate(page.read_text().splitlines(), 1)
+                 if re.search(r"\bsudo\s+-u\b", line)]
+        self.assertEqual(found, [], "use `runuser -u <user> -- <command>`")
+
+    def test_every_runuser_command_names_the_user_and_ends_its_options(self):
+        commands = [(page, line.strip())
+                    for page in self.guides()
+                    for line in page.read_text().splitlines()
+                    if re.search(r"\brunuser\b", line)]
+        users = set()
+        for page, line in commands:
+            with self.subTest(page=str(page.relative_to(ROOT)), line=line):
+                match = re.search(r"\brunuser -u (maki|maki-witness) -- \S", line)
+                self.assertIsNotNone(match)
+                users.add(match.group(1))
+        # The daemon user in the volume guides, the witness account in its own.
+        self.assertEqual(users, {"maki", "maki-witness"})
+
+    def test_both_packages_require_the_package_that_ships_runuser(self):
+        deb = (ROOT / "packaging/debian/build-deb.py").read_text()
+        depends, = re.findall(r"(?m)^    depends = \[([^\]]*)\]$", deb)
+        self.assertIn('"util-linux"', depends)
+        spec = (ROOT / "packaging/rpm/maki.spec").read_text()
+        self.assertRegex(spec, r"(?m)^Requires:\s+util-linux$")
 
 
 class LogFilterWarning(DocumentTest):
