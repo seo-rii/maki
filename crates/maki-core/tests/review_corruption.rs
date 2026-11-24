@@ -350,6 +350,19 @@ async fn deep_check_reports_allocation_repair_and_idle_checkpoint_persists_it() 
             store.repaired_allocations().is_empty(),
             "seed {seed}: idle checkpoint did not persist"
         );
+        // Two valid copies are not yet the repair: both must list the unit
+        // whose slot the older copy did not know.
+        let (shard, in_shard) = geometry().shard_of_unit(fresh);
+        for path in [layout::shard_alloc_a(shard), layout::shard_alloc_b(shard)] {
+            let file = backing.open(&path, false).unwrap();
+            let mut bytes = vec![0; file.len().unwrap() as usize];
+            file.read_at(0, &mut bytes).unwrap();
+            let map = <AllocationMap as maki_format::ab::AbRecord>::decode(&bytes).unwrap();
+            assert!(
+                map.get(in_shard),
+                "seed {seed}: {path} does not list unit {fresh} after the idle checkpoint"
+            );
+        }
     }
 }
 
