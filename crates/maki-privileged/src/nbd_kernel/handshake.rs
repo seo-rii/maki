@@ -263,7 +263,11 @@ pub fn negotiate(stream: &UnixStream, deadline: Instant) -> io::Result<Export> {
                     error_name(kind),
                     data.len()
                 );
-                return Err(invalid(refusal));
+                return Err(if kind == NBD_REP_ERR_UNKNOWN {
+                    io::Error::new(io::ErrorKind::InvalidData, ExportUnavailable(refusal))
+                } else {
+                    invalid(refusal)
+                });
             }
             kind => {
                 return Err(invalid(format!(
@@ -313,7 +317,10 @@ fn error_name(kind: u32) -> String {
         NBD_REP_ERR_INVALID => "NBD_REP_ERR_INVALID",
         NBD_REP_ERR_PLATFORM => "NBD_REP_ERR_PLATFORM",
         NBD_REP_ERR_TLS_REQD => "NBD_REP_ERR_TLS_REQD (TLS, which the kernel client cannot use)",
-        NBD_REP_ERR_UNKNOWN => "NBD_REP_ERR_UNKNOWN (no default export)",
+        NBD_REP_ERR_UNKNOWN => {
+            "NBD_REP_ERR_UNKNOWN (the export is not available: busy with another connection, \
+             or no default export)"
+        }
         NBD_REP_ERR_SHUTDOWN => "NBD_REP_ERR_SHUTDOWN",
         NBD_REP_ERR_BLOCK_SIZE_REQD => "NBD_REP_ERR_BLOCK_SIZE_REQD",
         NBD_REP_ERR_TOO_BIG => "NBD_REP_ERR_TOO_BIG",
