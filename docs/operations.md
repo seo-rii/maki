@@ -537,6 +537,11 @@ Every executing verb (attach, detach, cleanup, recover, grow, verify, and
 the `recover-failed-start` hook) reads this file only when it is a root-owned regular file with one link, not
 writable by group or others, below root-owned directories with the same
 restriction: the helper runs as root on what it says. `--plan` reads any file.
+Without `--config`, only a default path that does not exist selects the
+built-in defaults. A path the caller cannot examine, for example because
+`/etc/maki/attach` is closed to that user, is an error that names the path,
+for `--plan` too: a plan from the defaults would show another attachment than
+the configured one.
 For attach, detach, recover, cleanup and grow, command-line flags override the
 NBD device, NBD socket, VG, LV, mountpoint, volume UUID and XFS UUID, and
 `--init-sentinel` (attach only) turns the sentinel option on, never off.

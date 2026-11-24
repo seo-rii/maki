@@ -89,6 +89,11 @@ The helper negotiates with the daemon's NBD socket and connects and
 disconnects the kernel NBD device over netlink itself; no NBD client program
 is used. An export that does not advertise FLUSH and FUA is refused before the
 kernel sees it.
+A plan shows a placeholder for the backend identifier of an attach's
+connection, which is made when the attach runs; the executed step logs and
+reports the identifier it sent, which is what
+.I /sys/block/nbdN/backend
+then shows.
 .PP
 .B nbd-connect
 and
@@ -116,6 +121,12 @@ requires it.
 .BI \-\-config " file"
 Read attachment settings from this file. The default path, when present, is
 .IR /etc/maki/attach/name.toml .
+Only a default path that does not exist selects the built-in settings. One
+that cannot be examined, for example by a user who may not search
+.IR /etc/maki/attach ,
+is an error, for
+.B \-\-plan
+too.
 .B recover-failed-start
 refuses this option; to roll back an interrupted activation it reads the
 default path, under the same ownership rule as the other actions.
@@ -200,7 +211,11 @@ The expected XFS filesystem UUID
 .RB ( fs_uuid ).
 .SH EXIT STATUS
 Zero indicates success. A failed action returns 1, as does an attachment
-file that cannot be read, is not trusted or does not parse. Invalid command
+file that cannot be read, is not trusted or does not parse. An error about
+the attachment file, the state directory
+.I /run/maki-attach
+or its lock names that path, and says to run the command as root when the
+caller lacks the permission. Invalid command
 usage returns 2 and prints no plan: an unknown, repeated or misplaced
 option, a malformed volume name, which is checked first, or an option or
 setting value that fails validation, which is checked once the file has been
