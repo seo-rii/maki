@@ -172,6 +172,22 @@ impl PlannedStep {
             }
         }
     }
+
+    /// Replace the device `from` with `to` wherever the step names it.
+    fn rebind_device(&mut self, from: &str, to: &str) {
+        match self {
+            PlannedStep::NbdConnect { device, .. }
+            | PlannedStep::SetBlockSize { device, .. }
+            | PlannedStep::NbdDisconnect { device }
+            | PlannedStep::VerifyMountDevice {
+                nbd_device: device, ..
+            }
+            | PlannedStep::VerifyMountIdentity {
+                nbd_device: device, ..
+            } if device == from => *device = to.to_string(),
+            _ => {}
+        }
+    }
 }
 
 /// Render one argument in command-shaped plan output, preserving simple paths.
@@ -362,6 +378,14 @@ impl Plan {
     pub fn bind_device(&mut self, device: &str) {
         for step in &mut self.steps {
             step.bind_device(device);
+        }
+    }
+
+    /// Move a plan bound to the allocated device `from` to the device `to`:
+    /// an attach gives up a device the kernel keeps refusing as busy.
+    pub fn rebind_device(&mut self, from: &str, to: &str) {
+        for step in &mut self.steps {
+            step.rebind_device(from, to);
         }
     }
 }
