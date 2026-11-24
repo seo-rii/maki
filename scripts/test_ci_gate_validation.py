@@ -305,13 +305,45 @@ class RhelUserspaceJob(unittest.TestCase):
                          "CRB only, for nbdkit-devel")
         packages = set(re.findall(r"[\w.+-]+", " ".join(
             line for line in install.splitlines() if not line.strip().startswith(("nbdkit --", "test ")))))
-        for package in ("gcc", "git-core", "python3", "rpm-build", "cpio", "nbdkit", "nbdkit-devel",
-                        "libnbd", "lvm2", "xfsprogs", "util-linux", "kmod", "systemd", "kernel-headers"):
+        # Test tools: nbdkit-server as the RPM requires it, the basic plugins
+        # for the tests' memory and eval exports, the UAPI headers and a C
+        # compiler for the header probes.
+        for package in ("gcc", "git-core", "python3", "rpm-build", "cpio", "nbdkit-server",
+                        "nbdkit-basic-plugins", "nbdkit-devel", "libnbd", "util-linux", "systemd",
+                        "kernel-headers"):
             self.assertIn(package, packages)
+        # The nbdkit metapackage is what the guide says not to install; the
+        # rest of the runtime must come from the RPM's own Requires.
+        for package in ("nbdkit", "nbdkit-selinux", "lvm2", "xfsprogs", "kmod"):
+            self.assertNotIn(package, packages)
         for check in ("nbdkit --version", "nbdinfo --version", "nbdcopy --version",
-                      "test -f /usr/include/nbdkit-plugin.h",
+                      "test -f /usr/include/nbdkit-plugin.h", "test -f /usr/include/linux/nbd.h",
+                      "test -f /usr/include/linux/nbd-netlink.h",
                       'test "$(command -v nbdkit)" = /usr/sbin/nbdkit'):
             self.assertIn(check, install)
+
+    def test_root_in_the_runner_owned_workspace(self):
+        # Container steps run as root, but /__w (the workspace, RUNNER_TEMP)
+        # and /github/home belong to the runner's uid 1001. actions/checkout
+        # trusts the workspace only in a temporary git config, so root's git
+        # refuses it, and fixtures that require root-owned ancestors closed
+        # to others (regression_mount_target.rs) refuse the workspace, HOME
+        # and the world-writable /tmp.
+        name = "root in the runner-owned workspace"
+        position = self.names.index(name)
+        self.assertEqual(position, self.names.index("actions/checkout@v4") + 1)
+        self.assertLess(position, self.names.index("packaged binaries"))
+        script = self.step(name)
+        self.assertIn('git config --global --add safe.directory "$GITHUB_WORKSPACE"', script)
+        created = re.findall(r"install -d -o root -g root -m 0755 (/\S+)", script)
+        self.assertEqual(len(created), 1, script)
+        directory = created[0]
+        # 0755 like the root runner's scratch directory: fixtures hand files
+        # to uid 65534, which must be able to reach them.
+        for unsuitable in ("/tmp", "/var/tmp", "/dev/shm", "/__w", "/github", "/home", "/root"):
+            self.assertFalse(directory == unsuitable or directory.startswith(unsuitable + "/"),
+                             directory)
+        self.assertIn(f'echo "TMPDIR={directory}" >> "$GITHUB_ENV"', script)
 
     def test_builds_tests_and_packages_what_the_debian_package_ships(self):
         order = [self.names.index(name) for name in (
@@ -323,8 +355,10 @@ class RhelUserspaceJob(unittest.TestCase):
                       "-p maki-nbdkit\n", self.step("packaged binaries"))
         self.assertIn("run: cargo test --locked -p maki-nbdkit --test review_abi -- --nocapture\n",
                       self.step("nbdkit ABI against the EL9 header"))
-        self.assertIn("run: python3 -B scripts/run_cargo_tests.py --locked -p maki-privileged "
-                      "-p maki-attach -p maki-nbdkit\n", self.step("helper, attach and plugin suites"))
+        # One failing test binary must not hide the verdict of the others.
+        self.assertIn("run: python3 -B scripts/run_cargo_tests.py --locked --no-fail-fast "
+                      "-p maki-privileged -p maki-attach -p maki-nbdkit\n",
+                      self.step("helper, attach and plugin suites"))
         self.assertIn("run: python3 -B -m unittest scripts.test_rpm_package -v\n",
                       self.step("RPM package contract"))
 
@@ -338,6 +372,12 @@ class RhelUserspaceJob(unittest.TestCase):
                       "systemd-analyze verify", "/usr/lib/systemd/system/maki@.service",
                       "/run/maki-attach/", "rpm -e maki"):
             self.assertIn(check, script)
+        # The RPM's Requires bring the rest of the runtime, without the
+        # nbdkit metapackage.
+        install = script.index("dnf install -y")
+        self.assertLess(install, script.index("rpm -q nbdkit-server lvm2 xfsprogs util-linux systemd kmod\n"))
+        self.assertRegex(script, r"for unwanted in nbdkit nbdkit-selinux; do\n\s*if rpm -q \"\$unwanted\"; "
+                                 r"then exit 1; fi\n\s*done")
         record = script.index("/run/maki-attach/")
         self.assertLess(record, script.index("rpm -e maki"))
         self.assertRegex(script, r"if rpm -e maki; then[^\n]*\n[^\n]*exit 1")
