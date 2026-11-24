@@ -1,0 +1,14 @@
+# Round-8 audit helper (not part of the repository): writes valid encoded
+# images of every maki-format record as libFuzzer seed corpora.
+[package]
+name = "a8-seedgen"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+maki-format = { path = "/home/user/wt/audit8/crates/maki-format" }
+uuid = "1"
+crc32fast = "1"
+
+[workspace]

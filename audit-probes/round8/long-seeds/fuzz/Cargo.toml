@@ -1,0 +1,93 @@
+# Coverage-guided (libFuzzer) fuzz targets. Detached from the main workspace
+# (the empty [workspace] table below) so it never affects `cargo build
+# --workspace` and only builds under `cargo +nightly fuzz`.
+#
+# Run (Linux, nightly):
+#   cargo +nightly fuzz run format_decoders -- -max_total_time=60
+#   cargo +nightly fuzz run journal_scan    -- -max_total_time=60
+#   cargo +nightly fuzz run config_parse    -- -max_total_time=60
+#   cargo +nightly fuzz run endpoint_url    -- -max_total_time=60
+#   cargo +nightly fuzz run probe_parsers   -- -max_total_time=60
+
+[package]
+name = "maki-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+maki-format = { path = "/home/user/wt/audit8/crates/maki-format" }
+maki-privileged = { path = "/home/user/wt/audit8/crates/maki-privileged" }
+crc32fast = "1"
+maki-core = { path = "/home/user/wt/audit8/crates/maki-core" }
+maki-backing = { path = "/home/user/wt/audit8/crates/maki-backing" }
+maki-test-support = { path = "/home/user/wt/audit8/crates/maki-test-support" }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+uuid = "1"
+
+[[bin]]
+name = "format_decoders"
+path = "fuzz_targets/format_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_scan"
+path = "fuzz_targets/journal_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_url"
+path = "fuzz_targets/endpoint_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe_parsers"
+path = "fuzz_targets/probe_parsers.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "a8_decoders_crcfix"
+path = "fuzz_targets/a8_decoders_crcfix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "a8_journal_model"
+path = "fuzz_targets/a8_journal_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "a8_recover"
+path = "fuzz_targets/a8_recover.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Detach from the parent workspace.
+[workspace]

@@ -1,0 +1,645 @@
+0a1,29
+> //! Round-8 audit (slug `privileged-nbd`): an EXTENDED COPY of the crate's
+> //! `src/review_step_faults.rs`, compiled only by the integration test
+> //! `tests/audit8_kernel_semantics.rs` (see its header for how).
+> //!
+> //! The original's simulated kernel is kept; the changes are marked AUDIT8.
+> //! What the kernel's driver does (CentOS Stream 9 `nbd.c`) and the original
+> //! model leaves out:
+> //!
+> //! - an OPENER: anything that has `/dev/nbd3` open without being a holder in
+> //!   sysfs (a udev probe, blkid, an LVM scan, a monitoring agent). Every open
+> //!   holds a reference to the device's configuration (`nbd_open`), so
+> //!   (a) `NBD_CMD_CONNECT` of the unconnected device is refused with `EBUSY`
+> //!   (`nbd_genl_connect`, the `config_refs` check), which the helper's connect
+> //!   step reports as a refusal once its 5-second retry window is over, and
+> //!   (b) after a successful `NBD_CMD_DISCONNECT` the `pid` and `backend`
+> //!   attributes stay until the opener closes (`nbd_config_put` removes them
+> //!   only with the last reference);
+> //! - `NBD_CMD_DISCONNECT` of a device whose connection was already
+> //!   disconnected, or that has none, is acknowledged (`nbd_genl_disconnect`
+> //!   returns 0); the original model refused it;
+> //! - events at a chosen command of a verb: the opener opens or closes, the
+> //!   daemon dies.
+> //!
+> //! The first six tests are the original sweeps, unchanged except for their
+> //! names (`audit8_baseline_*`): they show that the changed model still
+> //! satisfies them. The `audit8_opener_*` and `audit8_daemon_*` tests are new.
+> //!
+> //! --- the original header follows ---
+> //!
+79a109,119
+>     /// AUDIT8: something has `/dev/nbd3` open that sysfs does not show as a
+>     /// holder.
+>     opener: bool,
+> }
+> 
+> /// AUDIT8: what happens right before a numbered command of one verb.
+> #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+> struct Schedule {
+>     opener_opens_before: Option<usize>,
+>     opener_closes_before: Option<usize>,
+>     daemon_dies_before: Option<usize>,
+181a222,231
+>     /// AUDIT8: events of the running verb.
+>     schedule: Schedule,
+>     /// AUDIT8: the identifier of the last connection the helper made.
+>     ours: RefCell<Option<String>>,
+>     /// AUDIT8: things the helper must never do, as they happened.
+>     violations: RefCell<Vec<String>>,
+>     /// AUDIT8: the device of every connect step the helper ran.
+>     connect_targets: RefCell<Vec<String>>,
+>     /// AUDIT8: sysfs also shows `/dev/nbd4`, idle and never opened.
+>     second_device: Cell<bool>,
+217a268,272
+>             schedule: Schedule::default(),
+>             ours: RefCell::new(None),
+>             violations: RefCell::new(Vec::new()),
+>             connect_targets: RefCell::new(Vec::new()),
+>             second_device: Cell::new(false),
+242a298,300
+>             // AUDIT8: the configuration, and with it `pid` and `backend`,
+>             // lives while anything has the device open.
+>             && !kernel.opener
+275a334,340
+>         if self.second_device.get() {
+>             // AUDIT8: a free device above the modelled one.
+>             let other = self.sysfs.join("nbd4");
+>             std::fs::create_dir_all(other.join("holders")).unwrap();
+>             std::fs::write(other.join("dev"), "43:4\n").unwrap();
+>             std::fs::write(other.join("size"), "0\n").unwrap();
+>         }
+287a353,358
+>     /// AUDIT8: something opens or closes `/dev/nbd3`.
+>     fn set_opener(&self, open: bool) {
+>         self.kernel.borrow_mut().opener = open;
+>         self.publish();
+>     }
+> 
+338a410,420
+>         // AUDIT8: the events scheduled right before this command.
+>         if self.schedule.opener_opens_before == Some(at) {
+>             self.set_opener(true);
+>         }
+>         if self.schedule.opener_closes_before == Some(at) {
+>             self.set_opener(false);
+>         }
+>         if self.schedule.daemon_dies_before == Some(at) {
+>             self.stop_daemon();
+>             self.publish();
+>         }
+571c653,654
+<             PlannedStep::NbdConnect { .. } => {
+---
+>             PlannedStep::NbdConnect { device, .. } => {
+>                 world.connect_targets.borrow_mut().push(device.clone());
+573c656,667
+<                 if !kernel.daemon_running || kernel.connection.is_some() {
+---
+>                 if kernel.connection.is_some() {
+>                     // AUDIT8: the executor checks the backend before it
+>                     // connects; reaching the kernel with a connection (live
+>                     // or lingering) on the device would be a second connect.
+>                     world
+>                         .violations
+>                         .borrow_mut()
+>                         .push("NBD_CMD_CONNECT sent for a device that shows a connection".into());
+>                 }
+>                 // AUDIT8: `kernel.opener` is the EBUSY of an open, unconnected
+>                 // device, final once the helper's retry window is over.
+>                 if !kernel.daemon_running || kernel.connection.is_some() || kernel.opener {
+575a670,671
+>                 let backend: String = identifier.expect("connect identifier").into();
+>                 *world.ours.borrow_mut() = Some(backend.clone());
+577c673
+<                     backend: identifier.expect("connect identifier").into(),
+---
+>                     backend,
+622a719,720
+>                 // AUDIT8: the kernel acknowledges a disconnect of a device
+>                 // without a connection, and of one already disconnected.
+624c722,726
+<                     return Err(End::Nonzero.report("NBD_CMD_DISCONNECT"));
+---
+>                     world
+>                         .violations
+>                         .borrow_mut()
+>                         .push("NBD_CMD_DISCONNECT sent for a device without a connection".into());
+>                     return Ok(());
+625a728,733
+>                 if Some(&connection.backend) != world.ours.borrow().as_ref() {
+>                     world
+>                         .violations
+>                         .borrow_mut()
+>                         .push("NBD_CMD_DISCONNECT sent for another connection".into());
+>                 }
+716a825,830
+>         self.run_scheduled(fault, Schedule::default(), verb)
+>     }
+> 
+>     /// AUDIT8: one helper invocation with events at chosen commands.
+>     fn run_scheduled(&mut self, fault: Option<Fault>, schedule: Schedule, verb: Verb) -> Outcome {
+>         self.world.schedule = schedule;
+733a848
+>         self.world.schedule = Schedule::default();
+877c992
+< fn an_attach_killed_in_the_activation_window_is_recovered_by_the_packaged_units() {
+---
+> fn audit8_baseline_an_attach_killed_in_the_activation_window_is_recovered_by_the_packaged_units() {
+888c1003
+< fn a_failed_attach_start_converges_through_the_packaged_recovery() {
+---
+> fn audit8_baseline_a_failed_attach_start_converges_through_the_packaged_recovery() {
+932c1047
+< fn a_faulted_teardown_converges_when_cleanup_is_retried() {
+---
+> fn audit8_baseline_a_faulted_teardown_converges_when_cleanup_is_retried() {
+985c1100
+< fn the_failed_start_hook_touches_only_an_interrupted_activation() {
+---
+> fn audit8_baseline_the_failed_start_hook_touches_only_an_interrupted_activation() {
+1036c1151
+< fn a_faulted_rollback_in_the_failed_start_hook_leaves_cleanup_to_the_coordinator() {
+---
+> fn audit8_baseline_a_faulted_rollback_in_the_failed_start_hook_leaves_cleanup_to_the_coordinator() {
+1114c1229,1230
+< fn an_interrupted_activation_nothing_serves_stays_refused_until_the_mapping_is_removed() {
+---
+> fn audit8_baseline_an_interrupted_activation_nothing_serves_stays_refused_until_the_mapping_is_removed(
+> ) {
+1166a1283,1757
+> }
+> 
+> // ===========================================================================
+> // AUDIT8: the new sweeps.
+> // ===========================================================================
+> 
+> impl Case {
+>     /// What the helper must never have done (see `World::violations`).
+>     fn violations(&self) -> Result<(), String> {
+>         let violations = self.world.violations.borrow();
+>         if violations.is_empty() {
+>             Ok(())
+>         } else {
+>             Err(violations.join("; "))
+>         }
+>     }
+> 
+>     fn checks(&self) -> Result<(), String> {
+>         self.record_covers_live_state()?;
+>         self.violations()
+>     }
+> 
+>     fn lingering(&self) -> bool {
+>         self.world
+>             .kernel
+>             .borrow()
+>             .connection
+>             .as_ref()
+>             .is_some_and(|connection| connection.disconnecting)
+>     }
+> 
+>     /// Bring the volume down the way the packaged units, and then an
+>     /// operator, would, with an opener that lets go at `late`: 0 before
+>     /// anything else runs, 1 after the failed-start hook, 2 only after the
+>     /// coordinator's first cleanup. While the opener holds the device a
+>     /// cleanup may refuse; once it has let go, cleanup must finish, except in
+>     /// the documented second-fault state (an activation intent nothing
+>     /// serves), which one manual removal of the unused mapping ends. Then a
+>     /// fresh attach must succeed.
+>     fn converge(&mut self, failed_start: bool, late: usize) -> Result<(), String> {
+>         if late == 0 {
+>             self.world.set_opener(false);
+>         }
+>         let hook = if failed_start {
+>             let hook = self.run(None, Verb::FailedStartHook);
+>             self.checks()
+>                 .map_err(|problem| format!("after the hook {hook:?}: {problem}"))?;
+>             Some(hook)
+>         } else {
+>             None
+>         };
+>         if late == 1 {
+>             self.world.set_opener(false);
+>         }
+>         self.world.stop_daemon();
+>         let mut cleanups = vec![self.run(None, Verb::Cleanup)];
+>         self.checks()
+>             .map_err(|problem| format!("after cleanup {:?}: {problem}", cleanups[0]))?;
+>         if late >= 2 {
+>             // Held open, the device keeps its backend; a second cleanup under
+>             // the same conditions must not make anything worse.
+>             cleanups.push(self.run(None, Verb::Cleanup));
+>             self.checks()
+>                 .map_err(|problem| format!("after cleanups {cleanups:?}: {problem}"))?;
+>             self.world.set_opener(false);
+>             cleanups.push(self.run(None, Verb::Cleanup));
+>             self.checks()
+>                 .map_err(|problem| format!("after cleanups {cleanups:?}: {problem}"))?;
+>         }
+>         if cleanups.last() != Some(&Outcome::Done) {
+>             let second_fault = self.live() == (true, true, false)
+>                 && !self.ran("dmsetup-remove")
+>                 && self
+>                     .record()
+>                     .is_some_and(|record| record.recovery_intent.is_some());
+>             if !second_fault {
+>                 return Err(format!(
+>                     "hook {hook:?}; cleanups {cleanups:?} left {:?}, record {}, lingering {}",
+>                     self.live(),
+>                     self.record().is_some(),
+>                     self.lingering()
+>                 ));
+>             }
+>             self.world.remove_unused_mapping_by_hand();
+>             cleanups.push(self.run(None, Verb::Cleanup));
+>             self.checks()?;
+>         }
+>         if cleanups.last() != Some(&Outcome::Done) || !self.clean() {
+>             return Err(format!(
+>                 "hook {hook:?}; cleanups {cleanups:?} left {:?}, record {}, lingering {}",
+>                 self.live(),
+>                 self.record().is_some(),
+>                 self.lingering()
+>             ));
+>         }
+>         self.restart()?;
+>         self.checks()
+>     }
+> }
+> 
+> /// How many commands a fault-free attach runs, and which one connects.
+> fn attach_shape() -> (usize, usize, usize) {
+>     let mut baseline = Case::new();
+>     assert_eq!(baseline.run(None, Verb::Attach), Outcome::Done);
+>     let (commands, observations) = baseline.points();
+>     let connect = baseline
+>         .commands_run()
+>         .iter()
+>         .position(|entry| entry.ends_with(":nbd-connect"))
+>         .expect("attach connects")
+>         + 1;
+>     (commands, observations, connect)
+> }
+> 
+> /// An opener that opens and closes at any two commands of a fault-free
+> /// attach, or outlives it.
+> #[test]
+> fn audit8_opener_during_a_fault_free_attach() {
+>     let (commands, _, connect) = attach_shape();
+>     let mut problems = Vec::new();
+>     let (mut refused, mut attached) = (0, 0);
+>     for opens in 1..=commands {
+>         for closes in (opens + 1..=commands).map(Some).chain([None]) {
+>             for late in 0..3 {
+>                 if closes.is_some() && late > 0 {
+>                     continue;
+>                 }
+>                 let mut case = Case::new();
+>                 let schedule = Schedule {
+>                     opener_opens_before: Some(opens),
+>                     opener_closes_before: closes,
+>                     daemon_dies_before: None,
+>                 };
+>                 let first = case.run_scheduled(None, schedule, Verb::Attach);
+>                 let context = format!(
+>                     "opens before c{opens}, closes before {closes:?}, late {late} -> {first:?}"
+>                 );
+>                 if let Err(problem) = case.checks() {
+>                     problems.push(format!("{context}: {problem}"));
+>                 }
+>                 match &first {
+>                     Outcome::Done => {
+>                         attached += 1;
+>                         if !case.fully_attached() {
+>                             problems.push(format!("{context}: success without an attachment"));
+>                         }
+>                         // Held open at the connect, the device is refused.
+>                         if opens <= connect && closes.is_none_or(|closes| closes > connect) {
+>                             problems.push(format!("{context}: connected an open device"));
+>                         }
+>                     }
+>                     _ => {
+>                         refused += 1;
+>                         if let Err(problem) = case.converge(true, late) {
+>                             problems.push(format!("{context}: {problem}"));
+>                         }
+>                     }
+>                 }
+>             }
+>         }
+>     }
+>     assert!(
+>         refused > 0 && attached > 0,
+>         "{refused} refused, {attached} attached"
+>     );
+>     assert!(problems.is_empty(), "{}", problems.join("\n"));
+> }
+> 
+> /// Every fault of an attach, with an opener that arrived before some command
+> /// and is still there when the helper ends.
+> #[test]
+> fn audit8_opener_during_a_faulted_attach() {
+>     let (commands, observations, _) = attach_shape();
+>     let mut problems = Vec::new();
+>     let mut lingered = 0;
+>     for opens in 1..=commands {
+>         for fault in faults(commands, observations) {
+>             for late in 0..3 {
+>                 let mut case = Case::new();
+>                 let schedule = Schedule {
+>                     opener_opens_before: Some(opens),
+>                     ..Schedule::default()
+>                 };
+>                 let first = case.run_scheduled(Some(fault), schedule, Verb::Attach);
+>                 let context = format!("opens before c{opens}, {fault:?}, late {late} -> {first:?}");
+>                 if case.lingering() {
+>                     lingered += 1;
+>                     // The record is the only authority over a device that
+>                     // still shows its connection.
+>                     if case.record().is_none() {
+>                         problems.push(format!("{context}: no record over a lingering backend"));
+>                     }
+>                 }
+>                 if let Err(problem) = case.checks() {
+>                     problems.push(format!("{context}: {problem}"));
+>                 }
+>                 if first == Outcome::Done {
+>                     if !case.fully_attached() {
+>                         problems.push(format!("{context}: success without an attachment"));
+>                     }
+>                     continue;
+>                 }
+>                 if let Err(problem) = case.converge(true, late) {
+>                     problems.push(format!("{context}: {problem}"));
+>                 }
+>             }
+>         }
+>     }
+>     assert!(lingered > 0, "no rollback met the opener");
+>     assert!(
+>         problems.is_empty(),
+>         "{} problems, the first 40:\n{}",
+>         problems.len(),
+>         problems
+>             .iter()
+>             .take(40)
+>             .cloned()
+>             .collect::<Vec<_>>()
+>             .join("\n")
+>     );
+> }
+> 
+> /// Detach and cleanup, fault-free and with every fault, while an opener holds
+> /// the device: before the verb, or from some command on.
+> #[test]
+> fn audit8_opener_during_a_teardown() {
+>     let mut problems = Vec::new();
+>     let mut lingered = 0;
+>     for (name, verb, daemon_stopped) in [
+>         ("detach", Verb::Detach, false),
+>         ("cleanup", Verb::Cleanup, false),
+>         ("cleanup after the daemon stopped", Verb::Cleanup, true),
+>     ] {
+>         let prepare = || {
+>             let case = Case::attached();
+>             if daemon_stopped {
+>                 case.world.stop_daemon();
+>             }
+>             case
+>         };
+>         let mut baseline = prepare();
+>         assert_eq!(baseline.run(None, verb), Outcome::Done, "{name}");
+>         let (commands, observations) = baseline.points();
+>         let all: Vec<Option<Fault>> = [None]
+>             .into_iter()
+>             .chain(faults(commands, observations).into_iter().map(Some))
+>             .collect();
+>         // 0: the opener is there before the verb starts.
+>         for opens in 0..=commands {
+>             for fault in &all {
+>                 for late in [0, 2] {
+>                     let mut case = prepare();
+>                     let schedule = if opens == 0 {
+>                         case.world.set_opener(true);
+>                         Schedule::default()
+>                     } else {
+>                         Schedule {
+>                             opener_opens_before: Some(opens),
+>                             ..Schedule::default()
+>                         }
+>                     };
+>                     let first = case.run_scheduled(*fault, schedule, verb);
+>                     let context = format!(
+>                         "{name}: opens before c{opens}, {fault:?}, late {late} -> {first:?}"
+>                     );
+>                     if case.lingering() {
+>                         lingered += 1;
+>                         if first == Outcome::Done {
+>                             problems.push(format!("{context}: success over a lingering backend"));
+>                         }
+>                     }
+>                     if let Err(problem) = case.checks() {
+>                         problems.push(format!("{context}: {problem}"));
+>                     }
+>                     if let Err(problem) = case.converge(false, late) {
+>                         problems.push(format!("{context}: {problem}"));
+>                     }
+>                 }
+>             }
+>         }
+>     }
+>     assert!(lingered > 0, "no disconnect met the opener");
+>     assert!(
+>         problems.is_empty(),
+>         "{} problems, the first 40:\n{}",
+>         problems.len(),
+>         problems
+>             .iter()
+>             .take(40)
+>             .cloned()
+>             .collect::<Vec<_>>()
+>             .join("\n")
+>     );
+> }
+> 
+> /// The daemon dies right before any command of an attach, with and without
+> /// an opener that arrived earlier or arrives later.
+> #[test]
+> fn audit8_daemon_dies_at_any_step_of_an_attach() {
+>     let (commands, _, _) = attach_shape();
+>     let mut problems = Vec::new();
+>     for dies in 1..=commands {
+>         for opens in (1..=commands).map(Some).chain([None]) {
+>             for late in 0..3 {
+>                 if opens.is_none() && late > 0 {
+>                     continue;
+>                 }
+>                 let mut case = Case::new();
+>                 let schedule = Schedule {
+>                     opener_opens_before: opens,
+>                     opener_closes_before: None,
+>                     daemon_dies_before: Some(dies),
+>                 };
+>                 let first = case.run_scheduled(None, schedule, Verb::Attach);
+>                 let context = format!(
+>                     "daemon dies before c{dies}, opener before {opens:?}, late {late} -> {first:?}"
+>                 );
+>                 if let Err(problem) = case.checks() {
+>                     problems.push(format!("{context}: {problem}"));
+>                 }
+>                 if first == Outcome::Done {
+>                     // The attach finished before it could notice; the
+>                     // teardown of an attachment nothing serves follows.
+>                     if let Err(problem) = case.converge(false, late) {
+>                         problems.push(format!("{context}: {problem}"));
+>                     }
+>                     continue;
+>                 }
+>                 if let Err(problem) = case.converge(true, late) {
+>                     problems.push(format!("{context}: {problem}"));
+>                 }
+>             }
+>         }
+>     }
+>     assert!(
+>         problems.is_empty(),
+>         "{} problems, the first 40:\n{}",
+>         problems.len(),
+>         problems
+>             .iter()
+>             .take(40)
+>             .cloned()
+>             .collect::<Vec<_>>()
+>             .join("\n")
+>     );
+> }
+> 
+> /// The daemon dies right before any command of a detach, a cleanup or the
+> /// failed-start hook's rollback, with and without an opener.
+> #[test]
+> fn audit8_daemon_dies_at_any_step_of_a_teardown() {
+>     let mut problems = Vec::new();
+>     for (name, verb, interrupted) in [
+>         ("detach", Verb::Detach, false),
+>         ("cleanup", Verb::Cleanup, false),
+>         ("failed-start hook", Verb::FailedStartHook, true),
+>     ] {
+>         let prepare = || {
+>             if interrupted {
+>                 interrupted_activation(false)
+>             } else {
+>                 Case::attached()
+>             }
+>         };
+>         let mut baseline = prepare();
+>         assert_eq!(baseline.run(None, verb), Outcome::Done, "{name}");
+>         let (commands, _) = baseline.points();
+>         for dies in 1..=commands {
+>             for opener in [false, true] {
+>                 for late in [0, 2] {
+>                     if !opener && late > 0 {
+>                         continue;
+>                     }
+>                     let mut case = prepare();
+>                     case.world.set_opener(opener);
+>                     let schedule = Schedule {
+>                         daemon_dies_before: Some(dies),
+>                         ..Schedule::default()
+>                     };
+>                     let first = case.run_scheduled(None, schedule, verb);
+>                     let context =
+>                         format!("{name}: daemon dies before c{dies}, opener {opener}, late {late} -> {first:?}");
+>                     if let Err(problem) = case.checks() {
+>                         problems.push(format!("{context}: {problem}"));
+>                     }
+>                     if let Err(problem) = case.converge(false, late) {
+>                         problems.push(format!("{context}: {problem}"));
+>                     }
+>                 }
+>             }
+>         }
+>     }
+>     assert!(
+>         problems.is_empty(),
+>         "{} problems, the first 40:\n{}",
+>         problems.len(),
+>         problems
+>             .iter()
+>             .take(40)
+>             .cloned()
+>             .collect::<Vec<_>>()
+>             .join("\n")
+>     );
+> }
+> 
+> /// What every verb does while the device still shows the recorded backend
+> /// after an acknowledged disconnect (an opener holds it), and once the
+> /// opener has let go. Printed for the audit report (`--nocapture`).
+> #[test]
+> fn audit8_opener_table_of_verbs_over_a_lingering_backend() {
+>     let mut case = Case::attached();
+>     case.world.set_opener(true);
+>     let detach = case.run(None, Verb::Detach);
+>     eprintln!(
+>         "detach with an opener: {detach:?}; commands {:?}",
+>         case.commands_run()
+>     );
+>     assert!(
+>         matches!(&detach, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+>         "{detach:?}"
+>     );
+>     assert!(case.lingering() && case.record().is_some());
+>     case.checks().unwrap();
+>     let record = case.record();
+>     for verb in [
+>         Verb::Attach,
+>         Verb::Recover,
+>         Verb::FailedStartHook,
+>         Verb::Detach,
+>         Verb::Cleanup,
+>     ] {
+>         let outcome = case.run(None, verb);
+>         eprintln!(
+>             "{verb:?} over the lingering backend: {outcome:?}; commands {:?}",
+>             case.commands_run()
+>         );
+>         assert!(!matches!(outcome, Outcome::HelperDied));
+>         assert_eq!(case.record(), record, "{verb:?} changed the record");
+>         assert!(case.lingering(), "{verb:?}");
+>         case.checks().unwrap();
+>     }
+>     case.world.set_opener(false);
+>     let cleanup = case.run(None, Verb::Cleanup);
+>     eprintln!(
+>         "cleanup once the opener let go: {cleanup:?}; commands {:?}",
+>         case.commands_run()
+>     );
+>     assert_eq!(cleanup, Outcome::Done);
+>     assert!(case.clean());
+>     case.restart().unwrap();
+> }
+> 
+> /// Automatic allocation knows a device only by what sysfs shows, and an
+> /// opener of an unconnected device shows nothing there. Every attach is
+> /// therefore handed the same lowest device, is refused as busy and rolls
+> /// back, while the next device stays free: a retry never moves on.
+> #[test]
+> fn audit8_opener_auto_allocation_never_moves_past_a_held_device() {
+>     let mut case = Case::new();
+>     case.world.second_device.set(true);
+>     case.world.set_opener(true);
+>     for attempt in 1..=3 {
+>         let outcome = case.run(None, Verb::Attach);
+>         eprintln!("attempt {attempt} with /dev/nbd3 held open and /dev/nbd4 free: {outcome:?}");
+>         assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+>         assert!(case.clean(), "attempt {attempt}");
+>     }
+>     assert_eq!(
+>         *case.world.connect_targets.borrow(),
+>         ["/dev/nbd3", "/dev/nbd3", "/dev/nbd3"],
+>         "allocation moved on"
+>     );
+>     // The same host attaches at once when the opener lets go.
+>     case.world.set_opener(false);
+>     case.restart().unwrap();
