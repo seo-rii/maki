@@ -43,7 +43,10 @@ through the same netlink interface.
 
 ## Build the Maki package
 
-No prebuilt packages are published yet. Build the release binaries and the
+Release candidates are published only as unsigned GitHub pre-releases
+([release workflow](../releasing.md#publishing-a-pre-release)); to install one,
+check it against its `SHA256SUMS` and continue with
+[Install the Maki package](#install-the-maki-package). Otherwise build the release binaries and the
 package on a native Debian 12 build host with Rust **1.94.0**, the pinned CI
 baseline (a separate job also checks latest stable), then copy the `.deb` to
 the target. For a candidate bundle that also records the exact committed

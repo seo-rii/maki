@@ -448,6 +448,14 @@ documents.
 
 ### Added
 
+- **Release workflow**: `.github/workflows/release.yml`, dispatched by hand on `main` with a
+  tag `v<workspace version>-rc.<n>`, builds the Debian 12 candidate bundle with
+  `scripts/prepare_release.py` and the RHEL 9 RPM with `packaging/rpm/build-rpm.py`
+  from the same commit, and publishes them with the source, both manifests and one
+  `SHA256SUMS` as an unsigned GitHub pre-release. Final tags are refused while
+  production approval is pending; a run that fails before publication leaves no
+  tag ([publishing a pre-release](docs/releasing.md#publishing-a-pre-release)).
+
 - **An RPM package for RHEL 9 and its rebuilds** (AUD-148, AUD-154,
   2026-11-24; [#374](https://github.com/seo-rii/maki/pull/374)).
   `packaging/rpm/build-rpm.py` packages the prebuilt release artifacts like

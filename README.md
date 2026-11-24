@@ -61,7 +61,9 @@ to build and install the Maki package:
   rebuilds: an RPM from BaseOS and AppStream packages; not qualified, CI
   checks the userspace only
 
-No prebuilt packages are published yet.
+Release candidates are published only as unsigned GitHub pre-releases by the
+[release workflow](docs/releasing.md#publishing-a-pre-release); otherwise
+build the packages from source as the guides show.
 
 ## Quick start
 
