@@ -42,6 +42,26 @@ fn an_attach_moves_past_an_allocated_device_that_stays_busy() {
     assert!(shows_no_connection(&host, "/dev/nbd3"));
     let mapping = host.mapping("vg_maki_pg").unwrap();
     assert!(mapping.join("slaves/nbd4").exists(), "the VG is on nbd4");
+    // Each device was asked for under an identifier of its own. The record
+    // carries the one that connected, and every later step that names a
+    // device names that device.
+    let [(first, given_up), (second, connected)] = host.connect_requests.as_slice() else {
+        panic!("{:?}", host.connect_requests);
+    };
+    assert_eq!(
+        (first.as_str(), second.as_str()),
+        ("/dev/nbd3", "/dev/nbd4")
+    );
+    assert_ne!(given_up, connected);
+    assert_eq!(&record.connection_id, connected);
+    assert!(!host.named_devices.is_empty());
+    assert!(
+        host.named_devices
+            .iter()
+            .all(|(_, device)| device == "/dev/nbd4"),
+        "{:?}",
+        host.named_devices
+    );
 
     // The teardown follows the record to the device it names.
     execute_with(&plan_detach(&request(&PG)), Some(&state), &mut host).unwrap();
@@ -214,6 +234,26 @@ fn no_other_device_is_tried_once_the_steps_time_is_over() {
 
     let error = execute_with(&plan_attach(&request(&PG)), Some(&state), &mut host)
         .expect_err("attached after its time was over")
+        .to_string();
+
+    assert!(error.contains("Device or resource busy"), "{error}");
+    assert_eq!(connects(&host), 1, "{:?}", host.commands);
+    assert!(shows_no_connection(&host, "/dev/nbd4"));
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+/// The step's time is looked at again once a device has stayed busy: a
+/// device that used it up is the last one tried.
+#[test]
+fn no_other_device_is_tried_when_the_busy_one_used_the_steps_time() {
+    let mut host = Host::new();
+    let state = host.state();
+    host.refused_connects.insert("/dev/nbd3", Refused::Busy);
+    host.refusal_takes = Duration::from_millis(400);
+    let _limit = command::finish_by(Instant::now() + Duration::from_millis(300));
+
+    let error = execute_with(&plan_attach(&request(&PG)), Some(&state), &mut host)
+        .expect_err("attached on another device after its time was over")
         .to_string();
 
     assert!(error.contains("Device or resource busy"), "{error}");

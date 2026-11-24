@@ -320,6 +320,23 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     })
     .unwrap();
 
+    // What cannot be read is not "gone". The kernel removes `pid` before
+    // `backend`, so a `pid` without an identifier is no state that this
+    // disconnect leaves behind.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let backend = sysfs.join("nbd5/backend");
+    let error = disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
+        std::fs::remove_file(&backend).unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
+    .expect_err("an unreadable device was taken for a disconnected one")
+    .to_string();
+    assert!(
+        error.contains("backend identifier is unreadable"),
+        "{error}"
+    );
+
     // Without the connection there is no request, and nothing to wait for.
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(

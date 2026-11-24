@@ -220,6 +220,13 @@ fn a_negotiated_connection_is_reusable_only_while_open_and_silent() {
     client.shutdown(std::net::Shutdown::Both).unwrap();
     assert!(!idle(&client));
 
+    // The daemon closed without reading what the helper had sent: the
+    // connection was reset, and the look ends in an error.
+    let (client, server) = UnixStream::pair().unwrap();
+    (&client).write_all(&[0x25]).unwrap();
+    drop(server);
+    assert!(!idle(&client));
+
     // A byte no server sends before a request; it stays unread.
     let (client, mut server) = UnixStream::pair().unwrap();
     server.write_all(&[0x67]).unwrap();

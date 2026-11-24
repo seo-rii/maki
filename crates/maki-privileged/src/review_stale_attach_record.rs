@@ -93,6 +93,13 @@ struct Host {
     refused_connects: BTreeMap<&'static str, Refused>,
     /// The helper dies right before it connects this device.
     killed_before_connecting: Option<&'static str>,
+    /// Every connect the helper asked for, refused or not: the device and
+    /// the identifier it was to be connected under.
+    connect_requests: Vec<(String, String)>,
+    /// The NBD device each other executed step named.
+    named_devices: Vec<(&'static str, String)>,
+    /// How long the kernel takes to refuse a connect.
+    refusal_takes: std::time::Duration,
 }
 
 /// How the kernel answers the connect of a device.
@@ -182,6 +189,9 @@ impl Host {
             lvm: RefCell::default(),
             refused_connects: BTreeMap::new(),
             killed_before_connecting: None,
+            connect_requests: Vec::new(),
+            named_devices: Vec::new(),
+            refusal_takes: std::time::Duration::ZERO,
         };
         for index in [3, 4] {
             host.add_device(index);
@@ -597,11 +607,26 @@ impl System for Host {
                 panic!("fixture: helper killed before connecting {device}");
             }
         }
+        match step {
+            PlannedStep::NbdConnect { device, .. } => self
+                .connect_requests
+                .push((device.clone(), identifier.unwrap_or_default().to_string())),
+            PlannedStep::SetBlockSize { device, .. }
+            | PlannedStep::NbdDisconnect { device }
+            | PlannedStep::VerifyMountDevice {
+                nbd_device: device, ..
+            }
+            | PlannedStep::VerifyMountIdentity {
+                nbd_device: device, ..
+            } => self.named_devices.push((step.kind(), device.clone())),
+            _ => {}
+        }
         self.command(step.kind(), |host| {
             match step {
                 PlannedStep::NbdConnect { device, .. }
                     if host.refused_connects.contains_key(device.as_str()) =>
                 {
+                    std::thread::sleep(host.refusal_takes);
                     let busy = || ExecError::DeviceBusy {
                         step: step.to_string(),
                         message: "the kernel refused NBD_CMD_CONNECT: Device or resource busy"
