@@ -321,7 +321,11 @@ each of its requests under the global generic-netlink mutex: while one is
 stuck, no other `nbd` request runs, and neither does a request to any other
 generic-netlink family without `parallel_ops`, on the whole host. The control
 family is one of those, so every family lookup (`CTRL_CMD_GETFAMILY`) waits
-too, whichever family a client wants to resolve.
+too, whichever family a client wants to resolve. The request also holds the
+generic-netlink callback lock (`cb_lock`) for reading: registering or
+unregistering a family, which loading or unloading a module that has one
+does, takes it for writing and waits, and from then on a new request to any
+family, with `parallel_ops` or not, queues behind that writer.
 `NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
 `NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
 that stopped reading with a full send buffer holds the helper, with the attach
