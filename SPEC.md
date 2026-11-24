@@ -217,7 +217,7 @@ Responsibilities:
 
 ```text
 allocate an NBD device
-connect the NBD device to the Unix socket
+negotiate with the volume's NBD socket and connect the kernel NBD device to it
 configure device block size
 verify NBD candidates and complete LVM membership
 activate the discovered VG UUID within the verified NBD device list
@@ -225,7 +225,7 @@ mount XFS
 verify mount identity
 grow LVM
 run xfs_growfs
-detach the NBD device
+disconnect the kernel NBD device
 ```
 
 The helper MUST NOT handle:
@@ -241,6 +241,89 @@ crypto request bodies
 ```
 
 The privileged helper is therefore strictly a **storage connection and control-plane component**.
+
+## NBD connection
+
+The helper connects and disconnects the kernel NBD device itself and runs no
+NBD client program. To connect, it opens the volume's NBD Unix socket,
+performs the NBD fixed-newstyle handshake with the volume daemon, and passes
+the negotiated socket to the kernel in one generic-netlink `NBD_CMD_CONNECT`
+request of the `nbd` family, for the device it allocated, with the export
+size, the configured block size, the export's transmission flags and the
+backend identifier. To disconnect, it sends `NBD_CMD_DISCONNECT` for that
+device. The daemon runs as an unprivileged user, so every byte the helper
+reads from its socket is untrusted input to a root process.
+
+The helper MUST:
+
+- set the trusted record's unique connection identifier as the device's
+  kernel backend identifier (`NBD_ATTR_BACKEND_IDENTIFIER`), which the kernel
+  shows as `/sys/block/nbdN/backend`, and refuse to connect when the kernel's
+  `nbd` family does not accept that attribute. The identity rule of §8 is
+  unchanged: the identifier must match the live backend before detach,
+  immediately before every disconnect, and in rollback;
+- select the default export (the empty name) with `NBD_OPT_GO` and no
+  information requests, and refuse a server that does not offer
+  fixed-newstyle negotiation, that does not answer with exactly one
+  `NBD_INFO_EXPORT` before `NBD_REP_ACK`, or that sends a reply to another
+  option or of another type. It MUST NOT fall back to `NBD_OPT_EXPORT_NAME`:
+  the volume's server is always nbdkit, which answers `NBD_OPT_GO` in every
+  release the project documents (1.32.5 and later), and a server that cannot
+  is not Maki's;
+- never negotiate structured replies, extended headers, metadata contexts or
+  TLS: the kernel's NBD client implements none of them;
+- forward the export's 16-bit transmission flags to the kernel unchanged
+  (`NBD_ATTR_SERVER_FLAGS`), and refuse, before the kernel sees the socket,
+  an export that does not advertise `NBD_FLAG_HAS_FLAGS`,
+  `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`. Without them the kernel
+  completes FLUSH and FUA requests without sending them to the server, so a
+  filesystem barrier would never reach the journal (§12, §24, §25). Maki's
+  plugin always advertises both;
+- refuse an export whose size is 0 or larger than 2^63 − 1 bytes;
+- bound the handshake in bytes, checking every reply's length before reading
+  it: no reply longer than 4098 bytes (a 4096-byte string and its type) and
+  no more than 64 KiB read in all;
+- bound its own waits in each connect and disconnect (the socket connect, the
+  handshake, the retries below and the wait for the kernel's answer) by the
+  limit of an external step command and by the deadline its caller set for all
+  of its commands (the failed-start hook's command budget);
+- retry a connect the kernel refuses with `EBUSY`, which it answers while
+  anything holds the unconnected device open (udev's probe after a
+  disconnect, any other opener), every 100 ms for up to 5 s within that time
+  bound, each time on a fresh connection to the daemon and only after checking
+  that the device still shows no connection; every other refusal is final;
+- create every descriptor close-on-exec, hand the kernel the socket without a
+  send or receive timeout (the kernel's own I/O on it would fail once the
+  device has been idle that long), and close its own descriptor of the socket
+  in every outcome: after a connect the kernel holds its own reference;
+- treat a kernel error reply as a failed step, and a request whose answer it
+  could not read (a timeout, a lost or malformed reply) as a step whose effect
+  is unknown. What is connected is then decided as after any other failed
+  step, by the backend identifier the kernel shows, never by assuming that
+  nothing changed.
+
+Provisioning a new volume connects its export once outside any attachment
+(`maki-attach nbd-connect`, then `nbd-disconnect`), with the same handshake and
+request. Such a connection MUST NOT use an identifier of the form attach records
+use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
+a trusted record names, and its disconnect MUST touch only a device connected
+under its own identifier.
+
+The kernel's own work on a request is not bounded: it runs inside the send of
+the request, and its mutex waits are uninterruptible, so no deadline or signal
+ends them; the kernel runs the `nbd` family's requests one at a time.
+`NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
+`NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
+that stopped reading with a full send buffer holds the helper, with the attach
+lock, until it reads again or its socket closes. In the helper's flows the
+unmount and the VG deactivation, bounded commands that need the daemon to serve
+I/O, run first when they are needed and fail first in that case; the outer
+bound is the unit's start or stop timeout, and a helper in an uninterruptible
+wait ends only when that wait does.
+
+The helper logs the process and user IDs of its socket peer when it connects,
+for diagnostics only: the documented flows may run nbdkit outside the
+volume's unit.
 
 `maki-attach verify` supplies a repeatable read-only workload-start check using
 existing trusted state and root-controlled configuration. Both volume and XFS
@@ -460,8 +543,8 @@ Privileged attachment state MUST be opened through root-controlled directory
 descriptors without following symlinks. Detach MUST verify its requested
 volume UUID, socket, mountpoint, VG, LV, and device against a trusted record
 before executing any step. The record's unique connection identifier MUST
-match the live NBD backend before detach and immediately before disconnect,
-including rollback. A missing or invalid record MUST fail closed, even when
+match the live NBD backend (the device's kernel backend identifier, §6) before
+detach and immediately before disconnect, including rollback. A missing or invalid record MUST fail closed, even when
 the caller supplies an explicit NBD device.
 
 A trusted record reserves the NBD device it names for its volume, connected

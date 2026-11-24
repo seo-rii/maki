@@ -13,10 +13,14 @@
 //! The model is one volume on `/dev/nbd3` with one linear LV. It knows what
 //! the helper's ordering depends on: LVM finds a volume group by reading its
 //! metadata from the PV, so every LVM command needs the daemon to be serving
-//! the device, while `dmsetup` and `nbd-client -d` do not; and netlink NBD
-//! keeps a connection's `pid` and `backend` attributes after its server
+//! the device, while `dmsetup` and the netlink disconnect do not; and netlink
+//! NBD keeps a connection's `pid` and `backend` attributes after its server
 //! died, until the device is disconnected and no mapping holds it open.
-//! Real LVM, device-mapper, NBD and systemd are not involved.
+//! Real LVM, device-mapper, NBD and systemd are not involved. The helper
+//! connects and disconnects with its own netlink requests rather than a
+//! command; their endings are swept like a command's: a refusal (exit
+//! status), an answer that never came (a timeout, a signal) and the helper
+//! dying, each before or after the kernel applied the request.
 
 use super::*;
 
@@ -61,8 +65,8 @@ struct Connection {
     backend: String,
     /// The daemon behind this connection still answers I/O.
     served: bool,
-    /// `nbd-client -d` ran. The kernel drops the connection once nothing
-    /// holds the device open.
+    /// The disconnect request ran. The kernel drops the connection once
+    /// nothing holds the device open.
     disconnecting: bool,
 }
 
@@ -567,7 +571,7 @@ impl System for World {
             PlannedStep::NbdConnect { .. } => {
                 let mut kernel = world.kernel.borrow_mut();
                 if !kernel.daemon_running || kernel.connection.is_some() {
-                    return Err(End::Nonzero.report("nbd-client"));
+                    return Err(End::Nonzero.report("NBD_CMD_CONNECT"));
                 }
                 kernel.connection = Some(Connection {
                     backend: identifier.expect("connect identifier").into(),
@@ -617,7 +621,7 @@ impl System for World {
             PlannedStep::NbdDisconnect { .. } => {
                 let mut kernel = world.kernel.borrow_mut();
                 let Some(connection) = &mut kernel.connection else {
-                    return Err(End::Nonzero.report("nbd-client -d"));
+                    return Err(End::Nonzero.report("NBD_CMD_DISCONNECT"));
                 };
                 connection.served = false;
                 connection.disconnecting = true;

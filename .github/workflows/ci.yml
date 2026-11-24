@@ -16,9 +16,14 @@ on:
 # A rollback fixture that finds no second filesystem for its witness prints
 # that it is skipped and passes, and test runs do not show the output of
 # passing tests. The runners have /dev/shm on a filesystem of its own, so
-# here a missing one is a failure (tests/support/other_filesystem.rs).
+# here a missing one is a failure (tests/support/other_filesystem.rs). The
+# same holds for the tests of the helper's NBD handshake against a real
+# nbdkit and of its constants against the kernel's UAPI headers: every job
+# that runs them installs nbdkit, linux-libc-dev and a C compiler.
 env:
   MAKI_TEST_REQUIRE_OTHER_FILESYSTEM: "1"
+  MAKI_TEST_REQUIRE_NBDKIT: "1"
+  MAKI_TEST_REQUIRE_NBD_HEADERS: "1"
 
 jobs:
   dependency-audit:
@@ -102,11 +107,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc linux-libc-dev
           nbdkit --version
           nbdinfo --version
           nbdcopy --version
           test -f /usr/include/nbdkit-plugin.h
+          test -f /usr/include/linux/nbd-netlink.h
       # SPEC §55 PR tier: unit, property smoke, codec, fake crypto, journal
       # failpoint smoke, retry/manual-clock, privilege unit, NBD protocol
       # smoke — all part of the default workspace suite. `--locked` keeps
@@ -116,13 +122,27 @@ jobs:
           python-version: "3.11"
       - name: workspace tests
         run: python scripts/run_cargo_tests.py --workspace --locked
+      # The helper's kernel NBD test connects a real /dev/nbdN. The runner's
+      # kernel may ship the module only in linux-modules-extra; if neither
+      # loads, this step fails, so CI says whether the runner has NBD.
+      - name: load the NBD kernel module (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if ! sudo modprobe nbd; then
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
+            sudo modprobe nbd
+          fi
+          test -d /sys/module/nbd
       # Tests that give a fixture to another user, run a binary as the
-      # daemon user or enter a private mount namespace skip without root,
-      # and the run above is unprivileged. The script reuses that
-      # compilation as the runner user and starts only the listed test
-      # executables through sudo; without root it fails instead of skipping.
+      # daemon user, enter a private mount namespace or connect a kernel
+      # NBD device skip without root, and the run above is unprivileged. The
+      # script reuses that compilation as the runner user and starts only
+      # the listed test executables through sudo; without root it fails
+      # instead of skipping. Only here does a missing NBD module fail.
       - name: root-only tests (Linux)
         if: runner.os == 'Linux'
+        env:
+          MAKI_TEST_REQUIRE_NBD: "1"
         run: python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked
       # A separate package invocation avoids workspace dev dependencies
       # supplying tonic's TLS backend and hiding missing production features.
@@ -207,7 +227,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc linux-libc-dev
       # Formatting does not depend on the platform. On Windows `cargo fmt
       # --all` passes every target's root file to one rustfmt command line,
       # which the workspace has outgrown ("The filename or extension is too

@@ -1,8 +1,11 @@
 """Locked raw-NBD operations for privileged-linux-validation.sh only.
 
 Each operation joins maki-attach's flock and checks the kernel backend before
-changing the device. Helper attach/cleanup must be called outside this wrapper:
-the helper owns its separate identifier, trusted record, and lock lifetime.
+changing the device. The raw connection is made and removed with the helper's
+own provisioning verbs (maki-attach nbd-connect and nbd-disconnect), which take
+no lock of their own, so they run inside this one. Helper attach/cleanup must be
+called outside this wrapper: the helper owns its separate identifier, trusted
+record, and lock lifetime.
 """
 import argparse
 import contextlib
@@ -86,8 +89,9 @@ def execute(args):
                 return 0
             if observed is not None:
                 raise RuntimeError("refusing to connect an occupied NBD device")
-            result = subprocess.run(["nbd-client", "-unix", args.socket, target,
-                                     "-b", "4096", "-identifier", args.identifier])
+            result = subprocess.run([args.helper, "nbd-connect", "--nbd-device", args.device,
+                                     "--socket", args.socket, "--block-size", "4096",
+                                     "--identifier", args.identifier])
             if result.returncode:
                 # The caller retains the identifier even after a partial attach.
                 return result.returncode
@@ -100,7 +104,8 @@ def execute(args):
             raise RuntimeError("refusing to change an absent or foreign NBD backend")
         commands = {
             "check": None,
-            "disconnect": ["nbd-client", "-d", target],
+            "disconnect": [args.helper, "nbd-disconnect", "--nbd-device", args.device,
+                           "--identifier", args.identifier],
             "activate-vg": ["vgchange", "-ay", args.vg],
             "remove-lv": ["lvremove", "--yes", "--force", f"/dev/{args.vg}/{args.lv}"],
             "remove-vg": ["vgremove", "--yes", "--force", args.vg],
@@ -126,6 +131,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", required=True)
     parser.add_argument("--identifier", required=True)
+    parser.add_argument("--helper", required=True,
+                        help="absolute path of the maki-attach binary this run built")
     parser.add_argument("action", choices=("connect", "check", "disconnect", "activate-vg",
                                            "remove-lv", "remove-vg", "remove-pv"))
     parser.add_argument("--socket")
@@ -136,6 +143,8 @@ def main(argv=None):
         parser.error("device must be a canonical /dev/nbdN with N <= 255")
     if not re.fullmatch(r"maki-privval-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.identifier):
         parser.error("invalid validation connection identifier")
+    if not args.helper.startswith("/"):
+        parser.error("the helper must be an absolute path")
     if args.action == "connect" and (not args.socket or not args.socket.startswith("/")):
         parser.error("connect requires an absolute socket path")
     if args.action in ("activate-vg", "remove-lv", "remove-vg"):

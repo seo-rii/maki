@@ -127,7 +127,7 @@ readonly nbd_target
 
 required_commands=(
     blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbd-client nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
+    modprobe nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
     sudo sync vgchange vgcreate vgremove vgs
 )
 
@@ -286,11 +286,11 @@ nbd_has_pid() {
 test_nbd_action() {
     [[ -n "$nbd_connection_id" ]] || return 1
     sudo -n python3 "$REPO_ROOT/scripts/privileged_validation_nbd.py" \
-        --device "$device" --identifier "$nbd_connection_id" "$@"
+        --device "$device" --identifier "$nbd_connection_id" --helper "$attach_bin" "$@"
 }
 
 connect_test_nbd() {
-    # Record ownership before invoking nbd-client, including partial failures.
+    # Record ownership before the helper's raw connect, including partial failures.
     # A disconnected phase gets a fresh identity; a cleanup retry keeps its own.
     if [[ -z "$nbd_connection_id" ]]; then
         nbd_connection_id="maki-privval-$(python3 -c 'import uuid; print(uuid.uuid4())')" || return 1
@@ -588,7 +588,7 @@ if [[ "$install_missing" == true ]]; then
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" update
     sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "${apt_source_args[@]}" \
         install -y --no-install-recommends binutils fio kmod libnbd-bin lvm2 \
-        nbd-client nbdkit nbdkit-plugin-dev python3 sqlite3 util-linux xfsprogs
+        nbdkit nbdkit-plugin-dev python3 sqlite3 util-linux xfsprogs
     pass "native validation dependencies installed"
 fi
 
@@ -596,12 +596,6 @@ mapfile -t still_missing < <(missing_commands)
 ((${#still_missing[@]} == 0)) ||
     die "missing commands: ${still_missing[*]} (rerun with --install-missing on Debian)"
 [[ "$(fio --version)" =~ ^fio-[0-9] ]] || die "fio resolves to an unexpected executable: $(fio --version)"
-nbd_client_version="$(nbd-client -h 2>&1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -n 1 || true)"
-if [[ ! "$nbd_client_version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]] ||
-    ((10#${BASH_REMATCH[1]} < 3)) ||
-    ((10#${BASH_REMATCH[1]} == 3 && 10#${BASH_REMATCH[2]} < 27)); then
-    die "nbd-client 3.27.0 or later with netlink identity support is required (found ${nbd_client_version:-unknown})"
-fi
 pass "required native tools available"
 
 log "building release binaries and nbdkit plugin"
@@ -856,20 +850,21 @@ done
     die "$device size is ${attached_size:-unknown}, expected $VIRTUAL_SIZE_BYTES"
 pass "kernel NBD attach and 512 MiB geometry"
 
-if nbd-client -d "$nbd_target" >"$run_dir/unprivileged-nbd-ioctl.txt" 2>&1; then
+# The invoking user runs the helper's own disconnect, which reads the
+# backend identifier and sends NBD_CMD_DISCONNECT over netlink: only the
+# kernel's EPERM for a sender without CAP_SYS_ADMIN, with this run's backend
+# still connected, is a denial. A usage, identity, module or executable error
+# is not.
+if "$attach_bin" nbd-disconnect --nbd-device "$device" --identifier "$nbd_connection_id" \
+    >"$run_dir/unprivileged-nbd-disconnect.txt" 2>&1; then
     die "the unprivileged invoking user unexpectedly disconnected $device"
 fi
-# Without CAP_SYS_ADMIN the kernel refuses the ioctl with EPERM, and opening a
-# device node the user cannot write fails with EACCES. A netlink client
-# reports the kernel's EPERM only as "Failed to disconnect device", so every
-# refusal must also leave this run's backend connected. A usage, target,
-# module or executable error is not a denial.
-grep -Eq 'Operation not permitted|Cannot open NBD: Permission denied|Failed to disconnect device' \
-    "$run_dir/unprivileged-nbd-ioctl.txt" ||
-    die "unprivileged NBD disconnect failed without a permission denial: $(cat "$run_dir/unprivileged-nbd-ioctl.txt")"
+grep -Fq "the kernel refused NBD_CMD_DISCONNECT for $nbd_target: Operation not permitted" \
+    "$run_dir/unprivileged-nbd-disconnect.txt" ||
+    die "unprivileged NBD disconnect failed without the kernel's permission denial: $(cat "$run_dir/unprivileged-nbd-disconnect.txt")"
 test_nbd_action check ||
     die "our backend on $device did not survive the unprivileged disconnect attempt"
-pass "unprivileged NBD disconnect ioctl is denied"
+pass "the kernel denies an unprivileged NBD disconnect"
 
 log "running CRC32C raw-device fio with periodic fsync"
 # The invoking user deliberately opens the JSON output file.

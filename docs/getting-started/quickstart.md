@@ -11,7 +11,7 @@ after this page.
 
 Before you start:
 
-- Maki is [installed](installation-debian.md), including `nbd-client` 3.27+.
+- Maki is [installed](installation-debian.md).
 - `/srv/demo` and `/dev/nbd0` are unused. The host has at least 10 GiB free
   under `/var/lib/maki`.
 - You have read the [status page](../status.md): nothing here is

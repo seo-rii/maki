@@ -45,6 +45,9 @@ const USAGE: &str = "usage:
   maki-attach recover-failed-start --volume <v> [--plan] (systemd ExecStopPost hook)
   maki-attach verify --volume <v> [--config <attach.toml>] [--plan]
   maki-attach grow   --volume <v> --size-bytes <n> [...]
+  maki-attach nbd-connect --nbd-device /dev/nbdN --socket <path> --identifier <id>
+                     [--block-size <n>] [--plan] (provisioning: outside any attachment)
+  maki-attach nbd-disconnect --nbd-device /dev/nbdN --identifier <id> [--plan]
   maki-attach --help | --version
 
 Without --config, /etc/maki/attach/<v>.toml is read when it exists. Execution
@@ -161,6 +164,144 @@ fn validate_arguments(args: &[OsString]) -> Result<(), String> {
         return Err("missing --size-bytes".into());
     }
     Ok(())
+}
+
+/// What `nbd-connect` and `nbd-disconnect` act on.
+struct RawConnection {
+    device: String,
+    identifier: String,
+    /// `nbd-connect` only.
+    socket: Option<String>,
+    block_size: u32,
+    plan_only: bool,
+}
+
+/// The options of `nbd-connect` (`connect`) or `nbd-disconnect`: misuse is
+/// a usage error, and a value these verbs must not take is refused.
+fn raw_connection(args: &[OsString], connect: bool) -> Result<RawConnection, Refusal> {
+    let mut seen = std::collections::HashSet::new();
+    let mut values = std::collections::HashMap::new();
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        let argument = argument.to_str().ok_or(Refusal::Usage)?;
+        if !seen.insert(argument) {
+            return Err(Refusal::Usage);
+        }
+        match argument {
+            "--plan" => continue,
+            "--nbd-device" | "--identifier" => {}
+            "--socket" | "--block-size" if connect => {}
+            _ => return Err(Refusal::Usage),
+        }
+        let value = arguments
+            .next()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.starts_with('-'))
+            .ok_or(Refusal::Usage)?;
+        values.insert(argument, value.to_string());
+    }
+    let mut take = |name: &str| values.remove(name).ok_or(Refusal::Usage);
+    let device = take("--nbd-device")?;
+    let identifier = take("--identifier")?;
+    let socket = if connect {
+        Some(take("--socket")?)
+    } else {
+        None
+    };
+    let invalid = |error: config::ConfigError| Refusal::Invalid(error.to_string());
+    if maki_privileged::probe::nbd_index(&device).is_none() {
+        return Err(Refusal::Invalid(format!(
+            "--nbd-device {device:?} is not a canonical /dev/nbdN"
+        )));
+    }
+    config::check_raw_identifier(&identifier).map_err(invalid)?;
+    if let Some(socket) = &socket {
+        config::check_abs_path("--socket", socket).map_err(invalid)?;
+    }
+    let block_size = match values.remove("--block-size") {
+        None => 4096,
+        // Plain decimal digits only, as --size-bytes takes them.
+        Some(text) => text
+            .parse::<u32>()
+            .ok()
+            .filter(|_| text.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| {
+                Refusal::Invalid(format!("--block-size {text:?} is not a block size"))
+            })?,
+    };
+    config::check_device_block_size("--block-size", block_size)
+        .map_err(|error| Refusal::Invalid(format!("block size: {error}")))?;
+    Ok(RawConnection {
+        device,
+        identifier,
+        socket,
+        block_size,
+        plan_only: seen.contains("--plan"),
+    })
+}
+
+/// `nbd-connect` and `nbd-disconnect`: a connection outside any
+/// attachment, for provisioning a new volume (and the qualification
+/// runner), with the attach steps' own NBD code.
+fn raw_nbd(verb: &str, args: &[OsString]) -> ExitCode {
+    let connect = verb == "nbd-connect";
+    let raw = match raw_connection(args, connect) {
+        Ok(raw) => raw,
+        Err(Refusal::Usage) => return usage(),
+        Err(Refusal::Invalid(error)) => {
+            diagnostic!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let name = raw.device.strip_prefix("/dev/").unwrap_or(&raw.device);
+    let step = match &raw.socket {
+        Some(socket) => format!(
+            "connect {name} to {socket} over netlink (block size {}, backend identifier '{}'; \
+             the export must advertise FLUSH and FUA)",
+            raw.block_size, raw.identifier
+        ),
+        None => format!(
+            "disconnect {name} over netlink, only while its backend identifier is '{}'",
+            raw.identifier
+        ),
+    };
+    let plan = format!(
+        "# {verb} {} outside any attachment\n1. {step}\n",
+        raw.device
+    );
+    if raw.plan_only {
+        return match print_plan(&plan) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                diagnostic!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let result = match &raw.socket {
+            Some(socket) => maki_privileged::exec::connect_raw(
+                socket,
+                &raw.device,
+                raw.block_size,
+                &raw.identifier,
+            ),
+            None => maki_privileged::exec::disconnect_raw(&raw.device, &raw.identifier),
+        };
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                diagnostic!("error: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        diagnostic!("{verb} requires Linux");
+        ExitCode::from(3)
+    }
 }
 
 /// The attach configuration a verb runs on: the file at `config_path` when
@@ -287,6 +428,12 @@ fn main() -> ExitCode {
                 }
             };
         }
+    }
+    // The provisioning verbs act on a device, not on a volume.
+    if let Some(verb @ ("nbd-connect" | "nbd-disconnect")) =
+        args.first().and_then(|verb| verb.to_str())
+    {
+        return raw_nbd(verb, &args[1..]);
     }
     if let Err(error) = validate_arguments(&args) {
         diagnostic!("error: {error}");

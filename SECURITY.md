@@ -24,7 +24,7 @@ Include what you can of:
 
 - the commit hash or package version you tested;
 - the configuration (`volume.toml`, `attach.toml`) with secrets removed;
-- the host, kernel, `nbd-client`, LVM and nbdkit versions;
+- the host, kernel, LVM and nbdkit versions;
 - a reproduction, or the code path and the invariant you believe is broken
   (SPEC §12 lists the durability invariants; SPEC §4–§9 the privilege and
   credential model);
@@ -64,7 +64,7 @@ otherwise.
   the experimental rollback-protected backing is where such reports belong.
 - Behaviour on platforms marked unsupported in the
   [support matrix](docs/deployment/support-matrix.md).
-- Vulnerabilities in nbdkit, nbd-client, LVM2, XFS or the Linux kernel; report
+- Vulnerabilities in nbdkit, LVM2, XFS or the Linux kernel; report
   those upstream (a Maki-side mitigation may still be worth a report).
 
 ## Hardening summary

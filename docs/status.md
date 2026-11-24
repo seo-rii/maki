@@ -151,7 +151,8 @@ See [cache reload](operations.md#growth-and-cache-reload).
   with all three remote transports under the shipped sandbox, with latency
   and packet loss, and NBD zeroing
   ([record](qualification/debian13-remote-transport-validation-2026-10-04.md)).
-  It needs `fc8d697` or later and nbd-client 3.27 built from source. That
+  It needs `fc8d697` or later; it ran with nbd-client 3.27 built from source,
+  which the helper no longer uses (see below). That
   campaign's per-item HTTP mapping was slow under latency (one round trip
   per 4 KiB unit, in sequence); a request's units now go out concurrently
   (R5-039). On Debian 13 a per-item HTTP volume then did 0.61 MiB/s of
@@ -182,8 +183,15 @@ See [cache reload](operations.md#growth-and-cache-reload).
   mapping record, with the helper gone as well, leaves an unused mapping that
   takes [one manual step](operations.md#interrupted-activation-after-the-daemon-stopped)
   to remove.
-- Debian 12's stock `nbd-client` 3.24 is too old; 3.27.0 or later is required
-  ([installation guide](getting-started/installation-debian.md#nbd-client-327-or-later)).
+- No NBD client package is needed: the privileged helper negotiates with the
+  daemon's socket and connects the kernel device over netlink itself, and
+  refuses an export without FLUSH and FUA. Every external campaign that
+  attached a kernel NBD device did so through nbd-client (3.27.1 where the
+  report names the version; 3.24 in the 2026-09-02 privileged run) and
+  predates the helper's own connect; the others attached none. Unit
+  tests, tests against a real nbdkit and Maki's plugin, and a root-only kernel
+  test in CI (whose runners load the `nbd` module) cover the helper's connect;
+  no external campaign has run it yet.
 
 ## Where the evidence lives
 

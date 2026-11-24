@@ -41,6 +41,24 @@ maki-attach \- manage the NBD, LVM and XFS attachment for a Maki volume
 .I name
 .RB [ \-\-plan ]
 .br
+.B maki-attach nbd-connect
+.B \-\-nbd-device
+.I device
+.B \-\-socket
+.I path
+.B \-\-identifier
+.I id
+.RB [ \-\-block-size
+.IR bytes ]
+.RB [ \-\-plan ]
+.br
+.B maki-attach nbd-disconnect
+.B \-\-nbd-device
+.I device
+.B \-\-identifier
+.I id
+.RB [ \-\-plan ]
+.br
 .BR "maki-attach \-\-help" " | " \-\-version
 .SH DESCRIPTION
 .B attach
@@ -66,10 +84,31 @@ mapping proof, rolls back that activation itself while the daemon still
 serves the device, also when systemd refused the request: the scoped VG
 deactivation, the NBD disconnect, and the removal of the record. It never
 unmounts.
+.PP
+The helper negotiates with the daemon's NBD socket and connects and
+disconnects the kernel NBD device over netlink itself; no NBD client program
+is used. An export that does not advertise FLUSH and FUA is refused before the
+kernel sees it.
+.PP
+.B nbd-connect
+and
+.B nbd-disconnect
+connect a new volume's export outside any attachment, to provision its LVM
+and XFS layout. They take no lock: run them while holding the attach lock
+.IR /run/maki-attach/attach.lock ,
+as the provisioning guide does.
+.B nbd-connect
+refuses a device that shows a connection or that an attachment record names,
+and an identifier of the form attachment records use
+.RI ( maki-uuid );
+.B nbd-disconnect
+disconnects only a device connected under the given identifier.
 .SH OPTIONS
 .TP
 .BI \-\-volume " name"
-The volume to act on. Every action requires it.
+The volume to act on. Every action but
+.BR nbd-connect " and " nbd-disconnect
+requires it.
 .TP
 .BI \-\-config " file"
 Read attachment settings from this file. The default path, when present, is
@@ -99,6 +138,19 @@ Accepted by
 only: create the volume sentinel on the mounted filesystem, as the setting
 .B init_sentinel = true
 does. The option cannot turn that setting off.
+.TP
+.BI \-\-identifier " id"
+Required by
+.BR nbd-connect " and " nbd-disconnect
+only: the backend identifier of the connection, 1 to 255 printable ASCII
+characters, such as
+.IR maki-bootstrap-uuid .
+.TP
+.BI \-\-block-size " bytes"
+Accepted by
+.B nbd-connect
+only: the device's logical block size, a power of two from 512; 4096 by
+default.
 .SS Overrides
 Each of these options replaces one attachment setting.
 .BR attach ", " detach ", " recover ", " cleanup " and " grow
@@ -115,10 +167,14 @@ The NBD device
 instead of the setting
 .B nbd_device
 or automatic allocation.
+.BR nbd-connect " and " nbd-disconnect
+require it.
 .TP
 .BI \-\-socket " path"
 The NBD socket of the daemon
 .RB ( nbd_socket ).
+.B nbd-connect
+requires it.
 .TP
 .BI \-\-vg " name"
 The volume group
