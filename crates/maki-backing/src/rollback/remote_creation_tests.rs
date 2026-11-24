@@ -564,6 +564,7 @@ fn a_binding_left_without_a_marker_is_continued_by_creation_from_any_cut() {
 /// a binding `left` without its marker.
 fn interrupted_chain(seed: u64, left: Option<&str>) -> Result<(), String> {
     use rand::Rng;
+    IN_CHAIN.with(|chain| chain.set(true));
     let outcome = std::panic::catch_unwind(|| {
         let mut rng = StdRng::seed_from_u64(seed);
         let machine = match left {
@@ -608,6 +609,7 @@ fn interrupted_chain(seed: u64, left: Option<&str>) -> Result<(), String> {
         }
         complete_binding(&machine, &context);
     });
+    IN_CHAIN.with(|chain| chain.set(false));
     outcome.map_err(|panic| {
         panic
             .downcast_ref::<String>()
@@ -615,6 +617,27 @@ fn interrupted_chain(seed: u64, left: Option<&str>) -> Result<(), String> {
             .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
             .unwrap_or_default()
     })
+}
+
+thread_local! {
+    /// Set on the sweep's thread while one of its chains runs.
+    static IN_CHAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A failing chain panics, and the sweep reports the chains that failed
+/// together at its end. Keep those panics, and no others, out of the output:
+/// the hook is process-wide, and another test that panics while the sweep
+/// runs must still say where and why.
+fn silence_failing_chains() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !IN_CHAIN.with(|chain| chain.get()) {
+                previous(info);
+            }
+        }));
+    });
 }
 
 /// Chains from an empty root, and from each root a binding was left in.
@@ -626,8 +649,7 @@ const CHAIN_SEEDS: [(Option<&str>, u64); 3] = [
 
 #[test]
 fn a_creation_interrupted_repeatedly_is_continued_by_exactly_one_command() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    silence_failing_chains();
     let failed: Vec<(Option<&str>, u64, String)> = CHAIN_SEEDS
         .iter()
         .flat_map(|&(left, seeds)| (0..seeds).map(move |seed| (left, seed)))
@@ -637,7 +659,6 @@ fn a_creation_interrupted_repeatedly_is_continued_by_exactly_one_command() {
                 .map(|error| (left, seed, error))
         })
         .collect();
-    std::panic::set_hook(previous);
     let from = |start: Option<&str>| -> Vec<u64> {
         failed
             .iter()
