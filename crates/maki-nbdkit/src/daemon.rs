@@ -132,22 +132,25 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
                     Path::new(&rollback.witness_root),
                 )?,
             };
-            let stored = backing.capacity()?;
-            if rollback.capacity.0 != stored {
-                return Err(DaemonError::Unsupported(format!(
-                    "protected backing capacity mismatch: configuration {}, stored {stored}; migration is required",
-                    rollback.capacity.0
-                )));
-            }
             // A local creation that stopped after its witness anchor left
             // a pair that opens and holds no volume. Say so, and what
-            // continues it, in place of a bare "no valid superblock".
+            // continues it, in place of a bare "no valid superblock", and
+            // before the capacity is compared: there is no volume yet whose
+            // capacity a configuration could contradict, and `create`
+            // names both values when it continues the pair.
             if rollback.remote.is_none() && init::unfinished_creation(&backing)? {
                 return Err(DaemonError::Format(FormatError::Invalid(
                     "no valid superblock: this volume's creation did not complete (its \
                      rollback-protected backing holds only an unfinished creation); run `maki \
                      volume create` again, which continues it"
                         .to_string(),
+                )));
+            }
+            let stored = backing.capacity()?;
+            if rollback.capacity.0 != stored {
+                return Err(DaemonError::Unsupported(format!(
+                    "protected backing capacity mismatch: configuration {}, stored {stored}; migration is required",
+                    rollback.capacity.0
                 )));
             }
             return Ok(Arc::new(backing));

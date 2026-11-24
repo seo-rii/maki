@@ -143,10 +143,13 @@ impl FileWitness {
             }
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "the witness directory holds no anchor: either a volume create did not complete, \
-                 or the witness is not mounted or lost its state. Running volume create again \
-                 continues an interrupted creation and refuses a backing that holds committed \
-                 data; otherwise mount or restore the witness directory",
+                "the witness directory holds no anchor: either the creation of this volume did \
+                 not complete, or the witness is not mounted or lost its state. First make sure \
+                 this directory is the mounted witness, because volume create enrolls a pair \
+                 that committed nothing into whatever directory is configured, an empty mount \
+                 point included. Then running volume create again continues an interrupted \
+                 creation and refuses a backing that holds committed data; if the witness lost \
+                 its state, restore the witness directory",
             )
         })?;
         // A prior process may have observed rename success and directory-sync

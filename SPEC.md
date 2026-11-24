@@ -1342,6 +1342,7 @@ the change was not applied; use the restart and self-test procedure above.
 ├── volume.lock
 ├── superblock.a
 ├── superblock.b
+├── superblock.next          (only while a creation writes its first copy)
 ├── shard-catalog.a
 ├── shard-catalog.b
 ├── canary.a

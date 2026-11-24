@@ -76,9 +76,21 @@ fn continue_creation(
     capacity: u64,
     refusal: std::io::Error,
 ) -> Result<RollbackBacking, RollbackCreateError> {
-    // A pair that does not open is not judged at all.
-    let Ok(backing) = open() else {
-        return Err(RollbackCreateError::Backing(refusal));
+    // A pair that does not open is not judged at all. The refusal alone
+    // reads as "empty both directories", so say why the pair does not open:
+    // the cause may be one to repair (a witness that is not mounted, a lock
+    // another command holds, an I/O error).
+    let backing = match open() {
+        Ok(backing) => backing,
+        Err(opened) => {
+            return Err(RollbackCreateError::Backing(std::io::Error::new(
+                refusal.kind(),
+                format!(
+                    "{refusal}; the existing pair does not open against its witness either: \
+                     {opened}"
+                ),
+            )))
+        }
     };
     // Serialize with a creation and an attach inside the backing, as
     // `create_volume` does.
@@ -228,16 +240,27 @@ fn create_volume_with_metadata_version(
         // report as present, and never one to initialize again: a release
         // that created the first copy before writing it can have left it,
         // and so can damage to both copies of a volume that holds data.
+        // Each refusal keeps its cause: a volume another release wrote and
+        // copies that could not be read are not "an earlier release stopped
+        // or the copies are damaged".
         return Err(FormatError::AlreadyExists(
-            if load_volume_superblock(backing).is_ok() {
-                "volume superblock already present".to_string()
-            } else {
-                "a superblock file is present but holds no valid superblock: either a volume \
-                 create of an earlier release stopped while it wrote the first copy, or this \
-                 volume's superblock copies are damaged. Only if the volume was never attached, \
-                 empty the backing root and create it again; otherwise restore the root from a \
-                 backup"
-                    .to_string()
+            match load_volume_superblock(backing) {
+                Ok(_) => "volume superblock already present".to_string(),
+                Err(error @ FormatError::Unsupported(_)) => format!(
+                    "a volume superblock is present that this release cannot use ({error}); \
+                     the root is not initialized again"
+                ),
+                Err(FormatError::Io(error)) => format!(
+                    "a superblock file is present but could not be read ({error}); the root is \
+                     not initialized again"
+                ),
+                Err(error) => format!(
+                    "a superblock file is present but holds no valid superblock ({error}): \
+                     either a volume create of an earlier release stopped while it wrote the \
+                     first copy, or this volume's superblock copies are damaged. Only if the \
+                     volume was never attached, empty the backing root and create it again; \
+                     otherwise restore the root from a backup"
+                ),
             },
         ));
     }
@@ -353,6 +376,8 @@ fn create_volume_with_metadata_version(
         staged.set_len(first.len() as u64)?;
         staged.write_at(0, &first)?;
         staged.sync_data()?;
+        // Closed before it is renamed, as the other staged records are.
+        drop(staged);
         backing.rename(layout::SUPERBLOCK_NEXT, layout::SUPERBLOCK_A)?; // side A, gen 1
     }
     sb_ab.store(backing, &mut envelope)?; // side B, gen 2
