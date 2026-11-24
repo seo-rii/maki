@@ -187,6 +187,83 @@ class RpmPackageTests(unittest.TestCase):
         self.assertIn("maki(x86-64)", provides)
         self.assertFalse([name for name in provides if ".so" in name], provides)
 
+    def sysusers_entries(self):
+        """What packaging/sysusers.d/maki.conf creates, as `user(name)` and
+        `group(name)`: the names rpm's sysusers generator gives a package
+        that ships such a file on EL9 (`u` creates the user and its group,
+        `g` a group, `m` names a user and a group)."""
+        entries = set()
+        for line in (ROOT / "packaging/sysusers.d/maki.conf").read_text().splitlines():
+            fields = line.split()
+            if fields[:1] == ["u"]:
+                entries |= {f"user({fields[1]})", f"group({fields[1]})"}
+            elif fields[:1] == ["g"]:
+                entries.add(f"group({fields[1]})")
+            elif fields[:1] == ["m"]:
+                entries |= {f"user({fields[1]})", f"group({fields[2]})"}
+        return sorted(entries)
+
+    def host_with_a_sysusers_generator(self):
+        """An environment in which rpmbuild has a sysusers dependency
+        generator, as on a host with systemd-rpm-macros (every RHEL 9 host
+        with systemd; the minimal container image has none). The stand-in
+        prints provides no package declares, so that its output shows."""
+        home = self.work / "generator-home"
+        attributes = home / "fileattrs"
+        attributes.mkdir(parents=True)
+        system = pathlib.Path(subprocess.check_output(["rpm", "--eval", "%{_fileattrsdir}"], text=True).strip())
+        for attribute in system.glob("*.attr"):
+            shutil.copyfile(attribute, attributes / attribute.name)
+        # rpm takes the generators' names from the files of this directory
+        # and their commands from macros.
+        (attributes / "sysusers.attr").write_text("")
+        generator = home / "sysusers.prov"
+        generator.write_text("#!/bin/sh\ncat > /dev/null\necho 'user(from-the-build-host)'\n"
+                             "echo 'group(from-the-build-host)'\n")
+        generator.chmod(0o755)
+        (home / ".rpmmacros").write_text(
+            f"%_fileattrsdir {attributes}\n%__sysusers_provides {generator}\n"
+            "%__sysusers_path ^/usr/lib/sysusers\\.d/.*\\.conf$\n")
+        return dict(self.environment, HOME=str(home))
+
+    def test_package_provides_the_user_and_groups_it_creates(self):
+        # Other packages may require the user or a group (`Requires:
+        # user(maki)`, `group(maki-admin)`); the names are those of EL9's own
+        # packages, each declared once and for every version.
+        expected = self.sysusers_entries()
+        self.assertEqual(expected, ["group(maki)", "group(maki-admin)", "user(maki)"])
+        package = self.build()
+        provided = [line.split("\t") for line in
+                    query(package, "[%{PROVIDENAME}\t%{PROVIDEFLAGS:depflags}\t%{PROVIDEVERSION}\n]").splitlines()]
+        accounts = [entry for entry in provided if entry[0].startswith(("user(", "group("))]
+        self.assertEqual(sorted(name for name, _, _ in accounts), expected)
+        for name, flags, version in accounts:
+            self.assertEqual((flags.strip(), version.strip()), ("", ""), name)
+
+    def test_provides_do_not_depend_on_the_build_hosts_dependency_generators(self):
+        # A RHEL 9 host has rpm's sysusers generator (systemd-rpm-macros),
+        # the release workflow's container has not: the published package
+        # lacked the provides a package built on a host carried.
+        plain = self.build("plain.rpm")
+        self.environment = self.host_with_a_sysusers_generator()
+        with_generator = self.build("generator.rpm")
+        self.assertEqual(query(with_generator, "[%{PROVIDES}\n]"), query(plain, "[%{PROVIDES}\n]"))
+        self.assertEqual(hashlib.sha256(with_generator.read_bytes()).hexdigest(),
+                         hashlib.sha256(plain.read_bytes()).hexdigest())
+        # The stand-in generator does run for a spec that leaves it on.
+        checkout = self.work / "checkout"
+        shutil.copytree(ROOT / "packaging", checkout / "packaging")
+        for name in ("CHANGELOG.md", "LICENSE"):
+            shutil.copyfile(ROOT / name, checkout / name)
+        spec = checkout / "packaging/rpm/maki.spec"
+        switch = "%global __sysusers_provides %{nil}\n"
+        self.assertEqual(spec.read_text().count(switch), 1)
+        spec.write_text(spec.read_text().replace(switch, ""))
+        self.builder = checkout / "packaging/rpm/build-rpm.py"
+        control = query(self.build("control.rpm"), "[%{PROVIDENAME}\n]").splitlines()
+        self.assertIn("user(from-the-build-host)", control)
+        self.assertIn("group(from-the-build-host)", control)
+
     def test_package_conflicts_with_the_nbdkit_selinux_module(self):
         # nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, which the
         # targeted policy lets systemd neither execute nor transition from.

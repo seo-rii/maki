@@ -58,6 +58,15 @@ class RhelInstallationGuide(unittest.TestCase):
             with self.subTest(path=path.name):
                 self.assertEqual(re.findall(r"^Conflicts: (.+)$", path.read_text(), re.M), [expected])
 
+    def test_guide_and_package_readme_quote_the_spec_provides(self):
+        # The user and groups of the sysusers file, for packages that
+        # require them; declared in the spec, not left to the build host.
+        expected = ", ".join(spec_tag("Provides"))
+        self.assertEqual(expected, "user(maki), group(maki), group(maki-admin)")
+        for path in (GUIDE, RPM_README):
+            with self.subTest(path=path.name):
+                self.assertEqual(re.findall(r"^Provides: (.+)$", path.read_text(), re.M), [expected])
+
     def test_guide_and_package_readme_say_how_the_package_is_removed(self):
         # rpm cannot stop a transaction from %preun: dnf is told not to
         # remove the package, and rpm removes it.

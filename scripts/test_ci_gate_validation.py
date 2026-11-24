@@ -372,6 +372,13 @@ class RhelUserspaceJob(unittest.TestCase):
                       "systemd-analyze verify", "/usr/lib/systemd/system/maki@.service",
                       "/run/maki-attach/", "rpm -e maki"):
             self.assertIn(check, script)
+        # The user and groups the package creates are provided, each once
+        # (scripts/test_rpm_package.py checks that they do not come from a
+        # dependency generator of the build host).
+        self.assertIn('rpm -qp --provides "$package" | tee "$RUNNER_TEMP/provides"\n', script)
+        self.assertRegex(script, r"for provided in 'user\(maki\)' 'group\(maki\)' 'group\(maki-admin\)'; do\n"
+                                 r"\s*test \"\$\(grep -cxF \"\$provided\" \"\$RUNNER_TEMP/provides\"\)\" = 1\n"
+                                 r"\s*done\n")
         # The RPM's Requires bring the rest of the runtime, without the
         # nbdkit metapackage.
         install = script.index("dnf install -y")
