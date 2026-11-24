@@ -5,9 +5,9 @@
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
-//!   NULL (multi-conn OFF). Zero is native and chunked (R5-036), fast zero
-//!   is not offered. TRIM is advertised per connection only for opt-in v3
-//!   volumes.
+//!   NULL (multi-conn OFF). Zero is native and chunked (R5-036); fast zero
+//!   is advertised and always refused (see `can_fast_zero`). TRIM is
+//!   advertised per connection only for opt-in v3 volumes.
 //! - `after_fork` initializes recovery, provider verification and the control
 //!   listener before announcing readiness. `open` only uses this adapter;
 //!   it never starts a runtime or retries a failed startup.
@@ -277,9 +277,13 @@ unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn can_fast_zero(_h: *mut c_void) -> c_int {
-    // Partial units are written, so a zero is never guaranteed faster
-    // than writing zeros.
-    0
+    // Advertised although `zero_v2` refuses every fast zero request. nbdkit
+    // does not check that a request's FAST_ZERO flag was advertised: it
+    // asserts it (`backend_zero`: `c->can_fast_zero == 1`), so with 0 here
+    // one such request from any client aborts the whole server. The NBD
+    // protocol lets a server advertise the flag and always fail with
+    // ENOTSUP, and nbdkit sends that failure on without emulating a zero.
+    1
 }
 
 unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
@@ -364,8 +368,9 @@ unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags
 
 unsafe extern "C" fn zero_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
     if flags & NBDKIT_FLAG_FAST_ZERO != 0 {
-        // Not advertised; a client that sends it anyway asked to fail
-        // rather than wait for a write.
+        // The client asked to fail rather than wait for a write. Partial
+        // units are written, so a zero is never known to be faster than
+        // writing zeros: refuse at once, before anything is changed.
         set_errno(libc::ENOTSUP);
         return -1;
     }
@@ -611,6 +616,23 @@ mod tests {
         assert_eq!(can_fua_value(), NBDKIT_FUA_NATIVE);
         assert_eq!(NBDKIT_FUA_NATIVE, 2, "nbdkit-common.h: NBDKIT_FUA_NATIVE 2");
         assert_ne!(can_fua_value(), NBDKIT_FUA_EMULATE);
+    }
+
+    /// nbdkit asserts, rather than checks, that a fast zero request was
+    /// advertised (`backend_zero`), so the answer must be 1 for such a
+    /// request to reach `zero_v2` at all. There it is refused before the
+    /// handle is read, with ENOTSUP, whatever else the request asks for.
+    #[test]
+    fn fast_zero_is_advertised_and_every_request_refused_with_enotsup() {
+        assert_eq!(unsafe { can_fast_zero(std::ptr::null_mut()) }, 1);
+        for extra in [0, NBDKIT_FLAG_MAY_TRIM, NBDKIT_FLAG_FUA] {
+            set_errno(0);
+            let flags = NBDKIT_FLAG_FAST_ZERO | extra;
+            // SAFETY: a fast zero request is refused before the handle is used.
+            let status = unsafe { zero_v2(std::ptr::null_mut(), 4096, 0, flags) };
+            assert_eq!(status, -1, "flags {flags:#x}");
+            assert_eq!(unsafe { *libc_errno_location() }, libc::ENOTSUP);
+        }
     }
 
     /// The published prefix ends right after `block_size` (nbdkit >= 1.30),

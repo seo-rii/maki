@@ -17,6 +17,10 @@
 %global _build_id_links none
 # The plugin is loaded by nbdkit only; it is not a library for other packages.
 %global __provides_exclude_from ^/usr/lib/maki/
+# The user and groups of sysusers.d/maki.conf are provided explicitly below.
+# rpm's sysusers generator (systemd-rpm-macros) would add them only on a build
+# host that has it: a RHEL 9 host does, the minimal container image does not.
+%global __sysusers_provides %{nil}
 
 Name:           maki
 Version:        %{maki_version}
@@ -40,9 +44,19 @@ Requires:       systemd >= 249
 Requires:       kmod
 # nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, and the targeted
 # policy then gives systemd neither a transition for that type nor permission
-# to execute it: maki@ could not start on an enforcing host. The nbdkit
-# metapackage pulls the module in; refuse it at install time instead.
+# to execute it: maki@ could not start on an enforcing host. Only the nbdkit
+# metapackage pulls the module in, wherever the targeted policy is or becomes
+# installed; refuse both at install time instead. The conflict with the
+# module alone is not enough: Maki is a protected package (see %files), and
+# `dnf install --allowerasing nbdkit` then satisfies the metapackage by
+# replacing selinux-policy-targeted with another policy.
 Conflicts:      nbdkit-selinux
+Conflicts:      nbdkit
+# What sysusers.d/maki.conf creates, in the form rpm's sysusers generator
+# gives other EL9 packages, for packages that require the user or a group.
+Provides:       user(maki)
+Provides:       group(maki)
+Provides:       group(maki-admin)
 # The owner of the binaries' ELF interpreter on the build host (glibc):
 # rpm's dependency generator does not read PT_INTERP.
 %{?maki_loader_requires:Requires: %{maki_loader_requires}}
@@ -122,6 +136,12 @@ exit 0
 
 %files
 %defattr(0644,root,root,0755)
+# dnf refuses, before it changes anything, a transaction that would remove a
+# package named in /etc/dnf/protected.d or break its dependencies. %%preun can
+# only keep Maki itself: rpm goes on with the rest of a transaction, which
+# used to erase nbdkit-server, lvm2, xfsprogs and kmod as unused dependencies
+# under an attached volume. `rpm -e maki` is the way to remove the package.
+%config(noreplace) /etc/dnf/protected.d/maki.conf
 %attr(0755,root,root) /usr/bin/maki
 %attr(0755,root,root) /usr/bin/maki-attach
 %attr(0755,root,root) /usr/bin/maki-check

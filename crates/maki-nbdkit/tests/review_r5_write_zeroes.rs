@@ -188,6 +188,7 @@ H, P, S, U64, U32 = c.c_void_p, c.c_void_p, c.c_size_t, c.c_uint64, c.c_uint32
 create = api('nbd_create', [], H)
 close = api('nbd_close', [H], None)
 error = api('nbd_get_error', [], c.c_char_p)
+get_errno = api('nbd_get_errno', [])
 connect_uri = api('nbd_connect_uri', [H, c.c_char_p])
 can_zero = api('nbd_can_zero', [H])
 can_fast_zero = api('nbd_can_fast_zero', [H])
@@ -195,7 +196,7 @@ pwrite = api('nbd_pwrite', [H, P, S, U64, U32])
 zero = api('nbd_zero', [H, U64, U64, U32])
 pread = api('nbd_pread', [H, P, S, U64, U32])
 shutdown = api('nbd_shutdown', [H, U32])
-FUA, NO_HOLE = 1, 2
+FUA, NO_HOLE, FAST_ZERO, ENOTSUP = 1, 2, 16, 95
 def check(result):
     if result < 0: raise RuntimeError(error().decode('utf-8', 'replace'))
     return result
@@ -204,9 +205,16 @@ if not h: raise RuntimeError(error().decode('utf-8', 'replace'))
 try:
     check(connect_uri(h, sys.argv[1].encode()))
     if check(can_zero(h)) != 1: raise RuntimeError('export did not negotiate write zeroes')
-    if check(can_fast_zero(h)) != 0: raise RuntimeError('fast zero advertised')
+    # Advertised so that nbdkit hands the request to the plugin, which
+    # refuses every fast zero and leaves the range as it was.
+    if check(can_fast_zero(h)) != 1: raise RuntimeError('fast zero not advertised')
     written = c.create_string_buffer(b'Z' * 8192, 8192)
     readback = c.create_string_buffer(8192)
+    check(pwrite(h, written, 8192, 0, 0))
+    if zero(h, 8192, 0, FAST_ZERO) != -1 or get_errno() != ENOTSUP:
+        raise RuntimeError('fast zero was not refused with ENOTSUP: ' + error().decode('utf-8', 'replace'))
+    check(pread(h, readback, 8192, 0, 0))
+    if readback.raw != written.raw: raise RuntimeError('a refused fast zero changed the export')
     for flags in (0, NO_HOLE):
         for offset in range(0, 1 << 20, 8192):
             check(pwrite(h, written, 8192, offset, 0))

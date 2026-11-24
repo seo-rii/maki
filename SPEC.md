@@ -316,15 +316,24 @@ under its own identifier.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal
-ends them; the kernel runs the `nbd` family's requests one at a time.
+ends them. The `nbd` family does not set `parallel_ops`, so the kernel runs
+each of its requests under the global generic-netlink mutex: while one is
+stuck, no other `nbd` request runs, and neither does a request to any other
+generic-netlink family without `parallel_ops`, on the whole host. The control
+family is one of those, so every family lookup (`CTRL_CMD_GETFAMILY`) waits
+too, whichever family a client wants to resolve. The request also holds the
+generic-netlink callback lock (`cb_lock`) for reading: registering or
+unregistering a family, which loading or unloading a module that has one
+does, takes it for writing and waits, and from then on a new request to any
+family, with `parallel_ops` or not, queues behind that writer.
 `NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
 `NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
 that stopped reading with a full send buffer holds the helper, with the attach
-lock, until it reads again or its socket closes. In the helper's flows the
-unmount and the VG deactivation, bounded commands that need the daemon to serve
-I/O, run first when they are needed and fail first in that case; the outer
-bound is the unit's start or stop timeout, and a helper in an uninterruptible
-wait ends only when that wait does.
+lock and that mutex, until it reads again or its socket closes. In the helper's
+flows the unmount and the VG deactivation, bounded commands that need the
+daemon to serve I/O, run first when they are needed and fail first in that
+case; the outer bound is the unit's start or stop timeout, and a helper in an
+uninterruptible wait ends only when that wait does.
 
 The helper logs the process and user IDs of its socket peer when it connects,
 for diagnostics only: the documented flows may run nbdkit outside the
@@ -762,6 +771,7 @@ maki/
     ├── tmpfiles.d/
     ├── sysusers.d/
     ├── debian/
+    ├── rpm/
     └── examples/
 ```
 
@@ -2678,9 +2688,20 @@ The adapter MUST verify device geometry, read and write callbacks, native FUA,
 FLUSH, parallel callbacks, panic containment, opt-in v3 TRIM (complete crypto
 units only), native WRITE_ZEROES of any length (chunked to the maximum I/O
 size; complete units discarded only when the client permits trimming on a v3
-volume; no fast zero), disabled multi-connection, disconnect, and clean
-detach. Default v2 volumes continue to advertise no TRIM; see
+volume), the refusal of fast zero, disabled multi-connection, disconnect, and
+clean detach. Default v2 volumes continue to advertise no TRIM; see
 `docs/space-reclamation.md` for the v3 persistence contract.
+
+The plugin MUST refuse every WRITE_ZEROES request that carries
+`NBD_CMD_FLAG_FAST_ZERO` with `ENOTSUP`, at once and without changing the
+export: partial units are written, so zeroing is never known to be faster
+than a write. It MUST nevertheless advertise fast zero
+(`NBD_FLAG_SEND_FAST_ZERO`), which the NBD protocol permits a server that
+always fails such requests. nbdkit does not check that the flag of a request
+was advertised; it asserts it, so an export that does not advertise fast zero
+lets one request from any client of the NBD socket abort a server built with
+assertions. The Linux NBD driver does not read that transmission flag and
+never sets the request flag.
 
 Linux qualification additionally covers the exported API-v2 prefix, libnbd
 round trips, fio verification, and the kernel NBD path. See

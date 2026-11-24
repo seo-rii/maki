@@ -187,11 +187,119 @@ class RpmPackageTests(unittest.TestCase):
         self.assertIn("maki(x86-64)", provides)
         self.assertFalse([name for name in provides if ".so" in name], provides)
 
+    def sysusers_entries(self):
+        """What packaging/sysusers.d/maki.conf creates, as `user(name)` and
+        `group(name)`: the names rpm's sysusers generator gives a package
+        that ships such a file on EL9 (`u` creates the user and its group,
+        `g` a group, `m` names a user and a group)."""
+        entries = set()
+        for line in (ROOT / "packaging/sysusers.d/maki.conf").read_text().splitlines():
+            fields = line.split()
+            if fields[:1] == ["u"]:
+                entries |= {f"user({fields[1]})", f"group({fields[1]})"}
+            elif fields[:1] == ["g"]:
+                entries.add(f"group({fields[1]})")
+            elif fields[:1] == ["m"]:
+                entries |= {f"user({fields[1]})", f"group({fields[2]})"}
+        return sorted(entries)
+
+    def host_with_a_sysusers_generator(self):
+        """An environment in which rpmbuild has a sysusers dependency
+        generator, as on a host with systemd-rpm-macros (every RHEL 9 host
+        with systemd; the minimal container image has none). The stand-in
+        prints provides no package declares, so that its output shows."""
+        home = self.work / "generator-home"
+        attributes = home / "fileattrs"
+        attributes.mkdir(parents=True)
+        system = pathlib.Path(subprocess.check_output(["rpm", "--eval", "%{_fileattrsdir}"], text=True).strip())
+        for attribute in system.glob("*.attr"):
+            shutil.copyfile(attribute, attributes / attribute.name)
+        # rpm takes the generators' names from the files of this directory
+        # and their commands from macros.
+        (attributes / "sysusers.attr").write_text("")
+        generator = home / "sysusers.prov"
+        generator.write_text("#!/bin/sh\ncat > /dev/null\necho 'user(from-the-build-host)'\n"
+                             "echo 'group(from-the-build-host)'\n")
+        generator.chmod(0o755)
+        (home / ".rpmmacros").write_text(
+            f"%_fileattrsdir {attributes}\n%__sysusers_provides {generator}\n"
+            "%__sysusers_path ^/usr/lib/sysusers\\.d/.*\\.conf$\n")
+        return dict(self.environment, HOME=str(home))
+
+    def test_package_provides_the_user_and_groups_it_creates(self):
+        # Other packages may require the user or a group (`Requires:
+        # user(maki)`, `group(maki-admin)`); the names are those of EL9's own
+        # packages, each declared once and for every version.
+        expected = self.sysusers_entries()
+        self.assertEqual(expected, ["group(maki)", "group(maki-admin)", "user(maki)"])
+        package = self.build()
+        provided = [line.split("\t") for line in
+                    query(package, "[%{PROVIDENAME}\t%{PROVIDEFLAGS:depflags}\t%{PROVIDEVERSION}\n]").splitlines()]
+        accounts = [entry for entry in provided if entry[0].startswith(("user(", "group("))]
+        self.assertEqual(sorted(name for name, _, _ in accounts), expected)
+        for name, flags, version in accounts:
+            self.assertEqual((flags.strip(), version.strip()), ("", ""), name)
+
+    def test_provides_do_not_depend_on_the_build_hosts_dependency_generators(self):
+        # A RHEL 9 host has rpm's sysusers generator (systemd-rpm-macros),
+        # the release workflow's container has not: the published package
+        # lacked the provides a package built on a host carried.
+        plain = self.build("plain.rpm")
+        self.environment = self.host_with_a_sysusers_generator()
+        with_generator = self.build("generator.rpm")
+        self.assertEqual(query(with_generator, "[%{PROVIDES}\n]"), query(plain, "[%{PROVIDES}\n]"))
+        self.assertEqual(hashlib.sha256(with_generator.read_bytes()).hexdigest(),
+                         hashlib.sha256(plain.read_bytes()).hexdigest())
+        # The stand-in generator does run for a spec that leaves it on.
+        checkout = self.work / "checkout"
+        shutil.copytree(ROOT / "packaging", checkout / "packaging")
+        for name in ("CHANGELOG.md", "LICENSE"):
+            shutil.copyfile(ROOT / name, checkout / name)
+        spec = checkout / "packaging/rpm/maki.spec"
+        switch = "%global __sysusers_provides %{nil}\n"
+        self.assertEqual(spec.read_text().count(switch), 1)
+        spec.write_text(spec.read_text().replace(switch, ""))
+        self.builder = checkout / "packaging/rpm/build-rpm.py"
+        control = query(self.build("control.rpm"), "[%{PROVIDENAME}\n]").splitlines()
+        self.assertIn("user(from-the-build-host)", control)
+        self.assertIn("group(from-the-build-host)", control)
+
     def test_package_conflicts_with_the_nbdkit_selinux_module(self):
         # nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, which the
-        # targeted policy lets systemd neither execute nor transition from;
-        # the nbdkit metapackage would bring it back after installation.
-        self.assertEqual(query(self.build(), "[%{CONFLICTS}\n]").split(), ["nbdkit-selinux"])
+        # targeted policy lets systemd neither execute nor transition from.
+        # Only the nbdkit metapackage requires the module, and only where
+        # selinux-policy-targeted is installed: with the module alone refused
+        # and Maki protected, `dnf install --allowerasing nbdkit` satisfies
+        # the metapackage by replacing the host's SELinux policy.
+        self.assertEqual(sorted(query(self.build(), "[%{CONFLICTS}\n]").split()), ["nbdkit", "nbdkit-selinux"])
+        self.assertEqual(set(query(self.build(), "[%{CONFLICTVERSION}\n]").split()), set(),
+                         "every version of both is refused")
+
+    def test_dnf_is_told_not_to_remove_the_package(self):
+        # A failing %preun keeps Maki, but rpm goes on with the rest of the
+        # transaction: `dnf remove maki` under an attachment erased
+        # nbdkit-server, lvm2, xfsprogs and kmod as unused dependencies, and
+        # `dnf --allowerasing` installed what conflicts with Maki beside it.
+        # dnf refuses a transaction that removes a protected package, or one
+        # of its dependencies, before it changes anything.
+        package = self.build()
+        installed = payload(package, self.work / "root") / "etc/dnf/protected.d/maki.conf"
+        self.assertEqual(installed.read_bytes(), (ROOT / "packaging/rpm/dnf-protected.conf").read_bytes())
+        # As dnf reads a protected.d file: a package name per line, blank
+        # lines and lines that start with `#` skipped.
+        names = [line.strip() for line in installed.read_text().splitlines()
+                 if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(names, [query(package, "%{NAME}")])
+        self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o644)
+        # The file is what an operator finds behind dnf's refusal.
+        for needed in ("rpm -e maki", "maki-workload@", "dnf autoremove"):
+            self.assertIn(needed, installed.read_text())
+        flags = dict(line.split("\t") for line in
+                     query(package, "[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]").splitlines())
+        # %config(noreplace), like systemd's own entry: an administrator's
+        # edit is kept by upgrades.
+        self.assertEqual({name: value for name, value in flags.items() if "c" in value},
+                         {"/etc/dnf/protected.d/maki.conf": "cn"})
 
     def test_package_owns_runtime_artifacts_but_not_live_configuration(self):
         package = self.build()
@@ -213,7 +321,10 @@ class RpmPackageTests(unittest.TestCase):
         for kind in ("sysusers.d", "tmpfiles.d"):
             self.assertEqual((root / "usr/lib" / kind / "maki.conf").read_bytes(),
                              (ROOT / "packaging" / kind / "maki.conf").read_bytes())
-        self.assertFalse((root / "etc").exists(), "the package owns nothing below /etc")
+        # Nothing below /etc/maki, which belongs to the operator; the one
+        # file outside /usr is dnf's.
+        self.assertEqual(sorted(path.relative_to(root).as_posix() for path in (root / "etc").rglob("*")
+                                if not path.is_dir()), ["etc/dnf/protected.d/maki.conf"])
 
     def test_daemon_unit_runs_the_distribution_nbdkit_by_absolute_path(self):
         root = payload(self.build(), self.work / "root")
@@ -576,9 +687,11 @@ class SameFilesAsTheDebianPackage(unittest.TestCase):
         deb = {name: entry for name, entry in tree(self.deb_root).items() if entry[0] == "file"}
         rpm = {name: entry for name, entry in tree(self.rpm_root).items() if entry[0] == "file"}
         # Format-specific records: Debian's changelog of the package itself;
-        # RHEL has no /usr/share/common-licenses for the notice to point to.
+        # RHEL has no /usr/share/common-licenses for the notice to point to,
+        # and dnf, unlike apt, goes on with a removal that %preun refused.
         self.assertEqual(sorted(set(deb) - set(rpm)), ["usr/share/doc/maki/changelog.Debian.gz"])
-        self.assertEqual(sorted(set(rpm) - set(deb)), ["usr/share/licenses/maki/LICENSE"])
+        self.assertEqual(sorted(set(rpm) - set(deb)),
+                         ["etc/dnf/protected.d/maki.conf", "usr/share/licenses/maki/LICENSE"])
         unit = "usr/lib/systemd/system/maki@.service"
         for name in sorted(set(deb) & set(rpm)):
             with self.subTest(name=name):

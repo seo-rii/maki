@@ -36,6 +36,10 @@ use handshake::{
     NBD_FLAG_SEND_FUA, NBD_FLAG_SEND_TRIM, NBD_FLAG_SEND_WRITE_ZEROES,
 };
 
+/// Bit 11 of the transmission flags: the kernel's NBD driver does not read
+/// it, and the plugin needs it advertised (see `review_fast_zero.rs`).
+const NBD_FLAG_SEND_FAST_ZERO: u16 = 1 << 11;
+
 const REQUIRE: &str = "MAKI_TEST_REQUIRE_NBDKIT";
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -172,6 +176,7 @@ fn the_plugin_passes_the_helpers_handshake_with_flush_and_fua() {
             (NBD_FLAG_SEND_FLUSH, "SEND_FLUSH"),
             (NBD_FLAG_SEND_FUA, "SEND_FUA"),
             (NBD_FLAG_SEND_WRITE_ZEROES, "SEND_WRITE_ZEROES"),
+            (NBD_FLAG_SEND_FAST_ZERO, "SEND_FAST_ZERO"),
         ] {
             assert_ne!(
                 flags & flag,

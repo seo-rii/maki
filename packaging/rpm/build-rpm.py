@@ -49,6 +49,8 @@ DEBIAN_NBDKIT = "ExecStart=/usr/bin/nbdkit \\"
 RPM_NBDKIT = "ExecStart=/usr/sbin/nbdkit \\"
 # The license text the Debian notice points to under /usr/share/common-licenses.
 LICENSE = "usr/share/licenses/maki/LICENSE"
+# Names `maki` as a package dnf must not remove (dnf.conf(5), protected_packages).
+DNF_PROTECTED = "etc/dnf/protected.d/maki.conf"
 # rpm refuses a changelog year before 1990 ("bad date in %changelog") and still
 # writes the package, without the entry.
 OLDEST_CHANGELOG = 631152000  # 1990-01-01T00:00:00Z
@@ -208,6 +210,7 @@ def create_tree(package_root, args):
     DEB.install_file(ROOT / "packaging/debian/copyright",
                      package_root / "usr/share/doc/maki/copyright", 0o644)
     DEB.install_file(ROOT / "LICENSE", package_root / LICENSE, 0o644)
+    DEB.install_file(ROOT / "packaging/rpm/dnf-protected.conf", package_root / DNF_PROTECTED, 0o644)
     DEB.install_gzip((ROOT / "CHANGELOG.md").read_bytes(), package_root / "usr/share/doc/maki/NEWS.gz")
     for name in ("maki", "maki-attach", "maki-check"):
         page = ROOT / "packaging/debian/man" / f"{name}.8"

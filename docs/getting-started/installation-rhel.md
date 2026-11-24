@@ -49,14 +49,19 @@ requirements and the builder the owner of their ELF loader (`glibc`):
 
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
-Conflicts: nbdkit-selinux
+Conflicts: nbdkit-selinux, nbdkit
+Provides: user(maki), group(maki), group(maki-admin)
 ```
 
 so `dnf install ./maki.rpm` installs whatever of them is missing from
 BaseOS and AppStream. It requires `nbdkit-server`, not the `nbdkit`
-metapackage, and conflicts with the SELinux module the metapackage installs,
-which by the policy's rules stops systemd from starting nbdkit
-([SELinux](#selinux)).
+metapackage, and conflicts with the metapackage and with the SELinux module
+the metapackage installs, which by the policy's rules stops systemd from
+starting nbdkit ([SELinux](#selinux)). nbdkit's plugins and filters install
+beside Maki under their own names, such as `nbdkit-basic-plugins`. The
+package provides the user and the groups it creates, for packages that
+require them. dnf treats Maki as a protected package: it is removed with
+`rpm -e` ([removal](#upgrading-and-removal)).
 
 ## Repositories
 
@@ -224,16 +229,23 @@ What follows is read from the CentOS Stream 9 targeted policy
   execute it, so in enforcing mode systemd would be refused when it starts
   `maki@` (this follows from the policy; it was not observed). The Maki RPM
   requires `nbdkit-server`, which does not install the module, and declares
-  `Conflicts: nbdkit-selinux`: dnf refuses to install Maki where the module
-  is installed, and refuses a later transaction that would add it (such as
-  `dnf install nbdkit`, or a package that requires the metapackage), naming
-  the conflict, rather than leaving `maki@` to fail at its next start, which
-  may be the next boot. The cost: Maki cannot be installed beside the module,
-  so neither a host that needs it for libvirt or virt-v2v nor one where
-  SELinux is permissive or disabled and the module would be harmless can run
-  Maki; both are outside what this guide covers. `dnf --allowerasing` would
-  resolve the conflict by removing Maki, which its `%preun` refuses while a
-  volume is attached. `ls -Z /usr/sbin/nbdkit` should show `bin_t`.
+  `Conflicts: nbdkit-selinux, nbdkit`: dnf refuses to install Maki where the
+  module or the metapackage is installed, and refuses a later transaction
+  that would add either (such as `dnf install nbdkit`), naming the conflict,
+  rather than leaving `maki@` to fail at its next start, which may be the
+  next boot. Nothing in BaseOS or AppStream requires the metapackage
+  (libvirt's QEMU driver recommends it, and dnf leaves a recommendation out
+  that it cannot install). The cost: Maki cannot be installed beside the
+  module or the metapackage, so neither a host that needs the module for
+  libvirt or virt-v2v nor one where SELinux is permissive or disabled and
+  the module would be harmless can run Maki; both are outside what this
+  guide covers. `dnf --allowerasing` does not get around the conflict: Maki
+  is a protected package ([removal](#upgrading-and-removal)), so dnf refuses
+  that transaction too. The metapackage is named for that reason: with only
+  the module refused, `dnf install --allowerasing nbdkit` proposed to
+  satisfy the metapackage by replacing `selinux-policy-targeted` with
+  another policy (dnf 4.14, in a CentOS Stream 9 root with the Core group).
+  `ls -Z /usr/sbin/nbdkit` should show `bin_t`.
 
 Check the mode and look for denials after starting a volume:
 
@@ -263,8 +275,36 @@ Stop workloads and detach every volume with the *old* helper before
 installing a newer package (`dnf install ./maki.rpm` with the newer file),
 then follow
 [upgrading the runtime layout](../operations.md#upgrading-the-runtime-layout).
-No package script stops or restarts a service, and an upgrade is never
-refused. `dnf remove maki` is refused while any volume is attached (an
-attachment record under `/run/maki-attach/` or an active Maki unit): the
-package's `%preun` fails with the stop procedure, and rpm keeps the package
-installed.
+No package script stops or restarts a service, and an upgrade, a downgrade
+or a reinstallation is never refused.
+
+Maki is removed with rpm, not with dnf. The package installs
+`/etc/dnf/protected.d/maki.conf`, which names `maki` as a protected package:
+`dnf remove maki` fails with "The operation would result in removing the
+following protected packages: maki", whether or not a volume is attached,
+and so does a transaction that would remove a package Maki requires (such as
+`dnf remove lvm2`) or install one it conflicts with. dnf decides that before
+it changes anything. The reason is that rpm cannot stop a transaction from a
+package's `%preun`: without the protection, a `dnf remove maki` that `%preun`
+refused under an attached volume kept Maki but went on to erase
+`nbdkit-server`, `lvm2`, `xfsprogs` and `kmod` as unused dependencies. The
+`v0.1.0-rc.1` RPM has no protection file and behaves that way: remove it
+with `rpm -e` as well.
+
+To remove Maki, stop the workloads, stop each
+`maki-workload@<volume>.target` and wait for its units to become inactive.
+Then:
+
+```bash
+rpm -e maki
+dnf autoremove
+```
+
+`rpm -e maki` is refused while any volume is attached (an attachment record
+under `/run/maki-attach/` or an active Maki unit): the package's `%preun`
+fails with the stop procedure, and rpm keeps the package installed.
+`dnf autoremove` then offers the dependencies that nothing else needs. Do not
+lift the protection for a single command (`--setopt=protected_packages=`) on
+a host with an attached volume: dnf then runs the transaction described
+above. The protection file is a configuration file; an administrator's
+change to it is kept by upgrades.
