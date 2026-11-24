@@ -893,7 +893,10 @@ fn disconnect_raw_with(
     loop {
         match nbd_backend_at(sysfs, device) {
             Ok(Some(backend)) if backend == identifier => {}
-            // No connection, or one made since: this one is gone.
+            // No connection, or one made since under another backend
+            // identifier: this one is gone. A connection made since without
+            // an identifier (an ioctl client's: `pid`, no `backend`) reads
+            // as neither; it is the unreadable case below and fails.
             Ok(_) => return Ok(()),
             Err(error) => {
                 return Err(identity_error(format!(

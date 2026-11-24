@@ -416,7 +416,8 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
         assert!(error.contains(expected), "{error}");
     }
 
-    // A connection made since is not this one: the disconnect is done.
+    // A connection made since under another identifier is not this one:
+    // the disconnect is done.
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
@@ -428,7 +429,8 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
 
     // What cannot be read is not "gone". The kernel removes `pid` before
     // `backend`, so a `pid` without an identifier is no state that this
-    // disconnect leaves behind.
+    // disconnect leaves behind. It is what a connection made since by an
+    // ioctl client shows, and the command fails on it.
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
