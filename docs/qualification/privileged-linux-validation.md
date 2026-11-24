@@ -30,7 +30,9 @@ The automated run checks:
   capability set;
 - denial of the protected socket to an unrelated user;
 - kernel `/dev/nbdN` attachment and exported geometry;
-- denial of an NBD disconnect ioctl to the invoking unprivileged user;
+- the kernel's denial of the helper's netlink `NBD_CMD_DISCONNECT` to the
+  invoking unprivileged user (an `NBD_DISCONNECT` ioctl or `nbd-client -d` in
+  the results below);
 - raw-device fio with CRC32C verification and periodic `fsync`;
 - disposable LVM and XFS creation;
 - the real `maki-attach` attach, read-only verify, and convergent cleanup paths,
@@ -181,9 +183,9 @@ installs nbd-client. Its raw phases use `maki-attach nbd-connect` and
 runs the helper's own `nbd-disconnect` as the invoking user: it passes only when
 the helper reports the kernel's `Operation not permitted` for
 `NBD_CMD_DISCONNECT` while the run's backend stays connected, and the evidence
-is kept as `unprivileged-nbd-disconnect.txt`. Every result below used
-nbd-client 3.27.1 (3.24 for the first one); no campaign has been run with the
-helper's own connect yet.
+is kept as `unprivileged-nbd-disconnect.txt`. Every result below attached
+through nbd-client, 3.27.1 (3.24 in the 2026-09-02 result); no campaign has
+been run with the helper's own connect yet.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 

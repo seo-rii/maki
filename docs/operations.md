@@ -43,7 +43,10 @@ socket itself (fixed-newstyle `NBD_OPT_GO` for the default export) and connects
 and disconnects the kernel device with generic-netlink requests to the `nbd`
 family, which needs a kernel whose `nbd` module has the netlink interface and
 the backend identifier (SPEC §6). It refuses an export that does not advertise
-FLUSH and FUA, before the kernel sees the socket. The
+FLUSH and FUA, before the kernel sees the socket. While something has the
+unconnected device open (udev probes a device right after a disconnect), the
+kernel refuses a connect as busy; the helper retries that for up to 5 s, as
+long as the device still shows no connection. The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -778,9 +781,10 @@ the helper refuses to connect on one that does not, and an unverifiable
 connection fails closed. The helper sets the identifier itself; until the
 change that made it do so, it ran `nbd-client` 3.27 or later, which set the
 same kernel attribute, so attachments connected that way stay detachable.
-Qualify the updated helper on the intended Linux target before deployment;
-the privileged validation reports before that change used `nbd-client` 3.27.1
-and do not cover the helper's own connect.
+Qualify the updated helper on the intended Linux target before deployment:
+every external campaign that attached a kernel NBD device did so through
+`nbd-client` (3.27.1 where the report names the version; 3.24 in the
+2026-09-02 privileged run), and none covers the helper's own connect.
 
 `maki-attach@<volume>.service` becomes active after the identity check passes.
 Its `RemainAfterExit=yes` retains that past result even if the mount later

@@ -185,11 +185,13 @@ See [cache reload](operations.md#growth-and-cache-reload).
   to remove.
 - No NBD client package is needed: the privileged helper negotiates with the
   daemon's socket and connects the kernel device over netlink itself, and
-  refuses an export without FLUSH and FUA. Every external campaign listed here
-  used nbd-client 3.27.1 and predates the helper's own connect, which unit
-  tests, tests against a real nbdkit and Maki's plugin and, where the CI runner
-  can load the `nbd` module, a root-only kernel test cover; no external
-  campaign has run it yet.
+  refuses an export without FLUSH and FUA. Every external campaign that
+  attached a kernel NBD device did so through nbd-client (3.27.1 where the
+  report names the version; 3.24 in the 2026-09-02 privileged run) and
+  predates the helper's own connect; the others attached none. Unit
+  tests, tests against a real nbdkit and Maki's plugin, and a root-only kernel
+  test in CI (whose runners load the `nbd` module) cover the helper's connect;
+  no external campaign has run it yet.
 
 ## Where the evidence lives
 
