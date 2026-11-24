@@ -19,7 +19,8 @@ on:
 # here a missing one is a failure (tests/support/other_filesystem.rs). The
 # same holds for the tests of the helper's NBD handshake against a real
 # nbdkit and of its constants against the kernel's UAPI headers: every job
-# that runs them installs nbdkit, linux-libc-dev and a C compiler.
+# that runs them installs nbdkit, the kernel's UAPI headers (linux-libc-dev,
+# kernel-headers on EL9) and a C compiler.
 env:
   MAKI_TEST_REQUIRE_OTHER_FILESYSTEM: "1"
   MAKI_TEST_REQUIRE_NBDKIT: "1"
@@ -107,7 +108,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc linux-libc-dev
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc linux-libc-dev rpm cpio
           nbdkit --version
           nbdinfo --version
           nbdcopy --version
@@ -190,6 +191,13 @@ jobs:
       - name: Debian package contract (Linux)
         if: runner.os == 'Linux'
         run: python3 -B -m unittest scripts.test_debian_package -v
+      # Ubuntu's rpm builds the RPM from the same artifacts as the Debian
+      # package, so here the two are also compared file by file.
+      - name: RPM package contract (Linux)
+        if: runner.os == 'Linux'
+        env:
+          MAKI_TEST_REQUIRE_DPKG_DEB: "1"
+        run: python3 -B -m unittest scripts.test_rpm_package -v
       - name: release candidate preparation contract (Linux)
         if: runner.os == 'Linux'
         run: python3 -B -m unittest scripts.test_release_preparation -v
@@ -242,6 +250,102 @@ jobs:
           python-version: "3.11"
       - name: workspace tests
         run: python scripts/run_cargo_tests.py --workspace --locked
+
+  rhel9:
+    # A RHEL 9 userspace: glibc 2.34, nbdkit 1.38 at /usr/sbin/nbdkit and its
+    # plugin header, LVM2, systemd 252, rpm 4.16 and Python 3.9. CentOS Stream
+    # 9 is the public upstream of RHEL 9 (Rocky and Alma rebuild RHEL; UBI
+    # lacks nbdkit-devel and CRB). The tag follows the stream on purpose. The
+    # kernel is the runner's and nothing attaches a device, so RHEL's kernel,
+    # SELinux and the attach path are not covered here.
+    runs-on: ubuntu-latest
+    container: quay.io/centos/centos:stream9
+    timeout-minutes: 60
+    steps:
+      # BaseOS and AppStream, plus CRB for nbdkit-devel (the ABI test's
+      # header; the package itself does not need CRB). No EPEL. nbdkit-server
+      # as the RPM requires it, not the nbdkit metapackage the guide warns
+      # about; the basic plugins for the tests' memory and eval exports, and
+      # the UAPI headers for the netlink constant probes. lvm2, xfsprogs and
+      # kmod come with the RPM's own Requires in its step.
+      - name: build and test dependencies
+        run: |
+          dnf install -y -q --enablerepo=crb --setopt=install_weak_deps=False \
+            gcc git-core python3 rpm-build cpio diffutils findutils gzip tar procps-ng \
+            nbdkit-server nbdkit-basic-plugins nbdkit-devel libnbd util-linux systemd kernel-headers
+          nbdkit --version
+          test "$(command -v nbdkit)" = /usr/sbin/nbdkit
+          nbdinfo --version
+          nbdcopy --version
+          test -f /usr/include/nbdkit-plugin.h
+          test -f /usr/include/linux/nbd.h
+          test -f /usr/include/linux/nbd-netlink.h
+      - uses: actions/checkout@v4
+      # The steps run as root, but the workspace, RUNNER_TEMP and HOME belong
+      # to the runner's uid 1001. actions/checkout trusts the workspace only
+      # in a temporary git config, so root's git refuses it ("dubious
+      # ownership"). Fixtures that need every ancestor of their directory to
+      # be root's and closed to others (regression_mount_target.rs) refuse
+      # the workspace, HOME and the world-writable /tmp, so the tests get a
+      # root-owned TMPDIR below root-owned ancestors; 0755, as the root
+      # runner's scratch directory, because fixtures hand files to uid 65534.
+      - name: root in the runner-owned workspace
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          install -d -o root -g root -m 0755 /var/lib/maki-ci-tmp
+          echo "TMPDIR=/var/lib/maki-ci-tmp" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rhel9
+      - name: packaged binaries
+        run: cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+      - name: nbdkit ABI against the EL9 header
+        run: cargo test --locked -p maki-nbdkit --test review_abi -- --nocapture
+      # The container runs as root, so the root-only targets of these crates
+      # run here too; those that need a private mount namespace or a writable
+      # cgroup tree, which the container lacks, print why they skip. The
+      # Ubuntu job runs them as root on the same kernel. --no-fail-fast: one
+      # failing test binary must not hide the others.
+      - name: helper, attach and plugin suites
+        run: python3 -B scripts/run_cargo_tests.py --locked --no-fail-fast -p maki-privileged -p maki-attach -p maki-nbdkit
+      - name: RPM package contract
+        run: python3 -B -m unittest scripts.test_rpm_package -v
+      - name: build, install and remove the RPM
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/maki.rpm"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 -B packaging/rpm/build-rpm.py --release-dir target/release \
+            --version 0.0.0~ci --architecture "$(rpm --eval '%{_arch}')" --output "$package"
+          rpm -qp --requires "$package" | tee "$RUNNER_TEMP/requires"
+          # The owner of the binaries' loader, and libraries of EL9's glibc.
+          grep -qx glibc "$RUNNER_TEMP/requires"
+          grep -q '^libc\.so\.6(GLIBC_2\.34)(64bit)$' "$RUNNER_TEMP/requires"
+          dnf install -y -q "$package"
+          # Its Requires brought the runtime, without the nbdkit metapackage.
+          rpm -q nbdkit-server lvm2 xfsprogs util-linux systemd kmod
+          for unwanted in nbdkit nbdkit-selinux; do
+            if rpm -q "$unwanted"; then exit 1; fi
+          done
+          # It conflicts with nbdkit-selinux: dnf refuses to add the module.
+          if dnf install --assumeno nbdkit-selinux > "$RUNNER_TEMP/selinux" 2>&1; then exit 1; fi
+          grep -q 'conflicts with nbdkit-selinux' "$RUNNER_TEMP/selinux"
+          rpm -V maki
+          getent passwd maki
+          getent group maki-admin
+          test "$(stat -c '%U:%G %a' /run/maki-attach /etc/maki/attach)" = "$(printf 'root:root 700\nroot:root 700')"
+          grep -qx 'ExecStart=/usr/sbin/nbdkit \\' /usr/lib/systemd/system/maki@.service
+          systemd-analyze verify maki@ci.service maki-attach@ci.service \
+            maki-recover@ci.service maki-workload@ci.target
+          echo '{}' > /run/maki-attach/ci.nbd
+          if rpm -e maki; then
+            echo "the package was removed under an attachment record" >&2; exit 1
+          fi
+          rpm -q maki
+          rm /run/maki-attach/ci.nbd
+          rpm -e maki
+          if rpm -q maki; then exit 1; fi
 
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))

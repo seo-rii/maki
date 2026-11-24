@@ -670,6 +670,14 @@ ReadWritePaths=/run/maki/%i
 ReadWritePaths=/run/maki-control/%i
 ```
 
+The unit MUST name nbdkit by the absolute path where the distribution's
+nbdkit package installs it: `/usr/bin/nbdkit` in the Debian package,
+`/usr/sbin/nbdkit` in the RHEL 9 RPM, which installs the same unit with that
+one line changed. It MUST NOT give a bare program name: systemd resolves one
+through a fixed search path that starts with `/usr/local/sbin` and
+`/usr/local/bin`, so an unpackaged binary there would receive the volume's
+configuration and crypto credential.
+
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
 
 The native plugin initializes its adapter in `after_fork`, so recovery,
