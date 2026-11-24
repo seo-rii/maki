@@ -57,6 +57,9 @@ Debian 12 is the primary platform. The stock `nbd-client` 3.24 is too old;
 and the Maki package:
 
 - [Installing on Debian 12](docs/getting-started/installation-debian.md)
+- [Installing on RHEL 9](docs/getting-started/installation-rhel.md) and its
+  rebuilds: an RPM from BaseOS and AppStream packages; not qualified, CI
+  checks the userspace only
 
 No prebuilt packages are published yet.
 

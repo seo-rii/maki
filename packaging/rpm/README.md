@@ -2,9 +2,10 @@
 
 `build-rpm.py` packages prebuilt release artifacts for RHEL 9 and its
 rebuilds (CentOS Stream 9, Rocky Linux 9, AlmaLinux 9) with `maki.spec`.
-Nothing is compiled by `rpmbuild`. On a RHEL 9 build host, with the release
-binaries built and the version selected as for the
-[Debian package](../debian/README.md):
+Nothing is compiled by `rpmbuild`. The
+[RHEL 9 installation guide](../../docs/getting-started/installation-rhel.md)
+gives the whole procedure; on a RHEL 9 build host, with the release binaries
+built and the version selected as there:
 
 ```bash
 set -euo pipefail
@@ -57,8 +58,10 @@ Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
 ```
 
 `nbdkit-server` provides `/usr/sbin/nbdkit`; the `nbdkit` metapackage would
-add plugins and filters Maki does not use (and, on a host with the targeted
-SELinux policy, the `nbdkit-selinux` module).
+add plugins and filters Maki does not use and, on a host with the targeted
+SELinux policy, the `nbdkit-selinux` module, under which the policy lets
+systemd neither execute nbdkit nor transition to its domain
+([SELinux](../../docs/getting-started/installation-rhel.md#selinux)).
 nbd-client is not required.
 
 rpm adds the binaries' shared-library requirements itself (`libc.so.6`,

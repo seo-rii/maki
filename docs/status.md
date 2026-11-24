@@ -19,6 +19,7 @@ Last updated: 2026-11-17. External campaign evidence below runs through
 | Recommended use | Evaluation and development on disposable Linux hosts |
 | Primary platform | Debian 12 (bookworm), Linux 6.1, systemd 252, on Google Compute Engine VMs |
 | Prebuilt packages | None published; build the Debian package from source ([installation guide](getting-started/installation-debian.md)) |
+| RHEL 9 | Not qualified: an RPM and an [installation guide](getting-started/installation-rhel.md) exist, and CI checks the userspace in a CentOS Stream 9 container; no kernel attachment or campaign has run there |
 
 ## Volume formats
 
