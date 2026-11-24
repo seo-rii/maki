@@ -152,7 +152,7 @@ fn root_offline_check_and_inspect_leave_the_daemon_able_to_open_its_witness() {
     let config = fixture.config();
     let config = config.to_str().unwrap();
     // The documented creation: directories the daemon user owns, then
-    // `sudo -u maki maki volume create`.
+    // `runuser -u maki -- maki volume create`.
     for directory in [fixture.directory.path(), fixture.witness_parent.path()] {
         std::os::unix::fs::chown(directory, Some(DAEMON.0), Some(DAEMON.1)).unwrap();
     }

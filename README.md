@@ -77,7 +77,7 @@ remaining steps, in outline:
 ```bash
 install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml
 install -d -o maki -g maki -m 0700 /var/lib/maki/demo
-sudo -u maki maki volume create /etc/maki/volumes/demo.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/demo.toml
 # one-time: pvcreate / vgcreate / lvcreate / mkfs.xfs on the export,
 # then pin the UUIDs in /etc/maki/attach/demo.toml  (docs/getting-started/first-volume.md)
 systemctl start maki-workload@demo.target
@@ -127,7 +127,7 @@ Format and behaviour changes: [CHANGELOG.md](CHANGELOG.md).
 |---|---|
 | `crates/` | Storage engine, format, crypto providers, control plane, remote witness, test support |
 | `bins/` | `maki`, `maki-attach`, `maki-check`, `maki-benchmark`, `maki-witness` |
-| `packaging/` | Debian package builder, systemd, sysusers, tmpfiles, provider examples |
+| `packaging/` | Debian and RPM package builders, systemd, sysusers, tmpfiles, provider examples |
 | `examples/` | Complete deployment bundles |
 | `docs/` | User, operator, reference and qualification documentation |
 | `scripts/` | Validation harnesses and repository checks |

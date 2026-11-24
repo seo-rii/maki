@@ -188,9 +188,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Called as "$(state)", where bash turns errexit off: each query
+          # reports its own failure, or one that was not answered would be
+          # read as "no release and no tag".
           state() {
-            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate > dist/releases.json
-            gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" > dist/refs.json
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate > dist/releases.json || return 1
+            gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" > dist/refs.json || return 1
             python3 -B scripts/release_assets.py state --tag "$TAG" --releases dist/releases.json --refs dist/refs.json
           }
           before="$(state)"

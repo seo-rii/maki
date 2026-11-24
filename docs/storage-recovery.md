@@ -156,7 +156,10 @@ hint files untouched. The attach lock does not coordinate other privileged
 tools or udev activation triggered by NBD connection. Device identity and
 metadata can change after an observation; neither external root races nor
 automatic udev activation are made safe by the UUID pins. Qualify the host's
-activation policy separately.
+activation policy separately. The provisioning guide creates the volume
+group with LVM's autoactivation property off, so that LVM's event activation
+skips it ([why](getting-started/first-volume.md#1-provision-and-record-the-layout));
+a volume group created another way keeps the property it was given.
 
 Failed-attach rollback uses the same preflight identities before any mount or
 VG teardown, and limits VG deactivation to the validated UUID and devices.

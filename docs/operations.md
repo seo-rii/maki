@@ -91,7 +91,8 @@ is disabled. See [space reclamation](space-reclamation.md) for format selection,
 partial-unit behavior and checkpoint ordering. WRITE_ZEROES is native and
 chunked to `nbd.maximum_io`, so a zero request of any length succeeds; on a
 `--discard` volume whole units may be discarded when the client allows it.
-Fast zero is not advertised.
+Fast zero is advertised, and every fast zero request is refused with `ENOTSUP`
+([why](space-reclamation.md)).
 
 ## Volume lifecycle
 
@@ -147,7 +148,7 @@ the daemon and run the command as that user:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/example
-sudo -u maki maki volume create /etc/maki/volumes/example.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/example.toml
 ```
 
 The backing filesystem must overwrite allocated blocks in place, or the

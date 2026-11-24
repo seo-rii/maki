@@ -240,26 +240,55 @@ def assemble(tag, commit, repository, deb_bundle, rpm_bundle, template, output, 
         print(output / name)
 
 
-def releases_from(path):
-    """Releases from `gh api --paginate` output: one JSON array per page."""
-    text, releases, position = path.read_text(encoding="utf-8"), [], 0
-    decoder = json.JSONDecoder()
+def answers(path, what):
+    """Every JSON document in the file a `gh api` query wrote: at least one.
+
+    gh writes nothing when it cannot reach GitHub, and "there are none" is the
+    answer `[]`: an empty file is a query that was not answered, and must
+    never be read as an empty answer."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"{path} is not the JSON a {what} query answers with: {error}")
+    found, position, decoder = [], 0, json.JSONDecoder()
     while position < len(text):
         if text[position].isspace():
             position += 1
             continue
-        page, position = decoder.raw_decode(text, position)
-        if not isinstance(page, list):
+        try:
+            document, position = decoder.raw_decode(text, position)
+        except ValueError as error:
+            fail(f"{path} is not the JSON a {what} query answers with ({error}): the query did not complete")
+        found.append(document)
+    if not found:
+        fail(f"{path} is empty: the {what} query was not answered, which does not show that there are none")
+    return found
+
+
+def releases_from(path):
+    """Releases from `gh api --paginate` output: one JSON array per page."""
+    releases = []
+    for page in answers(path, "releases"):
+        if not isinstance(page, list) or not all(isinstance(release, dict) for release in page):
             fail(f"{path} is not a list of releases")
         releases.extend(page)
     return releases
+
+
+def refs_from(path):
+    """Refs from one `gh api` answer: a JSON array of ref objects."""
+    pages = answers(path, "tags")
+    if len(pages) != 1 or not isinstance(pages[0], list) or not all(isinstance(ref, dict) for ref in pages[0]):
+        fail(f"{path} is not one list of refs")
+    return pages[0]
 
 
 def state(tag, releases, refs):
     """'release=none|draft|prerelease|release' and 'tag=none|<sha>' for one tag.
 
     A published release wins over drafts of the same name; 'release' is a
-    published release that is not marked as a pre-release."""
+    published release that is not marked as a pre-release. Nothing is printed
+    unless both files hold a complete answer."""
     matching = [release for release in releases_from(releases) if release.get("tag_name") == tag]
     published = [release for release in matching if not release.get("draft")]
     if not matching:
@@ -270,9 +299,13 @@ def state(tag, releases, refs):
         release = "prerelease"
     else:
         release = "release"
-    exact = [ref for ref in json.loads(refs.read_text(encoding="utf-8") or "[]")
-             if ref.get("ref") == f"refs/tags/{tag}"]
-    tag_state = exact[0]["object"]["sha"] if exact else "none"
+    exact = [ref for ref in refs_from(refs) if ref.get("ref") == f"refs/tags/{tag}"]
+    tag_state = "none"
+    if exact:
+        target = exact[0].get("object")
+        tag_state = target.get("sha") if isinstance(target, dict) else None
+        if not isinstance(tag_state, str) or not COMMIT.fullmatch(tag_state):
+            fail(f"{refs} does not name the object of refs/tags/{tag}")
     print(f"release={release}")
     print(f"tag={tag_state}")
 
