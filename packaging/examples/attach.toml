@@ -19,7 +19,7 @@ volume_uuid = "00000000-0000-0000-0000-000000000000"
 # lv_name = "data"
 # mountpoint = "/srv/postgres-prod"
 
-# Block size handed to nbd-client -b and blockdev --setbsz.
+# The NBD device's logical block size at connect, also set with blockdev --setbsz.
 device_block_size = 4096
 
 # Pin the XFS filesystem UUID once the filesystem exists (`blkid`). Any

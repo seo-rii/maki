@@ -5,8 +5,9 @@ rule it enforces. Guide: [PostgreSQL deployment](../../docs/deployment/postgres.
 
 ## Host
 
-- [ ] Debian 12 with `nbd-client` ≥ 3.27.0 (`dpkg -s nbd-client`), kernel `nbd`
-      module loaded at boot ([installation](../../docs/getting-started/installation-debian.md))
+- [ ] Debian 12 with the kernel `nbd` module loaded at boot
+      ([installation](../../docs/getting-started/installation-debian.md)); no
+      NBD client package is needed
 - [ ] Host, backing and topology are listed as at least "Expected" in the
       [support matrix](../../docs/deployment/support-matrix.md)
 - [ ] `systemd-analyze verify` passes for `maki@postgres.service`,
