@@ -288,13 +288,15 @@ fn a_device_held_open_is_connected_once_it_is_released() {
             .trim()
     );
     const HELD: Duration = Duration::from_millis(700);
+    // Before the device is opened: the release then comes no earlier than
+    // `HELD` after this instant, whenever the releasing thread starts.
+    let started = Instant::now();
     let opener = std::fs::File::open(&device).unwrap();
     let releasing = std::thread::spawn(move || {
         std::thread::sleep(HELD);
         drop(opener);
     });
 
-    let started = Instant::now();
     let mut connected = Connected(Some(index));
     connect(server.socket(), index, BLOCK_SIZE, &identifier)
         .unwrap_or_else(|error| panic!("connect {device}: {error}: {}", server.log()));
