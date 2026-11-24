@@ -138,8 +138,13 @@ empty or partly written beside nothing but those lock files is completed by
 `volume create` the same way. Nothing has to be removed by hand, and
 `resume-enrollment` refuses such a root with a message that says to create
 the volume again. Once `rollback.format` holds the marker, `volume create`
-refuses the root (`remote enrollment requires an empty backing`) and the
-procedure below continues it. The binding, the next file, is written the
+no longer continues the root: it answers
+`remote enrollment requires an empty backing` while the authority is still
+unclaimed (the creation stopped before its claim, while it wrote the
+binding), and `remote witness already enrolled or occupied` once the
+creation had claimed the authority (it stopped while reserving the
+namespace, on a full disk for example, or before activation). The
+procedure below continues both. The binding, the next file, is written the
 same way, as `remote.enrollment.next` renamed to `remote.enrollment` once it
 is synced: a creation that stopped while it wrote the binding leaves at most
 the staged file, which nothing reads, and `resume-enrollment` continues it
@@ -276,7 +281,9 @@ unwritten one): a witness mount that is missing (an empty directory in its
 place) cannot get a used volume recreated, and neither can slots that
 damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
 the anchor empty before writing it: an empty `anchor` that such a release
-left is refused by `create` and by the daemon, which say that the creation
+left is refused by `create`
+(`rollback enrollment requires empty backing and witness directories`) and
+by the daemon and the offline commands, which say that the creation
 did not complete or the witness lost its state. If the volume was never
 attached, remove that empty file and run `maki volume create` again;
 otherwise restore the witness directory.

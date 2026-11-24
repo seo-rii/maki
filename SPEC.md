@@ -762,6 +762,7 @@ maki/
     ├── tmpfiles.d/
     ├── sysusers.d/
     ├── debian/
+    ├── rpm/
     └── examples/
 ```
 
