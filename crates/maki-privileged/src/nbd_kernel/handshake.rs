@@ -74,10 +74,14 @@ pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
 pub const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
 pub const NBD_FLAG_CAN_MULTI_CONN: u16 = 1 << 8;
 
-/// What an export must advertise before the kernel may use it. Without
-/// `SEND_FLUSH` the kernel completes a FLUSH without sending it, and
-/// without `SEND_FUA` it completes a FUA write's durability promise the
-/// same way: the filesystem's barriers would never reach the journal.
+/// What an export must advertise before the kernel may use it.
+/// `SEND_FLUSH` is needed for durability: without it the kernel gives the
+/// device no write cache, so a FLUSH completes without reaching the server
+/// and a FUA write goes out as a plain write, and the filesystem's barriers
+/// would never reach the journal. `SEND_FUA` is required by policy: without
+/// it the block layer emulates every FUA write with a full flush, which does
+/// reach the server. `HAS_FLAGS` is required by the NBD protocol, without
+/// which the other bits mean nothing; the kernel itself ignores it.
 pub const REQUIRED_TRANSMISSION_FLAGS: u16 =
     NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA;
 
@@ -261,8 +265,8 @@ fn checked_export(size: u64, flags: u16) -> io::Result<Export> {
     .collect();
     if !missing.is_empty() {
         return Err(invalid(format!(
-            "the export does not advertise {} (transmission flags {flags:#06x}): the kernel \
-             would complete FLUSH and FUA requests without sending them to the server",
+            "the export does not advertise {} (transmission flags {flags:#06x}): Maki requires \
+             SEND_FLUSH for durability, SEND_FUA by policy and HAS_FLAGS by the NBD protocol",
             missing.join(", ")
         )));
     }

@@ -1,9 +1,10 @@
 //! The privileged helper's NBD handshake against Maki's own plugin in a
 //! real nbdkit. The helper refuses an export that does not advertise
-//! FLUSH and FUA (SPEC §6), because without them the kernel completes a
-//! filesystem's barriers without asking the server; so the plugin must
-//! always advertise both, natively, and TRIM exactly where the volume
-//! keeps discards.
+//! FLUSH and FUA (SPEC §6): without SEND_FLUSH the kernel would complete a
+//! filesystem's barriers without asking the server, and SEND_FUA is
+//! required by policy, so that a FUA write is not emulated with a full
+//! flush. The plugin must therefore always advertise both, natively, and
+//! TRIM exactly where the volume keeps discards.
 //!
 //! The handshake is the helper's own source, compiled here by path: a
 //! dependency on maki-privileged would change the lockfile, and this way

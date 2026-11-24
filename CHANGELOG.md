@@ -11,6 +11,59 @@ documents.
 
 ### Breaking changes
 
+- **The privileged helper connects and disconnects NBD devices itself; no NBD
+  client is used** (AUD-147, AUD-151, AUD-153, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). `maki-attach` starts no
+  program for its NBD steps: it negotiates with the volume daemon's socket
+  (fixed-newstyle `NBD_OPT_GO` for the default export) and sends
+  `NBD_CMD_CONNECT` and `NBD_CMD_DISCONNECT` to the kernel's `nbd`
+  generic-netlink family, setting the attachment's connection identifier as
+  the device's backend identifier, as `nbd-client -identifier` did. The Debian
+  package's `Depends` no longer lists `nbd-client (>= 1:3.27.0)`; its static
+  list is `nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod`,
+  followed by the library packages `dpkg-shlibdeps` finds. A source-built
+  `nbd-client` is no longer used and may be removed, and attachments it
+  connected stay detachable. A kernel whose `nbd` family takes no backend
+  identifier is refused before anything is connected. The plan prints `connect
+  nbdN to <socket> over netlink (block size B, backend identifier
+  '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)` and
+  `disconnect nbdN over netlink` instead of the `nbd-client` command lines. A
+  disconnect that the kernel cannot complete (a daemon that stopped reading
+  with a full send buffer) now holds the helper and the attach lock until the
+  daemon reads again or its socket closes, where the helper used to abandon a
+  stuck `nbd-client` at the 120 s step limit; the unmount and the VG
+  deactivation before it fail first in that case, and the unit's timeout is
+  the outer bound. This replaces the `nbd-client` 3.27.0 requirement listed
+  further down ([prerequisites](docs/operations.md#prerequisites),
+  [Debian](docs/getting-started/installation-debian.md#nbd-client-327-or-later)).
+- **An NBD export without FLUSH and FUA is refused** (AUD-149, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). Before the kernel sees
+  the socket, the helper refuses an export that does not advertise
+  `NBD_FLAG_HAS_FLAGS`, `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`, an
+  export of size 0 or above 2^63 − 1 bytes, and a server that offers no
+  fixed-newstyle negotiation or does not answer `NBD_OPT_GO`, with no fallback
+  to `NBD_OPT_EXPORT_NAME`. `SEND_FLUSH` is required for durability: without
+  it the kernel gives the device no write cache, so FLUSH requests complete
+  without reaching the server and FUA writes go out as plain writes.
+  `SEND_FUA` is required by policy (without it the block layer emulates each
+  FUA write with a full flush) and `HAS_FLAGS` by the NBD protocol.
+  `nbd-client` accepted such exports. Maki's own plugin always advertises
+  FLUSH and FUA, and nbdkit answers `NBD_OPT_GO` in every release the project
+  documents (SPEC §6).
+- **Provisioning connects a new volume's export with `maki-attach nbd-connect`
+  and `nbd-disconnect`** (AUD-152, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). `maki-attach nbd-connect
+  --nbd-device /dev/nbdN --socket <path> --identifier <id> [--block-size <n>]`
+  and `maki-attach nbd-disconnect --nbd-device /dev/nbdN --identifier <id>`
+  replace the `nbd-client` commands of the provisioning procedure and the
+  privileged validation runner. They refuse an identifier of the attach-record
+  form (`maki-` and a UUID); `nbd-connect` refuses a device that shows a
+  connection, whose backend cannot be read or that a trusted attach record
+  names, and `nbd-disconnect` touches only a device connected under its own
+  identifier. Neither takes the attach lock, which the procedure holds for its
+  whole run ([provisioning](docs/getting-started/first-volume.md),
+  `maki-attach(8)`).
+
 - **The command-line binaries exit 2 for misuse, and `maki-attach` actions
   exit 3 off Linux** (AUD-137, AUD-144, 2026-11-23;
   [#363](https://github.com/seo-rii/maki/pull/363)). `maki-witness` exits 2
@@ -376,6 +429,9 @@ documents.
   helper verifies the kernel NBD backend identifier over netlink and fails
   closed otherwise. Debian 12's 3.24 is too old
   ([installation](docs/getting-started/installation-debian.md)).
+  *Superseded by AUD-147
+  ([#375](https://github.com/seo-rii/maki/pull/375)): the helper connects
+  NBD devices itself and needs no NBD client.*
 - **Credential sources no longer fall back**: `credential`, `file` and `env`
   are each read only from the source they declare; the same name may not be
   declared with different sources in one configuration.
@@ -391,6 +447,43 @@ documents.
   `--add-bytes` is rejected because a retry could not identify itself.
 
 ### Added
+
+- **An RPM package for RHEL 9 and its rebuilds** (AUD-148, AUD-154,
+  2026-11-24; [#374](https://github.com/seo-rii/maki/pull/374)).
+  `packaging/rpm/build-rpm.py` packages the prebuilt release artifacts like
+  the Debian builder, with the same files, owners and modes, units, sysusers
+  and tmpfiles rules and scriptlet behaviour (`%preun` refuses an erase under
+  a live attachment and never blocks an upgrade). It declares `Requires:
+  nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod` and
+  `Conflicts: nbdkit-selinux`: by the targeted policy, that module's label on
+  `/usr/sbin/nbdkit` keeps systemd from starting `maki@` under enforcing
+  SELinux, and the `nbdkit` metapackage installs it, so dnf refuses to install
+  Maki beside it and refuses a later transaction that would add it. Maki
+  therefore cannot be installed on a host that needs the module for libvirt or
+  virt-v2v. The package's `maki@.service` runs `/usr/sbin/nbdkit`: the builder
+  rewrites the one `ExecStart=/usr/bin/nbdkit` line, and SPEC §10 requires the
+  unit to name nbdkit by its absolute path, never by a bare name that systemd
+  would look up in `/usr/local` first. `SOURCE_DATE_EPOCH` must be given, 1990
+  or later ([packaging/rpm/README.md](packaging/rpm/README.md)).
+
+- **A RHEL 9 installation guide** (AUD-158, 2026-11-24;
+  [#374](https://github.com/seo-rii/maki/pull/374)): BaseOS and AppStream
+  only, the toolchain, the build and installation, `modprobe nbd`, the LVM
+  devices file and SELinux. RHEL 9 is not qualified: nothing has run on a RHEL
+  kernel or with SELinux enforcing, and nothing has attached a device there
+  ([RHEL 9 installation](docs/getting-started/installation-rhel.md)).
+
+- **CI checks a RHEL 9 userspace and connects a kernel NBD device** (AUD-155,
+  AUD-156, 2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375),
+  [#374](https://github.com/seo-rii/maki/pull/374)). A `rhel9` job in a CentOS
+  Stream 9 container builds the packaged binaries, checks the plugin ABI
+  against EL9's nbdkit header, runs the `maki-privileged`, `maki-attach` and
+  `maki-nbdkit` suites with EL9's nbdkit 1.38, and builds, installs, verifies
+  and removes the RPM, on the runner's Ubuntu kernel. The Ubuntu job loads the
+  `nbd` module and connects and disconnects a real `/dev/nbdN` through the
+  helper as root; `MAKI_TEST_REQUIRE_NBD=1`, `MAKI_TEST_REQUIRE_NBDKIT=1` and
+  `MAKI_TEST_REQUIRE_NBD_HEADERS=1` make the NBD tests fail there instead of
+  skipping ([automated CI](docs/testing.md#automated-ci)).
 
 - **Concurrent and mixed benchmark workloads**: configurable concurrency,
   sequential/random access, read ratio, working set, FUA and periodic drained
@@ -509,6 +602,16 @@ documents.
   checker in CI (2026-09-23).
 
 ### Changed
+
+- **A connect retries while the kernel reports the NBD device busy** (AUD-150,
+  2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375)). The kernel
+  refuses `NBD_CMD_CONNECT` with `EBUSY` while anything has the unconnected
+  device open, as udev's probe does right after a disconnect, so an attach
+  right after a detach of the same device could fail, with `nbd-client` too.
+  The helper retries every 100 ms for up to 5 s within the step's deadline, on
+  a fresh connection to the daemon and only while the device still shows no
+  connection; a device held open longer still fails as busy
+  ([prerequisites](docs/operations.md#prerequisites)).
 
 - **A displaced attach record is retired automatically once nothing of its
   attachment remains** (AUD-134, 2026-11-23;
@@ -1108,6 +1211,28 @@ observable behaviour:
 
 ### Documentation
 
+- **2026-11-24 seventh round** (AUD-147, AUD-148, AUD-151, AUD-157, AUD-158).
+  SPEC §6 gains an "NBD connection" section: the handshake, the netlink
+  requests, the refusals, the busy retry, the provisioning connection's rules,
+  and exactly what the time bound covers (the helper's own waits, not the
+  kernel's work on a request); §8 says that the live backend is the device's
+  kernel backend identifier, and §10 that the daemon unit names nbdkit by its
+  absolute path ([#375](https://github.com/seo-rii/maki/pull/375),
+  [#374](https://github.com/seo-rii/maki/pull/374)). The status page, the
+  support matrix and operations say that every external campaign that attached
+  a kernel NBD device did so through `nbd-client` (3.27.1 where the report
+  names the version, 3.24 in the 2026-09-02 privileged run) and predates the
+  helper's own connect; the Debian guide's `nbd-client` section is one
+  sentence, kept under its old anchor. The support matrix has RHEL 9, Fedora
+  and RHEL 8 rows, and the testing guide describes the new tests, the CI
+  switches and the `rhel9` job. SPEC §6, the helper's documentation and its
+  refusal message say why each export flag is required (`SEND_FLUSH` for
+  durability, `SEND_FUA` by policy, `HAS_FLAGS` by the protocol), where they
+  said that without any of them the kernel completes FLUSH and FUA without
+  sending them ([#376](https://github.com/seo-rii/maki/pull/376)). The
+  remediation log records the seventh round and marks the statements it
+  supersedes.
+
 - **2026-11-23 fifth audit and follow-ups** (AUD-124 to AUD-127, AUD-141).
   SPEC §43 classifies journal damage by the durable proof and mark instead of
   refusing corruption before a valid successor record, and SPEC, the
@@ -1214,8 +1339,8 @@ observable behaviour:
 - [Cross-host remote transports under the sandbox](docs/qualification/cross-host-sandbox-validation-2026-10-05.md).
 - [Provider host reset under a writing client](docs/qualification/provider-host-reset-validation-2026-10-05.md).
 - The quick start and first-volume bootstrap passed `/dev/nbd0` to
-  `nbd-client`; version 3.27, which Maki requires, connects over netlink and
-  refuses it ("Invalid nbd device target"). They now pass the kernel name
+  `nbd-client`; version 3.27, which Maki then required, connects over netlink
+  and refuses it ("Invalid nbd device target"). They now pass the kernel name
   (`nbd0`); found by the 2026-10-03 packaged-lifecycle campaign.
 - Validation reports moved to `docs/qualification/`; the README now links to
   [status](docs/status.md) instead of carrying the campaign history.
