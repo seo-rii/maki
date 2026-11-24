@@ -1010,12 +1010,14 @@ impl SlotStore {
     /// A whole-catalog publication must not name any incomplete pair.
     /// Their in-memory maps hold only what open proved from maps and slots.
     fn commit_adopted_maps(&mut self) -> Result<(), CoreError> {
-        let pending: Vec<u64> = self
+        let mut pending: Vec<u64> = self
             .shards
             .iter()
             .filter(|(_, s)| !s.map_stored)
             .map(|(idx, _)| *idx)
             .collect();
+        // Shard order, not the map's: see `persist_allocations_with_progress`.
+        pending.sort_unstable();
         if pending.is_empty() {
             return Ok(());
         }
@@ -1116,12 +1118,21 @@ impl SlotStore {
     ) -> Result<(), CoreError> {
         // Loaded pairs awaiting proof are stored here too, before the catalog
         // commit below can name an adopted shard (K-03 / BUG-043).
-        let dirty: Vec<u64> = self
+        let mut dirty: Vec<u64> = self
             .shards
             .iter()
             .filter(|(_, s)| s.dirty_alloc || !s.map_stored)
             .map(|(idx, _)| *idx)
             .collect();
+        // The shards are kept in a hash map, whose order differs from one
+        // process to the next and from one store to the next. Which shard's
+        // metadata is written first decides nothing: the shards are
+        // independent and the commit points come after the whole loop. But
+        // a fault that is injected at the n-th backing operation, or a power
+        // loss that keeps the first n, must meet the same operation every
+        // time, or a failing seed cannot be run again. Ascending order is one
+        // of the orders the map could always have given.
+        dirty.sort_unstable();
         if !dirty.is_empty() {
             for idx in &dirty {
                 fp("checkpoint.alloc_store")?;
@@ -1155,12 +1166,13 @@ impl SlotStore {
         // `ensure_shard`'s commit: a zero-length orphan cataloged as is would
         // read as damage (EIO) after the next power loss.
         if self.catalog_dirty {
-            let unproven: Vec<u64> = self
+            let mut unproven: Vec<u64> = self
                 .shards
                 .iter()
                 .filter(|(_, s)| s.short.is_some())
                 .map(|(idx, _)| *idx)
                 .collect();
+            unproven.sort_unstable();
             for idx in unproven {
                 self.prove_data_file(idx)?;
                 progress();
@@ -1206,12 +1218,14 @@ impl SlotStore {
         &mut self,
         progress: &crate::recovery::RecoveryProgress<'_>,
     ) -> Result<(), CoreError> {
-        let dirty: Vec<u64> = self
+        let mut dirty: Vec<u64> = self
             .shards
             .iter()
             .filter(|(_, shard)| shard.dirty_discard)
             .map(|(idx, _)| *idx)
             .collect();
+        // Shard order, not the map's: see `persist_allocations_with_progress`.
+        dirty.sort_unstable();
         if dirty.is_empty() {
             return Ok(());
         }

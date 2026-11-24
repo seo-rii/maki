@@ -214,11 +214,36 @@ The scheduled `nightly-gates` job runs:
 | `phase5_gate_breaker_cycles_full` | 10,000 circuit-breaker lifecycles |
 | `phase11_gate_dbsim_full` | 500 database-simulation runs |
 | `phase12_gate_full` | 500 barrier and 500 FUA power-loss simulations |
-| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
-| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
+| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures. The seeds take turns between a journal segment of three records, one of sixteen and the default one, and the gate asserts a minimum of automatic rolls and of workloads that end with more than three unsynced journal records. Measured without faults (9,000 workloads): 40,249 rolls, 1,443 power losses and 631 restarts with such a tail, the longest 50 records; with sync failures (3,600): 2,738 rolls, 885 and 349, the longest 70 |
+| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle, with the same turns and assertions. Measured (1,800 workloads): 29,147 rolls, 377 power losses and 134 restarts with more than three unsynced records, the longest 43; the tails vary from run to run |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
-| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures, with the same turns between journal segments and the same assertions. Measured (4,000 workloads): 7,253 rolls, 910 power losses and 379 restarts with more than three unsynced records, the longest 49 |
+| `ab_torn_reuse_gate_full` | Chains of A/B stores cut at the record's sync, 2,000 to 4,000 seeds per record and torn-write unit (maps of five sectors, one page and 9000 bytes, checkpoint state, the durable proof through `advance`), and 1,000 to 2,000 seeds of mixed disturbances on the proof and the page-sized maps |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on a second filesystem) |
+
+The durability sweeps behind these gates also run in the default suite over
+fewer seeds (`review_r3b_durability.rs`, `review_trim_power_loss.rs`). A
+journal roll seals and syncs the segment it leaves, so a workload that rolls
+constantly never has more than a segment's records unsynced, and a workload
+with the default segment never rolls: each seed runs with a segment of three
+records, of sixteen, or the default, and every sweep asserts a minimum of
+rolls and of workloads that end with more than three unsynced records at the
+power loss or at the restart. Measured on the committed seeds:
+
+| Sweep | Workloads | Rolls | Long tail at power loss | Long tail at restart | Longest tail |
+|---|---|---|---|---|---|
+| Sequential | 480 | 2,052 | 74 | 35 | 50 |
+| Sequential, sync failures | 320 | 247 | 88 | 29 | 38 |
+| Sequential, plaintext cache | 240 | 1,014 | 39 | 15 | 21 |
+| Sequential, plaintext cache, sync failures | 160 | 110 | 51 | 11 | 38 |
+| Concurrent writers | 72 | 1,173 | 12 to 15 | 2 to 10 | 19 to 28 |
+| Concurrent writers, plaintext cache | 36 | 571 | 8 to 10 | 0 or 1 | 16 to 22 |
+| Writes and trims | 144 | 472 | 27 | 16 | 21 |
+| Writes and trims, sync failures | 144 | 73 to 92 | 32 to 37 | 12 to 15 | 41 |
+
+With the default segment for every seed the sequential sweep had 119 power
+losses and 52 restarts with a long tail and no roll; with three-record
+segments for every seed it had 5,353 rolls and no long tail.
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
 without a name filter, so every ignored test runs, including any new gate; the
@@ -370,7 +395,7 @@ packaged configuration without installing services or creating users.
 | Boundary | Regression coverage |
 |---|---|
 | A/B retry durability (BUG-001) | `review_ab_retry.rs` in `maki-format` and `maki-core`: failed data/directory sync, repeated retries and restart, sector tearing, writeback that loses dirty bits, preservation across metadata types, and recovery of durable volume data |
-| A/B torn side reuse | `maki-format/tests/review_ab_torn_reuse.rs`: a store cut by a power loss and a later cut store of the same generation never add up to a valid copy of the earlier record; an undecodable side is emptied and synced before it is written, the emptying is repeated after a failed sync, a decodable or absent side is not emptied, and seeded chains of cut stores over three record types and five tearing units never lose, regress or revive a record |
+| A/B torn side reuse | `maki-format/tests/review_ab_torn_reuse.rs`: a store cut by a power loss and a later cut store of the same generation never add up to a valid copy of the earlier record; an undecodable side is emptied and synced before it is written, the emptying is repeated after a failed sync, a decodable or absent side is not emptied, and seeded chains of cut stores over three record types and five tearing units never lose, regress or revive a record; chains of cut stores that revive a record without that rule cover a five-sector map, a map of one page and one of 9000 bytes, checkpoint state, and the durable proof through `DurableProofStore::advance` |
 | Required attach configuration (BUG-002) | `maki-privileged/tests/regression_missing_attach_config.rs`: required assertion in the unit and actual offline systemd assertion evaluation for missing/present temporary configuration |
 | Trusted helper state (BUG-003) | `maki-privileged/src/state_tests.rs`, `exec_tests.rs`, and `tests/regression_attach_state.rs`: protected state ancestors/files, configuration and live backend identity, stale records, fail-before-side-effects ordering, rollback, and cleanup failure; device operations are simulated |
 | Stale and displaced attach records | `maki-privileged/src/review_stale_attach_record.rs` and `review_displaced_attach_record.rs`: the production executor, allocation, observers and trusted state for several volumes over one simulated kernel. A record that outlived its connection keeps its device from other volumes' attaches. `review_busy_allocated_device.rs`: an attach whose allocated device stays busy moves to the next free one, record first, never onto a device another record names, never from a pinned device, never past the step's time, and never when the device shows a connection. A record whose device carries another connection (another volume, or an NBD client outside the helper) is retired by attach, cleanup, recover and detach without a command only when it names its VG UUID and the host shows no mapping of that VG, no holder of the device or its partitions other than an LVM mapping of another VG, no mount at the mountpoint or of such a mapping, and no other record on the device with the same or no VG UUID; each of these, an unreadable observation, a changed backend and a mismatched cleanup configuration keeps the record, and grow always refuses. No real LVM, device-mapper or NBD is involved |
@@ -567,7 +592,7 @@ Disk power-loss campaign.
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`). Only short runs have been made, from an empty corpus; the last, on 2026-11-24 with libFuzzer and AddressSanitizer, ended without a crash: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M); `endpoint_url` and `probe_parsers` were not run then. The input counts say little: every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reaches almost no image that passes one (256 covered edges). `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). A seed corpus and a 24 CPU-hour-per-target run remain outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
