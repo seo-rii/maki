@@ -4,7 +4,14 @@ A refusal a guide quotes is a string in the sources, the tier table of the
 testing guide describes steps of the workflow, a layout lists directories,
 the release pages describe what the release workflow tags, and a command a
 guide runs must exist on a host that has only the package's dependencies.
-Each test reads both sides, so that neither changes alone.
+
+Each test reads the source and the document. Two compare structures and hold
+what they say: the directories SPEC §11 lists against `packaging/`, and the
+commands of the guides against the forms `DaemonUserCommands` names. The
+others pin prose by an exact phrase, present or absent. They keep a quoted
+message equal to the string its source returns and keep a corrected sentence
+from being put back as it was; a page that says the same false thing in
+other words passes, and so does a false statement no phrase was written for.
 """
 
 from pathlib import Path
@@ -25,6 +32,95 @@ def prose(path):
 def rust_strings(path):
     """A Rust source's text with string continuations joined."""
     return re.sub(r"\\\n\s*", "", (ROOT / path).read_text())
+
+
+FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+
+
+def code_of(markdown):
+    """(lines of the fenced blocks, inline code spans outside them) of a Markdown text."""
+    lines, prose, fence = [], [], None
+    for line in markdown.splitlines():
+        marker, stripped = FENCE.match(line), line.strip()
+        if fence is None:
+            if marker:
+                fence = marker.group(1)
+            else:
+                prose.append(line)
+        elif stripped.startswith(fence) and not stripped.strip(fence[0]):
+            fence = None  # the same marker, at least as long, and nothing else
+        else:
+            lines.append(line)
+    # A span may wrap with its paragraph; a stray backtick ends with it.
+    spans = [" ".join(span.group(2).split())
+             for paragraph in re.split(r"\n[ \t]*\n", "\n".join(prose))
+             for span in CODE_SPAN.finditer(" ".join(paragraph.split()))]
+    return lines, spans
+
+
+# `sudo` as a command word and the words up to the end of its command.
+SUDO = re.compile(r"(?<![\w./-])sudo(?![\w.-])([^\n|;&`]*)")
+# sudo's own options that take a value: the word after one is not the command.
+SUDO_VALUE_FLAGS = "CDghpRrTtU"
+SUDO_VALUE_OPTIONS = ("--chdir", "--chroot", "--close-from", "--command-timeout", "--group",
+                      "--host", "--other-user", "--prompt", "--role", "--type")
+
+
+def sudo_selects_a_user(words):
+    """Whether sudo's own options, the words before its command, name a user."""
+    words = iter(words)
+    for word in words:
+        if word == "--" or not word.startswith("-"):
+            return False  # the command starts here: `sudo journalctl -u unit`
+        if word.startswith("--"):
+            if word.split("=")[0] == "--user":
+                return True
+            if word in SUDO_VALUE_OPTIONS:
+                next(words, None)
+            continue
+        for position, flag in enumerate(word[1:], 1):
+            if flag == "u":
+                return True
+            if flag in SUDO_VALUE_FLAGS:
+                if position == len(word) - 1:
+                    next(words, None)  # its value is the next word
+                break
+    return False
+
+
+def sudo_user_switches(line):
+    """Each `sudo` of a line that runs its command as a user it names."""
+    return [found.group(0).strip() for found in SUDO.finditer(line)
+            if sudo_selects_a_user(found.group(1).split())]
+
+
+# `runuser` as a command word, and the one form the guides give it.
+RUNUSER = re.compile(r"(?<![\w./-])runuser(?![\w.-])")
+RUNUSER_FORM = re.compile(r"(?<![\w./-])runuser -u (maki|maki-witness) -- \S")
+
+
+def runuser_commands(text, markdown=True):
+    """The commands of a page that run `runuser`.
+
+    In Markdown a command is a line of a fenced block that names the program
+    outside a shell comment, or an inline code span that starts with it. The
+    word in prose, in a table or alone in a code span is a mention. A manual
+    page marks no code, so each of its lines that names the program counts.
+    """
+    if not markdown:
+        return [line.replace("\\-", "-").strip() for line in text.splitlines()
+                if RUNUSER.search(line)]
+    lines, spans = code_of(text)
+    commands = [line.split(" #")[0].strip() for line in lines if not line.lstrip().startswith("#")]
+    return ([command for command in commands if RUNUSER.search(command)]
+            + [span for span in spans if span.startswith("runuser ")])
+
+
+def runuser_users(command):
+    """The accounts a command reaches, or None when one of its `runuser` has another form."""
+    users = RUNUSER_FORM.findall(command)
+    return users if len(users) == len(RUNUSER.findall(command)) else None
 
 
 class DocumentTest(unittest.TestCase):
@@ -78,11 +174,16 @@ class QuotedRefusals(DocumentTest):
 
 
 class DaemonUserCommands(DocumentTest):
-    """The guides run as root and reach another user with `runuser`.
+    """How the guides, which run as root, run a command as another user.
 
     Neither package depends on sudo, and a minimal Debian 12 or RHEL 9
     installation has none; `runuser` comes with util-linux, which both
-    packages require.
+    packages require. No guide may have sudo select a user, wherever the
+    option stands among sudo's own (`sudo -u maki`, `sudo -H -u maki`,
+    `sudo --user=maki`); sudo used to become root is left alone. Every
+    `runuser` command must name the daemon user or the witness account and
+    end its options with `--`. `su` is not checked: util-linux ships it as
+    well, so it is not a program a host may lack.
     """
 
     maxDiff = None
@@ -102,25 +203,86 @@ class DaemonUserCommands(DocumentTest):
                          "docs/deployment/postgres.md", "docs/rollback-protection.md",
                          "docs/remote-witness-service.md", "README.md"):
             self.assertIn(ROOT / expected, guides)
+        # Prose and code alike; a manual page writes its hyphens as `\\-`.
         found = [f"{page.relative_to(ROOT)}:{number}: {line.strip()}"
                  for page in guides
                  for number, line in enumerate(page.read_text().splitlines(), 1)
-                 if re.search(r"\bsudo\s+-u\b", line)]
+                 if sudo_user_switches(line.replace("\\-", "-"))]
         self.assertEqual(found, [], "use `runuser -u <user> -- <command>`")
 
+    def test_sudo_is_judged_by_its_own_options_and_not_by_those_of_its_command(self):
+        for line in ("sudo -u maki maki volume create /etc/maki/volumes/demo.toml",
+                     "sudo -H -u maki maki check demo.toml --deep",
+                     "sudo -Hu maki true",
+                     "sudo -umaki true",
+                     "sudo --user=maki true",
+                     "sudo --user maki true",
+                     "sudo -g maki -u maki true",
+                     "sudo -n -- true && sudo -iu maki-witness",
+                     "the daemon user (`sudo -H -u maki`), but",
+                     "install -d /var/lib/maki/demo; sudo -u maki true"):
+            with self.subTest(line=line):
+                self.assertEqual(len(sudo_user_switches(line)), 1)
+        for line in ("sudo journalctl -u maki@demo.service",
+                     "sudo maki-attach verify --volume pg",
+                     "sudo systemctl --user status",
+                     "sudo -n true",
+                     "sudo -g maki true",
+                     "sudo -- id -u",
+                     "same as root or with passwordless `sudo`. A new test -u that",
+                     "pseudo -u maki"):
+            with self.subTest(line=line):
+                self.assertEqual(sudo_user_switches(line), [])
+
     def test_every_runuser_command_names_the_user_and_ends_its_options(self):
-        commands = [(page, line.strip())
-                    for page in self.guides()
-                    for line in page.read_text().splitlines()
-                    if re.search(r"\brunuser\b", line)]
         users = set()
-        for page, line in commands:
-            with self.subTest(page=str(page.relative_to(ROOT)), line=line):
-                match = re.search(r"\brunuser -u (maki|maki-witness) -- \S", line)
-                self.assertIsNotNone(match)
-                users.add(match.group(1))
+        for page in self.guides():
+            for command in runuser_commands(page.read_text(), markdown=page.suffix == ".md"):
+                with self.subTest(page=str(page.relative_to(ROOT)), command=command):
+                    reached = runuser_users(command)
+                    self.assertIsNotNone(reached, "use `runuser -u <user> -- <command>`")
+                    users.update(reached)
         # The daemon user in the volume guides, the witness account in its own.
         self.assertEqual(users, {"maki", "maki-witness"})
+
+    def test_a_mention_of_runuser_is_no_command_and_a_malformed_command_is_found(self):
+        page = "\n".join((
+            "`runuser` comes with util-linux; runuser needs no password as root.",
+            "",
+            "| Package | Programs the guides use |",
+            "|---|---|",
+            "| util-linux | `runuser`, `mount` and /etc/pam.d/runuser |",
+            "",
+            "Run it as the daemon user (`runuser -u maki -- …`), or give the whole",
+            "command to the witness account (`runuser -u maki-witness --",
+            "maki-witness init /var/lib/maki-witness/volume`).",
+            "",
+            "   ```bash",
+            "   # runuser, not sudo: the packages do not depend on sudo",
+            "   install -d -o maki /x &&",
+            "       runuser -u maki -- maki volume create demo.toml  # as the daemon user",
+            "   ```",
+        ))
+        commands = runuser_commands(page)
+        self.assertEqual(commands, [
+            "runuser -u maki -- maki volume create demo.toml",
+            "runuser -u maki -- …",
+            "runuser -u maki-witness -- maki-witness init /var/lib/maki-witness/volume",
+        ])
+        self.assertEqual([runuser_users(command) for command in commands],
+                         [["maki"], ["maki"], ["maki-witness"]])
+        for malformed in ("as that user (`runuser -u maki maki check demo.toml`), but",
+                          "`runuser maki -- true`",
+                          "```\nrunuser -u postgres -- true\n```",
+                          "```bash\nrunuser -u maki -- true && runuser -l maki\n```"):
+            with self.subTest(malformed=malformed):
+                commands = runuser_commands(malformed)
+                self.assertEqual(len(commands), 1)
+                self.assertIsNone(runuser_users(commands[0]))
+        # A manual page: every line that names the program, hyphens unescaped.
+        self.assertEqual(runuser_commands(".B runuser \\-u maki \\-\\- maki check\n", markdown=False),
+                         [".B runuser -u maki -- maki check"])
+        self.assertIsNone(runuser_users(runuser_commands("runuser maki\n", markdown=False)[0]))
 
     def test_both_packages_require_the_package_that_ships_runuser(self):
         deb = (ROOT / "packaging/debian/build-deb.py").read_text()
