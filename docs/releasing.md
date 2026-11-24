@@ -219,7 +219,9 @@ read from `Cargo.toml` at the dispatched commit. Before anything is built, the
 `check` job refuses a run from another ref, any other tag, and a tag or
 published release of that name that already exists; drafts are visible only
 to the `publish` job's token, which refuses an existing draft before it
-creates anything. A final tag
+creates anything. Both jobs also refuse when a query of the releases or of
+the tag fails or is cut off: an answer that is missing, empty or incomplete
+is never read as "no release and no tag". A final tag
 (`v0.1.0`) is refused while production approval is pending
 ([status](status.md)); allowing one is a reviewed change to
 `scripts/release_assets.py` and the workflow, which then also decides whether
@@ -307,5 +309,6 @@ The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.
 `scripts/test_release_workflow_validation.py` checks the release workflow's
 structure, the tag and bundle checks of `scripts/release_assets.py`, the notes,
-and the publish and cleanup steps against a stand-in `gh`; it needs `rpm` and
-`rpmbuild` for a fixture RPM.
+and the publish and cleanup steps against a stand-in `gh`, also when its
+queries of the releases or of the tag fail, are cut off between pages or
+answer with an error; it needs `rpm` and `rpmbuild` for a fixture RPM.
