@@ -1409,6 +1409,11 @@ calls.
   or journal change; see the
   [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md).
   This does not preallocate untouched slots or cover non-Linux backing behavior.
+  It does not cover one metadata store either: an A/B copy that a power loss
+  left undecodable is emptied before it is written again, so that store needs
+  free blocks and fails with ENOSPC on a filesystem that has none. The
+  checkpoint, barrier or attach that needed it then fails; the other copy and
+  the journal are untouched, and it succeeds once space is available.
   A reserve-only refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. It wakes the
   checkpoint worker for an immediate pass, which deletes covered journal
