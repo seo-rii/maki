@@ -343,14 +343,26 @@ struct Cycle {
     power_loss: bool,
 }
 
+/// What a sweep did, for the tests that hold the sweep itself to something.
+struct Ran {
+    /// How often its workloads rolled the journal.
+    rolls: u64,
+    /// Every operation with its result, and every injected fault.
+    trace: String,
+}
+
 /// One seeded workload → crash/restart → recovery → oracle cycle set.
 /// Returns how often its workloads rolled the journal.
 async fn sweep(seed: u64, cycles: usize, sync_fault_permille: u32) -> u64 {
-    sweep_verbose(seed, cycles, sync_fault_permille, None, false).await
+    sweep_verbose(seed, cycles, sync_fault_permille, None, false)
+        .await
+        .rolls
 }
 
 async fn sweep_cached(seed: u64, cycles: usize, sync_fault_permille: u32) -> u64 {
-    sweep_verbose(seed, cycles, sync_fault_permille, None, true).await
+    sweep_verbose(seed, cycles, sync_fault_permille, None, true)
+        .await
+        .rolls
 }
 
 async fn sweep_verbose(
@@ -359,7 +371,7 @@ async fn sweep_verbose(
     sync_fault_permille: u32,
     verbose: Option<&'static str>,
     cache: bool,
-) -> u64 {
+) -> Ran {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x1234));
     let backing = Arc::new(CrashableBacking::new().with_tearing(128));
     let mut model = ReferenceBlockModel::new(UNIT as usize, DEVICE_UNITS);
@@ -519,7 +531,32 @@ async fn sweep_verbose(
             )));
         }
     }
-    rolls
+    Ran {
+        rolls,
+        trace: trace.report(),
+    }
+}
+
+/// A seed that fails is only useful if it fails again. The same seed must
+/// run the same operations with the same results and meet the same injected
+/// faults, in this process and in the next: nothing in the engine may order
+/// its backing operations by anything but the workload.
+#[tokio::test]
+async fn a_sync_fault_sweep_runs_the_same_way_twice_from_one_seed() {
+    let _serial = maki_test_support::failpoints::test_lock();
+    for seed in 0..24u64 {
+        let first = sweep_verbose(seed, 4, 150, None, false).await.trace;
+        let second = sweep_verbose(seed, 4, 150, None, false).await.trace;
+        if let Some((line, (a, b))) = first
+            .lines()
+            .zip(second.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+        {
+            panic!("seed {seed}: two runs differ from line {line}:\n  {a}\n  {b}");
+        }
+        assert_eq!(first.len(), second.len(), "seed {seed}");
+    }
 }
 
 #[tokio::test]

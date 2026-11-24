@@ -160,8 +160,26 @@ fn sync_faults(seed: u64, permille: u32, log: Arc<Mutex<Vec<String>>>) -> FaultH
     })
 }
 
+/// What a sweep did, for the tests that hold the sweep itself to something.
+struct Ran {
+    /// How often its workloads rolled the journal.
+    rolls: u64,
+    /// Every operation with its result, and every injected fault.
+    trace: String,
+}
+
 /// Returns how often the workloads rolled the journal.
 async fn sweep(seed: u64, cycles: usize, fault_permille: u32) -> u64 {
+    sweep_traced(seed, cycles, fault_permille, true).await.rolls
+}
+
+/// With `worker` the background checkpoint worker reclaims trimmed slots
+/// while the workload runs, as it does in the daemon. Its passes and the
+/// workload's requests then reach the backing in an order that the two
+/// tasks' scheduling decides, so an injected fault does not meet the same
+/// operation in every run. Without it the workload is the only source of
+/// backing operations.
+async fn sweep_traced(seed: u64, cycles: usize, fault_permille: u32, worker: bool) -> Ran {
     let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(0x51_7CC1_B727).wrapping_add(7));
     let backing = Arc::new(CrashableBacking::new().with_tearing(128));
     let mut model = ReferenceBlockModel::new(UNIT as usize, DEVICE_UNITS);
@@ -169,6 +187,9 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) -> u64 {
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut stamp = 0u32;
     let mut engine = try_attach(&backing).await.unwrap();
+    if !worker {
+        engine.stop_checkpoint_worker().await;
+    }
     let history = |log: &Arc<Mutex<Vec<String>>>| log.lock().join("\n  ");
 
     let mut rolls = 0;
@@ -312,6 +333,9 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) -> u64 {
                 history(&log)
             ),
         };
+        if !worker {
+            engine.stop_checkpoint_worker().await;
+        }
         let stats = engine.stats().await;
         assert!(
             stats.checkpoint_sequence <= stats.durable_sequence,
@@ -338,7 +362,33 @@ async fn sweep(seed: u64, cycles: usize, fault_permille: u32) -> u64 {
             maybe.superseded.remove(&unit);
         }
     }
-    rolls
+    Ran {
+        rolls,
+        trace: history(&log),
+    }
+}
+
+/// A seed that fails is only useful if it fails again. With the workload as
+/// the only source of backing operations, the same seed must run the same
+/// operations with the same results and meet the same injected faults, in
+/// this process and in the next: nothing in the engine may order its backing
+/// operations by anything but the workload.
+#[tokio::test]
+async fn a_sync_fault_sweep_without_the_worker_runs_the_same_way_twice_from_one_seed() {
+    let _serial = maki_test_support::failpoints::test_lock();
+    for seed in 0..12 {
+        let first = sweep_traced(1000 + seed, 6, 120, false).await.trace;
+        let second = sweep_traced(1000 + seed, 6, 120, false).await.trace;
+        if let Some((line, (a, b))) = first
+            .lines()
+            .zip(second.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+        {
+            panic!("seed {seed}: two runs differ from line {line}:\n  {a}\n  {b}");
+        }
+        assert_eq!(first.len(), second.len(), "seed {seed}");
+    }
 }
 
 #[tokio::test]
