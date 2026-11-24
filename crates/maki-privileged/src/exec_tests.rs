@@ -272,6 +272,14 @@ fn an_unanswered_nbd_step_is_an_io_error_of_unknown_outcome() {
         nbd_step_error(&step, NbdError::Failed("refused".into())),
         ExecError::Step { message, .. } if message == "refused"
     ));
+    // A device that stayed busy is a refusal too, but one an attach can
+    // answer with another device: it keeps its own kind.
+    let busy = nbd_step_error(&step, NbdError::DeviceBusy("busy".into()));
+    assert_eq!(
+        busy.to_string(),
+        format!("step {:?} failed: busy", step.to_string())
+    );
+    assert!(matches!(busy, ExecError::DeviceBusy { message, .. } if message == "busy"));
 }
 
 /// The connect and disconnect steps start no program: the helper

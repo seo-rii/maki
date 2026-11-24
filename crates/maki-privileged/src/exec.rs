@@ -54,6 +54,10 @@ pub enum ExecError {
     },
     #[error("step {step:?} failed: {message}")]
     Step { step: String, message: String },
+    /// The kernel answered the connect step as busy until the helper gave
+    /// up: the device was not changed, and something has it open.
+    #[error("step {step:?} failed: {message}")]
+    DeviceBusy { step: String, message: String },
     #[error("{0}")]
     Verify(#[from] crate::verify::MountVerifyError),
     #[error(
