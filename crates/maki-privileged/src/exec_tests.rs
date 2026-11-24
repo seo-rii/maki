@@ -2631,6 +2631,29 @@ fn a_step_killed_by_a_signal_reports_no_exit_status() {
     }
 }
 
+/// A step whose program cannot be started names the program: on a host
+/// without `kmod` an attach ended with "No such file or directory (os error
+/// 2)" and nothing else. The error keeps its kind.
+#[test]
+fn a_step_whose_program_cannot_be_started_names_it() {
+    let error = match run(
+        &PlannedStep::ModprobeNbd,
+        "maki-review-no-such-program",
+        &[],
+    ) {
+        Err(ExecError::Io(error)) => error,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "cannot run maki-review-no-such-program: {}",
+            io::Error::from_raw_os_error(libc::ENOENT)
+        )
+    );
+}
+
 /// BUG-096: the mount source comes from mountinfo, and whoever mounts on
 /// top of the mountpoint chooses it: a FUSE `fsname=-c/etc/shadow` stacked
 /// between `mount` and verification. Root's blkid must never read it as an

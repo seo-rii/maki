@@ -53,6 +53,8 @@ NOT_ROOT_ONLY = {
         "one case skips as root, whom no directory's mode keeps out",
     "bins/maki-attach/tests/e2e.rs":
         "one case skips as root, where the verb would really run",
+    "bins/maki-attach/tests/review_attach_messages.rs":
+        "one case skips as root, where the verbs would really run",
     "bins/maki/tests/remote_admin.rs":
         "drops CAP_DAC_OVERRIDE when it happens to run as root and asserts the same either way",
     "crates/maki-backing/src/creation_owner_tests.rs":
