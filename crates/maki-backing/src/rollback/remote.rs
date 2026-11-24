@@ -281,6 +281,16 @@ fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
     super::publish_marker(disk, REMOTE_MAGIC)
 }
 
+/// Re-publish the marker enrollment recovery has validated, before the
+/// independent authority can accept enrollment. A readable legacy marker may
+/// be cache-only. Called with both root operation and enrollment locks held.
+fn republish_marker(disk: &dyn Backing) -> io::Result<()> {
+    let marker = disk.open(MARKER, false)?;
+    marker.write_at(0, REMOTE_MAGIC)?;
+    marker.set_len(REMOTE_MAGIC.len() as u64)?;
+    marker.sync_data()
+}
+
 /// Say what to do with a root that enrollment recovery cannot open because
 /// its creation stopped before the marker was published, while the approved
 /// authority is still one a creation accepts (released, never activated).
@@ -589,12 +599,7 @@ impl RollbackBacking {
         // authority changes.
         Enrollment::verify_if_present(disk.as_ref(), expected.identity, capacity)?;
         let candidates = unactivated_candidates(&disk, expected, capacity)?;
-        // Re-publish the validated marker before the independent authority
-        // can accept enrollment. A readable legacy marker may be cache-only.
-        let marker = disk.open(MARKER, false)?;
-        marker.write_at(0, REMOTE_MAGIC)?;
-        marker.set_len(REMOTE_MAGIC.len() as u64)?;
-        marker.sync_data()?;
+        republish_marker(disk.as_ref())?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(
