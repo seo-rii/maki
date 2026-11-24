@@ -9,7 +9,9 @@ The package contains `maki`, `maki-attach`, `maki-check`, the nbdkit plugin,
 systemd units, and configuration examples. `maki-benchmark` is a development
 and qualification tool built separately from the included source. Candidate
 preparation does not install packages, create Git tags, publish a GitHub
-Release, start services, or qualify a production deployment.
+Release, start services, or qualify a production deployment. The release
+workflow builds such a candidate, with an RPM beside it, and publishes it as a
+GitHub pre-release ([publishing a pre-release](#publishing-a-pre-release)).
 
 ## Build prerequisites and source boundary
 
@@ -200,10 +202,97 @@ scanning and the same provenance/checksum evidence. Tagging, public upload and
 production approval are separate maintainer actions; this command intentionally
 produces candidate versions only.
 
+## Publishing a pre-release
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes
+a release candidate as a GitHub pre-release. It runs only when a maintainer
+dispatches it (`workflow_dispatch`) on `main`, with the tag to create:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v0.1.0-rc.1
+gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+The Actions tab's "Run workflow" button does the same. The tag must be
+`v<workspace version>-rc.<n>` (`n` = 1, 2, ...), with the workspace version
+read from `Cargo.toml` at the dispatched commit. Before anything is built, the
+`check` job refuses a run from another ref, any other tag, and a tag or
+published release of that name that already exists; drafts are visible only
+to the `publish` job's token, which refuses an existing draft before it
+creates anything. A final tag
+(`v0.1.0`) is refused while production approval is pending
+([status](status.md)); allowing one is a reviewed change to
+`scripts/release_assets.py` and the workflow, which then also decides whether
+the release becomes "latest". Runs are serialised.
+
+Every job checks out the dispatched commit (`github.sha`); the build jobs
+fetch its whole history, which the candidate version needs. Nothing is
+restored from a cache.
+
+- `deb`, in a `debian:12` container: `python3 -B scripts/prepare_release.py
+  --output dist/deb` builds the [candidate bundle](#prepare-and-inspect)
+  (package, source archive, `manifest.json`, `SHA256SUMS`) with Rust 1.94.0,
+  and the job checks it with `sha256sum --check`.
+- `rpm`, in a `quay.io/centos/centos:stream9` container: the release binaries,
+  then [`packaging/rpm/build-rpm.py`](../packaging/rpm/README.md) with the same
+  candidate version as the Debian package (rpm 4.16 accepts its `~` and `+`
+  and orders candidates as dpkg does), the commit time as `SOURCE_DATE_EPOCH`,
+  and a `manifest.json` and `SHA256SUMS` from `scripts/release_assets.py
+  rpm-manifest`.
+- `publish`, the only job with `contents: write`: checks both bundles against
+  their sums and manifests (one commit, one version), copies the assets under
+  release names, writes one `SHA256SUMS` over them and renders the notes from
+  [`.github/release-notes.md`](../.github/release-notes.md). It then creates a
+  draft pre-release with the runner's `gh` (`gh release create <tag> --draft
+  --prerelease --latest=false --target <commit>`), checks that every asset
+  arrived under its name and size, and publishes the draft. GitHub creates the
+  tag, at the dispatched commit, only when the draft is published.
+
+For `v0.1.0-rc.1` the release holds:
+
+| Asset | Content |
+|---|---|
+| `maki-0.1.0-rc.1-debian12-amd64.deb` | Debian 12 package, built on Debian 12 |
+| `maki-0.1.0-rc.1-debian12-amd64-manifest.json` | The Debian bundle's `manifest.json` |
+| `maki-0.1.0-rc.1-el9-x86_64.rpm` | RHEL 9 package, built on CentOS Stream 9 |
+| `maki-0.1.0-rc.1-el9-x86_64-manifest.json` | The RPM's manifest |
+| `maki-0.1.0-rc.1-source.tar.gz` | The exact committed source the packages were built from |
+| `SHA256SUMS` | SHA-256 of every other asset |
+
+The packages carry the candidate version (`0.1.0~rc+rev<count>.git<commit>`);
+the asset names use the tag because GitHub rewrites `~` and `+` in asset
+names, which would break the sums. The manifests keep the build's own file
+names.
+
+What the workflow does not do: the assets are not signed or attested, so
+the `SHA256SUMS` published beside them show that a download is complete, not
+who published it; the notes say so. It installs nothing and qualifies
+nothing: a published candidate has passed the build jobs only, and the
+[qualification handoff](#qualification-and-publication-handoff) still
+applies. It does not edit the changelog, the status page or the support
+matrix, and it never marks a release as "latest".
+
+If a run fails before the draft is published, its last step deletes the
+incomplete draft and no tag exists. If it fails after publication (the tag
+did not land on the dispatched commit), nothing is deleted automatically and
+the run's summary names what is left. To remove a bad release and its tag,
+or what a failed run left:
+
+```bash
+gh release delete v0.1.0-rc.1 --cleanup-tag --yes   # a published release and its tag
+gh release delete v0.1.0-rc.1 --yes                 # a draft (it has no tag)
+git push --delete origin v0.1.0-rc.1                # a tag without a release
+```
+
+A deleted tag stays in clones that fetched it. Do not publish different
+content under a deleted tag's name; publish the next release candidate
+number instead.
+
 ## Maintainer checks
 
 ```bash
 python3 -B -m unittest scripts.test_release_preparation scripts.test_debian_package -v
+python3 -B -m unittest scripts.test_release_workflow_validation -v
 python3 -B scripts/check_docs_links.py
 ```
 
@@ -216,3 +305,7 @@ compiler selection, refused and recorded build inputs and failure cleanup
 without rebuilding the Rust workspace.
 The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.
+`scripts/test_release_workflow_validation.py` checks the release workflow's
+structure, the tag and bundle checks of `scripts/release_assets.py`, the notes,
+and the publish and cleanup steps against a stand-in `gh`; it needs `rpm` and
+`rpmbuild` for a fixture RPM.

@@ -75,7 +75,10 @@ Neither building nor installing Maki needs it.
 
 ## Build the Maki package
 
-No prebuilt packages are published. Build the release binaries and the RPM on
+Release candidates are published only as unsigned GitHub pre-releases
+([release workflow](../releasing.md#publishing-a-pre-release)); to install one,
+check it against its `SHA256SUMS` and continue with
+[Install the Maki package](#install-the-maki-package). Otherwise build the release binaries and the RPM on
 a RHEL 9 family build host, then copy the `.rpm` to the target. The binaries
 link against the build host's glibc, and the RPM builder requires that a
 package of the build host's RPM database owns their ELF loader, so do not

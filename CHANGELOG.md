@@ -392,6 +392,13 @@ documents.
 
 ### Added
 
+- **Release workflow**: `.github/workflows/release.yml`, dispatched by hand on `main` with a
+  tag `v<workspace version>-rc.<n>`, builds the Debian 12 candidate bundle with
+  `scripts/prepare_release.py` and the RHEL 9 RPM with `packaging/rpm/build-rpm.py`
+  from the same commit, and publishes them with the source, both manifests and one
+  `SHA256SUMS` as an unsigned GitHub pre-release. Final tags are refused while
+  production approval is pending; a run that fails before publication leaves no
+  tag ([publishing a pre-release](docs/releasing.md#publishing-a-pre-release)).
 - **Concurrent and mixed benchmark workloads**: configurable concurrency,
   sequential/random access, read ratio, working set, FUA and periodic drained
   FLUSH; setup is separate from measurement. Reports preserve existing schema-1
