@@ -31,13 +31,13 @@ const SETTLE: Duration = Duration::from_secs(15);
 /// One test at a time: each picks a free device when it starts.
 static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The highest-numbered device that shows no connection and has no size.
-/// The other test takes the lowest free one, as the helper's allocation
-/// does: after a disconnect, udev probes the freed device, and the kernel
-/// refuses a connect while anything has it open (the helper's connect
-/// retries that for a few seconds), so the two tests use different devices
-/// and neither depends on the other's timing.
-fn highest_free_device() -> String {
+/// The highest-numbered device that shows no connection and has no size,
+/// or the one `below` it by that many. The first test takes the lowest free
+/// one, as the helper's allocation does: after a disconnect, udev probes
+/// the freed device, and the kernel refuses a connect while anything has it
+/// open (the helper's connect retries that for a few seconds), so the tests
+/// use different devices and none depends on another's timing.
+fn free_device_from_the_top(below: usize) -> String {
     let mut free: Vec<u32> = std::fs::read_dir("/sys/block")
         .unwrap()
         .filter_map(|entry| {
@@ -49,7 +49,9 @@ fn highest_free_device() -> String {
         })
         .collect();
     free.sort_unstable();
-    format!("/dev/nbd{}", free.last().expect("a free NBD device"))
+    free.reverse();
+    let index = free.get(below).or(free.first()).expect("a free NBD device");
+    format!("/dev/nbd{index}")
 }
 
 /// Report what is missing: a skip, or a failure when NBD is required.
@@ -221,7 +223,7 @@ fn a_provisioning_connection_is_disconnected_only_under_its_own_identifier() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let server = nbdkit::Server::start(&["memory", "64M"]);
-    let device = highest_free_device();
+    let device = free_device_from_the_top(0);
     let index: u32 = device.strip_prefix("/dev/nbd").unwrap().parse().unwrap();
     let identifier = format!(
         "maki-bootstrap-{}",
@@ -246,10 +248,71 @@ fn a_provisioning_connection_is_disconnected_only_under_its_own_identifier() {
     disconnect_raw(&device, &identifier)
         .unwrap_or_else(|error| panic!("disconnect {device}: {error}"));
     connected.0 = None;
+    // The provisioning disconnect returns only once the device shows no
+    // connection: the kernel keeps the attributes while anything has the
+    // device open, and its caller checks the device right away.
+    assert!(
+        !Path::new(&format!("/sys/block/nbd{index}/pid")).exists()
+            && sysfs(index, "backend").is_none_or(|backend| backend.is_empty()),
+        "{device} still shows the connection after the disconnect returned"
+    );
+    // Nothing left to disconnect is not a failure.
+    disconnect_raw(&device, &identifier).unwrap();
+}
+
+/// The kernel refuses a connect while anything has the unconnected device
+/// open, before it takes the socket. The helper keeps asking on the
+/// connection it negotiated, and connects once the opener has let go.
+#[test]
+fn a_device_held_open_is_connected_once_it_is_released() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return missing("the nbd netlink family needs root (CAP_SYS_ADMIN)");
+    }
+    if let Err(what) = nbd_module_loaded() {
+        return missing(&what);
+    }
+    if !nbdkit::available("a_device_held_open_is_connected_once_it_is_released") {
+        return missing("nbdkit is not installed");
+    }
+    let _one_at_a_time = KERNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let server = nbdkit::Server::start(&["memory", "64M"]);
+    let device = free_device_from_the_top(1);
+    let index: u32 = device.strip_prefix("/dev/nbd").unwrap().parse().unwrap();
+    let identifier = format!(
+        "maki-{}",
+        std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .unwrap()
+            .trim()
+    );
+    const HELD: Duration = Duration::from_millis(700);
+    let opener = std::fs::File::open(&device).unwrap();
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(HELD);
+        drop(opener);
+    });
+
+    let started = Instant::now();
+    let mut connected = Connected(Some(index));
+    connect(server.socket(), index, BLOCK_SIZE, &identifier)
+        .unwrap_or_else(|error| panic!("connect {device}: {error}: {}", server.log()));
+    assert!(
+        started.elapsed() >= HELD,
+        "{device} was connected after {:?}, while it was held open",
+        started.elapsed()
+    );
+    releasing.join().unwrap();
+    assert_eq!(
+        sysfs(index, "backend").as_deref(),
+        Some(identifier.as_str())
+    );
+
+    disconnect(index).unwrap_or_else(|error| panic!("disconnect {device}: {error}"));
+    connected.0 = None;
     wait_for("the disconnect", || {
         !Path::new(&format!("/sys/block/nbd{index}/pid")).exists()
             && sysfs(index, "backend").is_none_or(|backend| backend.is_empty())
     });
-    // Nothing left to disconnect is not a failure.
-    disconnect_raw(&device, &identifier).unwrap();
 }
