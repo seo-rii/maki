@@ -102,7 +102,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc
+          sudo apt-get install -y -q nbdkit nbdkit-plugin-dev libnbd-bin dpkg-dev gcc rpm cpio
           nbdkit --version
           nbdinfo --version
           nbdcopy --version
@@ -170,6 +170,13 @@ jobs:
       - name: Debian package contract (Linux)
         if: runner.os == 'Linux'
         run: python3 -B -m unittest scripts.test_debian_package -v
+      # Ubuntu's rpm builds the RPM from the same artifacts as the Debian
+      # package, so here the two are also compared file by file.
+      - name: RPM package contract (Linux)
+        if: runner.os == 'Linux'
+        env:
+          MAKI_TEST_REQUIRE_DPKG_DEB: "1"
+        run: python3 -B -m unittest scripts.test_rpm_package -v
       - name: release candidate preparation contract (Linux)
         if: runner.os == 'Linux'
         run: python3 -B -m unittest scripts.test_release_preparation -v
