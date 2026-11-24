@@ -1653,7 +1653,7 @@ fn connect_recorded(
         };
         // The kernel refused: nothing of this attach is on the device,
         // unless it shows a backend after all, which rollback then judges.
-        if !deadline.is_some_and(|deadline| Instant::now() < deadline)
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline)
             || !matches!(system.backend(device), Ok(None))
         {
             return Err(busy);
