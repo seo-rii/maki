@@ -768,31 +768,23 @@ pub fn connect_raw(
     block_size: u32,
     identifier: &str,
 ) -> Result<(), ExecError> {
-    let refused = |error: crate::config::ConfigError| identity_error(error.to_string());
-    crate::config::check_raw_identifier(identifier).map_err(refused)?;
-    crate::config::check_abs_path("--socket", socket).map_err(refused)?;
-    crate::config::check_device_block_size("--block-size", block_size).map_err(refused)?;
-    nbd_step_index(device)?;
     let reserved = match existing_state()? {
         // No volume has the empty name: every record counts.
         Some(state) => state.devices_of_other_volumes("")?,
         None => BTreeMap::new(),
     };
-    let sysfs = Path::new("/sys/block");
-    raw_device_is_free(sysfs, device, &reserved)?;
-    let step = PlannedStep::NbdConnect {
-        socket: socket.into(),
-        device: device.into(),
+    connect_raw_with(
+        Path::new("/sys/block"),
+        &reserved,
+        socket,
+        device,
         block_size,
-    };
-    run_step(&step, Some(identifier))?;
-    wait_nbd_ready(&step, device)?;
-    if !raw_backend_is(sysfs, device, identifier)? {
-        return Err(identity_error(format!(
-            "{device} shows no connection after the connect was acknowledged"
-        )));
-    }
-    Ok(())
+        identifier,
+        |step, identifier| {
+            run_step(step, Some(identifier))?;
+            wait_nbd_ready(step, device)
+        },
+    )
 }
 
 /// [`connect_raw`] on the device tree `sysfs` with the devices trusted
@@ -807,10 +799,24 @@ fn connect_raw_with(
     identifier: &str,
     connect: impl FnOnce(&PlannedStep, &str) -> Result<(), ExecError>,
 ) -> Result<(), ExecError> {
-    let _ = (
-        sysfs, reserved, socket, device, block_size, identifier, connect,
-    );
-    todo!("connect_raw_with")
+    let refused = |error: crate::config::ConfigError| identity_error(error.to_string());
+    crate::config::check_raw_identifier(identifier).map_err(refused)?;
+    crate::config::check_abs_path("--socket", socket).map_err(refused)?;
+    crate::config::check_device_block_size("--block-size", block_size).map_err(refused)?;
+    nbd_step_index(device)?;
+    raw_device_is_free(sysfs, device, reserved)?;
+    let step = PlannedStep::NbdConnect {
+        socket: socket.into(),
+        device: device.into(),
+        block_size,
+    };
+    connect(&step, identifier)?;
+    if !raw_backend_is(sysfs, device, identifier)? {
+        return Err(identity_error(format!(
+            "{device} shows no connection after the connect was acknowledged"
+        )));
+    }
+    Ok(())
 }
 
 /// Disconnect `device` if it is connected under `identifier`, a

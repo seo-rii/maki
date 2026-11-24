@@ -11,9 +11,38 @@
 //! kernel holds its own reference. A disconnect sends
 //! `NBD_CMD_DISCONNECT` for the device's index.
 //!
-//! Each step ends by the limit of an external step command, or by the
-//! thread's `finish_by` deadline when that comes first (the failed-start
-//! hook bounds all of its commands that way).
+//! The kernel refuses a connect with `EBUSY` while anything holds the
+//! unconnected device open (udev probes a device after a disconnect, and an
+//! open allocates the device's configuration), so a connect retries that
+//! answer every 100 ms for up to 5 s, each time on a fresh connection to the
+//! daemon and only while the device still shows no connection. Every other
+//! answer is final.
+//!
+//! What is bounded, and what is not. The helper's own waits end by the limit
+//! of an external step command, or by the thread's `finish_by` deadline when
+//! that comes first (the failed-start hook bounds all of its commands that
+//! way): connecting to the daemon's socket, the handshake, the retries of a
+//! busy device, and the wait for the kernel's answer. The kernel's work on a
+//! request is not: it runs inside the `sendto(2)` that sends it, and its
+//! mutex waits are uninterruptible, so neither a deadline nor a signal ends
+//! them. The kernel runs the `nbd` family's requests one at a time.
+//! `NBD_CMD_DISCONNECT` takes the device's configuration lock and each
+//! connection's transmit lock and writes `NBD_CMD_DISC` to the daemon's
+//! socket, which has no send timeout (none is set, and the kernel sets one
+//! only with `NBD_ATTR_TIMEOUT`). If the daemon has stopped reading and the
+//! socket's send buffer is full, a request in flight holds the transmit lock
+//! indefinitely, and the helper waits, holding the attach lock and blocking
+//! every other `nbd` request, until the daemon reads again or its socket
+//! closes (the daemon exits). In the helper's flows the unmount and the VG
+//! deactivation come first when they are needed; both need the daemon to
+//! serve I/O and are bounded external commands, so they fail first when it
+//! has stopped. A detach retry whose earlier attempt completed them goes
+//! straight to the disconnect. The outer bound is the unit's start or stop
+//! timeout, after which systemd kills the helper; a task in an
+//! uninterruptible wait ends only when the wait does. With `nbd-client`
+//! the helper could abandon a child stuck in the same request after the step
+//! limit and release the attach lock, with the same kernel state left
+//! behind.
 
 use std::fmt;
 use std::io;
@@ -84,32 +113,73 @@ pub fn connect(
     }
     let netlink = open_netlink()?;
     let family = resolve(&netlink, deadline)?;
-    // An older kernel would ignore the identifier and connect a device
-    // that no identity check could ever claim.
-    if family.max_attr < u32::from(netlink::NBD_ATTR_BACKEND_IDENTIFIER) {
-        return Err(NbdError::Failed(format!(
-            "the kernel's nbd netlink family takes no backend identifier (its highest \
-             attribute is {})",
-            family.max_attr
-        )));
+    check_family(&family)?;
+    connect_retrying(
+        index,
+        deadline,
+        &mut KernelAttempts {
+            netlink: &netlink,
+            family: family.id,
+            socket,
+            index,
+            block_size,
+            identifier,
+            deadline,
+        },
+    )
+}
+
+/// The real kernel behind [`Attempts`].
+struct KernelAttempts<'a> {
+    netlink: &'a netlink::Socket,
+    family: u16,
+    socket: &'a str,
+    index: u32,
+    block_size: u32,
+    identifier: &'a str,
+    deadline: Instant,
+}
+
+impl Attempts for KernelAttempts<'_> {
+    fn connect(&mut self, seq: u32) -> Result<Result<Vec<Vec<u8>>, Unacknowledged>, NbdError> {
+        // A fresh connection each time: the kernel's cleanup of a refused
+        // connect may have shut down the socket it was given.
+        let (stream, export) = open_export(self.socket, self.deadline)?;
+        let descriptor = u32::try_from(stream.as_raw_fd()).expect("an open descriptor");
+        let request = netlink::connect_request(
+            self.family,
+            seq,
+            &connect_attributes(
+                self.index,
+                self.block_size,
+                self.identifier,
+                export,
+                descriptor,
+            ),
+        );
+        let answer = self
+            .netlink
+            .exchange(&request, seq, self.family, self.deadline);
+        // Whatever the answer: a connected kernel holds its own reference.
+        drop(stream);
+        Ok(answer)
     }
-    let (stream, export) = open_export(socket, deadline)?;
-    let descriptor = u32::try_from(stream.as_raw_fd()).expect("an open descriptor");
-    let request = netlink::connect_request(
-        family.id,
-        COMMAND_SEQUENCE,
-        &connect_attributes(index, block_size, identifier, export, descriptor),
-    );
-    let answer = netlink.exchange(&request, COMMAND_SEQUENCE, family.id, deadline);
-    // Whatever the answer: a connected kernel holds its own reference.
-    drop(stream);
-    match answer {
-        Ok(replies) => connected(index, &replies),
-        Err(Unacknowledged::Refused(errno)) => Err(NbdError::Failed(format!(
-            "the kernel refused NBD_CMD_CONNECT for nbd{index}: {}",
-            io::Error::from_raw_os_error(errno)
-        ))),
-        Err(Unacknowledged::Unanswered(error)) => Err(unknown("NBD_CMD_CONNECT", index, error)),
+
+    fn shows_connection(&mut self) -> Result<bool, NbdError> {
+        device_shows_connection(std::path::Path::new("/sys/block"), self.index).map_err(|error| {
+            NbdError::Failed(format!(
+                "cannot tell whether nbd{} shows a connection: {error}",
+                self.index
+            ))
+        })
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
     }
 }
 
@@ -393,23 +463,68 @@ pub(crate) fn connect_retrying(
     deadline: Instant,
     attempts: &mut impl Attempts,
 ) -> Result<(), NbdError> {
-    let _ = (index, deadline, attempts);
-    todo!("connect_retrying")
+    let busy_until = deadline.min(attempts.now() + BUSY_RETRY_WINDOW);
+    let mut seq = COMMAND_SEQUENCE;
+    loop {
+        match attempts.connect(seq)? {
+            Ok(replies) => return connected(index, &replies),
+            Err(Unacknowledged::Refused(libc::EBUSY))
+                if attempts.now() + BUSY_RETRY_INTERVAL < busy_until =>
+            {
+                tracing::info!(
+                    "maki-attach: nbd{index} is busy (something has it open); retrying the \
+                     connect"
+                );
+                attempts.sleep(BUSY_RETRY_INTERVAL);
+                if attempts.shows_connection()? {
+                    return Err(NbdError::Failed(format!(
+                        "nbd{index} was busy and now shows a connection; refusing to connect it"
+                    )));
+                }
+                seq = seq.wrapping_add(1);
+            }
+            Err(Unacknowledged::Refused(errno)) => {
+                return Err(NbdError::Failed(format!(
+                    "the kernel refused NBD_CMD_CONNECT for nbd{index}: {}",
+                    io::Error::from_raw_os_error(errno)
+                )))
+            }
+            Err(Unacknowledged::Unanswered(error)) => {
+                return Err(unknown("NBD_CMD_CONNECT", index, error))
+            }
+        }
+    }
 }
 
 /// Refuse a family that does not take a backend identifier: an older kernel
 /// would ignore the attribute and connect a device that no identity check
 /// could ever claim.
 pub(crate) fn check_family(family: &netlink::Family) -> Result<(), NbdError> {
-    let _ = family;
-    todo!("check_family")
+    if family.max_attr < u32::from(netlink::NBD_ATTR_BACKEND_IDENTIFIER) {
+        return Err(NbdError::Failed(format!(
+            "the kernel's nbd netlink family takes no backend identifier (its highest \
+             attribute is {})",
+            family.max_attr
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `nbd<index>` under `sysfs` (`/sys/block`) shows a connection: a
-/// `pid` attribute or a non-empty backend identifier.
+/// `pid` attribute or a non-empty backend identifier. What cannot be read
+/// is an error, never "no connection".
 pub(crate) fn device_shows_connection(sysfs: &std::path::Path, index: u32) -> io::Result<bool> {
-    let _ = (sysfs, index);
-    todo!("device_shows_connection")
+    let device = sysfs.join(format!("nbd{index}"));
+    match std::fs::symlink_metadata(device.join("pid")) {
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+    match std::fs::read_to_string(device.join("backend")) {
+        Ok(backend) => Ok(!backend.trim().is_empty()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

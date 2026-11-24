@@ -283,9 +283,15 @@ The helper MUST:
 - bound the handshake in bytes, checking every reply's length before reading
   it: no reply longer than 4098 bytes (a 4096-byte string and its type) and
   no more than 64 KiB read in all;
-- bound each connect and disconnect in time by the limit of an external step
-  command and by the deadline its caller set for all of its commands (the
-  failed-start hook's command budget);
+- bound its own waits in each connect and disconnect (the socket connect, the
+  handshake, the retries below and the wait for the kernel's answer) by the
+  limit of an external step command and by the deadline its caller set for all
+  of its commands (the failed-start hook's command budget);
+- retry a connect the kernel refuses with `EBUSY`, which it answers while
+  anything holds the unconnected device open (udev's probe after a
+  disconnect, any other opener), every 100 ms for up to 5 s within that time
+  bound, each time on a fresh connection to the daemon and only after checking
+  that the device still shows no connection; every other refusal is final;
 - create every descriptor close-on-exec, hand the kernel the socket without a
   send or receive timeout (the kernel's own I/O on it would fail once the
   device has been idle that long), and close its own descriptor of the socket
@@ -302,6 +308,18 @@ request. Such a connection MUST NOT use an identifier of the form attach records
 use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
 a trusted record names, and its disconnect MUST touch only a device connected
 under its own identifier.
+
+The kernel's own work on a request is not bounded: it runs inside the send of
+the request, and its mutex waits are uninterruptible, so no deadline or signal
+ends them; the kernel runs the `nbd` family's requests one at a time.
+`NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
+`NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
+that stopped reading with a full send buffer holds the helper, with the attach
+lock, until it reads again or its socket closes. In the helper's flows the
+unmount and the VG deactivation, bounded commands that need the daemon to serve
+I/O, run first when they are needed and fail first in that case; the outer
+bound is the unit's start or stop timeout, and a helper in an uninterruptible
+wait ends only when that wait does.
 
 The helper logs the process and user IDs of its socket peer when it connects,
 for diagnostics only: the documented flows may run nbdkit outside the
