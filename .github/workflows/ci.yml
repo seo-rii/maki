@@ -322,6 +322,13 @@ jobs:
           # The owner of the binaries' loader, and libraries of EL9's glibc.
           grep -qx glibc "$RUNNER_TEMP/requires"
           grep -q '^libc\.so\.6(GLIBC_2\.34)(64bit)$' "$RUNNER_TEMP/requires"
+          # The user and groups of the sysusers file, each provided once. The
+          # spec declares them: rpm's sysusers generator comes with
+          # systemd-rpm-macros, which the release workflow's container lacks.
+          rpm -qp --provides "$package" | tee "$RUNNER_TEMP/provides"
+          for provided in 'user(maki)' 'group(maki)' 'group(maki-admin)'; do
+            test "$(grep -cxF "$provided" "$RUNNER_TEMP/provides")" = 1
+          done
           dnf install -y -q "$package"
           # Its Requires brought the runtime, without the nbdkit metapackage.
           rpm -q nbdkit-server lvm2 xfsprogs util-linux systemd kmod

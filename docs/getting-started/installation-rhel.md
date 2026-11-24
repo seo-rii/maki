@@ -50,6 +50,7 @@ requirements and the builder the owner of their ELF loader (`glibc`):
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
 Conflicts: nbdkit-selinux, nbdkit
+Provides: user(maki), group(maki), group(maki-admin)
 ```
 
 so `dnf install ./maki.rpm` installs whatever of them is missing from
@@ -57,9 +58,10 @@ BaseOS and AppStream. It requires `nbdkit-server`, not the `nbdkit`
 metapackage, and conflicts with the metapackage and with the SELinux module
 the metapackage installs, which by the policy's rules stops systemd from
 starting nbdkit ([SELinux](#selinux)). nbdkit's plugins and filters install
-beside Maki under their own names, such as `nbdkit-basic-plugins`. dnf
-treats Maki as a protected package: it is removed with `rpm -e`
-([removal](#upgrading-and-removal)).
+beside Maki under their own names, such as `nbdkit-basic-plugins`. The
+package provides the user and the groups it creates, for packages that
+require them. dnf treats Maki as a protected package: it is removed with
+`rpm -e` ([removal](#upgrading-and-removal)).
 
 ## Repositories
 

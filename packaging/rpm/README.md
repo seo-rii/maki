@@ -61,6 +61,7 @@ not start, stop or restart a service during install, upgrade or removal.
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
 Conflicts: nbdkit-selinux, nbdkit
+Provides: user(maki), group(maki), group(maki-admin)
 ```
 
 `nbdkit-server` provides `/usr/sbin/nbdkit`; the `nbdkit` metapackage would
@@ -93,6 +94,14 @@ off with a warning and keeps only the static `Requires`; it exists for the
 contract tests' header-only ELF stubs and must not be used for a package that
 will be installed. The plugin is excluded from rpm's provides: it is loaded by
 nbdkit, not linked by other packages.
+
+The package provides the user and the groups that its sysusers file creates,
+under the names other EL9 packages carry (`user(maki)`, `group(maki)`,
+`group(maki-admin)`), so that a package may require them. The spec declares
+them and turns rpm's sysusers dependency generator off: the generator comes
+with `systemd-rpm-macros`, which a RHEL 9 host with systemd has and the
+minimal container image has not, so it added them on one build host and not
+on the other.
 
 ## Artifact validation
 
@@ -139,7 +148,14 @@ has the procedure.
 file time and the changelog entry come from it, and rpm cannot date a
 changelog entry before 1990 (it reports "bad date in %changelog" and still
 writes a package without the entry). The build is reproducible for a given
-`SOURCE_DATE_EPOCH` and rpm version; the build host name is fixed. Run the contract tests with:
+`SOURCE_DATE_EPOCH` on EL9, whichever of its dependency generators the build
+host has installed: the build host name is fixed, and the user and group
+provides come from the spec. Another rpm version or another distribution's
+rpm configuration (payload compression, `rpmlib()` requirements) writes a
+different file with the same contents. The `v0.1.0-rc.1` RPM predates this:
+built in a container without the sysusers generator, it has none of the
+three `user()` and `group()` provides, which the same build on a RHEL 9 host
+carried. Run the contract tests with:
 
 ```bash
 python3 -B -m unittest scripts.test_rpm_package -v

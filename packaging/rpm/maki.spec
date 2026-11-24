@@ -17,6 +17,10 @@
 %global _build_id_links none
 # The plugin is loaded by nbdkit only; it is not a library for other packages.
 %global __provides_exclude_from ^/usr/lib/maki/
+# The user and groups of sysusers.d/maki.conf are provided explicitly below.
+# rpm's sysusers generator (systemd-rpm-macros) would add them only on a build
+# host that has it: a RHEL 9 host does, the minimal container image does not.
+%global __sysusers_provides %{nil}
 
 Name:           maki
 Version:        %{maki_version}
@@ -48,6 +52,11 @@ Requires:       kmod
 # replacing selinux-policy-targeted with another policy.
 Conflicts:      nbdkit-selinux
 Conflicts:      nbdkit
+# What sysusers.d/maki.conf creates, in the form rpm's sysusers generator
+# gives other EL9 packages, for packages that require the user or a group.
+Provides:       user(maki)
+Provides:       group(maki)
+Provides:       group(maki-admin)
 # The owner of the binaries' ELF interpreter on the build host (glibc):
 # rpm's dependency generator does not read PT_INTERP.
 %{?maki_loader_requires:Requires: %{maki_loader_requires}}
