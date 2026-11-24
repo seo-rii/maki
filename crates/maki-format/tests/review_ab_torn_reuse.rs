@@ -13,6 +13,12 @@
 //! durable, before a new record is written into it. A side that decodes is
 //! never emptied: the preserve-first rule (a readable newer generation is
 //! kept and made durable by the next store) is unchanged.
+//!
+//! The rule is in the store, so it holds for every record. The tests name
+//! the ones a torn write can split: a map of five sectors, a map of exactly
+//! one page and one of more than two, and, at the torn-write units the crash
+//! model allows below a sector, checkpoint state and the durable proof
+//! through `DurableProofStore::advance`.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -24,6 +30,9 @@ use maki_format::ab::{AbRecord, AbStore};
 use maki_format::allocation::AllocationMap;
 use maki_format::catalog::ShardCatalog;
 use maki_format::checkpoint::CheckpointState;
+use maki_format::durable_proof::{
+    DurableProof, DurableProofStore, DURABLE_PROOF_A, DURABLE_PROOF_B,
+};
 use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::CrashableBacking;
 use rand::rngs::StdRng;
@@ -95,6 +104,44 @@ impl Valued for AllocationMap {
     fn value(&self) -> u64 {
         (0..64).fold(0, |v, bit| {
             v | (u64::from(self.get(MAP_VALUE_AT + bit)) << bit)
+        })
+    }
+}
+
+/// An allocation map of `UNITS` units, `32 + UNITS / 8` bytes: a page
+/// (32512 units) or more than two (71744 units, 9000 bytes). What a store
+/// changes is in the last sector, with the CRC.
+struct Map<const UNITS: u64>(AllocationMap);
+
+impl<const UNITS: u64> AbRecord for Map<UNITS> {
+    const MAX_ENCODED_LEN: u64 = <AllocationMap as AbRecord>::MAX_ENCODED_LEN;
+
+    fn generation(&self) -> u64 {
+        AbRecord::generation(&self.0)
+    }
+    fn set_generation(&mut self, generation: u64) {
+        AbRecord::set_generation(&mut self.0, generation);
+    }
+    fn encode(&self) -> Vec<u8> {
+        AbRecord::encode(&self.0)
+    }
+    fn decode(data: &[u8]) -> Result<Self, maki_format::FormatError> {
+        <AllocationMap as AbRecord>::decode(data).map(Self)
+    }
+}
+
+impl<const UNITS: u64> Valued for Map<UNITS> {
+    fn fresh() -> Self {
+        Self(AllocationMap::new(UNITS))
+    }
+    fn set_value(&mut self, value: u64, _extra: u64) {
+        for bit in 0..64 {
+            self.0.set(UNITS - 64 + bit, value >> bit & 1 == 1);
+        }
+    }
+    fn value(&self) -> u64 {
+        (0..64).fold(0, |v, bit| {
+            v | (u64::from(self.0.get(UNITS - 64 + bit)) << bit)
         })
     }
 }
@@ -379,23 +426,97 @@ struct Profile {
     steps: (usize, usize),
 }
 
+/// What a chain stores into and reads back: a pair of copies under the code
+/// that owns them.
+trait Stored {
+    /// Both copies hold the value 1, durably.
+    fn create(process: &dyn Backing);
+    /// One process stores `value`; `extra` varies the encoded length where
+    /// the record allows it. `false` if the store did not return success.
+    fn store(machine: &CrashableBacking, value: u64, extra: u64) -> bool;
+    /// The value the pair loads, or why it loads none.
+    fn load(machine: &CrashableBacking) -> Result<u64, String>;
+    fn generations(machine: &CrashableBacking) -> String;
+}
+
+/// A record under `AbStore::store`.
+struct Record<T>(std::marker::PhantomData<T>);
+
+impl<T: Valued> Stored for Record<T> {
+    fn create(process: &dyn Backing) {
+        let mut record = T::fresh();
+        record.set_value(1, 0);
+        ab().store(process, &mut record).unwrap();
+        ab().store(process, &mut record).unwrap();
+        process.sync_dir("").unwrap();
+    }
+    fn store(machine: &CrashableBacking, value: u64, extra: u64) -> bool {
+        store_value::<T>(machine, value, extra)
+    }
+    fn load(machine: &CrashableBacking) -> Result<u64, String> {
+        match ab().load::<T>(machine.process().as_ref()) {
+            Ok(Some(record)) => Ok(record.value()),
+            Ok(None) => Err("no valid copy".into()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    fn generations(machine: &CrashableBacking) -> String {
+        format!("{:?}", sides::<T>(machine))
+    }
+}
+
+/// The durable proof under `DurableProofStore::advance`, which publishes a
+/// horizon to both copies and is what the journal's acknowledgements rest
+/// on. The value is the durable sequence.
+struct Proof;
+
+const VOLUME: uuid::Uuid = uuid::Uuid::from_u128(0x7012);
+
+impl Proof {
+    fn advance(process: &dyn Backing, value: u64) -> bool {
+        let Ok(mut proof) = DurableProofStore::load(process, VOLUME) else {
+            return false;
+        };
+        proof.durable_sequence = value;
+        // The record end moves with the sequence, as the store requires.
+        proof.durable_size = 4096 + value;
+        DurableProofStore::advance(process, &mut proof).is_ok()
+    }
+}
+
+impl Stored for Proof {
+    fn create(process: &dyn Backing) {
+        DurableProofStore::initialize(process, VOLUME).unwrap();
+        assert!(Self::advance(process, 1));
+    }
+    fn store(machine: &CrashableBacking, value: u64, _extra: u64) -> bool {
+        Self::advance(machine.process().as_ref(), value)
+    }
+    fn load(machine: &CrashableBacking) -> Result<u64, String> {
+        DurableProofStore::load(machine.process().as_ref(), VOLUME)
+            .map(|proof| proof.durable_sequence)
+            .map_err(|error| error.to_string())
+    }
+    fn generations(machine: &CrashableBacking) -> String {
+        format!(
+            "{:?}",
+            AbStore::new(DURABLE_PROOF_A, DURABLE_PROOF_B)
+                .side_generations::<DurableProof>(machine.process().as_ref())
+                .unwrap()
+        )
+    }
+}
+
 /// A chain of stores, each by a new process, each possibly cut, each
 /// followed by a restart or a power loss. After every step the pair must
 /// load the acknowledged value or one attempted since: never nothing
 /// (`LOST`), never an older value (`STALE`), never a value that a power loss
 /// had already been seen to lose (`REVIVED`), never anything else
 /// (`FOREIGN`).
-fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), String> {
+fn chain<S: Stored>(seed: u64, tear: usize, profile: Profile) -> Result<(), String> {
     let mut rng = StdRng::seed_from_u64(seed);
     let machine = CrashableBacking::new().with_tearing(tear);
-    {
-        let process = machine.process();
-        let mut record = T::fresh();
-        record.set_value(1, 0);
-        ab().store(process.as_ref(), &mut record).unwrap();
-        ab().store(process.as_ref(), &mut record).unwrap();
-        process.sync_dir("").unwrap();
-    }
+    S::create(machine.process().as_ref());
     let mut history = format!("seed {seed}, torn-write unit {tear}");
     let mut acknowledged = 1u64;
     let mut attempted = BTreeSet::new();
@@ -409,14 +530,14 @@ fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), Stri
         let extra = rng.random_range(0..40u64);
         let roll = rng.random_range(0..100u32);
         let (stored, died) = if roll < profile.clean {
-            (store_value::<T>(&machine, value, extra), false)
+            (S::store(&machine, value, extra), false)
         } else if roll < profile.clean + profile.cut_at_record_sync {
             let dead = arm(&machine, Cut::DiesAtRecordSync(2));
-            let stored = store_value::<T>(&machine, value, extra);
+            let stored = S::store(&machine, value, extra);
             (stored, dead.load(Ordering::SeqCst))
         } else if rng.random_bool(0.5) {
             let dead = arm(&machine, Cut::DiesAtOperation(rng.random_range(0..16)));
-            let stored = store_value::<T>(&machine, value, extra);
+            let stored = S::store(&machine, value, extra);
             (stored, dead.load(Ordering::SeqCst))
         } else {
             // One failed operation, the process lives: writeback-error
@@ -426,7 +547,7 @@ fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), Stri
             machine.set_fault_hook(Some(Arc::new(move |_op: &FaultOp<'_>| {
                 (count.fetch_add(1, Ordering::SeqCst) == at).then(|| io::Error::other("failed"))
             })));
-            (store_value::<T>(&machine, value, extra), false)
+            (S::store(&machine, value, extra), false)
         };
         disarm(&machine);
         // A store that returned to a live process is acknowledged (a cut
@@ -454,14 +575,12 @@ fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), Stri
                 false
             };
 
-        let seen = match ab().load::<T>(machine.process().as_ref()) {
-            Ok(Some(record)) => record.value(),
-            other => {
+        let seen = match S::load(&machine) {
+            Ok(value) => value,
+            Err(refusal) => {
                 return Err(format!(
-                    "LOST: after acknowledging {acknowledged} the pair loads {:?}\n{history}",
-                    other
-                        .map(|r| r.map(|r| r.value()))
-                        .map_err(|e| e.to_string())
+                    "LOST: after acknowledging {acknowledged} the pair loads nothing \
+                     ({refusal})\n{history}"
                 ))
             }
         };
@@ -475,8 +594,8 @@ fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), Stri
             };
             return Err(format!(
                 "{class}: the pair loads {seen}; acknowledged {acknowledged}, attempted since \
-                 {attempted:?}, generations {:?}\n{history}",
-                sides::<T>(&machine)
+                 {attempted:?}, generations {}\n{history}",
+                S::generations(&machine)
             ));
         }
         history += &format!(" -> {seen}");
@@ -492,13 +611,13 @@ fn chain<T: Valued>(seed: u64, tear: usize, profile: Profile) -> Result<(), Stri
 }
 
 /// The seeds whose chain fails, each with its report.
-fn failures<T: Valued>(
+fn failures<S: Stored>(
     seeds: std::ops::Range<u64>,
     tear: usize,
     profile: Profile,
 ) -> Vec<(u64, String)> {
     seeds
-        .filter_map(|seed| Some((seed, chain::<T>(seed, tear, profile).err()?)))
+        .filter_map(|seed| Some((seed, chain::<S>(seed, tear, profile).err()?)))
         .collect()
 }
 
@@ -513,19 +632,46 @@ fn assert_none(failed: &[(u64, String)]) {
 }
 
 /// Stores cut between the record's write and its sync, most of them
-/// followed by a power loss, on a five-sector record with 512-byte sectors.
+/// followed by a power loss.
+const CUT_STORES: Profile = Profile {
+    cut_at_record_sync: 60,
+    clean: 25,
+    power_loss_after_failure: 85,
+    steps: (30, 50),
+};
+
+/// On a five-sector record with 512-byte sectors.
 #[test]
 fn chains_of_cut_stores_never_revive_an_attempt_a_power_loss_lost() {
-    let profile = Profile {
-        cut_at_record_sync: 60,
-        clean: 25,
-        power_loss_after_failure: 85,
-        steps: (30, 50),
-    };
-    assert_none(&failures::<AllocationMap>(0..CUT_CHAIN_SEEDS, 512, profile));
+    assert_none(&failures::<Record<AllocationMap>>(
+        0..CUT_CHAIN_SEEDS,
+        512,
+        CUT_STORES,
+    ));
 }
 
 const CUT_CHAIN_SEEDS: u64 = 500;
+
+/// On a record of exactly one page and on one of more than two, with
+/// 512-byte sectors, and on the larger one with whole pages torn.
+#[test]
+fn chains_of_cut_stores_never_revive_a_record_of_a_page_or_more() {
+    let mut failed = failures::<Record<Map<32512>>>(50..100, 512, CUT_STORES);
+    failed.extend(failures::<Record<Map<71744>>>(200..300, 512, CUT_STORES));
+    failed.extend(failures::<Record<Map<71744>>>(50..100, 4096, CUT_STORES));
+    assert_none(&failed);
+}
+
+/// On the durable proof, through `DurableProofStore::advance`, and on
+/// checkpoint state. Both fit one sector; the crash model tears them in
+/// halves, which leaves the generation in one half and what a store changes
+/// in the other.
+#[test]
+fn chains_of_cut_stores_never_revive_a_durable_proof_or_checkpoint_state() {
+    let mut failed = failures::<Proof>(0..150, 32, CUT_STORES);
+    failed.extend(failures::<Record<CheckpointState>>(0..150, 16, CUT_STORES));
+    assert_none(&failed);
+}
 
 /// Mixed disturbances on a one-sector record, a record whose length changes
 /// and the five-sector record, at torn-write units from one byte to a page:
@@ -541,9 +687,42 @@ fn seeded_chains_never_lose_regress_or_revive_a_record() {
     };
     let mut failed = Vec::new();
     for tear in [1, 7, 64, 512, 4096] {
-        failed.extend(failures::<CheckpointState>(0..120, tear, profile));
-        failed.extend(failures::<ShardCatalog>(0..120, tear, profile));
-        failed.extend(failures::<AllocationMap>(0..120, tear, profile));
+        failed.extend(failures::<Record<CheckpointState>>(0..120, tear, profile));
+        failed.extend(failures::<Record<ShardCatalog>>(0..120, tear, profile));
+        failed.extend(failures::<Record<AllocationMap>>(0..120, tear, profile));
+    }
+    assert_none(&failed);
+}
+
+/// The same chains over many more seeds, and the mixed disturbances on the
+/// durable proof and the page-sized records as well.
+#[test]
+#[ignore = "release gate: long A/B torn-side sweep"]
+fn ab_torn_reuse_gate_full() {
+    let mixed = Profile {
+        cut_at_record_sync: 20,
+        clean: 45,
+        power_loss_after_failure: 55,
+        steps: (8, 40),
+    };
+    let mut failed = failures::<Record<AllocationMap>>(0..4000, 512, CUT_STORES);
+    failed.extend(failures::<Record<Map<32512>>>(0..2000, 512, CUT_STORES));
+    failed.extend(failures::<Record<Map<71744>>>(0..2000, 512, CUT_STORES));
+    failed.extend(failures::<Record<Map<71744>>>(0..2000, 4096, CUT_STORES));
+    for tear in [8, 16, 32] {
+        failed.extend(failures::<Proof>(0..4000, tear, CUT_STORES));
+        failed.extend(failures::<Proof>(0..2000, tear, mixed));
+    }
+    for tear in [1, 7, 16] {
+        failed.extend(failures::<Record<CheckpointState>>(
+            0..4000,
+            tear,
+            CUT_STORES,
+        ));
+    }
+    for tear in [512, 4096] {
+        failed.extend(failures::<Record<Map<32512>>>(0..1000, tear, mixed));
+        failed.extend(failures::<Record<Map<71744>>>(0..1000, tear, mixed));
     }
     assert_none(&failed);
 }
