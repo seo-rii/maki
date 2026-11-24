@@ -378,6 +378,11 @@ class RhelUserspaceJob(unittest.TestCase):
         self.assertLess(install, script.index("rpm -q nbdkit-server lvm2 xfsprogs util-linux systemd kmod\n"))
         self.assertRegex(script, r"for unwanted in nbdkit nbdkit-selinux; do\n\s*if rpm -q \"\$unwanted\"; "
                                  r"then exit 1; fi\n\s*done")
+        # dnf refuses nbdkit-selinux beside the installed package.
+        self.assertIn('if dnf install --assumeno nbdkit-selinux > "$RUNNER_TEMP/selinux" 2>&1; then exit 1; fi\n',
+                      script)
+        self.assertIn("grep -q 'conflicts with nbdkit-selinux' \"$RUNNER_TEMP/selinux\"\n", script)
+        self.assertLess(install, script.index("--assumeno nbdkit-selinux"))
         record = script.index("/run/maki-attach/")
         self.assertLess(record, script.index("rpm -e maki"))
         self.assertRegex(script, r"if rpm -e maki; then[^\n]*\n[^\n]*exit 1")

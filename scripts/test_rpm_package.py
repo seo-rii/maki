@@ -187,6 +187,12 @@ class RpmPackageTests(unittest.TestCase):
         self.assertIn("maki(x86-64)", provides)
         self.assertFalse([name for name in provides if ".so" in name], provides)
 
+    def test_package_conflicts_with_the_nbdkit_selinux_module(self):
+        # nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, which the
+        # targeted policy lets systemd neither execute nor transition from;
+        # the nbdkit metapackage would bring it back after installation.
+        self.assertEqual(query(self.build(), "[%{CONFLICTS}\n]").split(), ["nbdkit-selinux"])
+
     def test_package_owns_runtime_artifacts_but_not_live_configuration(self):
         package = self.build()
         root = payload(package, self.work / "root")

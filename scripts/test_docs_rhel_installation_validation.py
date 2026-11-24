@@ -35,8 +35,12 @@ def commands(path):
 
 
 def static_requires():
+    return spec_tag("Requires")
+
+
+def spec_tag(tag):
     return [line.split(":", 1)[1].strip() for line in SPEC.read_text().splitlines()
-            if line.startswith("Requires:")]
+            if line.startswith(f"{tag}:")]
 
 
 class RhelInstallationGuide(unittest.TestCase):
@@ -46,6 +50,13 @@ class RhelInstallationGuide(unittest.TestCase):
         for path in (GUIDE, RPM_README):
             with self.subTest(path=path.name):
                 self.assertEqual(re.findall(r"^Requires: (.+)$", path.read_text(), re.M), [expected])
+
+    def test_guide_and_package_readme_quote_the_spec_conflicts(self):
+        expected = ", ".join(spec_tag("Conflicts"))
+        self.assertEqual(expected, "nbdkit-selinux")
+        for path in (GUIDE, RPM_README):
+            with self.subTest(path=path.name):
+                self.assertEqual(re.findall(r"^Conflicts: (.+)$", path.read_text(), re.M), [expected])
 
     def test_packages_come_from_baseos_and_appstream_only(self):
         dnf = [command for command in commands(GUIDE) if re.match(r"(?:sudo )?dnf\b", command)]
