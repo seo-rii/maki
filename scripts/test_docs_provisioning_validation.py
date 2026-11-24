@@ -178,6 +178,15 @@ class ProvisioningContract(unittest.TestCase):
         self.assertEqual([call[1] for call in calls if call[0] == "maki-attach"],
                          ["nbd-connect", "nbd-disconnect"])
         self.assertNotIn("nbd-client", names)
+        # Only the helper activates this VG: it is created with LVM's
+        # autoactivation property off, and the new LV is still activated
+        # for mkfs by plain activation, which ignores the property.
+        vgcreate, = [call for call in calls if call[0] == "vgcreate"]
+        self.assertIn("--setautoactivation", vgcreate)
+        self.assertEqual(vgcreate[vgcreate.index("--setautoactivation") + 1], "n")
+        self.assertEqual(vgcreate[-2:], ["vg_maki_demo", vgcreate[vgcreate.index("--devices") + 1]])
+        lvcreate, = [call for call in calls if call[0] == "lvcreate"]
+        self.assertFalse({"-an", "-aay", "--activate", "--setautoactivation"} & set(lvcreate), lvcreate)
         for identity in [UUID, PV, VG, LV]:
             self.assertIn(identity, content)
         self.assertEqual(mode, 0o600)
