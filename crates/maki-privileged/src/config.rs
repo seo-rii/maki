@@ -2,8 +2,9 @@
 //! review M-016) and argument hygiene for everything the helper hands to
 //! system utilities.
 //!
-//! The helper runs as root and execs `nbd-client`, `mount`, `vgchange` and
-//! friends with values that come from configuration or the command line.
+//! The helper runs as root, connects to the configured NBD socket and execs
+//! `mount`, `vgchange` and friends with values that come from configuration
+//! or the command line.
 //! Every such value is checked here: no leading dash (option injection), no
 //! control characters, absolute canonical paths, a well-formed UUID.
 
@@ -235,19 +236,7 @@ impl AttachConfig {
             ));
         }
         let device_block_size = self.device_block_size.unwrap_or(4096);
-        // Linux BLKBSZSET accepts powers of two from 512 through PAGE_SIZE.
-        #[cfg(target_os = "linux")]
-        let maximum_block_size = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-            .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
-        #[cfg(not(target_os = "linux"))]
-        let maximum_block_size = 65536;
-        if !(512..=maximum_block_size).contains(&device_block_size)
-            || !device_block_size.is_power_of_two()
-        {
-            return Err(ConfigError::Invalid(format!(
-                "device_block_size must be a power of two between 512 and {maximum_block_size}"
-            )));
-        }
+        check_device_block_size("device_block_size", device_block_size)?;
         let volume_uuid = match overrides.volume_uuid.or(self.volume_uuid) {
             Some(uuid) => {
                 check_uuid("volume_uuid", &uuid)?;
@@ -467,6 +456,55 @@ pub fn check_lvm_name(name: &str, value: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(format!(
             "{name} is not a valid LVM name"
         )));
+    }
+    Ok(())
+}
+
+/// A device block size: Linux BLKBSZSET accepts powers of two from 512
+/// through PAGE_SIZE.
+pub fn check_device_block_size(name: &str, value: u32) -> Result<(), ConfigError> {
+    #[cfg(target_os = "linux")]
+    let maximum_block_size = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|_| ConfigError::Invalid("cannot determine the kernel page size".into()))?;
+    #[cfg(not(target_os = "linux"))]
+    let maximum_block_size = 65536;
+    if !(512..=maximum_block_size).contains(&value) || !value.is_power_of_two() {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be a power of two between 512 and {maximum_block_size}"
+        )));
+    }
+    Ok(())
+}
+
+/// The longest backend identifier of a connection outside any attachment.
+pub const MAX_RAW_IDENTIFIER_BYTES: usize = 255;
+
+/// A backend identifier for a connection made outside any attachment
+/// (`maki-attach nbd-connect`, which provisioning and the qualification
+/// runner use): 1 to [`MAX_RAW_IDENTIFIER_BYTES`] printable ASCII characters
+/// not starting with `-`, and never of the form attach records use (`maki-`
+/// and a UUID), so that no such connection can pass for a volume's
+/// attachment.
+pub fn check_raw_identifier(identifier: &str) -> Result<(), ConfigError> {
+    check_argument("--identifier", identifier)?;
+    if identifier.len() > MAX_RAW_IDENTIFIER_BYTES
+        || !identifier.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "--identifier must be 1 to {MAX_RAW_IDENTIFIER_BYTES} printable ASCII characters \
+             without spaces"
+        )));
+    }
+    if identifier
+        .strip_prefix("maki-")
+        .is_some_and(|nonce| check_uuid("--identifier", nonce).is_ok())
+    {
+        return Err(ConfigError::Invalid(
+            "--identifier has the form of an attach record's connection identifier \
+             (maki-<uuid>); a connection outside an attachment must use another, such as \
+             maki-bootstrap-<uuid>"
+                .into(),
+        ));
     }
     Ok(())
 }

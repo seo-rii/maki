@@ -39,7 +39,7 @@ thread_local! {
 }
 
 /// Restores the previous limit when dropped; see [`finish_by`].
-pub(super) struct Deadline(Option<Instant>);
+pub(crate) struct Deadline(Option<Instant>);
 
 impl Drop for Deadline {
     fn drop(&mut self) {
@@ -52,8 +52,25 @@ impl Drop for Deadline {
 /// is started after it. A caller that itself runs inside a time limit (the
 /// failed-start hook, inside the unit's stop timeout) bounds all of its
 /// commands at once this way.
-pub(super) fn finish_by(deadline: Instant) -> Deadline {
+pub(crate) fn finish_by(deadline: Instant) -> Deadline {
     Deadline(FINISH_BY.replace(Some(deadline)))
+}
+
+/// When a step the helper performs itself, without an external command
+/// (the NBD connect and disconnect), must end: after the time an external
+/// step command may take, or at the thread's [`finish_by`] deadline when
+/// that comes first. No step starts once that deadline has passed.
+pub(crate) fn step_deadline() -> io::Result<Instant> {
+    let now = Instant::now();
+    let limit = now + Policy::STEP.timeout;
+    match FINISH_BY.get() {
+        Some(deadline) if deadline <= now => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no time left to start an NBD step",
+        )),
+        Some(deadline) => Ok(limit.min(deadline)),
+        None => Ok(limit),
+    }
 }
 
 /// The limit [`finish_by`] set for this thread, if any.
@@ -69,8 +86,7 @@ pub(crate) fn controlled(program: &str) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()
-        // systemd's default service PATH: root-controlled locations only,
-        // /usr/local included, where a source-built nbd-client 3.27 lives.
+        // systemd's default service PATH: root-controlled locations only.
         .env(
             "PATH",
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -79,7 +95,49 @@ pub(crate) fn controlled(program: &str) -> Command {
     command
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECORDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Until the guard is dropped, the commands this thread would start are
+/// recorded by program name and fail without being started.
+#[cfg(test)]
+pub(crate) fn record_commands() -> Recording {
+    Recording(RECORDED.replace(Some(Vec::new())))
+}
+
+#[cfg(test)]
+pub(crate) struct Recording(Option<Vec<String>>);
+
+#[cfg(test)]
+impl Recording {
+    pub(crate) fn programs(&self) -> Vec<String> {
+        RECORDED.with_borrow(|recorded| recorded.clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for Recording {
+    fn drop(&mut self) {
+        RECORDED.set(self.0.take());
+    }
+}
+
 pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<Output> {
+    #[cfg(test)]
+    if RECORDED
+        .with_borrow_mut(|recorded| {
+            recorded
+                .as_mut()
+                .map(|programs| programs.push(command.get_program().to_string_lossy().into_owned()))
+        })
+        .is_some()
+    {
+        return Err(io::Error::other(
+            "this test records commands instead of starting them",
+        ));
+    }
     if let Some(deadline) = FINISH_BY.get() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -93,7 +151,7 @@ pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<O
     // Orphans must be reaped here even on hosts whose PID 1 does not promptly
     // reap. This process-wide setting remains enabled for the helper's short
     // lifetime. Reaping below is restricted to this command's process group;
-    // successful daemonized nbd-client children are left running.
+    // the descendants a successful command leaves running are left alone.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }

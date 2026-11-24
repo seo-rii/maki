@@ -197,9 +197,10 @@ impl fmt::Display for PlannedStep {
                 block_size,
             } => write!(
                 f,
-                "nbd-client -unix {} {} -b {block_size} -identifier '<generated-connection-uuid>'",
-                shell_word(socket),
-                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
+                "connect {} to {} over netlink (block size {block_size}, backend identifier \
+                 '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)",
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device)),
+                shell_word(socket)
             ),
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {}", shell_word(device))
@@ -246,7 +247,7 @@ impl fmt::Display for PlannedStep {
             PlannedStep::Umount { mountpoint } => write!(f, "umount {}", shell_word(mountpoint)),
             PlannedStep::NbdDisconnect { device } => write!(
                 f,
-                "nbd-client -d {}",
+                "disconnect {} over netlink",
                 shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::LvExtend {

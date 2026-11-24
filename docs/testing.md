@@ -74,10 +74,13 @@ golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
 power-loss simulations, and real-process tests for all five binaries (`maki`,
 `maki-attach`, `maki-check`, `maki-benchmark` and `maki-witness`).
-The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
-before the workspace tests and checks their executables. This runs the native
-startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
-tool availability. Native startup uses disposable files and Unix sockets; it
+The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, `libnbd-bin` and
+`linux-libc-dev` before the workspace tests and checks their executables. This
+runs the native startup, negotiation, drain, process-crash, and ABI regressions
+instead of relying on optional tool availability. The workflow sets
+`MAKI_TEST_REQUIRE_NBDKIT=1` and `MAKI_TEST_REQUIRE_NBD_HEADERS=1`, so the
+helper's NBD handshake tests against nbdkit and its check of the NBD constants
+against the UAPI headers fail there instead of skipping. Native startup uses disposable files and Unix sockets; it
 does not attach a kernel NBD device or mount a filesystem. On developer hosts
 without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
@@ -93,8 +96,10 @@ two packages file by file; `MAKI_TEST_REQUIRE_DPKG_DEB=1` makes a missing
 
 The workspace tests run as the unprivileged runner user. Tests that give a
 fixture to another user, run a binary as the daemon user, enter a private
-mount namespace or set the immutable flag print why they are skipped there
-and pass. The Linux baseline therefore runs
+mount namespace, set the immutable flag or connect a kernel NBD device print
+why they are skipped there and pass. The Linux baseline therefore loads the
+`nbd` module (from `linux-modules-extra` when the runner's kernel keeps it
+there; the step fails when neither loads) and runs
 `python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked`
 next. The script reuses the compilation of the workspace run as the runner
 user and starts only the test executables in its `ROOT_TARGETS` list as root
@@ -102,7 +107,10 @@ through `sudo -n`, each with a scratch `TMPDIR` under `/tmp` that other users
 can search and that it removes afterwards. It fails when root is not
 available (nothing is compiled or skipped), when a test that ran as root
 still reports that it needs root, and when the run leaves an entry owned by
-root in the checkout or the build tree. `--open-build-tree` lets the fixture
+root in the checkout or the build tree. That step sets
+`MAKI_TEST_REQUIRE_NBD=1`, and the script passes it and the other
+`MAKI_TEST_REQUIRE_*` switches on, so the kernel NBD test fails instead of
+skipping there. `--open-build-tree` lets the fixture
 user (uid 65534) reach the built `maki` and `maki-check` binaries, and the
 test executables that re-execute themselves as that user, below a `0750`
 home directory for the duration of the run.
@@ -385,7 +393,11 @@ packaged configuration without installing services or creating users.
 | Command-line output and exit status | `review_closed_output.rs` in all five binaries: stdout or stderr is a pipe whose read end is closed before the child starts, or `/dev/full`; a closed stdout keeps the command's own verdict, another failure to write a result exits 1 and names the verdict, a completed change only warns, and a diagnostic nobody reads leaves the status. `review_cli_help.rs` (`maki-attach`, `maki-witness`, `maki-benchmark`): `--help` and `--version` only as the sole argument. `review_misuse_status.rs` (`maki`, `maki-witness`): misuse exits 2 before anything is read, a failed command 1, an argument that is not UTF-8 2. `scripts/test_doc_output_validation.py`: no two workspace targets document into one directory |
 | Test fixture locations | `maki-backing/tests/review_other_filesystem.rs`: the five copies of `tests/support/other_filesystem.rs` are identical, and a fixture without a second filesystem skips unless `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1`, which makes it fail. `tests/support/short_dir.rs` keeps socket paths short; `tests/support/private_dir.rs`, `shared_dir.rs` and `witness_config.rs` set fixture modes explicitly, whatever the umask |
 | Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
-| Current privileged runner contract | `regression_nbd_client_version_probe.rs` and `phase7_priv.rs`: a 3.27.1 help banner with nonzero exit is accepted, netlink receives `nbdN`, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice |
+| Current privileged runner contract | `regression_runner_without_nbd_client.rs` and `phase7_priv.rs`: the runner neither requires nor installs nbd-client, its raw fixture connects and disconnects with `maki-attach nbd-connect`/`nbd-disconnect`, the unprivileged disconnect probe runs the helper's own request, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice; `scripts/test_privileged_denial_validation.py` accepts only the kernel's `Operation not permitted` for `NBD_CMD_DISCONNECT` as denial evidence |
+| Helper NBD handshake and netlink (SPEC §6) | `maki-privileged/src/nbd_kernel/handshake_tests.rs`: against scripted servers on a socketpair, the exact bytes sent (client flags, one `NBD_OPT_GO` for the default export), `NO_ZEROES` echoed only when offered, no fixed newstyle, oldstyle and bad magic, every GO error reply without an `EXPORT_NAME` fallback, a missing, repeated or malformed `NBD_INFO_EXPORT`, skipped information, unknown reply types and options, a reply over 4098 bytes refused before it is read, the 64 KiB total, truncation, stalls at the deadline, exports without `HAS_FLAGS`, `SEND_FLUSH` or `SEND_FUA`, size 0, and a negotiated socket left without timeouts. `netlink_tests.rs`: golden bytes of `CTRL_CMD_GETFAMILY`, `NBD_CMD_CONNECT` (libnl's order and `NLA_F_NESTED` nesting) and `NBD_CMD_DISCONNECT`, and the reading of replies (family id, connect index, ack, negative errno, truncation, sequence numbers, ports, senders). `header_tests.rs`: every constant against the installed UAPI headers through a C probe (`MAKI_TEST_REQUIRE_NBD_HEADERS=1` fails instead of skipping). `retry_tests.rs`, against a scripted kernel and a manual clock: an `EBUSY` connect retried every 100 ms on a fresh request after checking that the device still shows no connection, refused as busy after 5 s or at an earlier deadline, not retried once the device shows a connection, every other answer final; the family check (highest attribute 9 refused, 10 accepted). `tests.rs`, `command_tests.rs` and `exec_tests.rs`: flags and size forwarded unchanged, a blocking close-on-exec socket, the deadline, the step limit and an earlier `finish_by` deadline, no program started for either step, and an unanswered request kept as an I/O error of unknown outcome |
+| Helper NBD handshake against nbdkit | `maki-privileged/tests/review_nbd_handshake_nbdkit.rs`: a real `nbdkit memory` export negotiates, and eval exports without FLUSH or FUA are refused. `maki-nbdkit/tests/review_helper_nbd_handshake.rs` compiles the helper's handshake source by path and runs it against Maki's plugin: FLUSH, FUA and write zeroes always, TRIM exactly with discard, never read-only. Both skip without nbdkit unless `MAKI_TEST_REQUIRE_NBDKIT=1` |
+| Kernel NBD connect (root) | `maki-privileged/tests/review_nbd_kernel.rs`, a root-only target: nbdkit serves a memory export, the helper connects a free `/dev/nbdN`, sysfs must show the backend identifier, the size, `queue/write_cache` `write back` and `queue/fua` 1, a second connect is the kernel's refusal, a write and an fsync pass, and the disconnect frees the device; the provisioning path (`connect_raw`/`disconnect_raw`) refuses another identifier's disconnect. The two tests take different devices (the lowest and the highest free one), so neither waits for udev's probe of the other's device. It skips without root, the `nbd` module or nbdkit unless `MAKI_TEST_REQUIRE_NBD=1`, which CI's root-only step sets |
+| Provisioning connects | `maki-attach/tests/review_nbd_provisioning.rs` and `exec_tests.rs`: `nbd-connect`/`nbd-disconnect` plans, strict options and value checks, an attach-record identifier refused, a connected, unreadable or record-reserved device refused before anything is connected, and a disconnect only of the device's own connection; `scripts/test_docs_provisioning_validation.py` runs the provisioning guide with them |
 | Runtime logging (R4-001) | `maki-core/src/logging.rs` child-process tests, `maki-privileged/src/logging.rs` (the `maki-attach` sink: steps and halted rollbacks reach stderr) and `maki-nbdkit/tests/review_r4_native_logging.rs`: a real nbdkit run must show the store's `WARN` for an adopted orphan shard on its captured stderr, and `MAKI_LOG=error` must suppress it. `MAKI_LOG` values without a level (`warning`, `err`, a bare target, `target=`) fall back to `info` with one `WARN` naming the value, and an empty value means `info`, in both sinks and through `maki check` (`bins/maki/tests/review_log_filter.rs`) |
 | Guarded plaintext and keys (R4-002) | `maki-crypto-local/tests/review_r4_guarded_buffers.rs`: encryption, decryption, tampered-ciphertext failure and file/env key loading never wrap a bare `Vec` (`unguarded_wraps()` stays constant); `SecretBuffer::truncate` unit tests |
 | Package removal and inputs (R4-003, R4-007) | `scripts/test_debian_package.py`: `prerm` refuses removal under an attachment record or an active `maki@`/`maki-attach@`/`maki-workload@` unit or when `systemctl` cannot be queried but never blocks upgrades, no maintainer script starts/stops/restarts a service, ELF stubs of the wrong machine, class, type or a non-ELF file are refused, unknown architectures are refused, the dependency scan is on by default and fails closed on unanalysable artifacts or a missing `dpkg-shlibdeps`, `--no-shlibdeps` warns and keeps only the static `Depends` |
@@ -792,7 +804,8 @@ these results for the new format.
 
 ## External qualification checklist
 
-Scoped campaigns already cover Debian 12 kernel NBD/LVM/XFS/fio, installed
+Scoped campaigns already cover Debian 12 kernel NBD/LVM/XFS/fio (attached
+with nbd-client, before the helper's own connect), installed
 systemd recovery with a Docker SQLite ACK oracle, package install/upgrade,
 fresh-host backing restore and SQLite migration. PostgreSQL 15 on Debian 12
 and PostgreSQL 17 on Debian 13 passed short crash and packaged lifecycle

@@ -31,11 +31,11 @@ Current overall state is in [status](../status.md).
 
 | Platform | Status | Notes |
 |---|---|---|
-| Debian 12 (bookworm) on Google Compute Engine, Linux `6.1.0-*-cloud-amd64` | **Campaign passed** | Broadest coverage: kernel NBD/LVM/XFS, systemd lifecycle, package, database, workload-VM and provider-host reset campaigns with `nbd-client` 3.27.1 |
+| Debian 12 (bookworm) on Google Compute Engine, Linux `6.1.0-*-cloud-amd64` | **Campaign passed** | Broadest coverage: kernel NBD/LVM/XFS, systemd lifecycle, package, database, workload-VM and provider-host reset campaigns. Those that attached a kernel NBD device did so through `nbd-client` (3.27.1 where the report names the version; 3.24 in the 2026-09-02 privileged run), before the helper connected NBD devices itself; the workload-VM reset campaigns used userspace libnbd |
 | Debian 12 on KVM (other hypervisor) | **Campaign passed** (rootless data path only) | nbdkit/libnbd/fio path; kernel attachment not run there |
 | Firecracker microVM guest | **Campaign passed** (guest crash only) | 20 abrupt VMM kills; the L1 host and its caches stayed alive |
-| Debian 13 (trixie) on Google Compute Engine, Linux `6.12.*-cloud-amd64` | **Campaign passed** (scoped) | Remote HTTP/WebSocket/gRPC lifecycles under the shipped sandbox, netem latency and loss, NBD zeroing, with XFS directly on the NBD device ([record](../qualification/debian13-remote-transport-validation-2026-10-04.md)). Needs `fc8d697` or later (R5-037, R5-038). Debian 13 packages `nbd-client` 1:3.26.1, below the required 3.27.0: build 3.27 until a newer package exists. PostgreSQL 17 then passed its crash and lifecycle scenario under the packaged `maki-attach` LVM lifecycle ([record](../qualification/debian13-postgresql-http-validation-2026-10-05.md)) |
-| Later Debian releases | Not qualified | Check that `nbd-client` ≥ 3.27.0 and systemd ≥ 249 are available |
+| Debian 13 (trixie) on Google Compute Engine, Linux `6.12.*-cloud-amd64` | **Campaign passed** (scoped) | Remote HTTP/WebSocket/gRPC lifecycles under the shipped sandbox, netem latency and loss, NBD zeroing, with XFS directly on the NBD device ([record](../qualification/debian13-remote-transport-validation-2026-10-04.md)). Needs `fc8d697` or later (R5-037, R5-038). The campaigns ran with a source-built `nbd-client` 3.27, which the helper no longer uses. PostgreSQL 17 then passed its crash and lifecycle scenario under the packaged `maki-attach` LVM lifecycle ([record](../qualification/debian13-postgresql-http-validation-2026-10-05.md)) |
+| Later Debian releases | Not qualified | Check that systemd ≥ 249 is available |
 | Ubuntu 22.04 / 24.04 | Not qualified | Same requirements; the Debian packaging is not built for Ubuntu |
 | RHEL 9 (CentOS Stream 9, Rocky Linux 9, AlmaLinux 9) | Not qualified | RPM package and [installation guide](../getting-started/installation-rhel.md), BaseOS and AppStream only. On every change CI builds the packaged binaries in a CentOS Stream 9 container, checks the plugin ABI against EL9's nbdkit header, runs the helper, attach and plugin suites with EL9's nbdkit 1.38, and builds, installs and removes the RPM; that runs on Ubuntu's kernel. No kernel attachment, RHEL kernel, SELinux-enforcing run or campaign. LVM2 2.03.33 enables its devices file, which Maki's `--devices` scoping overrides; the RPM conflicts with `nbdkit-selinux`, which the `nbdkit` metapackage pulls in |
 | Fedora | Not qualified | Not built or tested; the RHEL 9 RPM is built against EL9's glibc and package names |
@@ -44,10 +44,11 @@ Current overall state is in [status](../status.md).
 | AWS EC2, Azure, other clouds | Not qualified | Reset semantics of the block service differ from GCE Persistent Disk |
 | Windows, macOS | Unsupported for the data plane | The workspace builds and its portable tests run; nbdkit plugin and privileged helper are Linux-only |
 
-Host requirements common to every Linux target: kernel NBD with the backend
-identifier in sysfs, `nbd-client` ≥ 3.27.0 built with netlink support, LVM2
-with `fullreport`/`--devices` (2.03.16 tested), xfsprogs, systemd ≥ 249 for
-the recovery unit's `OnSuccess=`. Details are in the
+Host requirements common to every Linux target: the kernel's `nbd` module with
+its generic-netlink interface and the backend identifier in sysfs (the helper
+negotiates and connects NBD devices itself; no NBD client package is needed),
+nbdkit with `NBD_OPT_GO`, LVM2 with `fullreport`/`--devices` (2.03.16 tested),
+xfsprogs, systemd ≥ 249 for the recovery unit's `OnSuccess=`. Details are in the
 [installation guide](../getting-started/installation-debian.md).
 
 ## Explicit memory admission

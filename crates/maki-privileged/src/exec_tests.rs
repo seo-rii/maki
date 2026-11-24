@@ -70,10 +70,241 @@ lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'
 }
 
 #[test]
-fn nbd_client_netlink_target_is_the_validated_kernel_name() {
-    assert_eq!(nbd_client_target("/dev/nbd15").unwrap(), "nbd15");
-    assert!(nbd_client_target("nbd15").is_err());
-    assert!(nbd_client_target("/dev/sda").is_err());
+fn nbd_steps_address_the_validated_kernel_index() {
+    assert_eq!(nbd_step_index("/dev/nbd15").unwrap(), 15);
+    for device in ["nbd15", "/dev/sda", "/dev/nbd01", "/dev/nbd"] {
+        assert!(nbd_step_index(device).is_err(), "{device}");
+    }
+}
+
+/// A fake `/sys/block` with one directory per `(device, pid, backend)`.
+fn raw_sysfs(fixture: &Fixture, devices: &[(&str, bool, Option<&str>)]) -> PathBuf {
+    let sysfs = fixture.0.join("block");
+    for (name, pid, backend) in devices {
+        let directory = sysfs.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        if *pid {
+            std::fs::write(directory.join("pid"), "4242\n").unwrap();
+        }
+        if let Some(backend) = backend {
+            std::fs::write(directory.join("backend"), format!("{backend}\n")).unwrap();
+        }
+    }
+    sysfs
+}
+
+/// `nbd-connect` takes only a device that shows no connection and that no
+/// trusted record names: a raw connection must never take another
+/// attachment's device, connected or not.
+#[test]
+fn a_raw_connection_takes_only_a_free_device_no_record_names() {
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            (
+                "nbd5",
+                true,
+                Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"),
+            ),
+            ("nbd6", true, None),
+            ("nbd7", false, None),
+            ("nbd8", false, Some("")),
+        ],
+    );
+    let reserved = BTreeMap::from([("/dev/nbd7".to_string(), "db".to_string())]);
+    for free in ["/dev/nbd4", "/dev/nbd8"] {
+        raw_device_is_free(&sysfs, free, &reserved).unwrap();
+    }
+    for (device, why) in [
+        ("/dev/nbd5", "already connected"),
+        ("/dev/nbd6", "backend identifier"),
+        ("/dev/nbd7", "volume db"),
+    ] {
+        let error = raw_device_is_free(&sysfs, device, &reserved).unwrap_err();
+        assert!(error.to_string().contains(why), "{device}: {error}");
+    }
+}
+
+/// `connect_raw` checks everything before it connects: a device a trusted
+/// record names is refused even while it shows no connection, and so is a
+/// value it must not take, before any step runs or socket opens.
+#[test]
+fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const SOCKET: &str = "/run/maki/pg/nbd.sock";
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd5", false, None),
+            ("nbd7", false, None),
+        ],
+    );
+    let reserved = BTreeMap::from([("/dev/nbd7".to_string(), "db".to_string())]);
+    for (socket, device, block_size, identifier, why) in [
+        (SOCKET, "/dev/nbd7", 4096, OURS, "volume db"),
+        (
+            SOCKET,
+            "/dev/nbd4",
+            4096,
+            "maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c",
+            "attach record",
+        ),
+        ("run/maki/pg/nbd.sock", "/dev/nbd4", 4096, OURS, "absolute"),
+        (SOCKET, "/dev/nbd4", 1000, OURS, "--block-size"),
+        (SOCKET, "/dev/nbd04", 4096, OURS, "invalid NBD device"),
+    ] {
+        let mut connected = false;
+        let error = connect_raw_with(
+            &sysfs,
+            &reserved,
+            socket,
+            device,
+            block_size,
+            identifier,
+            |_, _| {
+                connected = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(why), "{device}: {error}");
+        assert!(!connected, "{device}: the connect ran");
+    }
+    // A free device is connected with the identifier, which the kernel must
+    // then show.
+    let mut steps = Vec::new();
+    connect_raw_with(
+        &sysfs,
+        &reserved,
+        SOCKET,
+        "/dev/nbd4",
+        512,
+        OURS,
+        |step, identifier| {
+            steps.push((step.clone(), identifier.to_string()));
+            std::fs::write(sysfs.join("nbd4/pid"), "4242\n").unwrap();
+            std::fs::write(sysfs.join("nbd4/backend"), format!("{identifier}\n")).unwrap();
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        steps,
+        [(
+            PlannedStep::NbdConnect {
+                socket: SOCKET.into(),
+                device: "/dev/nbd4".into(),
+                block_size: 512,
+            },
+            OURS.to_string()
+        )]
+    );
+    // An acknowledged connect the kernel does not show is a failure.
+    let error = connect_raw_with(
+        &sysfs,
+        &reserved,
+        SOCKET,
+        "/dev/nbd5",
+        4096,
+        OURS,
+        |_, _| Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("shows no connection"), "{error}");
+}
+
+/// `nbd-disconnect` disconnects only the connection it names: a device that
+/// shows no connection needs nothing, and any other backend, or one that
+/// cannot be read, is refused.
+#[test]
+fn a_raw_disconnect_touches_only_its_own_connection() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd5", true, Some(OURS)),
+            ("nbd6", true, None),
+            (
+                "nbd7",
+                true,
+                Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"),
+            ),
+        ],
+    );
+    for absent in ["/dev/nbd4", "/dev/nbd9"] {
+        assert!(!raw_backend_is(&sysfs, absent, OURS).unwrap(), "{absent}");
+    }
+    assert!(raw_backend_is(&sysfs, "/dev/nbd5", OURS).unwrap());
+    for device in ["/dev/nbd6", "/dev/nbd7"] {
+        assert!(raw_backend_is(&sysfs, device, OURS).is_err(), "{device}");
+    }
+}
+
+/// A step whose kernel answer could not be read stays an I/O error of its
+/// kind (a timeout is still a timeout), never a plain refusal: the callers
+/// decide from the device's backend identifier what is connected.
+#[test]
+fn an_unanswered_nbd_step_is_an_io_error_of_unknown_outcome() {
+    let step = PlannedStep::NbdDisconnect {
+        device: "/dev/nbd3".into(),
+    };
+    match nbd_step_error(
+        &step,
+        NbdError::Unknown(io::Error::new(io::ErrorKind::TimedOut, "no answer")),
+    ) {
+        ExecError::Io(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                error.to_string().contains("backend identifier decides"),
+                "{error}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        nbd_step_error(&step, NbdError::Failed("refused".into())),
+        ExecError::Step { message, .. } if message == "refused"
+    ));
+}
+
+/// The connect and disconnect steps start no program: the helper
+/// negotiates with the daemon and talks to the kernel itself, so no
+/// `nbd-client` is needed or run. Netlink sockets are refused here, so
+/// both steps fail before any request reaches the kernel.
+#[test]
+fn nbd_steps_start_no_external_program() {
+    let recording = command::record_commands();
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let connect = PlannedStep::NbdConnect {
+        socket: "/run/maki/pg/nbd.sock".into(),
+        device: "/dev/nbd3".into(),
+        block_size: 4096,
+    };
+    let disconnect = PlannedStep::NbdDisconnect {
+        device: "/dev/nbd3".into(),
+    };
+    for (step, identifier) in [
+        (&connect, Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c")),
+        (&disconnect, None),
+    ] {
+        match run_step(step, identifier) {
+            Err(ExecError::Step { message, .. }) => {
+                assert!(message.contains("netlink"), "{step}: {message}")
+            }
+            other => panic!("{step}: {other:?}"),
+        }
+    }
+    assert_eq!(recording.programs(), Vec::<String>::new());
+    // The other steps still run their commands, which the recording sees.
+    assert!(run_step(&PlannedStep::ModprobeNbd, None).is_err());
+    assert_eq!(recording.programs(), ["modprobe"]);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2143,9 +2374,7 @@ mod workload_verify_tests;
 /// environment: a fixed PATH, `LC_ALL=C`, nothing inherited from the caller
 /// (`LD_*`, a hostile PATH, locale-dependent output). `recover` and the LVM
 /// preflight already did; the attach/detach/grow steps and their probes
-/// inherited everything. The PATH is systemd's default service PATH: a
-/// source-built nbd-client 3.27 lives in /usr/local/sbin (the 2026-10-03
-/// campaign found the first fixed PATH, without /usr/local, unable to find it).
+/// inherited everything. The PATH is systemd's default service PATH.
 #[test]
 fn step_commands_do_not_inherit_the_callers_environment() {
     std::env::set_var("MAKI_ENV_PROBE_LEAK", "leaked");

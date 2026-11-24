@@ -20,13 +20,18 @@ fn attach_plan_prints_ordered_steps_without_executing() {
     assert!(text.contains("# attach volume v1"), "{text}");
     assert!(text.contains("modprobe nbd"), "{text}");
     assert!(
-        text.contains("nbd-client -unix /run/maki/v1/nbd.sock 'nbd<auto>'"),
+        text.contains("connect 'nbd<auto>' to /run/maki/v1/nbd.sock over netlink"),
         "{text}"
     );
-    assert!(text.contains("/srv/v1"), "{text}");
-    // Steps are numbered in execution order; modprobe precedes nbd-client.
     assert!(
-        text.find("modprobe nbd").unwrap() < text.find("nbd-client").unwrap(),
+        text.contains("the export must advertise FLUSH and FUA"),
+        "{text}"
+    );
+    assert!(!text.contains("nbd-client"), "{text}");
+    assert!(text.contains("/srv/v1"), "{text}");
+    // Steps are numbered in execution order; modprobe precedes the connect.
+    assert!(
+        text.find("modprobe nbd").unwrap() < text.find("over netlink").unwrap(),
         "{text}"
     );
 }
@@ -252,7 +257,7 @@ fn recovery_plan_only_lists_conditional_disconnected_storage_cleanup() {
     assert!(plan.contains("umount /srv/v1"), "{plan}");
     assert!(plan.contains("vgchange -an"), "{plan}");
     assert!(
-        !plan.contains("nbd-client"),
+        !plan.contains("over netlink"),
         "recovery never disconnects a live backend: {plan}"
     );
     assert!(!plan.contains("systemctl"), "{plan}");
@@ -278,7 +283,11 @@ fn cleanup_plan_describes_idempotent_record_driven_storage_cleanup() {
     }
     assert!(plan.contains("umount /srv/v1"), "{plan}");
     assert!(plan.contains("vgchange -an"), "{plan}");
-    assert!(plan.contains("nbd-client -d"), "{plan}");
+    assert!(
+        plan.contains("disconnect 'nbd<auto>' over netlink"),
+        "{plan}"
+    );
+    assert!(!plan.contains("nbd-client"), "{plan}");
     assert!(!plan.contains("systemctl"), "{plan}");
 }
 
@@ -389,7 +398,14 @@ fn verify_plan_describes_the_workload_gate_without_claiming_live_evidence() {
     ] {
         assert!(text.contains(evidence), "missing {evidence}: {text}");
     }
-    for mutation in ["vgchange", "nbd-client", "mount -", "umount", "systemctl"] {
+    for mutation in [
+        "vgchange",
+        "over netlink",
+        "nbd-client",
+        "mount -",
+        "umount",
+        "systemctl",
+    ] {
         assert!(!text.contains(mutation), "{text}");
     }
 }
@@ -519,7 +535,7 @@ fn plans_preserve_command_arguments_with_spaces_and_apostrophes() {
         let quoted_mount = r"'/srv/DB one'\''s'";
         match verb {
             "attach" => {
-                assert!(plan.contains("nbd-client -unix '/run/DB socket' nbd1 -b 4096 -identifier '<generated-connection-uuid>'"), "{plan}");
+                assert!(plan.contains("connect nbd1 to '/run/DB socket' over netlink (block size 4096, backend identifier '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)"), "{plan}");
                 assert!(
                     plan.contains(&format!("/dev/vg_maki_audit/data {quoted_mount}")),
                     "{plan}"

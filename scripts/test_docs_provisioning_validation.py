@@ -59,11 +59,16 @@ elif name == "pvs":
     print(os.environ["BOOTSTRAP_PV"])
 elif name == "maki" and args[:2] == ["volume", "inspect"]:
     print("uuid: " + os.environ["BOOTSTRAP_UUID"])
-elif name == "nbd-client":
-    if "-d" in args:
+elif name == "maki-attach":
+    # The helper's provisioning verbs, not its volume lifecycle.
+    assert args[0] in ("nbd-connect", "nbd-disconnect"), args
+    assert args[args.index("--nbd-device") + 1].endswith("/dev/nbd0"), args
+    identity = args[args.index("--identifier") + 1]
+    if args[0] == "nbd-disconnect":
         (root / "connected").unlink()
     else:
-        identity = args[args.index("-identifier") + 1]
+        assert args[args.index("--socket") + 1].endswith("/run/maki/demo/nbd.sock"), args
+        assert args[args.index("--block-size") + 1] == "4096", args
         (root / "connected").touch()
         (root / "sys/block/nbd0/backend").write_text(
             "foreign" if scenario == "foreign-backend" else identity)
@@ -118,7 +123,7 @@ class ProvisioningContract(unittest.TestCase):
             if scenario == "backend-zero-size":
                 (root / "sys/block/nbd0/backend").write_text("foreign")
             commands = ["blockdev", "lsblk", "vgs", "lvs", "pvs", "maki", "systemctl",
-                        "nbd-client", "wipefs", "pvcreate", "vgcreate", "lvcreate",
+                        "maki-attach", "wipefs", "pvcreate", "vgcreate", "lvcreate",
                         "mkfs.xfs", "blkid", "vgchange"]
             for name in commands:
                 path = root / "bin" / name
@@ -149,7 +154,10 @@ class ProvisioningContract(unittest.TestCase):
         names = [call[0] for call in calls]
         self.assertEqual(names.count("mkfs.xfs"), 1)
         self.assertNotIn("-f", next(call for call in calls if call[0] == "mkfs.xfs"))
-        self.assertEqual(names[-3:], ["blockdev", "nbd-client", "systemctl"])
+        self.assertEqual(names[-3:], ["blockdev", "maki-attach", "systemctl"])
+        self.assertEqual([call[1] for call in calls if call[0] == "maki-attach"],
+                         ["nbd-connect", "nbd-disconnect"])
+        self.assertNotIn("nbd-client", names)
         for identity in [UUID, PV, VG, LV]:
             self.assertIn(identity, content)
         self.assertEqual(mode, 0o600)
@@ -161,12 +169,12 @@ class ProvisioningContract(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 result, calls, content, _ = self.run_case(scenario)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertFalse({"systemctl", "nbd-client", "pvcreate", "mkfs.xfs"}
+                self.assertFalse({"systemctl", "maki-attach", "pvcreate", "mkfs.xfs"}
                                  & {call[0] for call in calls}, result.stderr)
                 self.assertEqual(content, "preserved" if scenario == "existing-config" else None)
 
     def test_failures_never_reach_formatting_or_cleanup(self):
-        for scenario in ["fail-maki", "fail-systemctl", "fail-nbd-client", "wrong-size",
+        for scenario in ["fail-maki", "fail-systemctl", "fail-maki-attach", "wrong-size",
                          "foreign-backend", "signature", "fail-wipefs", "fail-pvcreate",
                          "fail-vgcreate", "fail-lvcreate", "fail-pvs", "invalid-lv-uuid",
                          "foreign-lv", "foreign-pv", "ambiguous-pv", "replaced-backend",
@@ -176,7 +184,8 @@ class ProvisioningContract(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("mkfs.xfs", [call[0] for call in calls], result.stderr)
                 self.assertNotIn("vgchange", [call[0] for call in calls])
-                self.assertFalse(any(call[:2] == ["nbd-client", "-d"] for call in calls))
+                self.assertFalse(any(call[:2] == ["maki-attach", "nbd-disconnect"]
+                                     for call in calls))
                 self.assertIsNone(content)
                 if scenario.startswith("fail-"):
                     self.assertIn(scenario[5:], [call[0] for call in calls], result.stderr)
