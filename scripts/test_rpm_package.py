@@ -125,6 +125,7 @@ class RpmPackageTests(unittest.TestCase):
         self.release = self.work / "release"
         self.release.mkdir()
         self.write_release_files()
+        self.environment = dict(os.environ, SOURCE_DATE_EPOCH=EPOCH)
 
     def write_release_files(self, machine=EM_X86_64, elf_class=64, endian="little", e_flags=0):
         for name in RELEASE_NAMES:
@@ -143,10 +144,12 @@ class RpmPackageTests(unittest.TestCase):
     def build(self, name="maki.rpm", version=VERSION, architecture="x86_64", extra=(), umask=None):
         # Header-only ELF stubs have no interpreter or libraries to depend on.
         output, command = self.builder_command(name, version, architecture, ["--no-autoreq", *extra])
-        result = subprocess.run(command, cwd=ROOT, env=dict(os.environ, SOURCE_DATE_EPOCH=EPOCH),
-                                capture_output=True, text=True,
+        result = subprocess.run(command, cwd=ROOT, env=self.environment, capture_output=True, text=True,
                                 preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
         self.assertEqual(result.returncode, 0, result.stderr)
+        # rpm reports some spec errors (a changelog date it cannot parse) and
+        # still writes a package.
+        self.assertNotIn("error:", result.stderr)
         return output
 
     def build_failure(self, name, version=VERSION, architecture="x86_64", extra=(), opt_out=True):
@@ -154,7 +157,7 @@ class RpmPackageTests(unittest.TestCase):
         if opt_out and "--autoreq" not in extra:
             extra.append("--no-autoreq")
         _, command = self.builder_command(name, version, architecture, extra)
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=ROOT, env=self.environment, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertFalse((self.work / name).exists(), "a refused build must leave no package")
         self.assertNotIn("Traceback", result.stderr)
@@ -418,7 +421,7 @@ class RpmPackageTests(unittest.TestCase):
                                capture_output=True, text=True)
         architecture = subprocess.check_output(["rpm", "--eval", "%{_arch}"], text=True).strip()
         output, command = self.builder_command("native.rpm", architecture=architecture)
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=ROOT, env=self.environment, capture_output=True, text=True)
         if owner.returncode:
             # Not an RPM host (or a loader no package owns): refuse rather
             # than build a package whose loader nothing provides.
@@ -443,7 +446,7 @@ class RpmPackageTests(unittest.TestCase):
 
     def test_opting_out_of_automatic_requirements_keeps_the_static_requires_and_warns(self):
         output, command = self.builder_command("opt-out.rpm", extra=["--no-autoreq"])
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=ROOT, env=self.environment, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--no-autoreq", result.stderr)
         self.assertIn("native library dependencies", result.stderr)
@@ -484,22 +487,29 @@ class RpmPackageTests(unittest.TestCase):
         times = set(query(first, "[%{FILEMTIMES}\n]").split())
         self.assertEqual(times, {EPOCH})
 
-    def test_source_date_epoch_must_be_a_non_negative_integer(self):
-        for value in ("soon", "-1"):
+    def test_source_date_epoch_must_be_given_and_datable_by_rpm(self):
+        # The build time, file times and the changelog entry come from it.
+        # rpm refuses a changelog year before 1990 ("bad date") and still
+        # writes a package without the entry, so such an epoch, and a build
+        # without one, is refused before rpmbuild runs.
+        for index, value in enumerate((None, "", "soon", "-1", "0", "631151999")):
             with self.subTest(value=value):
-                _, command = self.builder_command("epoch.rpm", extra=["--no-autoreq"])
-                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
-                                        env=dict(os.environ, SOURCE_DATE_EPOCH=value))
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("SOURCE_DATE_EPOCH", result.stderr)
-                self.assertFalse((self.work / "epoch.rpm").exists())
+                self.environment = dict(os.environ)
+                self.environment.pop("SOURCE_DATE_EPOCH", None)
+                if value is not None:
+                    self.environment["SOURCE_DATE_EPOCH"] = value
+                self.assertIn("SOURCE_DATE_EPOCH", self.build_failure(f"epoch-{index}.rpm"))
+        self.environment["SOURCE_DATE_EPOCH"] = "631152000"  # 1990-01-01T00:00:00Z
+        package = self.build("1990.rpm")
+        self.assertIn("* Mon Jan 01 1990 ", query(package, "[* %{CHANGELOGTIME:day} %{CHANGELOGNAME}\n]"))
+        self.assertEqual(query(package, "%{BUILDTIME}"), "631152000")
 
     def test_output_cannot_replace_a_required_release_input(self):
         for name in RELEASE_NAMES:
             original = (self.release / name).read_bytes()
             with self.subTest(name=name):
                 _, command = self.builder_command(self.release / name, extra=["--no-autoreq"])
-                result = subprocess.run(command, capture_output=True, text=True)
+                result = subprocess.run(command, env=self.environment, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overwrite a release input", result.stderr)
                 self.assertEqual((self.release / name).read_bytes(), original)
