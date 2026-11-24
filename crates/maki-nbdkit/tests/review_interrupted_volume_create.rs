@@ -244,12 +244,20 @@ struct Stopping {
 
 impl Stopping {
     fn step(&self) -> io::Result<()> {
-        self.left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .map(drop)
-            .map_err(|_| io::Error::other("stopped"))
+        // Decrement while positive. A compare-exchange loop rather than
+        // `fetch_update`, which newer toolchains deprecate (`try_update`
+        // does not exist on older ones).
+        let mut left = self.left.load(Ordering::SeqCst);
+        while left > 0 {
+            match self
+                .left
+                .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => left = actual,
+            }
+        }
+        Err(io::Error::other("stopped"))
     }
 }
 
