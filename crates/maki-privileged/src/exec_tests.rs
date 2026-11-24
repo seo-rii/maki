@@ -2654,6 +2654,30 @@ fn a_step_whose_program_cannot_be_started_names_it() {
     );
 }
 
+/// The error of a failed command prints the exit status as the number it
+/// is, and says so when a signal left none.
+#[test]
+fn a_failed_step_prints_its_exit_status_as_a_number() {
+    let failed = |status| {
+        ExecError::StepFailed {
+            step: "modprobe nbd".into(),
+            status,
+            stderr: "external command output omitted".into(),
+        }
+        .to_string()
+    };
+    assert_eq!(
+        failed(Some(1)),
+        "step \"modprobe nbd\" failed with status 1: external command output omitted"
+    );
+    let signalled = failed(None);
+    assert!(signalled.contains("a signal ended it"), "{signalled}");
+    assert!(
+        !signalled.contains("Some") && !signalled.contains("None"),
+        "{signalled}"
+    );
+}
+
 /// BUG-096: the mount source comes from mountinfo, and whoever mounts on
 /// top of the mountpoint chooses it: a FUSE `fsname=-c/etc/shadow` stacked
 /// between `mount` and verification. Root's blkid must never read it as an
