@@ -1,6 +1,6 @@
 //! Volume initialization (mkfs): create the durable on-disk layout (SPEC §21).
 
-use maki_backing::Backing;
+use maki_backing::{Backing, RollbackBacking};
 
 use crate::ab::AbStore;
 use crate::catalog::ShardCatalog;
@@ -12,6 +12,37 @@ use crate::superblock::{
     load_volume_superblock, Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2,
     SUPERBLOCK_VERSION_V3,
 };
+
+/// Why [`create_in_rollback_backing`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackCreateError {
+    /// The backing or its witness refused the creation, or failed.
+    #[error(transparent)]
+    Backing(std::io::Error),
+    /// The volume inside the backing could not be initialized.
+    #[error(transparent)]
+    Volume(#[from] FormatError),
+}
+
+/// Create a volume in a local rollback-protected backing: `create` enrolls
+/// the backing with its witness, and the volume is then initialized inside
+/// it. `open` opens the existing pair against its witness.
+pub fn create_in_rollback_backing(
+    create: impl FnOnce() -> std::io::Result<RollbackBacking>,
+    open: impl FnOnce() -> std::io::Result<RollbackBacking>,
+    capacity: u64,
+    superblock: Superblock,
+    discard: bool,
+) -> Result<(RollbackBacking, Superblock), RollbackCreateError> {
+    let _ = (open, capacity);
+    let backing = create().map_err(RollbackCreateError::Backing)?;
+    let superblock = if discard {
+        create_volume_with_discard(&backing, superblock)?
+    } else {
+        create_volume(&backing, superblock)?
+    };
+    Ok((backing, superblock))
+}
 
 /// Create a new volume in an empty backing root. Everything created here is
 /// durable when this returns (dirs synced), so a crash immediately after

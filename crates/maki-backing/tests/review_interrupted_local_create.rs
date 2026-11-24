@@ -480,3 +480,46 @@ fn control_create_refuses_a_backing_that_holds_anything_else() {
     assert_eq!(entries(root.path()), before);
     assert!(entries(witness.path()).is_empty());
 }
+
+/// Until `create` is run again, the daemon, `maki check` and `maki volume
+/// inspect` open the pair an interrupted creation left. They must say what
+/// it is and what continues it, not only that a file is missing, and keep
+/// the error kind of a missing file.
+#[test]
+fn open_names_an_interrupted_creation_and_what_continues_it() {
+    // Stopped before the marker was published.
+    let Some((root, witness)) = directories() else {
+        return;
+    };
+    std::fs::write(root.path().join("rollback.lock"), b"").unwrap();
+    std::fs::write(root.path().join("rollback.format.next"), b"MAKI").unwrap();
+    let error = RollbackBacking::open(root.path(), witness.path())
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("rollback.format") && text.contains("volume create"),
+        "{text}"
+    );
+
+    // Stopped before the anchor was published: the backing is complete.
+    // A witness mount that is not mounted looks the same, so both causes
+    // are named.
+    let Some((root, witness)) = directories() else {
+        return;
+    };
+    drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
+    std::fs::remove_file(witness.path().join("anchor")).unwrap();
+    let error = RollbackBacking::open(root.path(), witness.path())
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("no anchor") && text.contains("volume create") && text.contains("mounted"),
+        "{text}"
+    );
+    let unchanged = std::process::Command::new("true").output().unwrap();
+    create_again(root.path(), witness.path(), &unchanged);
+}

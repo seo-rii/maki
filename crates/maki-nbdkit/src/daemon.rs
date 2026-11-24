@@ -1310,11 +1310,23 @@ fn create_volume_from_config(
                         remote_witness_client(remote)?,
                         rollback.capacity.0,
                     )?),
-                    None => Arc::new(RollbackBacking::create(
-                        Path::new(&config.backing.root),
-                        Path::new(&rollback.witness_root),
-                        rollback.capacity.0,
-                    )?),
+                    None => {
+                        let root = Path::new(&config.backing.root);
+                        let witness = Path::new(&rollback.witness_root);
+                        let capacity = rollback.capacity.0;
+                        return init::create_in_rollback_backing(
+                            || RollbackBacking::create(root, witness, capacity),
+                            || RollbackBacking::open(root, witness),
+                            capacity,
+                            new_superblock(config)?,
+                            discard,
+                        )
+                        .map(|(_, superblock)| superblock)
+                        .map_err(|error| match error {
+                            init::RollbackCreateError::Backing(error) => DaemonError::Io(error),
+                            init::RollbackCreateError::Volume(error) => DaemonError::Format(error),
+                        });
+                    }
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -1382,8 +1394,18 @@ fn initialize_volume(
     backing: &dyn Backing,
     discard: bool,
 ) -> Result<Superblock, DaemonError> {
+    let superblock = new_superblock(config)?;
+    Ok(if discard {
+        init::create_volume_with_discard(backing, superblock)?
+    } else {
+        init::create_volume(backing, superblock)?
+    })
+}
+
+/// The superblock of a new volume for `config`, with a new identity.
+fn new_superblock(config: &VolumeConfig) -> Result<Superblock, DaemonError> {
     let geometry = config.geometry()?;
-    let superblock = Superblock {
+    Ok(Superblock {
         generation: 0,
         volume_uuid: uuid::Uuid::new_v4(),
         provider_type: config.crypto.provider.clone(),
@@ -1400,11 +1422,6 @@ fn initialize_volume(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-    };
-    Ok(if discard {
-        init::create_volume_with_discard(backing, superblock)?
-    } else {
-        init::create_volume(backing, superblock)?
     })
 }
 

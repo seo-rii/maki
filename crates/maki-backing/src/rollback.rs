@@ -373,6 +373,27 @@ impl RollbackBacking {
         Self::open_backing(Arc::new(FileBacking::new(root)?), witness)
     }
 
+    /// [`Self::create`] over a backing and a witness directory the caller
+    /// hosts, for the executable crash model of a creation that is
+    /// completed above this layer. The caller answers for what the path
+    /// form checks: that the witness is independent of the backing.
+    #[doc(hidden)]
+    pub fn create_on(
+        disk: Arc<dyn Backing>,
+        witness: Arc<dyn Backing>,
+        capacity_bytes: u64,
+    ) -> io::Result<Self> {
+        validate_capacity(capacity_bytes)?;
+        Self::create_backing(disk, witness, capacity_bytes)
+    }
+
+    /// [`Self::open`] over a backing and a witness directory the caller
+    /// hosts (see [`Self::create_on`]).
+    #[doc(hidden)]
+    pub fn open_on(disk: Arc<dyn Backing>, witness: Arc<dyn Backing>) -> io::Result<Self> {
+        Self::open_witnessed(disk, || FileWitness::open_backing(witness))
+    }
+
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
