@@ -17,6 +17,12 @@ on:
 permissions:
   contents: read
 
+# Every step under bash: in a container job a step without `shell:` runs under
+# `sh -e`, which is dash in debian:12 and refuses `set -o pipefail`.
+defaults:
+  run:
+    shell: bash
+
 # One release at a time: the existence checks and the publication must not
 # interleave with another run's.
 concurrency:
