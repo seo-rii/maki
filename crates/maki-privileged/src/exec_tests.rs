@@ -127,6 +127,97 @@ fn a_raw_connection_takes_only_a_free_device_no_record_names() {
     }
 }
 
+/// `connect_raw` checks everything before it connects: a device a trusted
+/// record names is refused even while it shows no connection, and so is a
+/// value it must not take, before any step runs or socket opens.
+#[test]
+fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const SOCKET: &str = "/run/maki/pg/nbd.sock";
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd5", false, None),
+            ("nbd7", false, None),
+        ],
+    );
+    let reserved = BTreeMap::from([("/dev/nbd7".to_string(), "db".to_string())]);
+    for (socket, device, block_size, identifier, why) in [
+        (SOCKET, "/dev/nbd7", 4096, OURS, "volume db"),
+        (
+            SOCKET,
+            "/dev/nbd4",
+            4096,
+            "maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c",
+            "attach record",
+        ),
+        ("run/maki/pg/nbd.sock", "/dev/nbd4", 4096, OURS, "absolute"),
+        (SOCKET, "/dev/nbd4", 1000, OURS, "--block-size"),
+        (SOCKET, "/dev/nbd04", 4096, OURS, "invalid NBD device"),
+    ] {
+        let mut connected = false;
+        let error = connect_raw_with(
+            &sysfs,
+            &reserved,
+            socket,
+            device,
+            block_size,
+            identifier,
+            |_, _| {
+                connected = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(why), "{device}: {error}");
+        assert!(!connected, "{device}: the connect ran");
+    }
+    // A free device is connected with the identifier, which the kernel must
+    // then show.
+    let mut steps = Vec::new();
+    connect_raw_with(
+        &sysfs,
+        &reserved,
+        SOCKET,
+        "/dev/nbd4",
+        512,
+        OURS,
+        |step, identifier| {
+            steps.push((step.clone(), identifier.to_string()));
+            std::fs::write(sysfs.join("nbd4/pid"), "4242\n").unwrap();
+            std::fs::write(sysfs.join("nbd4/backend"), format!("{identifier}\n")).unwrap();
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        steps,
+        [(
+            PlannedStep::NbdConnect {
+                socket: SOCKET.into(),
+                device: "/dev/nbd4".into(),
+                block_size: 512,
+            },
+            OURS.to_string()
+        )]
+    );
+    // An acknowledged connect the kernel does not show is a failure.
+    let error = connect_raw_with(
+        &sysfs,
+        &reserved,
+        SOCKET,
+        "/dev/nbd5",
+        4096,
+        OURS,
+        |_, _| Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("shows no connection"), "{error}");
+}
+
 /// `nbd-disconnect` disconnects only the connection it names: a device that
 /// shows no connection needs nothing, and any other backend, or one that
 /// cannot be read, is refused.

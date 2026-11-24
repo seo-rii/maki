@@ -366,8 +366,57 @@ fn log_peer(stream: &UnixStream, path: &str) {
     }
 }
 
+/// How long a connect keeps retrying a device the kernel reports busy, and
+/// how often. The kernel refuses `NBD_CMD_CONNECT` with `EBUSY` while
+/// anything holds the unconnected device open: udev probes a device after a
+/// disconnect, and opening one allocates its configuration.
+pub(crate) const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What the connect retries need, so that they are tested without a kernel.
+pub(crate) trait Attempts {
+    /// Negotiate a fresh connection to the daemon and send one
+    /// `NBD_CMD_CONNECT` with sequence number `seq`. An error is a failure
+    /// before the request (the handshake): final, nothing changed.
+    fn connect(&mut self, seq: u32) -> Result<Result<Vec<Vec<u8>>, Unacknowledged>, NbdError>;
+    /// Whether the device shows a connection now.
+    fn shows_connection(&mut self) -> Result<bool, NbdError>;
+    fn now(&self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+/// Connect `nbd<index>` by `deadline`, retrying an `EBUSY` refusal every
+/// [`BUSY_RETRY_INTERVAL`] for up to [`BUSY_RETRY_WINDOW`] while the device
+/// still shows no connection. Every other answer is final.
+pub(crate) fn connect_retrying(
+    index: u32,
+    deadline: Instant,
+    attempts: &mut impl Attempts,
+) -> Result<(), NbdError> {
+    let _ = (index, deadline, attempts);
+    todo!("connect_retrying")
+}
+
+/// Refuse a family that does not take a backend identifier: an older kernel
+/// would ignore the attribute and connect a device that no identity check
+/// could ever claim.
+pub(crate) fn check_family(family: &netlink::Family) -> Result<(), NbdError> {
+    let _ = family;
+    todo!("check_family")
+}
+
+/// Whether `nbd<index>` under `sysfs` (`/sys/block`) shows a connection: a
+/// `pid` attribute or a non-empty backend identifier.
+pub(crate) fn device_shows_connection(sysfs: &std::path::Path, index: u32) -> io::Result<bool> {
+    let _ = (sysfs, index);
+    todo!("device_shows_connection")
+}
+
 #[cfg(test)]
 mod handshake_tests;
+
+#[cfg(test)]
+mod retry_tests;
 
 #[cfg(test)]
 mod netlink_tests;

@@ -28,8 +28,29 @@ const SIZE: u64 = 64 << 20;
 const BLOCK_SIZE: u32 = 4096;
 const SETTLE: Duration = Duration::from_secs(15);
 
-/// The tests pick the lowest free device: one at a time.
+/// One test at a time: each picks a free device when it starts.
 static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The highest-numbered device that shows no connection and has no size.
+/// The other test takes the lowest free one, as the helper's allocation
+/// does: after a disconnect, udev probes the freed device, and the kernel
+/// refuses a connect while anything has it open (the helper's connect
+/// retries that for a few seconds), so the two tests use different devices
+/// and neither depends on the other's timing.
+fn highest_free_device() -> String {
+    let mut free: Vec<u32> = std::fs::read_dir("/sys/block")
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().into_string().ok()?;
+            let index: u32 = name.strip_prefix("nbd")?.parse().ok()?;
+            let unused = !Path::new(&format!("/sys/block/{name}/pid")).exists()
+                && sysfs(index, "size").as_deref() == Some("0");
+            unused.then_some(index)
+        })
+        .collect();
+    free.sort_unstable();
+    format!("/dev/nbd{}", free.last().expect("a free NBD device"))
+}
 
 /// Report what is missing: a skip, or a failure when NBD is required.
 fn missing(what: &str) {
@@ -196,8 +217,7 @@ fn a_provisioning_connection_is_disconnected_only_under_its_own_identifier() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let server = nbdkit::Server::start(&["memory", "64M"]);
-    let device = maki_privileged::exec::allocate_nbd_device()
-        .unwrap_or_else(|error| panic!("no free NBD device: {error}"));
+    let device = highest_free_device();
     let index: u32 = device.strip_prefix("/dev/nbd").unwrap().parse().unwrap();
     let identifier = format!(
         "maki-bootstrap-{}",

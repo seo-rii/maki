@@ -795,6 +795,24 @@ pub fn connect_raw(
     Ok(())
 }
 
+/// [`connect_raw`] on the device tree `sysfs` with the devices trusted
+/// records name (`reserved`): everything is checked before `connect`, which
+/// runs the connect step and waits for the device, is called.
+fn connect_raw_with(
+    sysfs: &Path,
+    reserved: &BTreeMap<String, String>,
+    socket: &str,
+    device: &str,
+    block_size: u32,
+    identifier: &str,
+    connect: impl FnOnce(&PlannedStep, &str) -> Result<(), ExecError>,
+) -> Result<(), ExecError> {
+    let _ = (
+        sysfs, reserved, socket, device, block_size, identifier, connect,
+    );
+    todo!("connect_raw_with")
+}
+
 /// Disconnect `device` if it is connected under `identifier`, a
 /// connection [`connect_raw`] made (`maki-attach nbd-disconnect`). A device
 /// without a connection needs nothing; any other connection is refused.

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::command::{capture, finish_by, Policy};
+use super::command::{capture, finish_by, step_deadline, Policy};
 
 /// Fixture directories are named by pid + wall clock; the clock can repeat
 /// within one process (coarse ticks), so a per-process sequence keeps them
@@ -214,4 +214,34 @@ fn child_fixture() {
         _ => panic!("unknown fixture scenario"),
     }
     std::process::exit(0);
+}
+
+/// A step the helper runs itself (the NBD connect and disconnect) ends at the
+/// step limit, or at the thread's `finish_by` deadline when that is sooner:
+/// the failed-start hook bounds its NBD disconnect that way.
+#[test]
+fn an_nbd_steps_deadline_is_the_step_limit_or_an_earlier_finish_by() {
+    let before = Instant::now();
+    let unbounded = step_deadline().unwrap();
+    assert!(
+        unbounded >= before + Policy::STEP.timeout
+            && unbounded <= Instant::now() + Policy::STEP.timeout,
+        "{:?}",
+        unbounded - before
+    );
+    let limit = Instant::now() + Duration::from_secs(1);
+    {
+        let _bounded = finish_by(limit);
+        assert_eq!(step_deadline().unwrap(), limit);
+    }
+    // A later finish_by deadline leaves the step limit.
+    {
+        let later = Instant::now() + Policy::STEP.timeout * 2;
+        let _bounded = finish_by(later);
+        assert!(step_deadline().unwrap() < later);
+    }
+    {
+        let _bounded = finish_by(Instant::now());
+        assert_eq!(step_deadline().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
 }

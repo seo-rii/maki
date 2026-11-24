@@ -212,14 +212,23 @@ fn expected() -> Vec<(&'static str, String, bool)> {
     ]
 }
 
-/// Skip with `reason`, or fail when the headers are required.
-fn unavailable(reason: &str, required: bool) -> Result<(), String> {
+/// The notice of a check that cannot run for `reason`, or the failure when
+/// the headers are required. Deciding prints nothing: the root runner lists
+/// every printed skip notice, and the test of this decision skips nothing.
+fn skip_notice(reason: &str, required: bool) -> Result<String, String> {
     if required {
         return Err(format!(
             "{REQUIRE}=1 requires the NBD header check, but {reason}"
         ));
     }
-    eprintln!("skipping the NBD UAPI header check: {reason} (set {REQUIRE}=1 to fail instead)");
+    Ok(format!(
+        "skipping the NBD UAPI header check: {reason} (set {REQUIRE}=1 to fail instead)"
+    ))
+}
+
+/// Skip with `reason`, or fail when the headers are required.
+fn unavailable(reason: &str, required: bool) -> Result<(), String> {
+    eprintln!("{}", skip_notice(reason, required)?);
     Ok(())
 }
 
@@ -305,8 +314,9 @@ fn the_constants_match_the_installed_kernel_headers() {
 
 #[test]
 fn missing_headers_fail_only_when_they_are_required() {
-    assert!(unavailable("a header is missing", false).is_ok());
-    let error = unavailable("a header is missing", true).unwrap_err();
+    let notice = skip_notice("a header is missing", false).unwrap();
+    assert!(notice.contains("a header is missing"), "{notice}");
+    let error = skip_notice("a header is missing", true).unwrap_err();
     assert!(
         error.contains(REQUIRE) && error.contains("a header is missing"),
         "{error}"
