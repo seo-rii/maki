@@ -27,6 +27,10 @@ TimeoutStartSec=180
 User=maki
 Group=maki
 
+# nbdkit by absolute path, never by bare name: systemd would resolve one
+# through /usr/local/sbin and /usr/local/bin first, and whatever it found
+# there would receive the crypto credential below. This is Debian's path; the
+# RPM installs the unit with /usr/sbin/nbdkit (RHEL 9's nbdkit-server).
 ExecStart=/usr/bin/nbdkit \
     --foreground \
     -U /run/maki/%i/nbd.sock \
