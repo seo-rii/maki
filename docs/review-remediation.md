@@ -17,7 +17,7 @@ proposed PR fixes from remote-main changes and combined qualification.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
-## Eighth round (2026-11-24): AUD-159–AUD-179
+## Eighth round (2026-11-24): AUD-159–AUD-180
 
 An eighth internal audit, of `main` at `956e354` (after the sixth and seventh
 rounds; also the commit of the first release candidate, `v0.1.0-rc.1`), was
@@ -31,20 +31,20 @@ sweeps and fuzzing. None of this lost or corrupted an acknowledged write or
 served wrong data. What they found is one finding of medium severity, AUD-161
 (on RHEL 9 the documented `dnf remove maki` under an attached volume kept Maki
 and erased the packages it needs), and otherwise low-severity findings and
-wrong statements in the documents. Nine pull requests,
+wrong statements in the documents. Ten pull requests,
 [#379](https://github.com/seo-rii/maki/pull/379) to
-[#387](https://github.com/seo-rii/maki/pull/387), were merged into `main` on
+[#388](https://github.com/seo-rii/maki/pull/388), were merged into `main` on
 2026-11-24 (#380 at `9dd523b`, #381 at `6d8b2f9`, #379 at `d888fbf`, #384 at
 `02b1471`, #383 at `bf8e926`, #382 at `03a329d`, #385 at `d31aaf2`, #386 at
-`27cc86e`, #387 at `e12dafd`). Three change documented design decisions
+`27cc86e`, #387 at `e12dafd`, #388 at `d5ca5c1`). Three change documented design decisions
 (AUD-159 to AUD-161), and each of those rows states the earlier behaviour,
 what replaced it and what is kept; AUD-159 closes an item of the fifth and
 sixth rounds' open list, and AUD-162 and AUD-172 each change one earlier rule
 and say so. AUD-162 to AUD-165 are the helper's NBD connection, AUD-166 to
 AUD-168 its messages, AUD-169 and AUD-170 volume creation, AUD-171 the A/B
 records, AUD-172 remote enrollment, AUD-173 to AUD-175 packaging and release
-tooling, AUD-176 to AUD-178 the documentation, and AUD-179 what CI found in
-this round's own pull requests. Every code fix landed test-first. All rows are
+tooling, AUD-176 to AUD-178 the documentation, AUD-179 what CI found in
+this round's own pull requests, and AUD-180 the randomized tests. Every code fix landed test-first. All rows are
 **Fixed**; AUD-165 and the precaution of AUD-178 rest on reading and were not
 exercised on a real host, which the open list keeps. No change alters a record
 format or a golden vector: AUD-170 adds one transient file name,
@@ -53,11 +53,12 @@ held torn bytes, which every release reads as an invalid copy. The
 operator-visible changes are listed in the
 [changelog](../CHANGELOG.md#breaking-changes).
 
-Every pull request was read before it merged, and no reading found a blocking
-defect. #380 and #384 had no independent review: their diffs were read by the
+Every pull request was read before it merged. One reading found a blocking
+defect, in #388, which was fixed before the merge (AUD-180); no other did.
+#380 and #384 had no independent review: their diffs were read by the
 maintainer who merged them, and #384 also had its `rhel9` job. Review led to
-new commits for four of the others: before the merge in #379, #382 and #387,
-and for #383 in #385. In #379 it widened the scan for a guide that has `sudo`
+new commits for five of the others: before the merge in #379, #382, #387 and
+#388, and for #383 in #385. In #379 it widened the scan for a guide that has `sudo`
 select a user, limited the check of the `runuser` form to commands, corrected
 what the document suite says about its own pins, narrowed a root-target
 exemption and added the callback lock to SPEC §6 (AUD-176 to AUD-178). In #382
@@ -70,8 +71,13 @@ merged as reviewed, and its three follow-ups landed with #385: a test that
 pins the real look at a negotiated connection in the negative direction, a
 timing window in the root-only kernel test, and a comment's wording (AUD-162,
 AUD-165). In #387 two reviews each found a regression of the change itself,
-fixed before the merge (AUD-172). CI found three things that the local runs
-had not (AUD-179). This records change,
+fixed before the merge (AUD-172). In #388 it found that the change had moved
+coverage of the durability sweeps instead of only adding it: with every seed
+on a three-record journal segment, no workload ended with more than three
+unsynced records any more. Each seed now takes one of three segments, and
+the sweeps assert both properties; that fix was read, not reviewed again
+independently (AUD-180). CI found three things that the local runs had not
+(AUD-179). This records change,
 [#389](https://github.com/seo-rii/maki/pull/389), adds what the review of #386
 left for the documents: where the emptying step of AUD-171 can fail for want
 of space, and what it assumes of the backing filesystem.
@@ -81,7 +87,8 @@ the changed crates' suites and the dependents that exercise the change, strict
 Clippy, `cargo fmt --check`, the Python suites and the link checker, with
 fails-before runs of the test commits and mutation checks. #382 also ran its
 release gate, #386 four of maki-core's extended gates, one at a time in the
-debug profile and two rebases before its head, and #384 a replay of the whole
+debug profile and two rebases before its head, #388 six release gates, and
+after review again the three whose sweeps it changed, and #384 a replay of the whole
 `rhel9` job in a CentOS Stream 9 root. #381 and #383 ran against nbdkit 1.36.3
 with Maki's plugin, and #381 against stock clients (libnbd, `qemu-io`,
 `qemu-img`, `nbdcopy`). #382 killed a real `maki volume create` 240 times, and
@@ -132,7 +139,7 @@ run.
 
 | ID | Finding | Fix | Regression | PR |
 |---|---|---|---|---|
-| AUD-171 | Two interrupted stores of an A/B record could add up to a valid copy of the first one. A store that a power loss cuts leaves its target side invalid; recovery falls back to the other side, and the next store targets the same side again with the same generation, one above the other side's. `AbStore` wrote that record in place. Two records with the same generation begin with the same bytes (magic, version, generation) and share every part of the payload that did not change. When the first cut kept every sector of its record except the shared ones and the second cut kept only the shared ones, the side held the earlier record complete, with a valid CRC, and `load` selected it by generation, although every recovery in between had found that side invalid: metadata the volume had moved on from came back, and no store of it was ever acknowledged. It needs a record longer than one torn-write unit. On the crash model with a 2080-byte allocation map and 512-byte sectors: side A holds the acknowledged value 34 at generation 3; a store of 37 to side B is cut and loses only its first sector; a store of 43 is cut when only its first sector has reached the disk; the pair then loads 37. Latent: the audit's sweeps revived attempts this way and found no acknowledged record lost or regressed. | In `AbStore::store_with_images`, after the preserve-first step and before the generation is advanced, a target that exists but does not decode is truncated to zero length and that is synced (`fdatasync`) before the record is written. From then on a cut leaves the side empty, partly the new record with zeros elsewhere, or the new record, never bytes of an earlier attempt; if power is lost before that sync returns, nothing of the new record exists yet. The truncation is issued and synced on every attempt, also when the file already reads as empty, because a truncation whose sync failed is not known to be on the disk. A target that decodes is opened and overwritten as before, and one that does not exist is created. Kept: the preserve-first rule, and the decision not to empty a target whose sync failed (BUG-001, which subsumed N-09). Only a side that does not decode is emptied, and only before it is written. The pull request checked by reading that every A/B user stores through this function. One side has since come to be written another way: the first superblock copy of a new volume is staged as `superblock.next` and renamed (AUD-170); that side does not exist beforehand, so the rule does not concern it. One error path changed with the order of the steps: a target that cannot be opened now fails the store before the caller's record takes the new generation, where the generation was advanced first. SPEC §43 states the rule as MUST, and the [architecture guide](architecture.md) describes it. **Behaviour change:** a store whose target exists and does not decode issues one truncation and one `fdatasync` more, and fails if that sync fails. After a power loss during such a store the side can be found empty where it held torn bytes. Emptying frees the side's blocks and the write allocates them again, so on a filesystem with no free block that store can fail with `ENOSPC` where the overwrite in place needed no new space; the other copy is untouched and the side stays invalid. The review injected `ENOSPC` into that write, at a checkpoint and at an attach whose checkpoint-state side was torn: both failed with an error, acknowledged data stayed readable, and both succeeded once space returned. The rule relies on what the journal's tail truncation and the shard data files already rely on: a synced truncation is durable, and a file grown after it reads as zeros where nothing was written. A filesystem that can show old blocks in a file after a crash does not give that; SPEC §43 and the [support matrix](deployment/support-matrix.md#backing-store-below-maki) state the assumption since this record was written (the open list). | maki-format `review_ab_torn_reuse.rs`, on the crash model: `a_second_cut_store_does_not_complete_the_first`, `chains_of_cut_stores_never_revive_an_attempt_a_power_loss_lost` (500 seeded chains of cut stores of a 2080-byte map on 512-byte sectors), `a_truncation_whose_sync_failed_is_repeated_before_the_side_is_written` and `only_a_side_that_does_not_decode_is_emptied_first` (the operations of a store for a decodable, an undecodable and an absent target), which failed before; `seeded_chains_never_lose_regress_or_revive_a_record` (checkpoint state, the catalog and the map over five torn-write units) passed before and after. These tests pin a revived attempt for the 2080-byte map only. A sweep in review that was not committed (40,000 seeds for each of 18 combinations of record type and torn-write unit, and the durable proof through `advance`) passed with the fix and reported revived attempts on the store as it was for checkpoint state, three map sizes and the proof. The key canary and the superblock are covered by the shared code path, not by a test of their own | [#386](https://github.com/seo-rii/maki/pull/386) |
+| AUD-171 | Two interrupted stores of an A/B record could add up to a valid copy of the first one. A store that a power loss cuts leaves its target side invalid; recovery falls back to the other side, and the next store targets the same side again with the same generation, one above the other side's. `AbStore` wrote that record in place. Two records with the same generation begin with the same bytes (magic, version, generation) and share every part of the payload that did not change. When the first cut kept every sector of its record except the shared ones and the second cut kept only the shared ones, the side held the earlier record complete, with a valid CRC, and `load` selected it by generation, although every recovery in between had found that side invalid: metadata the volume had moved on from came back, and no store of it was ever acknowledged. It needs a record longer than one torn-write unit. On the crash model with a 2080-byte allocation map and 512-byte sectors: side A holds the acknowledged value 34 at generation 3; a store of 37 to side B is cut and loses only its first sector; a store of 43 is cut when only its first sector has reached the disk; the pair then loads 37. Latent: the audit's sweeps revived attempts this way and found no acknowledged record lost or regressed. | In `AbStore::store_with_images`, after the preserve-first step and before the generation is advanced, a target that exists but does not decode is truncated to zero length and that is synced (`fdatasync`) before the record is written. From then on a cut leaves the side empty, partly the new record with zeros elsewhere, or the new record, never bytes of an earlier attempt; if power is lost before that sync returns, nothing of the new record exists yet. The truncation is issued and synced on every attempt, also when the file already reads as empty, because a truncation whose sync failed is not known to be on the disk. A target that decodes is opened and overwritten as before, and one that does not exist is created. Kept: the preserve-first rule, and the decision not to empty a target whose sync failed (BUG-001, which subsumed N-09). Only a side that does not decode is emptied, and only before it is written. The pull request checked by reading that every A/B user stores through this function. One side has since come to be written another way: the first superblock copy of a new volume is staged as `superblock.next` and renamed (AUD-170); that side does not exist beforehand, so the rule does not concern it. One error path changed with the order of the steps: a target that cannot be opened now fails the store before the caller's record takes the new generation, where the generation was advanced first. SPEC §43 states the rule as MUST, and the [architecture guide](architecture.md) describes it. **Behaviour change:** a store whose target exists and does not decode issues one truncation and one `fdatasync` more, and fails if that sync fails. After a power loss during such a store the side can be found empty where it held torn bytes. Emptying frees the side's blocks and the write allocates them again, so on a filesystem with no free block that store can fail with `ENOSPC` where the overwrite in place needed no new space; the other copy is untouched and the side stays invalid. The review injected `ENOSPC` into that write, at a checkpoint and at an attach whose checkpoint-state side was torn: both failed with an error, acknowledged data stayed readable, and both succeeded once space returned. The rule relies on what the journal's tail truncation and the shard data files already rely on: a synced truncation is durable, and a file grown after it reads as zeros where nothing was written. A filesystem that can show old blocks in a file after a crash does not give that; SPEC §43 and the [support matrix](deployment/support-matrix.md#backing-store-below-maki) state the assumption since this record was written (the open list). | maki-format `review_ab_torn_reuse.rs`, on the crash model: `a_second_cut_store_does_not_complete_the_first`, `chains_of_cut_stores_never_revive_an_attempt_a_power_loss_lost` (500 seeded chains of cut stores of a 2080-byte map on 512-byte sectors), `a_truncation_whose_sync_failed_is_repeated_before_the_side_is_written` and `only_a_side_that_does_not_decode_is_emptied_first` (the operations of a store for a decodable, an undecodable and an absent target), which failed before; `seeded_chains_never_lose_regress_or_revive_a_record` (checkpoint state, the catalog and the map over five torn-write units) passed before and after. These tests pin a revived attempt for the 2080-byte map only; AUD-180 adds two that do for 4096- and 9000-byte maps, the durable proof and checkpoint state, and an ignored gate. A sweep in review that was not committed (40,000 seeds for each of 18 combinations of record type and torn-write unit, and the durable proof through `advance`) passed with the fix and reported revived attempts on the store as it was for checkpoint state, three map sizes and the proof. The key canary and the superblock are covered by the shared code path, not by a test of their own | [#386](https://github.com/seo-rii/maki/pull/386) |
 
 ### Remote enrollment
 
@@ -161,10 +168,11 @@ run.
 | ID | Finding | Fix | Regression | PR |
 |---|---|---|---|---|
 | AUD-179 | CI stopped three of this round's pull requests for things their authors' runs had not shown. #383 failed strict Clippy on the baseline toolchain, 1.94.0, which refuses `!deadline.is_some_and(..)` as a boolean that can be simplified (`clippy::nonminimal_bool`); newer toolchains do not report it. #382 failed strict Clippy on the latest stable, 1.100.0, which deprecates `fetch_update` for `try_update`, a method that is not stable on the baseline toolchain. #385's new test of the built helper required every executing verb run without root to be refused at the attach state directory; `verify` never creates that directory, so on CI's clean runner it names the directory as missing, and the test had passed locally only because an earlier run had left `/run/maki-attach` behind. | Each was fixed with a new commit before the merge: the deadline check reads `deadline.is_none_or(..)` with no change in behaviour (`5b87839`), the test's counter is a compare-exchange loop that builds on both toolchains (`5b604e4`), and the helper test expects the missing-directory line for `verify` when the directory does not exist (`8db5e71`). The last led the pull request to run the helper's cases that depend on the caller's privilege as an unprivileged user with and without the directory, with an empty `/run` in a private mount namespace. The development guide gains three traps: run strict Clippy on both toolchains before pushing; a test that passes as root, or because of what an earlier run left on the host, says nothing about CI's unprivileged run on a clean host; and AUD-160's rule for a capability that nbdkit asserts. | The `pr` and `latest-stable` jobs, which run strict Clippy on 1.94.0 and on the latest stable; `an_executing_verb_without_root_names_the_state_directory_and_root` (maki-attach `review_attach_messages.rs`) with and without the directory | [#383](https://github.com/seo-rii/maki/pull/383), [#382](https://github.com/seo-rii/maki/pull/382), [#385](https://github.com/seo-rii/maki/pull/385) |
+| AUD-180 | Five gaps in the randomized tests. (1) `review_r3b_durability.rs` and `review_trim_power_loss.rs` said that a tiny journal makes automatic rolls and checkpoints happen constantly, but the constant they called the journal's size was the shard size and the engine ran with the default 256 MiB segment: on the committed seeds no workload of either file, and none of the release gates built on them, rolled the journal once. (2) A sync-fault sweep could not be run again from its seed: the sweeps fail a sync chosen by a seeded generator, one draw per sync, and the slot store wrote the allocation maps, discard maps and data-file sizes of several shards in the iteration order of a `HashMap`, so the same draw met a different file from one run to the next. (3) `deep_check_reports_allocation_repair_and_idle_checkpoint_persists_it` needed a stale allocation-map copy and left that to its workload: it passed for its hard-coded seed and failed at its precondition for others, and it did not check that the repair was persisted. (4) The decoder fuzz target `format_decoders` lacked the durable proof and the volume superblock envelope, and since every decoder checks a CRC-32 before it reads a field, from an empty corpus it reached almost no image behind a checksum. (5) The rule of AUD-171 was pinned for the 2080-byte map only. | The sweeps' seeds take turns between three journal segments: the default one (no rolls, long unsynced tails), one of three records (constant rolls) and one of sixteen (some of each) (`segment_for`). The first version gave every seed the three-record segment; review found that a roll seals and syncs the segment it leaves, so no workload then ended with more than three unsynced records, where about a third of the sequential sweep's power losses and restarts had (119 of 332, up to 39 records; 52 of 147, up to 50). The sweeps now return their rolls and the workloads that end in a power loss or a restart with more than three unsynced records, and every default-suite sweep and gate asserts a minimum of each below the measured count. The slot store writes the metadata of several shards in ascending shard order (`crates/maki-core/src/store.rs`, four lists); the shards are independent and the commit points come after the loops, so nothing a volume can observe changes, which the review confirmed. The deep-check test makes the stale copy itself, runs for four seeds and requires the repaired bit in both map copies after the idle checkpoint. `format_decoders` gains the two decoders, and a new target, `format_records`, repairs the checksum first and requires every accepted record to encode within its type's bound and to decode to the same record again. The chain test of AUD-171 is generic over the record, with two more tests that fail on the store as it was before the rule, and an ignored release gate. | `a_sync_fault_sweep_runs_the_same_way_twice_from_one_seed` and `adopted_orphans_are_sized_in_shard_order` (maki-core `review_r3b_durability.rs`), `a_sync_fault_sweep_without_the_worker_runs_the_same_way_twice_from_one_seed` (`review_trim_power_loss.rs`), the roll and long-tail minimums asserted by the sweeps of both files and by `phase_r3b_durability_gate_full`, `phase_r3b_concurrent_gate_full` and `trim_power_loss_gate_full`, `deep_check_reports_allocation_repair_and_idle_checkpoint_persists_it` (`review_corruption.rs`), `chains_of_cut_stores_never_revive_a_record_of_a_page_or_more`, `chains_of_cut_stores_never_revive_a_durable_proof_or_checkpoint_state` and the gate `ab_torn_reuse_gate_full` (maki-format `review_ab_torn_reuse.rs`); the fuzz target `format_records` | [#388](https://github.com/seo-rii/maki/pull/388) |
 
 ### Not closed in the eighth round
 
-Each item was checked against `main` at `e12dafd`, with the nine pull requests
+Each item was checked against `main` at `d5ca5c1`, with the ten pull requests
 merged.
 
 - Nothing in this round ran on a real kernel NBD device outside the three
@@ -196,7 +204,9 @@ merged.
   of the netlink answer, where a root process parses bytes that the daemon and
   a netlink socket send. The seeded property tests of AUD-162
   (`nbd_kernel/property_tests.rs`) run both over random, cut and mutated input
-  in the unit suite; no fuzzer does.
+  in the unit suite; no fuzzer does. No seed corpus is committed for any
+  fuzz target, the decoders of `maki-backing`'s own records are in none, and
+  no CI job builds the fuzz crate (AUD-180).
 - The A/B rule of AUD-171 ran only on the in-memory crash model, not on a real
   filesystem or through a real power loss. A store that empties a torn side
   needs free blocks again and can fail with `ENOSPC` on a filesystem that has
@@ -211,7 +221,9 @@ merged.
   slot headers only when fewer than two copies of its allocation map are
   valid; that this is sound with the rule is an argument from the code, and no
   test of AUD-171 exercises the probe. The committed tests pin a revived
-  attempt for one record size.
+  attempt for three map sizes, the durable proof and checkpoint state
+  (AUD-171, AUD-180); the key canary and the superblock only through the
+  shared code path.
 - A remote creation that stops after its first activation is unchanged: the
   authority is enrolled by then, and neither AUD-159 nor AUD-172 applies. A
   `remote.enrollment` that an older binary wrote in place and left empty or
@@ -227,6 +239,11 @@ merged.
   enrolled into by `create` when the backing committed nothing, which the new
   message warns about; and a refused `create` leaves a `witness.lock` in such
   a directory.
+- The trim sweep is still not repeatable from a seed while its background
+  checkpoint worker runs: reclamation and the workload's requests reach the
+  backing in an order the scheduling of the two tasks decides, and only the
+  repeatability test stops the worker. The concurrent sweep is not repeatable
+  by design (AUD-180).
 - `v0.1.0-rc.1` predates every change of this round, and no later release
   candidate had been tagged when this was written: its RPM has neither the dnf
   protection nor the provides (AUD-161, AUD-173), its plugin does not
@@ -3013,7 +3030,8 @@ The first group needs a design decision.
 - **Test tooling.** A directory sync also makes the directory's own entry
   durable; the HTTP chaos server merges
   repeated headers; the fuzz targets omit `DurableProof`, the witness decoders
-  and the privileged mountinfo parsers.
+  and the privileged mountinfo parsers. *Since AUD-180 the format targets
+  cover `DurableProof`.*
 
 Later update (2026-11-17): the guarded response JSON tree now keeps only the
 values the response mapping reads (AUD-024,
@@ -3053,6 +3071,8 @@ items of the list have since been fixed, in whole or in part:
   splits its records through the `probe::mount_record` that target reaches.
   The allocation, detach and recovery observations built on that splitter,
   `DurableProof` and the witness decoders still have no fuzz target.
+  *Since AUD-180 the format targets cover `DurableProof`; the witness
+  decoders still have none.*
 
 One more setting belongs to the list's "validated but not applied" group and
 is still open: `cache.zeroize_on_evict` is accepted but never read. The
