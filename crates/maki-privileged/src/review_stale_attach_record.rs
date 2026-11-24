@@ -717,7 +717,7 @@ impl System for Host {
             Ok(())
         })
     }
-    fn wait_ready(&mut self, _: &PlannedStep, _: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, _: &str, _: &str) -> Result<(), ExecError> {
         Ok(())
     }
     fn allocate(&mut self) -> Result<String, ExecError> {
@@ -909,7 +909,7 @@ impl System for KernelView {
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         self.0.run_step(step, identifier)
     }
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.0.wait_ready(step, device)
     }
     fn allocate(&mut self) -> Result<String, ExecError> {

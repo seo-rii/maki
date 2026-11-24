@@ -166,7 +166,7 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
             device,
             block_size,
             identifier,
-            |_, _| {
+            |_, _, _| {
                 connected = true;
                 Ok(())
             },
@@ -185,7 +185,7 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
         "/dev/nbd4",
         512,
         OURS,
-        |step, identifier| {
+        |step, identifier, _| {
             steps.push((step.clone(), identifier.to_string()));
             std::fs::write(sysfs.join("nbd4/pid"), "4242\n").unwrap();
             std::fs::write(sysfs.join("nbd4/backend"), format!("{identifier}\n")).unwrap();
@@ -212,10 +212,116 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
         "/dev/nbd5",
         4096,
         OURS,
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
     .unwrap_err();
     assert!(error.to_string().contains("shows no connection"), "{error}");
+}
+
+/// Run `action` and return what it logged.
+fn logged<T>(action: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, action);
+    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    (result, text)
+}
+
+/// A plan cannot know the backend identifier of a connect, which is made
+/// for each attach, and prints a placeholder. The executed step sends a real
+/// one, and its log line and its errors name that one: it is what
+/// `/sys/block/nbdN/backend` shows, and what `nbd-disconnect` must be given.
+#[test]
+fn an_executed_connect_names_the_identifier_it_sends() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const SOCKET: &str = "/run/maki/pg/nbd.sock";
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let step = PlannedStep::NbdConnect {
+        socket: SOCKET.into(),
+        device: "/dev/nbd4".into(),
+        block_size: 4096,
+    };
+    let planned = step.to_string();
+    assert!(
+        planned.contains("backend identifier '<generated-connection-uuid>'"),
+        "{planned}"
+    );
+    let executed = planned.replace("<generated-connection-uuid>", OURS);
+
+    // The step itself: netlink sockets are refused here, so it fails.
+    let (result, log) = logged(|| run_step(&step, Some(OURS)));
+    match result {
+        Err(ExecError::Step { step, .. }) => assert_eq!(step, executed),
+        other => panic!("{other:?}"),
+    }
+    assert!(log.contains(&format!("maki-attach: {executed}")), "{log}");
+    assert!(!log.contains("generated-connection-uuid"), "{log}");
+
+    // `nbd-connect` waits for the device as an attach does: that wait is
+    // given the same line for its error.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd4", false, None)]);
+    let error = connect_raw_with(
+        &sysfs,
+        &BTreeMap::new(),
+        SOCKET,
+        "/dev/nbd4",
+        4096,
+        OURS,
+        |_, _, executed| {
+            Err(ExecError::Step {
+                step: executed.to_string(),
+                message: "/dev/nbd4 did not become ready".into(),
+            })
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Step { step, .. } if *step == executed),
+        "{error}"
+    );
+}
+
+/// An attach makes its identifier itself, so the line of its failed connect
+/// is the only place that says which connection the attach was.
+#[test]
+fn an_attach_whose_device_never_becomes_ready_names_its_identifier() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        readiness_failure: true,
+        ..Default::default()
+    };
+    let error = execute_with(&plan_attach(&request()), Some(&state), &mut system)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("fixture readiness timeout"), "{error}");
+    let identifier = error
+        .split_once("backend identifier '")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(identifier, _)| identifier)
+        .unwrap_or_else(|| panic!("no identifier in {error}"));
+    let nonce = identifier
+        .strip_prefix("maki-")
+        .unwrap_or_else(|| panic!("{identifier} is not an attach's identifier: {error}"));
+    crate::config::check_uuid("connection_id", nonce)
+        .unwrap_or_else(|reason| panic!("{identifier}: {reason}"));
 }
 
 /// `nbd-disconnect` disconnects only the connection it names: a device that
@@ -576,7 +682,7 @@ impl System for InventorySystem {
         let result = self.inner.run_step(step, identifier);
         self.settle(result)
     }
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.inner.wait_ready(step, device)
     }
     fn allocate(&mut self) -> Result<String, ExecError> {
@@ -933,9 +1039,13 @@ impl System for FakeSystem {
         Ok(())
     }
 
-    fn wait_ready(&mut self, _step: &PlannedStep, _device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, _device: &str) -> Result<(), ExecError> {
         if self.readiness_failure {
-            Err(identity_error("fixture readiness timeout"))
+            // Like the real wait, the failure names the step it was given.
+            Err(ExecError::Step {
+                step: step.to_string(),
+                message: "fixture readiness timeout".into(),
+            })
         } else {
             Ok(())
         }
@@ -1987,7 +2097,7 @@ impl System for ReviewForeignMountSystem {
         }
     }
 
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.inner.wait_ready(step, device)
     }
 
@@ -2221,7 +2331,7 @@ impl System for ObservedSystem {
         }
         result
     }
-    fn wait_ready(&mut self, s: &PlannedStep, d: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, s: &str, d: &str) -> Result<(), ExecError> {
         self.fake.wait_ready(s, d)
     }
     fn allocate(&mut self) -> Result<String, ExecError> {

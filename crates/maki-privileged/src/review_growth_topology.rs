@@ -79,7 +79,7 @@ impl System for GrowthSystem {
         Ok(())
     }
 
-    fn wait_ready(&mut self, _: &PlannedStep, _: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, _: &str, _: &str) -> Result<(), ExecError> {
         panic!("no device readiness in growth")
     }
     fn allocate(&mut self) -> Result<String, ExecError> {

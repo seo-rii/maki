@@ -240,7 +240,9 @@ pub fn allocate_nbd_device() -> Result<String, ExecError> {
     allocation::allocate(Path::new("/sys/class/block"), Path::new(MOUNTINFO))
 }
 
-fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+/// Wait until `device` shows the connection that `step`, the connect
+/// step as it reports itself, made.
+fn wait_nbd_ready(step: &str, device: &str) -> Result<(), ExecError> {
     let Some(n) = nbd_index(device) else {
         return Err(ExecError::Step {
             step: step.to_string(),
@@ -793,16 +795,18 @@ pub fn connect_raw(
         device,
         block_size,
         identifier,
-        |step, identifier| {
+        |step, identifier, executed| {
             run_step(step, Some(identifier))?;
-            wait_nbd_ready(step, device)
+            wait_nbd_ready(executed, device)
         },
     )
 }
 
 /// [`connect_raw`] on the device tree `sysfs` with the devices trusted
 /// records name (`reserved`): everything is checked before `connect`, which
-/// runs the connect step and waits for the device, is called.
+/// runs the connect step and waits for the device, is called. It is given
+/// the step, the identifier and the step as it reports itself, for the
+/// wait's error.
 fn connect_raw_with(
     sysfs: &Path,
     reserved: &BTreeMap<String, String>,
@@ -810,7 +814,7 @@ fn connect_raw_with(
     device: &str,
     block_size: u32,
     identifier: &str,
-    connect: impl FnOnce(&PlannedStep, &str) -> Result<(), ExecError>,
+    connect: impl FnOnce(&PlannedStep, &str, &str) -> Result<(), ExecError>,
 ) -> Result<(), ExecError> {
     let refused = |error: crate::config::ConfigError| identity_error(error.to_string());
     crate::config::check_raw_identifier(identifier).map_err(refused)?;
@@ -823,7 +827,7 @@ fn connect_raw_with(
         device: device.into(),
         block_size,
     };
-    connect(&step, identifier)?;
+    connect(&step, identifier, &step.to_string())?;
     if !raw_backend_is(sysfs, device, identifier)? {
         return Err(identity_error(format!(
             "{device} shows no connection after the connect was acknowledged"
@@ -1058,7 +1062,9 @@ trait System {
     /// real system prints.
     fn announce_bound_device(&mut self, _device: &str) {}
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
+    /// Wait for `device` after its connect step ran; `step` is that step as
+    /// it reports itself, for the error.
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
     /// A free device that is none of `reserved`, the devices other volumes'
     /// trusted records name. An implementation that knows only `allocate`
@@ -1180,7 +1186,7 @@ impl System for LinuxSystem {
         run_step(step, identifier)
     }
 
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         wait_nbd_ready(step, device)
     }
 
@@ -1645,7 +1651,7 @@ fn connect_recorded(
         let busy = match system.run_step(&step, Some(&record.connection_id)) {
             Ok(()) => {
                 return system
-                    .wait_ready(&step, device)
+                    .wait_ready(&step.to_string(), device)
                     .and_then(|()| verify_connection(record, system))
             }
             Err(busy @ ExecError::DeviceBusy { .. }) => busy,
