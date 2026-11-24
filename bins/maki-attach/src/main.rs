@@ -597,3 +597,71 @@ fn main() -> ExitCode {
         ExitCode::from(3)
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::attach_config;
+
+    const CONFIG: &str =
+        "volume_uuid = \"0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c\"\nvg_name = \"vg_custom\"\n";
+
+    /// Without `--config` a verb reads `/etc/maki/attach/<volume>.toml` when
+    /// it exists and runs on the built-in defaults otherwise. Only "does not
+    /// exist" selects the defaults: a path that cannot be examined, or that
+    /// names a link to nothing, may hide a configuration, and a plan from the
+    /// defaults would then show another attachment than the configured one.
+    #[test]
+    fn only_a_default_path_that_does_not_exist_selects_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("attach/pg.toml");
+        assert_eq!(attach_config(&absent, false, true).unwrap().vg_name, None);
+
+        let present = dir.path().join("pg.toml");
+        std::fs::write(&present, CONFIG).unwrap();
+        assert_eq!(
+            attach_config(&present, false, true)
+                .unwrap()
+                .vg_name
+                .as_deref(),
+            Some("vg_custom")
+        );
+
+        // A path through a file: no directory to look in.
+        let beyond = present.join("pg.toml");
+        let dangling = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), &dangling).unwrap();
+        for path in [&beyond, &dangling] {
+            for plan_only in [true, false] {
+                let error = attach_config(path, false, plan_only)
+                    .expect_err("the verb went on with the built-in defaults");
+                assert!(error.contains(path.to_str().unwrap()), "{error}");
+            }
+        }
+    }
+
+    /// A caller who may not search the directory cannot tell whether a
+    /// configuration exists: `--plan` as an unprivileged user printed the
+    /// plan of the defaults, with status 0, beside a root-only
+    /// `/etc/maki/attach`.
+    #[test]
+    fn a_default_path_the_caller_may_not_examine_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            // No directory's mode refuses root: nothing to check.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let closed = dir.path().join("attach");
+        std::fs::create_dir(&closed).unwrap();
+        let path = closed.join("pg.toml");
+        std::fs::write(&path, CONFIG).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = attach_config(&path, false, true);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.expect_err("planned from the built-in defaults");
+        assert!(error.contains(path.to_str().unwrap()), "{error}");
+        assert!(error.contains("Permission denied"), "{error}");
+    }
+}
