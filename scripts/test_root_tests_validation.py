@@ -53,6 +53,9 @@ NOT_ROOT_ONLY = {
         "one case skips as root, where the verb would really run",
     "bins/maki/tests/remote_admin.rs":
         "drops CAP_DAC_OVERRIDE when it happens to run as root and asserts the same either way",
+    "bins/maki/src/main.rs":
+        "asserts the text of the ownership hint, which names chown; the case passes the "
+        "privilege as an argument and never asks for its own",
     "crates/maki-backing/src/creation_owner_tests.rs":
         "two cases skip as root, which may give files away; the others use the running user",
     "crates/maki-backing/src/root_directory_tests.rs":
