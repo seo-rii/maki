@@ -55,13 +55,18 @@ service during install, upgrade or removal.
 
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
+Conflicts: nbdkit-selinux
 ```
 
 `nbdkit-server` provides `/usr/sbin/nbdkit`; the `nbdkit` metapackage would
 add plugins and filters Maki does not use and, on a host with the targeted
 SELinux policy, the `nbdkit-selinux` module, under which the policy lets
 systemd neither execute nbdkit nor transition to its domain
-([SELinux](../../docs/getting-started/installation-rhel.md#selinux)).
+([SELinux](../../docs/getting-started/installation-rhel.md#selinux)). The
+conflict makes dnf refuse that module, also when a later transaction would
+pull it in, instead of leaving `maki@` unable to start under enforcing
+SELinux; the price is that Maki cannot be installed beside it (libvirt and
+virt-v2v hosts, or hosts with SELinux off, where it would be harmless).
 nbd-client is not required.
 
 rpm adds the binaries' shared-library requirements itself (`libc.so.6`,

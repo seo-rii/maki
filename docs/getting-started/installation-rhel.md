@@ -49,12 +49,14 @@ requirements and the builder the owner of their ELF loader (`glibc`):
 
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
+Conflicts: nbdkit-selinux
 ```
 
 so `dnf install ./maki.rpm` installs whatever of them is missing from
-BaseOS and AppStream. Install `nbdkit-server`, not the `nbdkit` metapackage,
-which also installs an SELinux module that by its rules stops systemd from
-starting nbdkit ([SELinux](#selinux)).
+BaseOS and AppStream. It requires `nbdkit-server`, not the `nbdkit`
+metapackage, and conflicts with the SELinux module the metapackage installs,
+which by the policy's rules stops systemd from starting nbdkit
+([SELinux](#selinux)).
 
 ## Repositories
 
@@ -218,10 +220,17 @@ What follows is read from the CentOS Stream 9 targeted policy
   systemd's `init_t` neither a transition for that type nor permission to
   execute it, so in enforcing mode systemd would be refused when it starts
   `maki@` (this follows from the policy; it was not observed). The Maki RPM
-  requires `nbdkit-server`, which does not install the module. Keep it so:
-  `rpm -q nbdkit-selinux` should report it is not installed, and
-  `ls -Z /usr/sbin/nbdkit` should show `bin_t`. A host that needs
-  `nbdkit-selinux` for libvirt is outside what this guide covers.
+  requires `nbdkit-server`, which does not install the module, and declares
+  `Conflicts: nbdkit-selinux`: dnf refuses to install Maki where the module
+  is installed, and refuses a later transaction that would add it (such as
+  `dnf install nbdkit`, or a package that requires the metapackage), naming
+  the conflict, rather than leaving `maki@` to fail at its next start, which
+  may be the next boot. The cost: Maki cannot be installed beside the module,
+  so neither a host that needs it for libvirt or virt-v2v nor one where
+  SELinux is permissive or disabled and the module would be harmless can run
+  Maki; both are outside what this guide covers. `dnf --allowerasing` would
+  resolve the conflict by removing Maki, which its `%preun` refuses while a
+  volume is attached. `ls -Z /usr/sbin/nbdkit` should show `bin_t`.
 
 Check the mode and look for denials after starting a volume:
 

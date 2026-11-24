@@ -38,6 +38,11 @@ Requires:       xfsprogs
 Requires:       util-linux
 Requires:       systemd >= 249
 Requires:       kmod
+# nbdkit-selinux labels /usr/sbin/nbdkit nbdkit_exec_t, and the targeted
+# policy then gives systemd neither a transition for that type nor permission
+# to execute it: maki@ could not start on an enforcing host. The nbdkit
+# metapackage pulls the module in; refuse it at install time instead.
+Conflicts:      nbdkit-selinux
 # The owner of the binaries' ELF interpreter on the build host (glibc):
 # rpm's dependency generator does not read PT_INTERP.
 %{?maki_loader_requires:Requires: %{maki_loader_requires}}

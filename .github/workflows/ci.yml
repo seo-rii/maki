@@ -307,6 +307,9 @@ jobs:
           for unwanted in nbdkit nbdkit-selinux; do
             if rpm -q "$unwanted"; then exit 1; fi
           done
+          # It conflicts with nbdkit-selinux: dnf refuses to add the module.
+          if dnf install --assumeno nbdkit-selinux > "$RUNNER_TEMP/selinux" 2>&1; then exit 1; fi
+          grep -q 'conflicts with nbdkit-selinux' "$RUNNER_TEMP/selinux"
           rpm -V maki
           getent passwd maki
           getent group maki-admin
