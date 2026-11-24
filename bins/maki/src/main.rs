@@ -573,7 +573,8 @@ fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Opt
     let arguments: Vec<String> = held.iter().map(|(_, path)| shell_word(path)).collect();
     Some(format!(
         "{} {} entries created owner-only by root; the daemon runs as the maki user and \
-         cannot open them. Run `maki volume create` as that user (sudo -u maki ...) or \
+         cannot open them. Run `maki volume create` as that user \
+         (`runuser -u maki -- maki volume create <config.toml>`) or \
          `chown -R maki:maki {}` before starting the service",
         named.join(" and "),
         if held.len() == 1 { "holds" } else { "hold" },
@@ -1125,5 +1126,48 @@ mod tests {
         })
         .await;
         assert_eq!(response, None);
+    }
+
+    /// The hint is read on hosts that have only what the package depends
+    /// on: `runuser` comes with util-linux, sudo with neither package.
+    #[test]
+    fn the_ownership_hint_reaches_the_daemon_user_without_sudo() {
+        let cfg = maki_format::config::parse_config(
+            r#"
+config_schema_version = 1
+
+[volume]
+name = "demo"
+max_virtual_size = "8GiB"
+device_block_size = 4096
+crypto_unit_size = 4096
+shard_logical_size = "1GiB"
+
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "local-aes-gcm-siv-v1"
+key = { source = "credential", name = "crypto-token" }
+
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+
+[backing]
+root = "/nonexistent/maki-ownership-hint"
+"#,
+        )
+        .unwrap();
+        // A backing root that cannot be described counts as root's.
+        let hint = ownership_hint(true, &cfg).expect("a hint for a root-owned tree");
+        assert!(
+            hint.contains("`runuser -u maki -- maki volume create <config.toml>`"),
+            "{hint}"
+        );
+        assert!(!hint.contains("sudo"), "{hint}");
+        assert!(
+            hint.contains("`chown -R maki:maki /nonexistent/maki-ownership-hint`"),
+            "{hint}"
+        );
+        assert_eq!(ownership_hint(false, &cfg), None);
     }
 }

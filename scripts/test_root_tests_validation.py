@@ -53,6 +53,9 @@ NOT_ROOT_ONLY = {
         "one case skips as root, where the verb would really run",
     "bins/maki/tests/remote_admin.rs":
         "drops CAP_DAC_OVERRIDE when it happens to run as root and asserts the same either way",
+    "bins/maki/src/main.rs":
+        "asserts the text of the ownership hint, which names chown; the case passes the "
+        "privilege as an argument and never asks for its own",
     "crates/maki-backing/src/creation_owner_tests.rs":
         "two cases skip as root, which may give files away; the others use the running user",
     "crates/maki-backing/src/root_directory_tests.rs":
@@ -62,6 +65,14 @@ NOT_ROOT_ONLY = {
     "crates/maki-privileged/tests/regression_mount_target.rs":
         "asserts more without root, and its fixtures live below CARGO_TARGET_TMPDIR, which "
         "a root run must leave to the unprivileged user",
+}
+
+# Sources of NOT_ROOT_ONLY that match only because a text their tests assert
+# spells a probe word, and that text. The exemption covers the text alone:
+# with it taken out, nothing in their test code may match, so a case added
+# there later that asks for its privilege or skips without root is seen.
+ASSERTED_TEXT_ONLY = {
+    "bins/maki/src/main.rs": "`chown -R maki:maki /nonexistent/maki-ownership-hint`",
 }
 
 INLINE_TESTS = re.compile(
@@ -86,6 +97,12 @@ def probing_sources():
                for directory in ROOT.glob(pattern) for path in directory.rglob("*.rs")]
     return sorted(path.relative_to(ROOT).as_posix() for path in sources
                   if PRIVILEGE_PROBE.search(unit_test_code(path)))
+
+
+def probes_beside_the_text(source, text):
+    """What the test code of `source` matches once the asserted `text` is taken out."""
+    code = unit_test_code(ROOT / source)
+    return [found.group(0) for found in PRIVILEGE_PROBE.finditer(code.replace(text, ""))]
 
 
 def targets_of(source):
@@ -142,6 +159,35 @@ class RootOnlyTargetsAreNotForgotten(unittest.TestCase):
             self.assertTrue((ROOT / source).is_file(), f"{source} is classified but gone")
             self.assertIn(source, probing, f"{source} no longer probes its privilege")
             self.assertTrue(reason)
+
+    def test_a_source_exempted_for_a_text_it_asserts_probes_nothing_else(self):
+        for source, text in ASSERTED_TEXT_ONLY.items():
+            with self.subTest(source=source):
+                self.assertIn(source, NOT_ROOT_ONLY)
+                self.assertIn(text, unit_test_code(ROOT / source),
+                              f"{source} no longer asserts the text its exemption is for")
+                self.assertEqual(probes_beside_the_text(source, text), [], (
+                    f"{source} is exempt only for the text it asserts. Its test code now "
+                    "probes its privilege as well: if a case skips without root, drop the "
+                    "source from NOT_ROOT_ONLY and ASSERTED_TEXT_ONLY and list its target in "
+                    "ROOT_TARGETS"))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bins" / "fixture" / "src" / "main.rs"
+            source.parent.mkdir(parents=True)
+            text = "`chown -R maki:maki /x`"
+            hint = ("fn main() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn hint() {\n"
+                    f'        assert!(super::hint().contains("{text}"));\n    }}\n')
+            with mock.patch.object(sys.modules[__name__], "ROOT", Path(directory)):
+                source.write_text(hint + "}\n")
+                self.assertRegex(unit_test_code(source), PRIVILEGE_PROBE)
+                self.assertEqual(probes_beside_the_text("bins/fixture/src/main.rs", text), [])
+                source.write_text(
+                    hint + "\n    #[test]\n    fn as_root() {\n"
+                    "        if unsafe { libc::geteuid() } != 0 {\n"
+                    '            eprintln!("needs root; skipping");\n            return;\n'
+                    "        }\n    }\n}\n")
+                self.assertEqual(probes_beside_the_text("bins/fixture/src/main.rs", text),
+                                 ["geteuid", "needs root"])
 
     def test_a_root_run_stays_out_of_the_build_tree_and_needs_no_native_plugin(self):
         # Entries a root run creates below CARGO_TARGET_TMPDIR stay root-owned

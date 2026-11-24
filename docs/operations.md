@@ -130,7 +130,7 @@ the daemon and run the command as that user:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/example
-sudo -u maki maki volume create /etc/maki/volumes/example.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/example.toml
 ```
 
 The backing filesystem must overwrite allocated blocks in place, or the

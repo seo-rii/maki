@@ -108,7 +108,8 @@ signatures=$(wipefs --no-act --noheadings --output TYPE "$dev")
 [[ -z $signatures ]] || die "Export already has signatures"
 pvcreate --devices "$dev" "$dev"
 verify_backend
-vgcreate --devices "$dev" "$vg" "$dev"
+# Only maki-attach activates this VG: LVM's own autoactivation skips it.
+vgcreate --devices "$dev" --setautoactivation n "$vg" "$dev"
 verify_backend
 lvcreate --devices "$dev" --type linear -L "$lv_size" -n "$lv" "$vg"
 
@@ -172,6 +173,30 @@ one device. Before formatting, the device-mapper UUID must contain the newly
 observed VG and LV UUIDs and its only backing device must be that NBD device.
 These checks assume a trusted root administrator; they cannot prevent another
 root process from replacing a mapping between a check and a command.
+
+The VG is created with LVM's autoactivation property off
+(`--setautoactivation n`, an option as old as `--devices`: LVM 2.03.12), as
+a precaution. `maki-attach` activates the VG itself, by its UUID and on the
+device it verified, and refuses an attach that finds a mapping of the VG
+already active, so nothing else should activate it. LVM's event activation,
+on by default in Debian 12 and RHEL 9 (`event_activation = 1`), runs
+`vgchange -aay` from a udev rule when a PV appears. For a device that is not
+a device-mapper, MD or loop device, that rule acts only on the device's
+`add` event, and a kernel NBD device that already exists gets `change`
+events when it is connected and disconnected, so the rule does not normally
+act on a Maki volume. It can when an `add` event of the device is handled
+while the export is connected: when the `nbd` module was loaded only just
+before the connect, which `maki-attach attach` does if the module is missing
+(the installation guides load it at boot), or when events are replayed with
+`udevadm trigger --action=add`. With the property off, `vgchange -aay` skips
+the VG. Plain activation ignores the property, so `lvcreate` above and the
+helper's own activation are unaffected. On RHEL 9, a devices file that does
+not list the NBD device already keeps LVM commands that pass no `--devices`,
+the rule's `pvscan` included, from using it
+([LVM devices file](installation-rhel.md#the-lvm-devices-file)). This is read
+from the udev rules and manual pages that Debian 12 (LVM 2.03.16) and RHEL 9
+(LVM 2.03.33) ship, from the LVM 2.03.16 sources and from the kernel's NBD
+driver; none of it has been exercised on a host.
 
 The LV is deliberately smaller than the exported device. `maki-attach grow`
 later expands the LV within its VG and grows XFS; the export size is fixed at

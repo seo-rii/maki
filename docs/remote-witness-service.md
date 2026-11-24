@@ -25,7 +25,7 @@ directory that account owns:
 
 ```sh
 install -d -o maki-witness -g maki-witness -m 0700 /var/lib/maki-witness
-sudo -u maki-witness maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
+runuser -u maki-witness -- maki-witness init /var/lib/maki-witness/volume 01234567-89ab-cdef-0123-456789abcdef
 ```
 
 Initialization refuses existing state. Local `serve` holds the authority's
@@ -274,8 +274,9 @@ run as root therefore refuses a key owned by the service or daemon user. Run
 the server as its service account. The remote `maki volume` commands load
 their configuration's client key before they contact the authority, so run
 `witness`, `snapshot` and `gc` with the daemon's writer configuration as the
-daemon user (`sudo -u maki`); a snapshot also needs a backup directory that
-user can create. `witness` may instead use the administrator configuration as
+daemon user (from a root shell, `runuser -u maki -- …`); a snapshot also
+needs a backup directory that user can create. `witness` may instead use the
+administrator configuration as
 root. `takeover`, `restore` and `resume-enrollment` need the administrator
 configuration: run them as root; they create the new writer namespace for the
 daemon user that owns the backing root
@@ -407,7 +408,7 @@ connection that closes without an alert remains a transport failure.
 Inspect through the configured client without claiming a session:
 
 ```sh
-sudo -u maki maki volume witness /etc/maki/volume-writer.toml
+runuser -u maki -- maki volume witness /etc/maki/volume-writer.toml
 ```
 
 ## Snapshot, takeover and restore
@@ -419,7 +420,7 @@ that key), into a location that user can create:
 
 ```sh
 install -d -o maki -g maki -m 0700 /backup/maki
-sudo -u maki maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
+runuser -u maki -- maki volume snapshot /etc/maki/volume-writer.toml /backup/maki/snapshot-001
 ```
 
 The command copies authenticated committed data, durably writes the bounded
@@ -558,7 +559,7 @@ again after old processes have exited, run it with the writer configuration as
 the daemon user (a process run as root refuses the daemon-owned writer key):
 
 ```sh
-sudo -u maki maki volume gc /etc/maki/volume-writer.toml
+runuser -u maki -- maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
