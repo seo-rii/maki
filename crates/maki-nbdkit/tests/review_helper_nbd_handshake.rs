@@ -233,3 +233,30 @@ fn a_second_connection_is_answered_unavailable_until_the_first_is_closed() {
         }
     }
 }
+
+/// nbdkit gives a client no reason for that answer, so the daemon's own log
+/// has to say that the export exists and is taken.
+#[test]
+fn the_daemon_says_why_it_refuses_a_second_connection() {
+    if !nbdkit_available("the_daemon_says_why_it_refuses_a_second_connection") {
+        return;
+    }
+    let daemon = Daemon::start(false);
+    let first = UnixStream::connect(&daemon.socket).unwrap();
+    handshake::negotiate(&first, Instant::now() + DEADLINE)
+        .unwrap_or_else(|error| panic!("{error}: {}", daemon.log()));
+    let second = UnixStream::connect(&daemon.socket).unwrap();
+    assert!(handshake::negotiate(&second, Instant::now() + DEADLINE).is_err());
+    let started = Instant::now();
+    while !daemon
+        .log()
+        .contains("the volume serves one connection at a time")
+    {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "the daemon's log does not say why: {}",
+            daemon.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
