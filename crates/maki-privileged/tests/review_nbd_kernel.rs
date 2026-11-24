@@ -162,10 +162,14 @@ fn the_helper_connects_and_disconnects_a_kernel_nbd_device() {
     );
     assert_eq!(sysfs(index, "queue/fua").as_deref(), Some("1"));
 
-    // A connected device is the kernel's refusal to connect again: a
-    // definite failure that changes nothing.
+    // The kernel answers a connect of a connected device busy; the helper's
+    // retry sees the connection and refuses: a definite failure that
+    // changes nothing.
     match connect(server.socket(), index, BLOCK_SIZE, "maki-another") {
-        Err(NbdError::Failed(message)) => assert!(message.contains("refused"), "{message}"),
+        Err(NbdError::Failed(message)) => assert!(
+            message.contains("busy and now shows a connection"),
+            "{message}"
+        ),
         other => panic!("a second connect of {device}: {other:?}"),
     }
     assert_eq!(
