@@ -264,10 +264,29 @@ nothing can open the volume, so nothing was acknowledged. A `maki volume
 create` that is killed, loses power or fails before it publishes the anchor
 (a full disk while it reserves the arena, for example) is completed by
 running it again, with nothing to remove by hand. Once the anchor is
-published, the command initializes the volume inside the backing; one that
-stops there is refused by a later `create`, which never writes over an
-anchor: if the volume was never attached, empty both directories and create
-it again. The format marker and the anchor are each written under
+published, the command initializes the volume inside the backing, in
+several commits that end with the volume's superblock. One that stops
+there is completed by running it again as well, with the capacity it was
+started with: `create` opens the pair against its witness, which
+authenticates the manifest and every committed page, and continues only
+if what it then finds is nothing but an unfinished creation, that is, no
+superblock copy and no entry other than what a creation writes before its
+superblock (the volume lock, the first shard-catalog copy, a staged
+`superblock.next`, the empty `data`, `journal` and `checkpoint`
+directories with the durable proof, the initial checkpoint state and a
+durable mark that is still empty). It
+removes those files and initializes the volume anew, with a new volume
+UUID. A volume that was ever attached holds a superblock copy, so it is
+never continued this way, and damage cannot make one look unfinished: a
+pair whose superblock pages, manifest slots or anchor are damaged or
+missing, or whose witness is not mounted, does not open, and `create`
+refuses it as before and leaves it as it is. Until the command is run
+again, the daemon, `maki check` and `maki volume inspect` refuse the pair
+and say why: before the anchor that the backing holds no format marker or
+the witness no anchor, after it `no valid superblock: this volume's
+creation did not complete`, each naming `maki volume create` as what
+continues it. Once a superblock copy is committed the volume exists and
+`create` refuses it. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
@@ -279,7 +298,8 @@ so `create` never creates over one, whatever the witness directory holds
 and short of both slots lost or zeroed entirely (an all-zero slot is an
 unwritten one): a witness mount that is missing (an empty directory in its
 place) cannot get a used volume recreated, and neither can slots that
-damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
+damage left holding anything else. It never enrolls over an `anchor` either: a pair that
+has one is only ever opened against it. Earlier releases created
 the anchor empty before writing it: an empty `anchor` that such a release
 left is refused by `create`
 (`rollback enrollment requires empty backing and witness directories`) and

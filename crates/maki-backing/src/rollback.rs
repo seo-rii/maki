@@ -373,6 +373,27 @@ impl RollbackBacking {
         Self::open_backing(Arc::new(FileBacking::new(root)?), witness)
     }
 
+    /// [`Self::create`] over a backing and a witness directory the caller
+    /// hosts, for the executable crash model of a creation that is
+    /// completed above this layer. The caller answers for what the path
+    /// form checks: that the witness is independent of the backing.
+    #[doc(hidden)]
+    pub fn create_on(
+        disk: Arc<dyn Backing>,
+        witness: Arc<dyn Backing>,
+        capacity_bytes: u64,
+    ) -> io::Result<Self> {
+        validate_capacity(capacity_bytes)?;
+        Self::create_backing(disk, witness, capacity_bytes)
+    }
+
+    /// [`Self::open`] over a backing and a witness directory the caller
+    /// hosts (see [`Self::create_on`]).
+    #[doc(hidden)]
+    pub fn open_on(disk: Arc<dyn Backing>, witness: Arc<dyn Backing>) -> io::Result<Self> {
+        Self::open_witnessed(disk, || FileWitness::open_backing(witness))
+    }
+
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
@@ -384,7 +405,22 @@ impl RollbackBacking {
         witness: impl FnOnce() -> io::Result<FileWitness>,
     ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        let marker = disk.open(MARKER, false)?;
+        // A backing without its marker is what a creation leaves that
+        // stopped before it published one (or a wrong `backing.root`).
+        // Say so and name the way out, with the same error kind.
+        let marker = disk.open(MARKER, false).map_err(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return error;
+            }
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "this rollback backing holds no format marker ({MARKER}): either a volume \
+                     create did not complete here, which running volume create again continues, \
+                     or this is not the volume's backing root"
+                ),
+            )
+        })?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {
             return Err(invalid("invalid rollback format marker"));
