@@ -329,5 +329,12 @@ fn root_create_names_a_volume_directory_it_had_to_create() {
         warnings[0].contains(&format!("chown -R maki:maki {}", fixture.root().display())),
         "{warnings:?}"
     );
+    // The other way out must exist on a host with only the package's
+    // dependencies: util-linux brings `runuser`, nothing brings sudo.
+    assert!(
+        warnings[0].contains("`runuser -u maki -- maki volume create <config.toml>`"),
+        "{warnings:?}"
+    );
+    assert!(!warnings[0].contains("sudo"), "{warnings:?}");
     assert_eq!(owner_of(&fixture.root()), (0, 0));
 }

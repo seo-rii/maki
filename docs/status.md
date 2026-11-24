@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-11-17. External campaign evidence below runs through
+Last updated: 2026-11-24. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 

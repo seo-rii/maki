@@ -85,6 +85,13 @@ This mode checks committed source and complete history, prints one version,
 and creates no build or output directory. It needs Python and Git, without
 probing Rust or Debian packaging tools.
 
+Both modes of the command refuse a source tree that is not the top level of
+its own Git checkout. Git looks for a repository in every parent directory,
+so a tree unpacked from a source archive below another checkout would
+otherwise get that repository's version and commit. An archive has no
+history to count; its version is recorded in its release's manifest
+([rebuilding from a published source archive](#rebuilding-from-a-published-source-archive)).
+
 ### Migrating legacy source-build packages
 
 Earlier source-build recipes used `0.1.0+git<commit>`. Debian orders those
@@ -219,7 +226,9 @@ read from `Cargo.toml` at the dispatched commit. Before anything is built, the
 `check` job refuses a run from another ref, any other tag, and a tag or
 published release of that name that already exists; drafts are visible only
 to the `publish` job's token, which refuses an existing draft before it
-creates anything. A final tag
+creates anything. Both jobs also refuse when a query of the releases or of
+the tag fails or is cut off: an answer that is missing, empty or incomplete
+is never read as "no release and no tag". A final tag
 (`v0.1.0`) is refused while production approval is pending
 ([status](status.md)); allowing one is a reviewed change to
 `scripts/release_assets.py` and the workflow, which then also decides whether
@@ -288,6 +297,55 @@ A deleted tag stays in clones that fetched it. Do not publish different
 content under a deleted tag's name; publish the next release candidate
 number instead.
 
+## Rebuilding from a published source archive
+
+The source archive of a release (`maki-<tag>-source.tar.gz`) holds the
+committed tree without its history, in a directory named
+`maki-<workspace version>`. `prepare_release.py` therefore cannot be used in
+it: `--print-version` and `--output` stop with "is not a Git checkout" and
+name the manifest. A candidate bundle is prepared from a clone of the
+repository at the commit that `source.commit` names.
+
+To build a package from the archive itself, take the version and the source
+epoch from the Debian manifest published beside it (`package.version` and
+`source.source_date_epoch`), build the binaries as the
+[installation guide](getting-started/installation-debian.md#build-the-maki-package)
+does, and give both values to the package builder. With the release's assets
+in the current directory, on the build distribution the manifest names:
+
+```bash
+set -euo pipefail
+sha256sum --check --ignore-missing SHA256SUMS
+manifest="$PWD/maki-0.1.0-rc.1-debian12-amd64-manifest.json"
+tar -xzf maki-0.1.0-rc.1-source.tar.gz
+cd maki-0.1.0
+maki_version="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["package"]["version"])' "$manifest")"
+SOURCE_DATE_EPOCH="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["source"]["source_date_epoch"])' "$manifest")"
+export SOURCE_DATE_EPOCH CARGO_TARGET_DIR="$PWD/target"
+maki_host="$(rustc +1.94.0 -vV | sed -n 's/^host: //p')"
+cargo +1.94.0 build --release --locked --target "$maki_host" \
+  -p maki -p maki-attach -p maki-check -p maki-nbdkit
+python3 packaging/debian/build-deb.py \
+  --release-dir "$CARGO_TARGET_DIR/$maki_host/release" \
+  --version "$maki_version" \
+  --architecture "$(dpkg --print-architecture)" \
+  --output ../maki.deb
+```
+
+[`packaging/rpm/build-rpm.py`](../packaging/rpm/README.md) takes the same
+`--version` and `SOURCE_DATE_EPOCH` on a RHEL 9 family build host. Cargo
+downloads the locked dependencies that `vendor/` does not hold.
+
+The package carries the release's version, and the package builder is
+deterministic: from the same binaries, version and epoch it writes the same
+file. The compiled binaries are not expected to be identical to the
+release's, for the reasons given under
+[prepare and inspect](#prepare-and-inspect) (compiler, system libraries,
+build paths, Cargo configuration), so neither is the package, and nothing
+here signs or qualifies it.
+
 ## Maintainer checks
 
 ```bash
@@ -300,12 +358,16 @@ The preparation contract uses a temporary Git repository, small native C ELF
 fixtures, a simulated Cargo build and the real Debian package/dependency tools.
 It checks committed-source provenance, checksums, deterministic packaging,
 version ordering with real Git history and `dpkg`, shallow- and dirty-source
-refusal, output preservation, source-link refusal, intermediate build isolation,
+refusal, the refusal of a source tree that is not the top level of its own
+checkout (unpacked alone or below another repository), the rebuild block of
+this page from a source archive and its manifest, output preservation,
+source-link refusal, intermediate build isolation,
 compiler selection, refused and recorded build inputs and failure cleanup
 without rebuilding the Rust workspace.
 The Linux PR job runs it;
 successful contract tests are not a full candidate-build or installation result.
 `scripts/test_release_workflow_validation.py` checks the release workflow's
 structure, the tag and bundle checks of `scripts/release_assets.py`, the notes,
-and the publish and cleanup steps against a stand-in `gh`; it needs `rpm` and
-`rpmbuild` for a fixture RPM.
+and the publish and cleanup steps against a stand-in `gh`, also when its
+queries of the releases or of the tag fail, are cut off between pages or
+answer with an error; it needs `rpm` and `rpmbuild` for a fixture RPM.

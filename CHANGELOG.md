@@ -3,8 +3,9 @@
 All notable changes to Maki, in particular anything that affects on-disk
 compatibility, the runtime layout, credentials or operator procedures. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-Maki has no tagged release yet, so everything is under *Unreleased* with the
-commit that introduced it. Procedures for each change live in the linked
+Maki has no final release yet (release candidates are tagged
+`v0.1.0-rc.<n>` as GitHub pre-releases), so everything is under *Unreleased*
+with the commit that introduced it. Procedures for each change live in the linked
 documents.
 
 ## Unreleased

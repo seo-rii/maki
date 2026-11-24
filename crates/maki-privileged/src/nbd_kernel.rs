@@ -40,15 +40,21 @@
 //! busy device or export, and the wait for the kernel's answer. The kernel's work on a
 //! request is not: it runs inside the `sendto(2)` that sends it, and its
 //! mutex waits are uninterruptible, so neither a deadline nor a signal ends
-//! them. The kernel runs the `nbd` family's requests one at a time.
+//! them. The `nbd` family sets no `parallel_ops`, so the kernel runs each of
+//! its requests under the global generic-netlink mutex (`genl_mutex`), which
+//! every family without `parallel_ops` shares, the control family that
+//! answers family lookups (`CTRL_CMD_GETFAMILY`) among them.
 //! `NBD_CMD_DISCONNECT` takes the device's configuration lock and each
 //! connection's transmit lock and writes `NBD_CMD_DISC` to the daemon's
 //! socket, which has no send timeout (none is set, and the kernel sets one
 //! only with `NBD_ATTR_TIMEOUT`). If the daemon has stopped reading and the
 //! socket's send buffer is full, a request in flight holds the transmit lock
-//! indefinitely, and the helper waits, holding the attach lock and blocking
-//! every other `nbd` request, until the daemon reads again or its socket
-//! closes (the daemon exits). In the helper's flows the unmount and the VG
+//! indefinitely, and the helper waits, holding the attach lock and that
+//! mutex, so that no other `nbd` request runs, nor a request to any other
+//! such family or a family lookup, anywhere on the host (a client that has
+//! yet to resolve its family's ID waits whichever family it wants), until
+//! the daemon reads again or its socket closes (the daemon exits). In the
+//! helper's flows the unmount and the VG
 //! deactivation come first when they are needed; both need the daemon to
 //! serve I/O and are bounded external commands, so they fail first when it
 //! has stopped. A detach retry whose earlier attempt completed them goes

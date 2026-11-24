@@ -120,7 +120,7 @@ The backing tree must be owned by the daemon user, so create it as `maki`:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/demo &&
-    sudo -u maki maki volume create /etc/maki/volumes/demo.toml &&
+    runuser -u maki -- maki volume create /etc/maki/volumes/demo.toml &&
     maki volume inspect /etc/maki/volumes/demo.toml &&
     maki check /etc/maki/volumes/demo.toml
 ```

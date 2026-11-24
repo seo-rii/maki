@@ -74,8 +74,8 @@ install -m 0640 -o root -g maki volume.toml /etc/maki/volumes/<volume>.toml
 
 The daemon user reads that file through its group, and commands run as root or
 as the daemon user accept it. A file owned by the daemon user is accepted by
-the daemon and by commands run as that user (`sudo -u maki`), but refused by
-commands run as root. A configuration a user writes for
+the daemon and by commands run as that user (`runuser -u maki -- …`), but
+refused by commands run as root. A configuration a user writes for
 their own runs, such as a disposable one below `/tmp`, is accepted with the
 usual `0600` or `0644`. A configuration tool that installs the file as a
 symlink, or as a hard link into a store, must copy it instead. Keep the
