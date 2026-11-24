@@ -573,7 +573,8 @@ fn ownership_hint(as_root: bool, cfg: &maki_format::config::VolumeConfig) -> Opt
     let arguments: Vec<String> = held.iter().map(|(_, path)| shell_word(path)).collect();
     Some(format!(
         "{} {} entries created owner-only by root; the daemon runs as the maki user and \
-         cannot open them. Run `maki volume create` as that user (sudo -u maki ...) or \
+         cannot open them. Run `maki volume create` as that user \
+         (`runuser -u maki -- maki volume create <config.toml>`) or \
          `chown -R maki:maki {}` before starting the service",
         named.join(" and "),
         if held.len() == 1 { "holds" } else { "hold" },
