@@ -64,7 +64,14 @@ xfsprogs, systemd ≥ 249 for the recovery unit's `OnSuccess=`. Details are in t
 The backing is an ordinary directory (`backing.root`). Maki relies on the
 filesystem honouring `fdatasync`, directory `fsync`, `posix_fallocate`, file
 locks and atomic rename, and on it overwriting allocated blocks in place
-([copy-on-write](#copy-on-write-filesystems)).
+([copy-on-write](#copy-on-write-filesystems)). It also relies on a file never
+showing old blocks after a crash: a truncation that was synced is durable,
+and a file grown after it reads as zeros where nothing was written. The
+journal's tail truncation, the shard data files and the A/B metadata stores
+(SPEC §43) depend on that. ext4 mounted with `data=writeback` does not give
+it: the kernel's ext4 documentation says that mode can leave stale data
+exposed in recently written files after an unclean shutdown. The rows below
+do not distinguish mount options.
 
 | Backing | Status | Notes |
 |---|---|---|

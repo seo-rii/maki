@@ -998,6 +998,12 @@ already allocated journal or slot blocks before checkpoint completes. That
 holds only where the backing filesystem overwrites allocated blocks in place:
 not for extents shared with a reflink copy, and not on a copy-on-write
 filesystem ([backing store](deployment/support-matrix.md#backing-store-below-maki)).
+One metadata store is an exception there too: an A/B copy that a power loss
+left undecodable is emptied before it is written again, which releases its
+blocks, so on a filesystem with no free block that store can fail with ENOSPC,
+and with it the checkpoint, barrier or attach that needed it. The other copy
+is untouched, acknowledged writes stay in the journal, and the operation
+succeeds once space is available.
 A reservation failure returns ENOSPC without consuming a journal sequence and
 is retryable.
 

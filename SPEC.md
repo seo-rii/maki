@@ -2665,7 +2665,12 @@ is above `u64::MAX - 2^62`. A store MUST NOT write into an existing side that
 does not decode until that side is durably empty: an interrupted store leaves
 its side carrying the generation the next store uses, and the sectors of two
 interrupted stores MUST NOT be able to form a valid record. A side that
-decodes MUST NOT be emptied. Torn final journal tails may be truncated. Damage
+decodes MUST NOT be emptied. This rule, like the truncation of a torn journal
+tail, assumes a backing filesystem on which a synced truncation is durable
+and a file grown after it reads as zeros where nothing was written, after a
+crash too; a filesystem that can show old blocks in a file after a crash does
+not meet it ([backing store](docs/deployment/support-matrix.md#backing-store-below-maki)).
+Torn final journal tails may be truncated. Damage
 inside a non-final segment, or inside the part of the final segment that the
 durable proof or the durable mark covers, MUST refuse recovery. Beyond that
 part, a record that fails its checksum is a torn tail whether or not an intact
