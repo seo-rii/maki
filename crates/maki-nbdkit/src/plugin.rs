@@ -613,6 +613,23 @@ mod tests {
         assert_ne!(can_fua_value(), NBDKIT_FUA_EMULATE);
     }
 
+    /// nbdkit asserts, rather than checks, that a fast zero request was
+    /// advertised (`backend_zero`), so the answer must be 1 for such a
+    /// request to reach `zero_v2` at all. There it is refused before the
+    /// handle is read, with ENOTSUP, whatever else the request asks for.
+    #[test]
+    fn fast_zero_is_advertised_and_every_request_refused_with_enotsup() {
+        assert_eq!(unsafe { can_fast_zero(std::ptr::null_mut()) }, 1);
+        for extra in [0, NBDKIT_FLAG_MAY_TRIM, NBDKIT_FLAG_FUA] {
+            set_errno(0);
+            let flags = NBDKIT_FLAG_FAST_ZERO | extra;
+            // SAFETY: a fast zero request is refused before the handle is used.
+            let status = unsafe { zero_v2(std::ptr::null_mut(), 4096, 0, flags) };
+            assert_eq!(status, -1, "flags {flags:#x}");
+            assert_eq!(unsafe { *libc_errno_location() }, libc::ENOTSUP);
+        }
+    }
+
     /// The published prefix ends right after `block_size` (nbdkit >= 1.30),
     /// the last callback the shim populates: 384 bytes on LP64, with
     /// `block_size` at offset 376 (BUG-011; the C probe in
