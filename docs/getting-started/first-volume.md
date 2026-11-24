@@ -167,8 +167,11 @@ device over netlink with the helper's own code, the same as an attach; no
 kernel's `backend` attribute, and an identifier of the form attach records use
 (`maki-<uuid>`) is refused. It refuses a device that shows a connection or that
 an attach record names, and `nbd-disconnect` disconnects only a device
-connected under its identifier. A missing or unreadable attribute is a
-failure. LVM queries and mutations after connection are restricted to that
+connected under its identifier. It then waits up to 15 seconds until the
+device no longer shows that connection, which the kernel keeps showing while
+anything has the device open (udev probes a device that was just written to),
+and fails if it still does; run it again in that case. A missing or unreadable
+attribute is a failure. LVM queries and mutations after connection are restricted to that
 one device. Before formatting, the device-mapper UUID must contain the newly
 observed VG and LV UUIDs and its only backing device must be that NBD device.
 These checks assume a trusted root administrator; they cannot prevent another

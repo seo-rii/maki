@@ -332,6 +332,62 @@ fn every_error_reply_to_go_is_a_refusal_without_a_fallback() {
     }
 }
 
+/// One refusal can end by itself: the export that is not available, which
+/// nbdkit answers while Maki's plugin still holds its one connection. The
+/// caller that waits for it must be able to tell it from every other
+/// failure, which waiting does not help.
+#[test]
+fn only_the_refusal_of_an_unavailable_export_is_told_apart() {
+    for kind in [
+        NBD_REP_ERR_UNSUP,
+        NBD_REP_ERR_POLICY,
+        NBD_REP_ERR_INVALID,
+        NBD_REP_ERR_PLATFORM,
+        NBD_REP_ERR_TLS_REQD,
+        NBD_REP_ERR_UNKNOWN,
+        NBD_REP_ERR_SHUTDOWN,
+        NBD_REP_ERR_BLOCK_SIZE_REQD,
+        NBD_REP_ERR_TOO_BIG,
+        NBD_REP_ERR_EXT_HEADER_REQD,
+        NBD_REP_FLAG_ERROR | 0x7fff,
+    ] {
+        let script = concat(&[
+            greeting(NBD_FLAG_FIXED_NEWSTYLE),
+            reply(NBD_OPT_GO, kind, b""),
+        ]);
+        let error = exchange(script, Then::Wait, PATIENCE).result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{kind:#x}");
+        assert_eq!(
+            export_unavailable(&error),
+            kind == NBD_REP_ERR_UNKNOWN,
+            "{kind:#x}: {error}"
+        );
+    }
+    // Its text says what the answer can mean.
+    let script = concat(&[
+        greeting(NBD_FLAG_FIXED_NEWSTYLE),
+        reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, b""),
+    ]);
+    let error = exchange(script, Then::Wait, PATIENCE).result.unwrap_err();
+    assert!(
+        error.to_string().contains("busy with another connection"),
+        "{error}"
+    );
+    // No other failure is one: a wrong magic, a stream that ends, a server
+    // that acknowledges without the export.
+    for (script, then) in [
+        (b"NBDMAGICnot-nbd!".to_vec(), Then::Wait),
+        (greeting(NBD_FLAG_FIXED_NEWSTYLE), Then::End),
+        (
+            concat(&[greeting(NBD_FLAG_FIXED_NEWSTYLE), ack()]),
+            Then::Wait,
+        ),
+    ] {
+        let error = exchange(script, then, PATIENCE).result.unwrap_err();
+        assert!(!export_unavailable(&error), "{error}");
+    }
+}
+
 #[test]
 fn go_must_report_the_export_exactly_once_before_its_acknowledgement() {
     let missing = concat(&[greeting(NBD_FLAG_FIXED_NEWSTYLE), ack()]);

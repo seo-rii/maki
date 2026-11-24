@@ -103,6 +103,33 @@ pub struct Export {
     pub transmission_flags: u16,
 }
 
+/// The refusal `NBD_REP_ERR_UNKNOWN` of `NBD_OPT_GO`: the export is not
+/// available. It is the one refusal that can end by itself. nbdkit answers
+/// it whenever its plugin cannot open the export, with no message and
+/// whatever the plugin's reason (checked in 1.32.5, 1.36.3 and 1.38.5), and
+/// Maki's plugin serves one connection at a time: until nbdkit has closed
+/// the previous connection, the next one is answered this way. A server
+/// without a default export answers the same, so a caller that waits for
+/// the export bounds its wait.
+#[derive(Debug)]
+pub struct ExportUnavailable(String);
+
+impl std::fmt::Display for ExportUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExportUnavailable {}
+
+/// Whether `error`, from [`negotiate`], is the server's answer that the
+/// export is not available ([`ExportUnavailable`]).
+pub fn export_unavailable(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ExportUnavailable>())
+}
+
 /// Everything the client sends after a greeting that carried
 /// `server_flags`: its own flags, then `NBD_OPT_GO` for the default export.
 pub fn client_request(server_flags: u16) -> Vec<u8> {
@@ -129,7 +156,9 @@ pub fn client_request(server_flags: u16) -> Vec<u8> {
 /// caller drops the stream.
 ///
 /// A protocol violation or refusal is `InvalidData`, a deadline that
-/// passed `TimedOut` and a stream that ended early `UnexpectedEof`.
+/// passed `TimedOut` and a stream that ended early `UnexpectedEof`. The
+/// refusal of an export that is not available is told apart by
+/// [`export_unavailable`].
 pub fn negotiate(stream: &UnixStream, deadline: Instant) -> io::Result<Export> {
     let mut session = Session {
         fd: stream.as_raw_fd(),
@@ -228,12 +257,17 @@ pub fn negotiate(stream: &UnixStream, deadline: Instant) -> io::Result<Export> {
             }
             kind if kind & NBD_REP_FLAG_ERROR != 0 => {
                 // The message is the daemon's text: not shown to root's log.
-                return Err(invalid(format!(
+                let refusal = format!(
                     "the server refused NBD_OPT_GO with {} (its {}-byte message is not \
                      shown); NBD_OPT_EXPORT_NAME is not tried",
                     error_name(kind),
                     data.len()
-                )));
+                );
+                return Err(if kind == NBD_REP_ERR_UNKNOWN {
+                    io::Error::new(io::ErrorKind::InvalidData, ExportUnavailable(refusal))
+                } else {
+                    invalid(refusal)
+                });
             }
             kind => {
                 return Err(invalid(format!(
@@ -283,7 +317,10 @@ fn error_name(kind: u32) -> String {
         NBD_REP_ERR_INVALID => "NBD_REP_ERR_INVALID",
         NBD_REP_ERR_PLATFORM => "NBD_REP_ERR_PLATFORM",
         NBD_REP_ERR_TLS_REQD => "NBD_REP_ERR_TLS_REQD (TLS, which the kernel client cannot use)",
-        NBD_REP_ERR_UNKNOWN => "NBD_REP_ERR_UNKNOWN (no default export)",
+        NBD_REP_ERR_UNKNOWN => {
+            "NBD_REP_ERR_UNKNOWN (the export is not available: busy with another connection, \
+             or no default export)"
+        }
         NBD_REP_ERR_SHUTDOWN => "NBD_REP_ERR_SHUTDOWN",
         NBD_REP_ERR_BLOCK_SIZE_REQD => "NBD_REP_ERR_BLOCK_SIZE_REQD",
         NBD_REP_ERR_TOO_BIG => "NBD_REP_ERR_TOO_BIG",

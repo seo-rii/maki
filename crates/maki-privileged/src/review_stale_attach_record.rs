@@ -89,6 +89,30 @@ struct Host {
     before_backend_read: Option<(usize, Change)>,
     /// What LVM finds on the host; see [`Lvm`].
     lvm: RefCell<Lvm>,
+    /// Devices whose connect the kernel refuses, and how.
+    refused_connects: BTreeMap<&'static str, Refused>,
+    /// The helper dies right before it connects this device.
+    killed_before_connecting: Option<&'static str>,
+    /// Every connect the helper asked for, refused or not: the device and
+    /// the identifier it was to be connected under.
+    connect_requests: Vec<(String, String)>,
+    /// The NBD device each other executed step named.
+    named_devices: Vec<(&'static str, String)>,
+    /// How long the kernel takes to refuse a connect.
+    refusal_takes: std::time::Duration,
+}
+
+/// How the kernel answers the connect of a device.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// Busy until the helper gives up: something has the unconnected device
+    /// open, which sysfs does not show.
+    Busy,
+    /// Busy, and by the time the helper gives up the device carries
+    /// somebody else's connection.
+    BusyThenConnectedByAnother,
+    /// Any other refusal.
+    Otherwise,
 }
 
 /// A disk that is no NBD device and carries a volume group of its own.
@@ -163,12 +187,14 @@ impl Host {
             backend_reads: Cell::new(0),
             before_backend_read: None,
             lvm: RefCell::default(),
+            refused_connects: BTreeMap::new(),
+            killed_before_connecting: None,
+            connect_requests: Vec::new(),
+            named_devices: Vec::new(),
+            refusal_takes: std::time::Duration::ZERO,
         };
         for index in [3, 4] {
-            let device = host.sysfs.join(format!("nbd{index}"));
-            std::fs::create_dir_all(device.join("holders")).unwrap();
-            std::fs::write(device.join("dev"), format!("43:{index}\n")).unwrap();
-            std::fs::write(device.join("size"), "0\n").unwrap();
+            host.add_device(index);
         }
         std::fs::write(
             &host.mountinfo,
@@ -176,6 +202,14 @@ impl Host {
         )
         .unwrap();
         host
+    }
+
+    /// One more unconnected `/dev/nbd<index>`.
+    fn add_device(&self, index: u32) {
+        let device = self.sysfs.join(format!("nbd{index}"));
+        std::fs::create_dir_all(device.join("holders")).unwrap();
+        std::fs::write(device.join("dev"), format!("43:{index}\n")).unwrap();
+        std::fs::write(device.join("size"), "0\n").unwrap();
     }
 
     fn state(&self) -> TrustedState {
@@ -568,8 +602,47 @@ impl System for Host {
             .unwrap_or(&(1 << 30)))
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        if let PlannedStep::NbdConnect { device, .. } = step {
+            if self.killed_before_connecting == Some(device.as_str()) {
+                panic!("fixture: helper killed before connecting {device}");
+            }
+        }
+        match step {
+            PlannedStep::NbdConnect { device, .. } => self
+                .connect_requests
+                .push((device.clone(), identifier.unwrap_or_default().to_string())),
+            PlannedStep::SetBlockSize { device, .. }
+            | PlannedStep::NbdDisconnect { device }
+            | PlannedStep::VerifyMountDevice {
+                nbd_device: device, ..
+            }
+            | PlannedStep::VerifyMountIdentity {
+                nbd_device: device, ..
+            } => self.named_devices.push((step.kind(), device.clone())),
+            _ => {}
+        }
         self.command(step.kind(), |host| {
             match step {
+                PlannedStep::NbdConnect { device, .. }
+                    if host.refused_connects.contains_key(device.as_str()) =>
+                {
+                    std::thread::sleep(host.refusal_takes);
+                    let busy = || ExecError::DeviceBusy {
+                        step: step.to_string(),
+                        message: "the kernel refused NBD_CMD_CONNECT: Device or resource busy"
+                            .into(),
+                    };
+                    return Err(match host.refused_connects[device.as_str()] {
+                        Refused::Busy => busy(),
+                        Refused::BusyThenConnectedByAnother => {
+                            let nbd = host.nbd(device);
+                            std::fs::write(nbd.join("pid"), "777\n").unwrap();
+                            std::fs::write(nbd.join("backend"), "another-client\n").unwrap();
+                            busy()
+                        }
+                        Refused::Otherwise => lvm_failed(step),
+                    });
+                }
                 PlannedStep::NbdConnect { device, socket, .. } => {
                     let volume = [PG.volume, DB.volume, CLONE.volume]
                         .into_iter()
@@ -1053,6 +1126,9 @@ fn a_recorded_device_under_another_identity_is_refused_with_the_way_out() {
 
 #[path = "review_displaced_attach_record.rs"]
 mod displaced_record;
+
+#[path = "review_busy_allocated_device.rs"]
+mod busy_allocated_device;
 
 #[path = "review_lvm_device_scope.rs"]
 mod lvm_device_scope;

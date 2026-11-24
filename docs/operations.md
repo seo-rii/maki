@@ -43,10 +43,28 @@ socket itself (fixed-newstyle `NBD_OPT_GO` for the default export) and connects
 and disconnects the kernel device with generic-netlink requests to the `nbd`
 family, which needs a kernel whose `nbd` module has the netlink interface and
 the backend identifier (SPEC §6). It refuses an export that does not advertise
-FLUSH and FUA, before the kernel sees the socket. While something has the
-unconnected device open (udev probes a device right after a disconnect), the
-kernel refuses a connect as busy; the helper retries that for up to 5 s, as
-long as the device still shows no connection. The
+FLUSH and FUA, before the kernel sees the socket. Two answers to a connect
+mean "busy" and are retried every 100 ms, for up to 5 s from the first of them
+and only while the device still shows no connection:
+
+- the kernel's, while something has the unconnected device open (udev probes a
+  device right after a disconnect). The helper sends its next request on the
+  connection it has already negotiated, and negotiates a fresh one only when
+  that connection has been closed or shut down;
+- the daemon's, while its export is not available. The daemon serves one
+  connection at a time and closes one a moment after its peer did, so a
+  handshake right after a disconnect can be refused (`NBD_REP_ERR_UNKNOWN`).
+  A server without a default export answers the same: when the 5 s are over,
+  the refusal names both, and the daemon's own log says whether it refused a
+  second connection ("the volume serves one connection at a time, and one is
+  open").
+
+A device that stays busy to the end shows nothing in sysfs. When the attach
+allocated it (no pinned `nbd_device`), the helper gives it up, logs a warning
+and tries the next free device within the same step's time; a pinned device
+fails the attach. `maki-attach nbd-disconnect` waits up to 15 s until the
+device no longer shows its connection, which the kernel keeps showing while
+anything has the device open, and fails if it still does. The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -603,7 +621,10 @@ Execution (Linux, root) then:
    connecting it;
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
-   the device reports a size, and verifies its kernel backend identifier;
+   the device reports a size, and verifies its kernel backend identifier. An
+   allocated device that the kernel keeps refusing as busy is given up for
+   the next free one: the record is replaced by one that names that device,
+   under a new identifier, before it is connected;
 3. activates the VG and records its mapping identity, then verifies XFS TYPE
    and the optional configured `fs_uuid` with a bounded block probe before
    mounting with `noatime,nosuid,nodev`: the filesystem's bytes come from the

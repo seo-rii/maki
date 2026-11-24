@@ -43,6 +43,10 @@ use crate::verify::{
 /// Serializes attach helpers system-wide (device allocation + connect).
 pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `nbd-disconnect` waits for a device to stop showing the
+/// connection it disconnected, and how often it looks.
+const NBD_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
+const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -54,6 +58,10 @@ pub enum ExecError {
     },
     #[error("step {step:?} failed: {message}")]
     Step { step: String, message: String },
+    /// The kernel answered the connect step as busy until the helper gave
+    /// up: the device was not changed, and something has it open.
+    #[error("step {step:?} failed: {message}")]
+    DeviceBusy { step: String, message: String },
     #[error("{0}")]
     Verify(#[from] crate::verify::MountVerifyError),
     #[error(
@@ -638,13 +646,18 @@ fn nbd_step_index(device: &str) -> Result<u32, ExecError> {
 }
 
 /// A failed NBD step. The kernel refusing it, or a failure before the
-/// request, is the step's failure; an answer that could not be read is an
-/// I/O error of the step, like a command that ran out of time, so that
-/// what is connected is decided by the backend identifier the callers
-/// observe next, never by an assumption that nothing changed.
+/// request, is the step's failure, and a device that stayed busy is told
+/// apart, because an attach may then take another; an answer that could not
+/// be read is an I/O error of the step, like a command that ran out of
+/// time, so that what is connected is decided by the backend identifier the
+/// callers observe next, never by an assumption that nothing changed.
 fn nbd_step_error(step: &PlannedStep, error: NbdError) -> ExecError {
     match error {
         NbdError::Failed(message) => ExecError::Step {
+            step: step.to_string(),
+            message,
+        },
+        NbdError::DeviceBusy(message) => ExecError::DeviceBusy {
             step: step.to_string(),
             message,
         },
@@ -820,22 +833,69 @@ fn connect_raw_with(
 }
 
 /// Disconnect `device` if it is connected under `identifier`, a
-/// connection [`connect_raw`] made (`maki-attach nbd-disconnect`). A device
-/// without a connection needs nothing; any other connection is refused.
+/// connection [`connect_raw`] made (`maki-attach nbd-disconnect`), and wait
+/// until the device no longer shows it. A device without a connection needs
+/// nothing; any other connection is refused.
+///
+/// The kernel acknowledges a disconnect before the connection is gone from
+/// the device: it keeps the `pid` and `backend` attributes, and refuses a
+/// new connect, until the last opener of the device has closed it (udev
+/// probes a device that was just written to). A caller that goes on to use
+/// the device, or to check that it is free, must not see that state as
+/// success.
 pub fn disconnect_raw(device: &str, identifier: &str) -> Result<(), ExecError> {
+    disconnect_raw_with(
+        Path::new("/sys/block"),
+        device,
+        identifier,
+        NBD_RELEASE_TIMEOUT,
+        |step| run_step(step, None),
+    )
+}
+
+/// [`disconnect_raw`] on the device tree `sysfs`, with `patience` for the
+/// device to stop showing the connection after `disconnect`, which runs the
+/// disconnect step.
+fn disconnect_raw_with(
+    sysfs: &Path,
+    device: &str,
+    identifier: &str,
+    patience: Duration,
+    disconnect: impl FnOnce(&PlannedStep) -> Result<(), ExecError>,
+) -> Result<(), ExecError> {
     crate::config::check_raw_identifier(identifier)
         .map_err(|error| identity_error(error.to_string()))?;
     nbd_step_index(device)?;
-    if !raw_backend_is(Path::new("/sys/block"), device, identifier)? {
+    if !raw_backend_is(sysfs, device, identifier)? {
         tracing::info!("maki-attach: {device} shows no connection; nothing to disconnect");
         return Ok(());
     }
-    run_step(
-        &PlannedStep::NbdDisconnect {
-            device: device.into(),
-        },
-        None,
-    )
+    disconnect(&PlannedStep::NbdDisconnect {
+        device: device.into(),
+    })?;
+    let acknowledged = Instant::now();
+    loop {
+        match nbd_backend_at(sysfs, device) {
+            Ok(Some(backend)) if backend == identifier => {}
+            // No connection, or one made since: this one is gone.
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                return Err(identity_error(format!(
+                    "the kernel acknowledged the disconnect, but {device}'s backend identifier \
+                     is unreadable ({error}): it cannot be shown that the connection is gone"
+                )))
+            }
+        }
+        if acknowledged.elapsed() >= patience {
+            return Err(identity_error(format!(
+                "the kernel acknowledged the disconnect, but {device} still shows the \
+                 connection after {patience:?}: something still has the device open, and the \
+                 kernel keeps a connection's attributes, and refuses a new connect, until the \
+                 last opener has closed. Run the command again once it has let go"
+            )));
+        }
+        std::thread::sleep(NBD_RELEASE_INTERVAL.min(patience));
+    }
 }
 
 /// Refuse a device for a connection outside any attachment unless it shows
@@ -1493,6 +1553,141 @@ fn detach_step_needed(
     }
 }
 
+/// The record of a new attachment of `plan` on `device`, once nothing
+/// speaks against publishing it: no other volume's record names the device,
+/// it shows no connection, and nothing the attachment would create is there
+/// already.
+fn prepare_attachment(
+    plan: &Plan,
+    device: String,
+    reserved: &BTreeMap<String, String>,
+    system: &impl System,
+) -> Result<BoundDeviceRecord, ExecError> {
+    let attachment = plan
+        .attachment
+        .as_ref()
+        .ok_or_else(|| identity_error("missing attachment configuration identity"))?;
+    // An automatic device becomes concrete only after loading the module.
+    crate::config::check_vg_device(&attachment.vg_name, &device)
+        .map_err(|error| identity_error(error.to_string()))?;
+    // A pinned device never went through allocation, and an allocated
+    // one is checked again: another volume's record keeps its device.
+    if let Some(owner) = reserved.get(&device) {
+        return Err(identity_error(format!(
+            "{device} is named by the attach record of volume {owner}; refusing to attach \
+             volume {volume} on it. If that attachment is gone, run `maki-attach cleanup \
+             --volume {owner}` first; otherwise use another nbd_device",
+            volume = plan.volume,
+        )));
+    }
+    if system.backend(&device)?.is_some() {
+        return Err(identity_error("requested NBD device is already connected"));
+    }
+    let nonce = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?;
+    let prepared = BoundDeviceRecord {
+        version: 1,
+        volume: plan.volume.clone(),
+        attachment: attachment.clone(),
+        device,
+        connection_id: format!("maki-{}", nonce.trim()),
+        recovery: None,
+        recovery_intent: None,
+    };
+    // A new operation owns only resources it creates. Refuse an already
+    // mounted target, active VG, or holder before connecting or publishing
+    // a record that could later authorize their rollback.
+    let before = system.detach_observation(&prepared)?;
+    if before.mounted || before.vg_active || before.nbd_in_use {
+        return Err(identity_error(
+            "new attachment has pre-existing mounts, mappings, or holders; refusing to adopt them",
+        ));
+    }
+    // Mounting over a filesystem already mounted below the mountpoint
+    // hides it, and its owner's detach would then resolve the same path
+    // inside this volume (BUG-118). The verify gate refuses the same.
+    if before.nested {
+        return Err(identity_error(
+            "a filesystem is already mounted below the mountpoint; refusing to mount over it",
+        ));
+    }
+    Ok(prepared)
+}
+
+/// Run the connect step `plan.steps[at]` for `record`, wait for the device
+/// and check its identity.
+///
+/// A device this attach allocated itself (`allocated`) and that the kernel
+/// refused as busy to the end is given up for the next free one. Something
+/// has such a device open, which shows nowhere in sysfs, so allocation would
+/// hand it out again, to this volume and to every other. The record moves
+/// first: under the attach lock the caller holds, this volume's record is
+/// replaced by one that names the next device, with an identifier of its
+/// own, before that device is connected, and a device another volume's
+/// record names (`reserved`) is never taken. A pinned device is never given
+/// up. All attempts together have the time of one step.
+fn connect_recorded(
+    plan: &mut Plan,
+    at: usize,
+    record: &mut BoundDeviceRecord,
+    state: &TrustedState,
+    system: &mut impl System,
+    reserved: &BTreeMap<String, String>,
+    allocated: bool,
+) -> Result<(), ExecError> {
+    let deadline = allocated.then(|| command::step_deadline().ok()).flatten();
+    let _bounded = deadline.map(command::finish_by);
+    let mut left_out: BTreeSet<String> = reserved.keys().cloned().collect();
+    loop {
+        let step = plan.steps[at].clone();
+        let PlannedStep::NbdConnect { device, .. } = &step else {
+            return Err(identity_error("the plan has no connect step here"));
+        };
+        let busy = match system.run_step(&step, Some(&record.connection_id)) {
+            Ok(()) => {
+                return system
+                    .wait_ready(&step, device)
+                    .and_then(|()| verify_connection(record, system))
+            }
+            Err(busy @ ExecError::DeviceBusy { .. }) => busy,
+            Err(error) => return Err(error),
+        };
+        // The kernel refused: nothing of this attach is on the device,
+        // unless it shows a backend after all, which rollback then judges.
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline)
+            || !matches!(system.backend(device), Ok(None))
+        {
+            return Err(busy);
+        }
+        left_out.insert(device.clone());
+        let moved = match system.allocate_excluding(&left_out) {
+            // A chooser that cannot look past a device gives it again.
+            Ok(next) if left_out.contains(&next) => return Err(busy),
+            Ok(next) => prepare_attachment(plan, next, reserved, system),
+            Err(ExecError::NoFreeDevice) => return Err(busy),
+            Err(error) => Err(error),
+        };
+        let moved = match moved {
+            Ok(moved) => moved,
+            Err(reason) => {
+                tracing::warn!(
+                    "maki-attach: {device} stayed busy, and no other device was taken: {reason}"
+                );
+                return Err(busy);
+            }
+        };
+        tracing::warn!(
+            "maki-attach: {device} stayed busy (something has it open); moving the attach to {}",
+            moved.device
+        );
+        // Replacing this volume's record releases the device given up and
+        // reserves the next one before it is connected.
+        state.write(&moved)?;
+        plan.rebind_device(device, &moved.device);
+        system.announce_bound_device(&moved.device);
+        *record = moved;
+    }
+}
+
 /// Execute under one root-controlled lock, resolving runtime records only
 /// after taking it. A pinned device never bypasses identity verification.
 pub fn execute(plan: &Plan) -> Result<(), ExecError> {
@@ -1648,7 +1843,10 @@ fn execute_with_options(
             record = Some(prior);
         }
     }
-    if plan.needs_device_allocation() {
+    // Whether this attach chose its device itself. Only such a device may
+    // be given up for another when the kernel keeps refusing it as busy.
+    let allocated = plan.needs_device_allocation();
+    if allocated {
         // Only an attach takes a device: it holds the lock under which the
         // records were read, and publishes its own before connecting.
         if !connects {
@@ -1671,53 +1869,7 @@ fn execute_with_options(
                 _ => None,
             })
             .unwrap();
-        let attachment = plan
-            .attachment
-            .as_ref()
-            .ok_or_else(|| identity_error("missing attachment configuration identity"))?;
-        // An automatic device becomes concrete only after loading the module.
-        crate::config::check_vg_device(&attachment.vg_name, &device)
-            .map_err(|error| identity_error(error.to_string()))?;
-        // A pinned device never went through allocation, and an allocated
-        // one is checked again: another volume's record keeps its device.
-        if let Some(owner) = reserved.get(&device) {
-            return Err(identity_error(format!(
-                "{device} is named by the attach record of volume {owner}; refusing to attach \
-                 volume {volume} on it. If that attachment is gone, run `maki-attach cleanup \
-                 --volume {owner}` first; otherwise use another nbd_device",
-                volume = plan.volume,
-            )));
-        }
-        if system.backend(&device)?.is_some() {
-            return Err(identity_error("requested NBD device is already connected"));
-        }
-        let nonce = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?;
-        let prepared = BoundDeviceRecord {
-            version: 1,
-            volume: plan.volume.clone(),
-            attachment: attachment.clone(),
-            device,
-            connection_id: format!("maki-{}", nonce.trim()),
-            recovery: None,
-            recovery_intent: None,
-        };
-        // A new operation owns only resources it creates. Refuse an already
-        // mounted target, active VG, or holder before connecting or publishing
-        // a record that could later authorize their rollback.
-        let before = system.detach_observation(&prepared)?;
-        if before.mounted || before.vg_active || before.nbd_in_use {
-            return Err(identity_error(
-                "new attachment has pre-existing mounts, mappings, or holders; refusing to adopt them",
-            ));
-        }
-        // Mounting over a filesystem already mounted below the mountpoint
-        // hides it, and its owner's detach would then resolve the same path
-        // inside this volume (BUG-118). The verify gate refuses the same.
-        if before.nested {
-            return Err(identity_error(
-                "a filesystem is already mounted below the mountpoint; refusing to mount over it",
-            ));
-        }
+        let prepared = prepare_attachment(&plan, device, &reserved, system)?;
         // Persist the unique identity before connecting: process death
         // cannot leave an unrecorded connection or authorize a later reuse
         // of the same /dev/nbdN by a different attachment.
@@ -1727,7 +1879,11 @@ fn execute_with_options(
 
     let mut activation_identity = None;
     let mut activation_attempted = false;
-    for step in &plan.steps {
+    let mut next = 0;
+    while next < plan.steps.len() {
+        // A copy: the connect step can move the plan to another device.
+        let step = &plan.steps[next].clone();
+        next += 1;
         if grows {
             // Never let a changed mount/backend slip between lvextend and
             // xfs_growfs. Absolute targets make retries safe after either
@@ -1764,16 +1920,17 @@ fn execute_with_options(
         // was configured never leaks a connected device (O-07), without a
         // separately tracked prefix.
         let result = match step {
-            PlannedStep::NbdConnect { device, .. } => {
-                let record = record.as_ref().unwrap();
-                match system.run_step(step, Some(&record.connection_id)) {
-                    Ok(()) => match system
-                        .wait_ready(step, device)
-                        .and_then(|()| verify_connection(record, system))
-                    {
-                        Ok(()) => continue,
-                        Err(e) => Err(e),
-                    },
+            PlannedStep::NbdConnect { .. } => {
+                match connect_recorded(
+                    &mut plan,
+                    next - 1,
+                    record.as_mut().unwrap(),
+                    state.unwrap(),
+                    system,
+                    &reserved,
+                    allocated,
+                ) {
+                    Ok(()) => continue,
                     Err(e) => Err(e),
                 }
             }

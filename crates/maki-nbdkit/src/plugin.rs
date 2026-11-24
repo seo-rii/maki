@@ -122,6 +122,8 @@ impl FailureLog {
 }
 
 static FAILURES: FailureLog = FailureLog::new();
+/// Refused second connections, logged at the same rate.
+static REFUSED_CONNECTIONS: FailureLog = FailureLog::new();
 
 /// Fail a request: nbdkit reads errno, and the log says why. The client
 /// only ever sees an I/O error, so without this line a slot CRC failure, a
@@ -213,6 +215,16 @@ unsafe extern "C" fn open(_readonly: c_int) -> *mut c_void {
             {
                 a as *const NbdAdapter as *mut c_void
             } else {
+                // nbdkit answers a failed open with NBD_REP_ERR_UNKNOWN and
+                // no message, whatever the reason: only this log can say
+                // that the export exists and is taken.
+                if let Some(suppressed) = REFUSED_CONNECTIONS.admit(Instant::now()) {
+                    tracing::warn!(
+                        suppressed,
+                        "refused an NBD connection: the volume serves one connection at a time, \
+                         and one is open"
+                    );
+                }
                 set_errno(libc::EBUSY);
                 std::ptr::null_mut()
             }

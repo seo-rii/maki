@@ -11,18 +11,33 @@
 //! kernel holds its own reference. A disconnect sends
 //! `NBD_CMD_DISCONNECT` for the device's index.
 //!
-//! The kernel refuses a connect with `EBUSY` while anything holds the
-//! unconnected device open (udev probes a device after a disconnect, and an
-//! open allocates the device's configuration), so a connect retries that
-//! answer every 100 ms for up to 5 s, each time on a fresh connection to the
-//! daemon and only while the device still shows no connection. Every other
-//! answer is final.
+//! Two answers are "busy" and are retried, every 100 ms for up to 5 s from
+//! the first of them and only while the device still shows no connection;
+//! every other answer is final.
+//!
+//! - The kernel refuses a connect with `EBUSY` while anything holds the
+//!   unconnected device open (udev probes a device after a disconnect, and
+//!   an open allocates the device's configuration). It answers so before it
+//!   takes the socket, so the next request goes out on the connection that
+//!   is already negotiated, as long as that is still open with nothing to
+//!   read on it. A refusal after the kernel took the socket shuts it down,
+//!   and only then is a fresh connection negotiated.
+//! - The daemon refuses `NBD_OPT_GO` with `NBD_REP_ERR_UNKNOWN` while its
+//!   export is not available. Maki's plugin serves one connection at a time,
+//!   and nbdkit closes a connection a moment after its peer did: a handshake
+//!   that follows a disconnect, or the helper's own closed connection, can
+//!   arrive before that. A server without a default export answers the
+//!   same, and is refused once the time is over.
+//!
+//! A device that stayed busy to the end is reported as such
+//! ([`NbdError::DeviceBusy`]): nothing was changed, and an attach that
+//! allocated the device itself may take another.
 //!
 //! What is bounded, and what is not. The helper's own waits end by the limit
 //! of an external step command, or by the thread's `finish_by` deadline when
 //! that comes first (the failed-start hook bounds all of its commands that
 //! way): connecting to the daemon's socket, the handshake, the retries of a
-//! busy device, and the wait for the kernel's answer. The kernel's work on a
+//! busy device or export, and the wait for the kernel's answer. The kernel's work on a
 //! request is not: it runs inside the `sendto(2)` that sends it, and its
 //! mutex waits are uninterruptible, so neither a deadline nor a signal ends
 //! them. The `nbd` family sets no `parallel_ops`, so the kernel runs each of
@@ -68,6 +83,9 @@ pub enum NbdError {
     /// The device was not changed: a check, the family lookup or the
     /// handshake failed before the request, or the kernel refused it.
     Failed(String),
+    /// The device was not changed: the kernel answered every connect in the
+    /// busy window with `EBUSY`. Something has the unconnected device open.
+    DeviceBusy(String),
     /// The request was sent but its answer could not be read (a timeout, a
     /// lost or malformed reply): the kernel may have applied it, and only
     /// the backend identifier it shows decides what is connected.
@@ -77,7 +95,7 @@ pub enum NbdError {
 impl fmt::Display for NbdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NbdError::Failed(message) => f.write_str(message),
+            NbdError::Failed(message) | NbdError::DeviceBusy(message) => f.write_str(message),
             NbdError::Unknown(error) => write!(
                 f,
                 "{error}; the kernel may have applied the request, so the device's backend \
@@ -131,26 +149,51 @@ pub fn connect(
             block_size,
             identifier,
             deadline,
+            negotiated: None,
         },
     )
 }
 
-/// The real kernel behind [`Attempts`].
-struct KernelAttempts<'a> {
-    netlink: &'a netlink::Socket,
-    family: u16,
-    socket: &'a str,
-    index: u32,
-    block_size: u32,
-    identifier: &'a str,
-    deadline: Instant,
+/// The real daemon and kernel behind [`Attempts`]. The negotiated
+/// connection is the helper's own descriptor: it is closed when this is
+/// dropped, in every outcome, and a connected kernel holds its own
+/// reference.
+pub(crate) struct KernelAttempts<'a> {
+    pub(crate) netlink: &'a netlink::Socket,
+    pub(crate) family: u16,
+    pub(crate) socket: &'a str,
+    pub(crate) index: u32,
+    pub(crate) block_size: u32,
+    pub(crate) identifier: &'a str,
+    pub(crate) deadline: Instant,
+    pub(crate) negotiated: Option<(UnixStream, handshake::Export)>,
 }
 
 impl Attempts for KernelAttempts<'_> {
-    fn connect(&mut self, seq: u32) -> Result<Result<Vec<Vec<u8>>, Unacknowledged>, NbdError> {
-        // A fresh connection each time: the kernel's cleanup of a refused
-        // connect may have shut down the socket it was given.
-        let (stream, export) = open_export(self.socket, self.deadline)?;
+    fn negotiate(&mut self) -> Result<Negotiation, NbdError> {
+        // The daemon serves one connection: close the earlier one first.
+        self.negotiated = None;
+        match try_open_export(self.socket, self.deadline) {
+            Ok(negotiated) => {
+                self.negotiated = Some(negotiated);
+                Ok(Negotiation::Ready)
+            }
+            Err(Refusal::ExportUnavailable(refusal)) => Ok(Negotiation::ExportUnavailable(refusal)),
+            Err(Refusal::Final(message)) => Err(NbdError::Failed(message)),
+        }
+    }
+
+    fn reusable(&mut self) -> bool {
+        self.negotiated
+            .as_ref()
+            .is_some_and(|(stream, _)| idle(stream))
+    }
+
+    fn request(&mut self, seq: u32) -> Result<Vec<Vec<u8>>, Unacknowledged> {
+        let (stream, export) = self
+            .negotiated
+            .as_ref()
+            .expect("a request follows a negotiation");
         let descriptor = u32::try_from(stream.as_raw_fd()).expect("an open descriptor");
         let request = netlink::connect_request(
             self.family,
@@ -159,16 +202,12 @@ impl Attempts for KernelAttempts<'_> {
                 self.index,
                 self.block_size,
                 self.identifier,
-                export,
+                *export,
                 descriptor,
             ),
         );
-        let answer = self
-            .netlink
-            .exchange(&request, seq, self.family, self.deadline);
-        // Whatever the answer: a connected kernel holds its own reference.
-        drop(stream);
-        Ok(answer)
+        self.netlink
+            .exchange(&request, seq, self.family, self.deadline)
     }
 
     fn shows_connection(&mut self) -> Result<bool, NbdError> {
@@ -220,12 +259,37 @@ pub fn open_export(
     path: &str,
     deadline: Instant,
 ) -> Result<(UnixStream, handshake::Export), NbdError> {
+    try_open_export(path, deadline).map_err(|refusal| match refusal {
+        Refusal::ExportUnavailable(message) | Refusal::Final(message) => NbdError::Failed(message),
+    })
+}
+
+/// Why [`try_open_export`] returned no export.
+enum Refusal {
+    /// The server answered that the export is not available
+    /// ([`handshake::ExportUnavailable`]): it may be once the daemon has
+    /// closed its previous connection.
+    ExportUnavailable(String),
+    /// Anything else: waiting does not help.
+    Final(String),
+}
+
+/// [`open_export`], telling the one refusal that can end by itself apart.
+fn try_open_export(
+    path: &str,
+    deadline: Instant,
+) -> Result<(UnixStream, handshake::Export), Refusal> {
     let stream = connect_socket(path, deadline).map_err(|error| {
-        NbdError::Failed(format!("cannot connect to the NBD socket {path}: {error}"))
+        Refusal::Final(format!("cannot connect to the NBD socket {path}: {error}"))
     })?;
     log_peer(&stream, path);
     let export = handshake::negotiate(&stream, deadline).map_err(|error| {
-        NbdError::Failed(format!("the NBD handshake on {path} failed: {error}"))
+        let message = format!("the NBD handshake on {path} failed: {error}");
+        if handshake::export_unavailable(&error) {
+            Refusal::ExportUnavailable(message)
+        } else {
+            Refusal::Final(message)
+        }
     })?;
     tracing::info!(
         "maki-attach: {path} exports {} bytes with transmission flags {:#06x}",
@@ -233,6 +297,34 @@ pub fn open_export(
         export.transmission_flags
     );
     Ok((stream, export))
+}
+
+/// Whether a negotiated stream is still what the handshake left: open, with
+/// nothing to read. A peer that closed, a socket the kernel shut down when
+/// it cleaned up a refused connect, and bytes that no server sends before a
+/// request all make it unfit for the kernel. `MSG_PEEK` consumes nothing.
+pub(crate) fn idle(stream: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: one writable byte; MSG_DONTWAIT never blocks.
+        let received = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if received >= 0 {
+            // End of stream, or a byte nobody asked for.
+            return false;
+        }
+        match io::Error::last_os_error().kind() {
+            io::ErrorKind::WouldBlock => return true,
+            io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
+    }
 }
 
 /// The `NBD_CMD_CONNECT` attributes for `export` on `socket`: the export's
@@ -442,63 +534,138 @@ fn log_peer(stream: &UnixStream, path: &str) {
     }
 }
 
-/// How long a connect keeps retrying a device the kernel reports busy, and
-/// how often. The kernel refuses `NBD_CMD_CONNECT` with `EBUSY` while
-/// anything holds the unconnected device open: udev probes a device after a
-/// disconnect, and opening one allocates its configuration.
+/// How long a connect keeps retrying after its first busy answer, and how
+/// often. The kernel refuses `NBD_CMD_CONNECT` with `EBUSY` while anything
+/// holds the unconnected device open: udev probes a device after a
+/// disconnect, and opening one allocates its configuration. The daemon
+/// answers that its export is not available until it has closed its
+/// previous connection.
 pub(crate) const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
 pub(crate) const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What the connect retries need, so that they are tested without a kernel.
+/// What a negotiation with the daemon gave.
+#[derive(Debug)]
+pub(crate) enum Negotiation {
+    /// A connection in the transmission phase, ready for the kernel.
+    Ready,
+    /// The server answered that the export is not available, in these
+    /// words; no connection is kept.
+    ExportUnavailable(String),
+}
+
+/// What the connect retries need, so that they are tested without a daemon
+/// or a kernel.
 pub(crate) trait Attempts {
-    /// Negotiate a fresh connection to the daemon and send one
-    /// `NBD_CMD_CONNECT` with sequence number `seq`. An error is a failure
-    /// before the request (the handshake): final, nothing changed.
-    fn connect(&mut self, seq: u32) -> Result<Result<Vec<Vec<u8>>, Unacknowledged>, NbdError>;
+    /// Close the connection of an earlier negotiation, connect to the
+    /// daemon and negotiate. An error is final: nothing changed.
+    fn negotiate(&mut self) -> Result<Negotiation, NbdError>;
+    /// Whether the negotiated connection can still be handed to the kernel:
+    /// open, with nothing to read on it.
+    fn reusable(&mut self) -> bool;
+    /// Send one `NBD_CMD_CONNECT` with sequence number `seq` for the
+    /// negotiated connection.
+    fn request(&mut self, seq: u32) -> Result<Vec<Vec<u8>>, Unacknowledged>;
     /// Whether the device shows a connection now.
     fn shows_connection(&mut self) -> Result<bool, NbdError>;
     fn now(&self) -> Instant;
     fn sleep(&mut self, duration: Duration);
 }
 
-/// Connect `nbd<index>` by `deadline`, retrying an `EBUSY` refusal every
-/// [`BUSY_RETRY_INTERVAL`] for up to [`BUSY_RETRY_WINDOW`] while the device
-/// still shows no connection. Every other answer is final.
+/// Which side answered busy.
+enum Busy {
+    /// The kernel: `EBUSY` for the device.
+    Device,
+    /// The daemon: the export is not available.
+    Export(String),
+}
+
+/// Connect `nbd<index>` by `deadline`. A busy answer, the kernel's `EBUSY`
+/// or the daemon's unavailable export, is retried every
+/// [`BUSY_RETRY_INTERVAL`] for up to [`BUSY_RETRY_WINDOW`] from the first
+/// one, while the device still shows no connection. A request after the
+/// kernel's `EBUSY` reuses the negotiated connection when it is still
+/// usable. Every other answer is final.
 pub(crate) fn connect_retrying(
     index: u32,
     deadline: Instant,
     attempts: &mut impl Attempts,
 ) -> Result<(), NbdError> {
-    let busy_until = deadline.min(attempts.now() + BUSY_RETRY_WINDOW);
+    let mut busy_until = None;
     let mut seq = COMMAND_SEQUENCE;
+    let mut negotiated = false;
     loop {
-        match attempts.connect(seq)? {
-            Ok(replies) => return connected(index, &replies),
-            Err(Unacknowledged::Refused(libc::EBUSY))
-                if attempts.now() + BUSY_RETRY_INTERVAL < busy_until =>
-            {
-                tracing::info!(
-                    "maki-attach: nbd{index} is busy (something has it open); retrying the \
-                     connect"
-                );
-                attempts.sleep(BUSY_RETRY_INTERVAL);
-                if attempts.shows_connection()? {
-                    return Err(NbdError::Failed(format!(
-                        "nbd{index} was busy and now shows a connection; refusing to connect it"
-                    )));
+        let mut unavailable = None;
+        if !(negotiated && attempts.reusable()) {
+            match attempts.negotiate()? {
+                Negotiation::Ready => negotiated = true,
+                Negotiation::ExportUnavailable(refusal) => {
+                    negotiated = false;
+                    unavailable = Some(refusal);
                 }
-                seq = seq.wrapping_add(1);
-            }
-            Err(Unacknowledged::Refused(errno)) => {
-                return Err(NbdError::Failed(format!(
-                    "the kernel refused NBD_CMD_CONNECT for nbd{index}: {}",
-                    io::Error::from_raw_os_error(errno)
-                )))
-            }
-            Err(Unacknowledged::Unanswered(error)) => {
-                return Err(unknown("NBD_CMD_CONNECT", index, error))
             }
         }
+        let busy = match unavailable {
+            Some(refusal) => Busy::Export(refusal),
+            None => {
+                let answer = attempts.request(seq);
+                seq = seq.wrapping_add(1);
+                match answer {
+                    Ok(replies) => return connected(index, &replies),
+                    Err(Unacknowledged::Refused(libc::EBUSY)) => Busy::Device,
+                    Err(Unacknowledged::Refused(errno)) => {
+                        return Err(NbdError::Failed(format!(
+                            "the kernel refused NBD_CMD_CONNECT for nbd{index}: {}",
+                            io::Error::from_raw_os_error(errno)
+                        )))
+                    }
+                    Err(Unacknowledged::Unanswered(error)) => {
+                        return Err(unknown("NBD_CMD_CONNECT", index, error))
+                    }
+                }
+            }
+        };
+        let now = attempts.now();
+        let until = *busy_until.get_or_insert(deadline.min(now + BUSY_RETRY_WINDOW));
+        if now + BUSY_RETRY_INTERVAL >= until {
+            return Err(gave_up(index, busy));
+        }
+        match &busy {
+            Busy::Device => tracing::info!(
+                "maki-attach: nbd{index} is busy (something has it open); retrying the connect"
+            ),
+            Busy::Export(_) => tracing::info!(
+                "maki-attach: the daemon's export is not available yet (it serves one \
+                 connection at a time); retrying the handshake"
+            ),
+        }
+        attempts.sleep(BUSY_RETRY_INTERVAL);
+        if attempts.shows_connection()? {
+            return Err(NbdError::Failed(match busy {
+                Busy::Device => format!(
+                    "nbd{index} was busy and now shows a connection; refusing to connect it"
+                ),
+                Busy::Export(_) => format!(
+                    "nbd{index} shows a connection now, after the daemon's export was not \
+                     available; refusing to connect it"
+                ),
+            }));
+        }
+    }
+}
+
+/// The final answer of a connect whose busy answers did not end in time.
+fn gave_up(index: u32, busy: Busy) -> NbdError {
+    match busy {
+        Busy::Device => NbdError::DeviceBusy(format!(
+            "the kernel refused NBD_CMD_CONNECT for nbd{index}: {}; something has kept the \
+             unconnected device open",
+            io::Error::from_raw_os_error(libc::EBUSY)
+        )),
+        Busy::Export(refusal) => NbdError::Failed(format!(
+            "{refusal}. The export stayed unavailable: it is busy with another connection (the \
+             daemon serves one at a time, and a kernel NBD device or another client still holds \
+             it), or the server has no default export"
+        )),
     }
 }
 
@@ -544,6 +711,9 @@ mod netlink_tests;
 
 #[cfg(test)]
 mod header_tests;
+
+#[cfg(test)]
+mod property_tests;
 
 #[cfg(test)]
 mod tests;

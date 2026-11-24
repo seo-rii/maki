@@ -10,12 +10,23 @@
 //! require it to converge: nothing live, no record, and a fresh attach that
 //! succeeds.
 //!
-//! The model is one volume on `/dev/nbd3` with one linear LV. It knows what
-//! the helper's ordering depends on: LVM finds a volume group by reading its
-//! metadata from the PV, so every LVM command needs the daemon to be serving
-//! the device, while `dmsetup` and the netlink disconnect do not; and netlink
+//! The model is one volume with one linear LV on `/dev/nbd3`, or on a second
+//! device, `/dev/nbd4`, where a sweep adds one. It knows what the helper's
+//! ordering depends on: LVM finds a volume group by reading its metadata
+//! from the PV, so every LVM command needs the daemon to be serving the
+//! device, while `dmsetup` and the netlink disconnect do not; and netlink
 //! NBD keeps a connection's `pid` and `backend` attributes after its server
-//! died, until the device is disconnected and no mapping holds it open.
+//! died, until the device is disconnected and nothing holds it open.
+//!
+//! Something can have `/dev/nbd3` open without being a holder that sysfs
+//! shows: a udev probe, an LVM scan, a monitoring agent. Every open holds a
+//! reference to the device's configuration in the kernel. While the device
+//! is unconnected, the kernel then refuses a connect as busy, which the
+//! helper reports once its retries are over; and after an acknowledged
+//! disconnect the device keeps showing the connection until the opener has
+//! closed it. The kernel acknowledges a disconnect of a device that is
+//! already disconnected, or has no connection. An opener can arrive or
+//! leave, and the daemon can die, right before any command of a verb.
 //! Real LVM, device-mapper, NBD and systemd are not involved. The helper
 //! connects and disconnects with its own netlink requests rather than a
 //! command; their endings are swept like a command's: a refusal (exit
@@ -62,6 +73,8 @@ fn silence_simulated_deaths() {
 
 #[derive(Clone, Debug)]
 struct Connection {
+    /// `/dev/nbd3` or `/dev/nbd4`.
+    device: String,
     backend: String,
     /// The daemon behind this connection still answers I/O.
     served: bool,
@@ -77,6 +90,16 @@ struct Kernel {
     mounted: bool,
     sentinel: Option<String>,
     daemon_running: bool,
+    /// Something has `/dev/nbd3` open that sysfs does not show as a holder.
+    opener: bool,
+}
+
+/// What happens right before a numbered command of one verb.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Schedule {
+    opener_opens_before: Option<usize>,
+    opener_closes_before: Option<usize>,
+    daemon_dies_before: Option<usize>,
 }
 
 /// What exists for the volume: (NBD connection, LV mapping, mount).
@@ -179,6 +202,16 @@ struct World {
     /// it exits nonzero, or it exits zero because no volume group matched.
     /// No LVM was available to decide which, so the sweeps run both.
     lvm_select_matches_nothing: bool,
+    /// Events of the running verb.
+    schedule: Schedule,
+    /// The host also has `/dev/nbd4`, which nothing has open.
+    second_device: Cell<bool>,
+    /// The identifier of the last connection the helper made, the device of
+    /// every connect it requested, and what it must never do, as it
+    /// happened.
+    ours: RefCell<Option<String>>,
+    connect_targets: RefCell<Vec<String>>,
+    violations: RefCell<Vec<String>>,
 }
 
 impl World {
@@ -215,6 +248,11 @@ impl World {
             fault: None,
             trace: RefCell::new(Vec::new()),
             lvm_select_matches_nothing: false,
+            schedule: Schedule::default(),
+            second_device: Cell::new(false),
+            ours: RefCell::new(None),
+            connect_targets: RefCell::new(Vec::new()),
+            violations: RefCell::new(Vec::new()),
         };
         world.publish();
         world
@@ -235,46 +273,65 @@ impl World {
     /// observers read.
     fn publish(&self) {
         let mut kernel = self.kernel.borrow_mut();
-        if kernel
-            .connection
-            .as_ref()
-            .is_some_and(|connection| connection.disconnecting)
-            && !kernel.mapped
-        {
+        // The configuration, and with it `pid` and `backend`, lives while
+        // anything has the device open: a mapping, or an opener.
+        if kernel.connection.as_ref().is_some_and(|connection| {
+            connection.disconnecting
+                && !kernel.mapped
+                && !(kernel.opener && connection.device == DEVICE)
+        }) {
             kernel.connection = None;
         }
         let _ = std::fs::remove_dir_all(&self.sysfs);
-        let nbd = self.sysfs.join("nbd3");
-        std::fs::create_dir_all(nbd.join("holders")).unwrap();
-        std::fs::write(nbd.join("dev"), "43:3\n").unwrap();
-        let size = if kernel.connection.is_some() {
-            "1024\n"
-        } else {
-            "0\n"
-        };
-        std::fs::write(nbd.join("size"), size).unwrap();
-        if let Some(connection) = &kernel.connection {
+        let mut devices = vec![3];
+        if self.second_device.get() {
+            devices.push(4);
+        }
+        for index in devices {
+            let name = format!("nbd{index}");
+            let nbd = self.sysfs.join(&name);
+            std::fs::create_dir_all(nbd.join("holders")).unwrap();
+            std::fs::write(nbd.join("dev"), format!("43:{index}\n")).unwrap();
+            let connection = kernel
+                .connection
+                .as_ref()
+                .filter(|connection| connection.device == format!("/dev/{name}"));
+            let size = if connection.is_some() {
+                "1024\n"
+            } else {
+                "0\n"
+            };
+            std::fs::write(nbd.join("size"), size).unwrap();
+            let Some(connection) = connection else {
+                continue;
+            };
             std::fs::write(nbd.join("pid"), "4242\n").unwrap();
             std::fs::write(nbd.join("backend"), format!("{}\n", connection.backend)).unwrap();
-        }
-        if kernel.mapped {
-            let dm = self.sysfs.join("dm-0");
-            for directory in ["dm", "slaves", "holders"] {
-                std::fs::create_dir_all(dm.join(directory)).unwrap();
+            if kernel.mapped {
+                let dm = self.sysfs.join("dm-0");
+                for directory in ["dm", "slaves", "holders"] {
+                    std::fs::create_dir_all(dm.join(directory)).unwrap();
+                }
+                std::fs::write(dm.join("dev"), "253:0\n").unwrap();
+                std::fs::write(dm.join("dm/name"), format!("{MAPPING}\n")).unwrap();
+                let uuid = format!(
+                    "LVM-{}{}\n",
+                    VG_UUID.replace('-', ""),
+                    LV_UUID.replace('-', "")
+                );
+                std::fs::write(dm.join("dm/uuid"), uuid).unwrap();
+                std::fs::write(dm.join("slaves").join(&name), "").unwrap();
+                std::fs::write(nbd.join("holders/dm-0"), "").unwrap();
             }
-            std::fs::write(dm.join("dev"), "253:0\n").unwrap();
-            std::fs::write(dm.join("dm/name"), format!("{MAPPING}\n")).unwrap();
-            let uuid = format!(
-                "LVM-{}{}\n",
-                VG_UUID.replace('-', ""),
-                LV_UUID.replace('-', "")
-            );
-            std::fs::write(dm.join("dm/uuid"), uuid).unwrap();
-            std::fs::write(dm.join("slaves/nbd3"), "").unwrap();
-            std::fs::write(nbd.join("holders/dm-0"), "").unwrap();
         }
         drop(kernel);
         std::fs::write(&self.mountinfo, self.mounts()).unwrap();
+    }
+
+    /// Something opens or closes `/dev/nbd3`.
+    fn set_opener(&self, open: bool) {
+        self.kernel.borrow_mut().opener = open;
+        self.publish();
     }
 
     fn stop_daemon(&self) {
@@ -336,6 +393,16 @@ impl World {
     ) -> Result<(), ExecError> {
         let at = self.commands.get() + 1;
         self.commands.set(at);
+        if self.schedule.opener_opens_before == Some(at) {
+            self.set_opener(true);
+        }
+        if self.schedule.opener_closes_before == Some(at) {
+            self.set_opener(false);
+        }
+        if self.schedule.daemon_dies_before == Some(at) {
+            self.stop_daemon();
+            self.publish();
+        }
         self.trace.borrow_mut().push(format!("c{at}:{name}"));
         let fault = match self.fault {
             Some(Fault::Command {
@@ -372,11 +439,15 @@ impl World {
                 "LVM preflight found an existing mount, mapping, or holder",
             ));
         }
+        let number = (
+            43,
+            crate::probe::nbd_index(&record.device).expect("an NBD device"),
+        );
         let report = serde_json::json!({"report": [{
             "vg": [{"vg_name": record.attachment.vg_name, "vg_uuid": VG_UUID, "vg_seqno": "1",
                 "pv_count": "1", "vg_missing_pv_count": "0", "vg_partial": "0",
                 "vg_exported": "0", "vg_systemid": "", "vg_lock_type": ""}],
-            "pv": [{"pv_name": DEVICE, "pv_uuid": PV_UUID, "vg_uuid": VG_UUID,
+            "pv": [{"pv_name": record.device, "pv_uuid": PV_UUID, "vg_uuid": VG_UUID,
                 "pv_missing": "0", "pv_duplicate": "0"}],
             "lv": [{"lv_name": record.attachment.lv_name, "lv_uuid": LV_UUID,
                 "vg_uuid": VG_UUID, "lv_layout": "linear"}]
@@ -384,18 +455,18 @@ impl World {
         Ok(lvm_preflight::validate(
             &serde_json::to_vec(&report).unwrap(),
             vec![lvm_preflight::Device {
-                path: DEVICE.into(),
-                number: (43, 3),
+                path: record.device.clone(),
+                number,
                 start: 0,
                 sectors: 1024,
             }],
-            [(DEVICE.to_string(), PV_UUID.to_string())].into(),
+            [(record.device.clone(), PV_UUID.to_string())].into(),
             &record.attachment.vg_name,
             &record.attachment.lv_name,
             record.attachment.lvm_identity.as_ref(),
             |path| {
-                if path == DEVICE {
-                    Ok((43, 3))
+                if path == record.device {
+                    Ok(number)
                 } else {
                     Err(io::Error::other("foreign device"))
                 }
@@ -568,13 +639,32 @@ impl System for World {
             |message: &str| ExecError::Verify(crate::verify::MountVerifyError(message.into()));
         self.command(step.kind(), |world| match step {
             PlannedStep::ModprobeNbd => Ok(()),
-            PlannedStep::NbdConnect { .. } => {
+            PlannedStep::NbdConnect { device, .. } => {
+                world.connect_targets.borrow_mut().push(device.clone());
                 let mut kernel = world.kernel.borrow_mut();
+                if kernel.connection.is_some() {
+                    // The executor checks the backend before it connects: a
+                    // request for a device that shows a connection, live or
+                    // lingering, would be a second connect.
+                    world
+                        .violations
+                        .borrow_mut()
+                        .push("a connect was requested while a device shows a connection".into());
+                }
                 if !kernel.daemon_running || kernel.connection.is_some() {
                     return Err(End::Nonzero.report("NBD_CMD_CONNECT"));
                 }
+                if kernel.opener && device == DEVICE {
+                    return Err(ExecError::DeviceBusy {
+                        step: "NBD_CMD_CONNECT".into(),
+                        message: "Device or resource busy".into(),
+                    });
+                }
+                let backend: String = identifier.expect("connect identifier").into();
+                *world.ours.borrow_mut() = Some(backend.clone());
                 kernel.connection = Some(Connection {
-                    backend: identifier.expect("connect identifier").into(),
+                    device: device.clone(),
+                    backend,
                     served: true,
                     disconnecting: false,
                 });
@@ -618,11 +708,28 @@ impl System for World {
                 kernel.mounted = false;
                 Ok(())
             }
-            PlannedStep::NbdDisconnect { .. } => {
+            PlannedStep::NbdDisconnect { device } => {
                 let mut kernel = world.kernel.borrow_mut();
-                let Some(connection) = &mut kernel.connection else {
-                    return Err(End::Nonzero.report("NBD_CMD_DISCONNECT"));
+                // The kernel acknowledges a disconnect of a device without
+                // a connection, and of one already disconnected. The helper
+                // never asks for the first, nor for another's connection.
+                let Some(connection) = kernel
+                    .connection
+                    .as_mut()
+                    .filter(|connection| &connection.device == device)
+                else {
+                    world
+                        .violations
+                        .borrow_mut()
+                        .push(format!("a disconnect of {device}, which has no connection"));
+                    return Ok(());
                 };
+                if Some(&connection.backend) != world.ours.borrow().as_ref() {
+                    world
+                        .violations
+                        .borrow_mut()
+                        .push("a disconnect of a connection the helper did not make".into());
+                }
                 connection.served = false;
                 connection.disconnecting = true;
                 Ok(())
@@ -646,6 +753,11 @@ impl System for World {
     fn allocate(&mut self) -> Result<String, ExecError> {
         self.observe("allocate")?;
         allocation::allocate(&self.sysfs, &self.mountinfo)
+    }
+
+    fn allocate_excluding(&mut self, reserved: &BTreeSet<String>) -> Result<String, ExecError> {
+        self.observe("allocate")?;
+        allocation::allocate_excluding(&self.sysfs, &self.mountinfo, reserved)
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
@@ -714,6 +826,12 @@ impl Case {
     /// Run one helper invocation from its first command, with at most one
     /// fault.
     fn run(&mut self, fault: Option<Fault>, verb: Verb) -> Outcome {
+        self.run_scheduled(fault, Schedule::default(), verb)
+    }
+
+    /// One helper invocation with events at chosen commands.
+    fn run_scheduled(&mut self, fault: Option<Fault>, schedule: Schedule, verb: Verb) -> Outcome {
+        self.world.schedule = schedule;
         self.world.commands.set(0);
         self.world.observations.set(0);
         self.world.trace.borrow_mut().clear();
@@ -731,6 +849,7 @@ impl Case {
             }
         }));
         self.world.fault = None;
+        self.world.schedule = Schedule::default();
         match result {
             Ok(Ok(())) => Outcome::Done,
             Ok(Err(error)) => Outcome::Refused(error.to_string()),
@@ -802,7 +921,8 @@ impl Case {
         let kernel = self.world.kernel.borrow();
         match &kernel.connection {
             Some(connection)
-                if record.device != DEVICE || connection.backend != record.connection_id =>
+                if record.device != connection.device
+                    || connection.backend != record.connection_id =>
             {
                 Err("the record does not name the live connection".into())
             }
@@ -1017,6 +1137,7 @@ fn the_failed_start_hook_touches_only_an_interrupted_activation() {
         let mut case = interrupted_activation(false);
         let record = case.record().unwrap();
         case.world.kernel.borrow_mut().connection = foreign.then(|| Connection {
+            device: DEVICE.into(),
             backend: "maki-ffffffff-ffff-4fff-8fff-ffffffffffff".into(),
             served: true,
             disconnecting: false,
@@ -1164,4 +1285,485 @@ fn an_interrupted_activation_nothing_serves_stays_refused_until_the_mapping_is_r
         assert!(case.clean());
         case.restart().unwrap();
     }
+}
+
+impl Case {
+    /// What the helper must never have done.
+    fn violations(&self) -> Result<(), String> {
+        let violations = self.world.violations.borrow();
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations.join("; "))
+        }
+    }
+
+    fn checks(&self) -> Result<(), String> {
+        self.record_covers_live_state()?;
+        self.violations()
+    }
+
+    /// The device still shows a connection whose disconnect the kernel
+    /// acknowledged.
+    fn lingering(&self) -> bool {
+        self.world
+            .kernel
+            .borrow()
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.disconnecting)
+    }
+
+    /// Bring the volume down as the packaged units, and then an operator,
+    /// would, beside an opener that lets go at `late`: 0 before anything
+    /// else runs, 1 after the failed-start hook, 2 only after the
+    /// coordinator's cleanup ran twice. While the opener holds the device a
+    /// cleanup may refuse; once it has let go, cleanup must finish, except
+    /// in the documented state of an activation intent nothing serves,
+    /// which one manual removal of the unused mapping ends. Then a fresh
+    /// attach must succeed.
+    fn converge(&mut self, failed_start: bool, late: usize) -> Result<(), String> {
+        if late == 0 {
+            self.world.set_opener(false);
+        }
+        let hook = failed_start.then(|| self.run(None, Verb::FailedStartHook));
+        self.checks()
+            .map_err(|problem| format!("after the hook {hook:?}: {problem}"))?;
+        if late == 1 {
+            self.world.set_opener(false);
+        }
+        self.world.stop_daemon();
+        let mut cleanups = vec![self.run(None, Verb::Cleanup)];
+        self.checks()
+            .map_err(|problem| format!("after cleanup {cleanups:?}: {problem}"))?;
+        if late >= 2 {
+            // A second cleanup under the same conditions changes nothing
+            // for the worse.
+            cleanups.push(self.run(None, Verb::Cleanup));
+            self.checks()
+                .map_err(|problem| format!("after cleanups {cleanups:?}: {problem}"))?;
+            self.world.set_opener(false);
+            cleanups.push(self.run(None, Verb::Cleanup));
+            self.checks()
+                .map_err(|problem| format!("after cleanups {cleanups:?}: {problem}"))?;
+        }
+        let left = |case: &Self, cleanups: &[Outcome]| {
+            format!(
+                "hook {hook:?}; cleanups {cleanups:?} left {:?}, record {}, lingering {}",
+                case.live(),
+                case.record().is_some(),
+                case.lingering()
+            )
+        };
+        if cleanups.last() != Some(&Outcome::Done) {
+            let intent_nothing_serves = self.live() == (true, true, false)
+                && !self.ran("dmsetup-remove")
+                && self
+                    .record()
+                    .is_some_and(|record| record.recovery_intent.is_some());
+            if !intent_nothing_serves {
+                return Err(left(self, &cleanups));
+            }
+            self.world.remove_unused_mapping_by_hand();
+            cleanups.push(self.run(None, Verb::Cleanup));
+            self.checks()?;
+        }
+        if cleanups.last() != Some(&Outcome::Done) || !self.clean() {
+            return Err(left(self, &cleanups));
+        }
+        self.restart()?;
+        self.checks()
+    }
+}
+
+/// How many commands and observations a fault-free attach has, and which
+/// command connects.
+fn attach_shape() -> (usize, usize, usize) {
+    let mut baseline = Case::new();
+    assert_eq!(baseline.run(None, Verb::Attach), Outcome::Done);
+    let (commands, observations) = baseline.points();
+    let connect = baseline
+        .commands_run()
+        .iter()
+        .position(|entry| entry.ends_with(":nbd-connect"))
+        .expect("attach connects")
+        + 1;
+    (commands, observations, connect)
+}
+
+fn report(problems: Vec<String>) {
+    assert!(
+        problems.is_empty(),
+        "{} problems, the first 40:\n{}",
+        problems.len(),
+        problems
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Something opens the device before any command of an attach and closes
+/// it before a later one, or outlives the attach. Held open at the connect,
+/// the only device is refused and the attach rolls back; opened later, it
+/// changes nothing.
+#[test]
+fn an_opener_during_an_attach_fails_it_cleanly_or_not_at_all() {
+    let (commands, _, connect) = attach_shape();
+    let mut problems = Vec::new();
+    let (mut refused, mut attached) = (0, 0);
+    for opens in 1..=commands {
+        for closes in (opens + 1..=commands).map(Some).chain([None]) {
+            for late in 0..3 {
+                if closes.is_some() && late > 0 {
+                    continue;
+                }
+                let mut case = Case::new();
+                let schedule = Schedule {
+                    opener_opens_before: Some(opens),
+                    opener_closes_before: closes,
+                    daemon_dies_before: None,
+                };
+                let first = case.run_scheduled(None, schedule, Verb::Attach);
+                let context = format!(
+                    "opens before c{opens}, closes before {closes:?}, late {late} -> {first:?}"
+                );
+                if let Err(problem) = case.checks() {
+                    problems.push(format!("{context}: {problem}"));
+                }
+                let held_at_the_connect =
+                    opens <= connect && closes.is_none_or(|closes| closes > connect);
+                if first == Outcome::Done {
+                    attached += 1;
+                    if !case.fully_attached() || held_at_the_connect {
+                        problems.push(format!("{context}: an attachment that cannot be"));
+                    }
+                } else {
+                    refused += 1;
+                    if !held_at_the_connect {
+                        problems.push(format!("{context}: refused a device nothing held"));
+                    }
+                    if let Err(problem) = case.converge(true, late) {
+                        problems.push(format!("{context}: {problem}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        refused > 0 && attached > 0,
+        "{refused} refused, {attached} attached"
+    );
+    report(problems);
+}
+
+/// Every fault of an attach, beside an opener that arrived before some
+/// command and is still there when the helper ends. A rollback whose
+/// disconnect the kernel acknowledged then leaves a device that still shows
+/// the connection: its record must stay, and everything must end once the
+/// opener lets go.
+#[test]
+fn a_faulted_attach_beside_an_opener_converges_once_it_lets_go() {
+    let (commands, observations, _) = attach_shape();
+    let mut problems = Vec::new();
+    let mut lingered = 0;
+    for opens in 1..=commands {
+        for fault in faults(commands, observations) {
+            for late in 0..3 {
+                let mut case = Case::new();
+                let schedule = Schedule {
+                    opener_opens_before: Some(opens),
+                    ..Schedule::default()
+                };
+                let first = case.run_scheduled(Some(fault), schedule, Verb::Attach);
+                let context = format!("opens before c{opens}, {fault:?}, late {late} -> {first:?}");
+                if case.lingering() {
+                    lingered += 1;
+                    if case.record().is_none() {
+                        problems.push(format!(
+                            "{context}: no record over a device that shows the connection"
+                        ));
+                    }
+                }
+                if let Err(problem) = case.checks() {
+                    problems.push(format!("{context}: {problem}"));
+                }
+                if first == Outcome::Done {
+                    if !case.fully_attached() {
+                        problems.push(format!("{context}: success without an attachment"));
+                    }
+                    continue;
+                }
+                if let Err(problem) = case.converge(true, late) {
+                    problems.push(format!("{context}: {problem}"));
+                }
+            }
+        }
+    }
+    assert!(lingered > 0, "no rollback met the opener");
+    report(problems);
+}
+
+/// Detach and cleanup, fault-free and under every fault, while something
+/// has the device open from before the verb or from some command on: a
+/// verb never succeeds over a device that still shows the connection, and
+/// keeps its record until it no longer does.
+#[test]
+fn a_teardown_beside_an_opener_keeps_its_record_until_the_backend_is_gone() {
+    let mut problems = Vec::new();
+    let mut lingered = 0;
+    for (name, verb, daemon_stopped) in [
+        ("detach", Verb::Detach, false),
+        ("cleanup", Verb::Cleanup, false),
+        ("cleanup after the daemon stopped", Verb::Cleanup, true),
+    ] {
+        let prepare = || {
+            let case = Case::attached();
+            if daemon_stopped {
+                case.world.stop_daemon();
+            }
+            case
+        };
+        let mut baseline = prepare();
+        assert_eq!(baseline.run(None, verb), Outcome::Done, "{name}");
+        let (commands, observations) = baseline.points();
+        let all: Vec<Option<Fault>> = [None]
+            .into_iter()
+            .chain(faults(commands, observations).into_iter().map(Some))
+            .collect();
+        // 0: the opener is there before the verb starts.
+        for opens in 0..=commands {
+            for fault in &all {
+                for late in [0, 2] {
+                    let mut case = prepare();
+                    let schedule = if opens == 0 {
+                        case.world.set_opener(true);
+                        Schedule::default()
+                    } else {
+                        Schedule {
+                            opener_opens_before: Some(opens),
+                            ..Schedule::default()
+                        }
+                    };
+                    let first = case.run_scheduled(*fault, schedule, verb);
+                    let context = format!(
+                        "{name}: opens before c{opens}, {fault:?}, late {late} -> {first:?}"
+                    );
+                    if case.lingering() {
+                        lingered += 1;
+                        if first == Outcome::Done {
+                            problems.push(format!(
+                                "{context}: success over a device that shows the connection"
+                            ));
+                        }
+                    }
+                    if let Err(problem) = case.checks() {
+                        problems.push(format!("{context}: {problem}"));
+                    }
+                    if let Err(problem) = case.converge(false, late) {
+                        problems.push(format!("{context}: {problem}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(lingered > 0, "no disconnect met the opener");
+    report(problems);
+}
+
+/// The daemon dies right before any command of an attach, with and without
+/// an opener.
+#[test]
+fn a_daemon_that_dies_during_an_attach_leaves_what_cleanup_ends() {
+    let (commands, _, _) = attach_shape();
+    let mut problems = Vec::new();
+    for dies in 1..=commands {
+        for opens in (1..=commands).map(Some).chain([None]) {
+            for late in 0..3 {
+                if opens.is_none() && late > 0 {
+                    continue;
+                }
+                let mut case = Case::new();
+                let schedule = Schedule {
+                    opener_opens_before: opens,
+                    opener_closes_before: None,
+                    daemon_dies_before: Some(dies),
+                };
+                let first = case.run_scheduled(None, schedule, Verb::Attach);
+                let context = format!(
+                    "daemon dies before c{dies}, opener before {opens:?}, late {late} -> {first:?}"
+                );
+                if let Err(problem) = case.checks() {
+                    problems.push(format!("{context}: {problem}"));
+                }
+                // An attach that finished before it could notice is torn
+                // down like any attachment nothing serves.
+                if let Err(problem) = case.converge(first != Outcome::Done, late) {
+                    problems.push(format!("{context}: {problem}"));
+                }
+            }
+        }
+    }
+    report(problems);
+}
+
+/// The daemon dies right before any command of a detach, a cleanup or the
+/// failed-start hook's rollback, with and without an opener.
+#[test]
+fn a_daemon_that_dies_during_a_teardown_leaves_what_cleanup_ends() {
+    let mut problems = Vec::new();
+    for (name, verb, interrupted) in [
+        ("detach", Verb::Detach, false),
+        ("cleanup", Verb::Cleanup, false),
+        ("failed-start hook", Verb::FailedStartHook, true),
+    ] {
+        let prepare = || {
+            if interrupted {
+                interrupted_activation(false)
+            } else {
+                Case::attached()
+            }
+        };
+        let mut baseline = prepare();
+        assert_eq!(baseline.run(None, verb), Outcome::Done, "{name}");
+        let (commands, _) = baseline.points();
+        for dies in 1..=commands {
+            for opener in [false, true] {
+                for late in [0, 2] {
+                    if !opener && late > 0 {
+                        continue;
+                    }
+                    let mut case = prepare();
+                    case.world.set_opener(opener);
+                    let schedule = Schedule {
+                        daemon_dies_before: Some(dies),
+                        ..Schedule::default()
+                    };
+                    let first = case.run_scheduled(None, schedule, verb);
+                    let context = format!(
+                        "{name}: daemon dies before c{dies}, opener {opener}, late {late} -> {first:?}"
+                    );
+                    if let Err(problem) = case.checks() {
+                        problems.push(format!("{context}: {problem}"));
+                    }
+                    if let Err(problem) = case.converge(false, late) {
+                        problems.push(format!("{context}: {problem}"));
+                    }
+                }
+            }
+        }
+    }
+    report(problems);
+}
+
+/// While a device still shows the recorded connection after an acknowledged
+/// disconnect, every verb says so or does nothing, keeps the record and
+/// changes nothing; a retry sends the disconnect again, which the kernel
+/// acknowledges again. Once the opener has let go, cleanup retires the
+/// record without a command.
+#[test]
+fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
+    let mut case = Case::attached();
+    case.world.set_opener(true);
+    let detach = case.run(None, Verb::Detach);
+    assert!(
+        matches!(&detach, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+        "{detach:?}"
+    );
+    assert_eq!(
+        case.commands_run(),
+        ["c1:umount", "c2:lvm-deactivate", "c3:nbd-disconnect"]
+    );
+    assert!(case.lingering());
+    let record = case.record().expect("the record is kept");
+    case.checks().unwrap();
+
+    for (verb, says, commands) in [
+        (Verb::Attach, "recorded device is still connected", &[][..]),
+        (Verb::Recover, "backend is still connected", &[]),
+        (Verb::FailedStartHook, "", &[]),
+        (
+            Verb::Detach,
+            "disconnect has not completed",
+            &["c1:nbd-disconnect"],
+        ),
+        (
+            Verb::Cleanup,
+            "disconnect has not completed",
+            &["c1:nbd-disconnect"],
+        ),
+    ] {
+        let outcome = case.run(None, verb);
+        match &outcome {
+            Outcome::Refused(text) => assert!(text.contains(says), "{verb:?}: {text}"),
+            // The hook has nothing to roll back here.
+            Outcome::Done => assert!(matches!(verb, Verb::FailedStartHook), "{verb:?}"),
+            Outcome::HelperDied => panic!("{verb:?}"),
+        }
+        assert_eq!(case.commands_run(), commands, "{verb:?}");
+        assert_eq!(case.record(), Some(record.clone()), "{verb:?}");
+        assert!(case.lingering(), "{verb:?}");
+        case.checks().unwrap();
+    }
+
+    case.world.set_opener(false);
+    assert_eq!(case.run(None, Verb::Cleanup), Outcome::Done);
+    assert!(case.commands_run().is_empty() && case.clean());
+    case.restart().unwrap();
+}
+
+/// With `/dev/nbd3` held open and `/dev/nbd4` free, an attach gives the
+/// first up and ends on the second, and every fault on the way leaves a
+/// state the packaged recovery ends: whichever device the record names when
+/// the helper stops, nothing live is outside it.
+#[test]
+fn an_attach_past_a_held_device_converges_under_every_fault() {
+    let held = || {
+        let case = Case::new();
+        case.world.second_device.set(true);
+        case.world.set_opener(true);
+        case
+    };
+    let mut baseline = held();
+    assert_eq!(baseline.run(None, Verb::Attach), Outcome::Done);
+    assert!(baseline.fully_attached());
+    assert_eq!(
+        *baseline.world.connect_targets.borrow(),
+        ["/dev/nbd3", "/dev/nbd4"]
+    );
+    assert_eq!(baseline.record().unwrap().device, "/dev/nbd4");
+    let (commands, observations) = baseline.points();
+
+    let mut problems = Vec::new();
+    let mut recorded = std::collections::BTreeSet::new();
+    for fault in faults(commands, observations) {
+        for late in 0..3 {
+            let mut case = held();
+            let first = case.run(Some(fault), Verb::Attach);
+            let context = format!("{fault:?}, late {late} -> {first:?}");
+            if let Some(record) = case.record() {
+                recorded.insert(record.device);
+            }
+            if let Err(problem) = case.checks() {
+                problems.push(format!("{context}: {problem}"));
+            }
+            if first == Outcome::Done {
+                if !case.fully_attached() {
+                    problems.push(format!("{context}: success without an attachment"));
+                }
+                continue;
+            }
+            if let Err(problem) = case.converge(true, late) {
+                problems.push(format!("{context}: {problem}"));
+            }
+        }
+    }
+    // A helper that stopped on either side of the move was swept.
+    assert_eq!(
+        recorded.into_iter().collect::<Vec<_>>(),
+        ["/dev/nbd3", "/dev/nbd4"]
+    );
+    report(problems);
 }
