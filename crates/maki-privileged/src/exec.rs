@@ -240,8 +240,8 @@ pub fn allocate_nbd_device() -> Result<String, ExecError> {
     allocation::allocate(Path::new("/sys/class/block"), Path::new(MOUNTINFO))
 }
 
-/// Wait until `device` shows the connection that `step`, the connect
-/// step as it reports itself, made.
+/// Wait until `device` shows the connection that `step`, the executed
+/// connect step as [`PlannedStep::executed_with`] describes it, made.
 fn wait_nbd_ready(step: &str, device: &str) -> Result<(), ExecError> {
     let Some(n) = nbd_index(device) else {
         return Err(ExecError::Step {
@@ -653,7 +653,7 @@ fn nbd_step_index(device: &str) -> Result<u32, ExecError> {
 /// be read is an I/O error of the step, like a command that ran out of
 /// time, so that what is connected is decided by the backend identifier the
 /// callers observe next, never by an assumption that nothing changed.
-fn nbd_step_error(step: &PlannedStep, error: NbdError) -> ExecError {
+fn nbd_step_error(step: &dyn std::fmt::Display, error: NbdError) -> ExecError {
     match error {
         NbdError::Failed(message) => ExecError::Step {
             step: step.to_string(),
@@ -682,9 +682,12 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             let index = nbd_step_index(device)?;
             let identifier =
                 connection_id.ok_or_else(|| identity_error("missing connect identifier"))?;
-            tracing::info!("maki-attach: {step}");
+            // The log and the error name the identifier that is sent, which
+            // the plan could only show as a placeholder.
+            let executed = step.executed_with(identifier);
+            tracing::info!("maki-attach: {executed}");
             crate::nbd_kernel::connect(socket, index, *block_size, identifier)
-                .map_err(|error| nbd_step_error(step, error))
+                .map_err(|error| nbd_step_error(&executed, error))
         }
         PlannedStep::SetBlockSize { device, block_size } => run(
             step,
@@ -805,8 +808,8 @@ pub fn connect_raw(
 /// [`connect_raw`] on the device tree `sysfs` with the devices trusted
 /// records name (`reserved`): everything is checked before `connect`, which
 /// runs the connect step and waits for the device, is called. It is given
-/// the step, the identifier and the step as it reports itself, for the
-/// wait's error.
+/// the step, the identifier and the step as executed, which names the
+/// identifier, for the wait's error.
 fn connect_raw_with(
     sysfs: &Path,
     reserved: &BTreeMap<String, String>,
@@ -827,7 +830,7 @@ fn connect_raw_with(
         device: device.into(),
         block_size,
     };
-    connect(&step, identifier, &step.to_string())?;
+    connect(&step, identifier, &step.executed_with(identifier))?;
     if !raw_backend_is(sysfs, device, identifier)? {
         return Err(identity_error(format!(
             "{device} shows no connection after the connect was acknowledged"
@@ -1063,7 +1066,7 @@ trait System {
     fn announce_bound_device(&mut self, _device: &str) {}
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
     /// Wait for `device` after its connect step ran; `step` is that step as
-    /// it reports itself, for the error.
+    /// executed ([`PlannedStep::executed_with`]), for the error.
     fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
     /// A free device that is none of `reserved`, the devices other volumes'
@@ -1651,7 +1654,7 @@ fn connect_recorded(
         let busy = match system.run_step(&step, Some(&record.connection_id)) {
             Ok(()) => {
                 return system
-                    .wait_ready(&step.to_string(), device)
+                    .wait_ready(&step.executed_with(&record.connection_id), device)
                     .and_then(|()| verify_connection(record, system))
             }
             Err(busy @ ExecError::DeviceBusy { .. }) => busy,

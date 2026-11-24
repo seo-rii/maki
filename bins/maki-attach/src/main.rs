@@ -255,11 +255,13 @@ fn raw_nbd(verb: &str, args: &[OsString]) -> ExitCode {
     };
     let name = raw.device.strip_prefix("/dev/").unwrap_or(&raw.device);
     let step = match &raw.socket {
-        Some(socket) => format!(
-            "connect {name} to {socket} over netlink (block size {}, backend identifier '{}'; \
-             the export must advertise FLUSH and FUA)",
-            raw.block_size, raw.identifier
-        ),
+        // The line the executed step logs and reports.
+        Some(socket) => maki_privileged::plan::PlannedStep::NbdConnect {
+            socket: socket.clone(),
+            device: raw.device.clone(),
+            block_size: raw.block_size,
+        }
+        .executed_with(&raw.identifier),
         None => format!(
             "disconnect {name} over netlink, only while its backend identifier is '{}'",
             raw.identifier
