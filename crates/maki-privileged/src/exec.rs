@@ -31,6 +31,7 @@ mod allocation;
 mod displaced;
 
 use crate::detach::DetachObservation;
+use crate::nbd_kernel::NbdError;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
 use crate::probe::{nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices};
 use crate::state::{BoundDeviceRecord, StateLock, TrustedState};
@@ -630,12 +631,29 @@ pub fn observe_mount(mountpoint: &str, nbd_device: &str) -> io::Result<MountObse
     observe(mountpoint, nbd_device, true)
 }
 
-/// The upstream netlink API names a target as `nbdN`; `/dev/nbdN` is used by
-/// block-device tools but is rejected by nbd-client's netlink parser.
-fn nbd_client_target(device: &str) -> Result<String, ExecError> {
-    nbd_index(device)
-        .map(|index| format!("nbd{index}"))
-        .ok_or_else(|| identity_error("invalid NBD device for nbd-client"))
+/// The kernel's index of a canonical `/dev/nbdN`: what the `nbd` netlink
+/// family addresses a device by.
+fn nbd_step_index(device: &str) -> Result<u32, ExecError> {
+    nbd_index(device).ok_or_else(|| identity_error("invalid NBD device for a netlink step"))
+}
+
+/// A failed NBD step. The kernel refusing it, or a failure before the
+/// request, is the step's failure; an answer that could not be read is an
+/// I/O error of the step, like a command that ran out of time, so that
+/// what is connected is decided by the backend identifier the callers
+/// observe next, never by an assumption that nothing changed.
+fn nbd_step_error(step: &PlannedStep, error: NbdError) -> ExecError {
+    match error {
+        NbdError::Failed(message) => ExecError::Step {
+            step: step.to_string(),
+            message,
+        },
+        NbdError::Unknown(cause) => {
+            let kind = cause.kind();
+            let unknown = NbdError::Unknown(cause);
+            ExecError::Io(io::Error::new(kind, format!("{step}: {unknown}")))
+        }
+    }
 }
 
 fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecError> {
@@ -646,23 +664,12 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             device,
             block_size,
         } => {
-            let bs = block_size.to_string();
-            let target = nbd_client_target(device)?;
+            let index = nbd_step_index(device)?;
             let identifier =
                 connection_id.ok_or_else(|| identity_error("missing connect identifier"))?;
-            run(
-                step,
-                "nbd-client",
-                &[
-                    "-unix",
-                    socket,
-                    &target,
-                    "-b",
-                    &bs,
-                    "-identifier",
-                    identifier,
-                ],
-            )
+            tracing::info!("maki-attach: {step}");
+            crate::nbd_kernel::connect(socket, index, *block_size, identifier)
+                .map_err(|error| nbd_step_error(step, error))
         }
         PlannedStep::SetBlockSize { device, block_size } => run(
             step,
@@ -735,8 +742,9 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
         }
         PlannedStep::Umount { mountpoint } => run(step, "umount", &[mountpoint.as_str()]),
         PlannedStep::NbdDisconnect { device } => {
-            let target = nbd_client_target(device)?;
-            run(step, "nbd-client", &["-d", &target])
+            let index = nbd_step_index(device)?;
+            tracing::info!("maki-attach: {step}");
+            crate::nbd_kernel::disconnect(index).map_err(|error| nbd_step_error(step, error))
         }
         PlannedStep::XfsGrowfs { mountpoint } => run(step, "xfs_growfs", &[mountpoint.as_str()]),
     }
@@ -1619,12 +1627,13 @@ fn execute_with_options(
                 continue;
             }
         }
-        // `nbd-client` connecting and the device becoming ready are two
-        // outcomes: once the connect command runs, a partially-connected
-        // device is cleaned up by the observation-based rollback below, which
+        // The connect request and the device becoming ready are two
+        // outcomes: once the request is sent, a partially-connected device
+        // is cleaned up by the observation-based rollback below, which
         // disconnects any backend that carries our identity — so a readiness
-        // timeout (or a failure after the kernel was configured) never leaks a
-        // connected device (O-07), without a separately tracked prefix.
+        // timeout, an unreadable kernel answer or a failure after the kernel
+        // was configured never leaks a connected device (O-07), without a
+        // separately tracked prefix.
         let result = match step {
             PlannedStep::NbdConnect { device, .. } => {
                 let record = record.as_ref().unwrap();

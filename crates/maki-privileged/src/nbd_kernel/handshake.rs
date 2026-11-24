@@ -21,6 +21,7 @@
 //! it by path to run it against Maki's own plugin.
 
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
@@ -101,8 +102,21 @@ pub struct Export {
 /// Everything the client sends after a greeting that carried
 /// `server_flags`: its own flags, then `NBD_OPT_GO` for the default export.
 pub fn client_request(server_flags: u16) -> Vec<u8> {
-    let _ = server_flags;
-    todo!("client_request")
+    let mut client_flags = NBD_FLAG_C_FIXED_NEWSTYLE;
+    // A flag the server did not offer makes nbdkit drop the connection.
+    if server_flags & NBD_FLAG_NO_ZEROES != 0 {
+        client_flags |= NBD_FLAG_C_NO_ZEROES;
+    }
+    let mut bytes = Vec::with_capacity(26);
+    bytes.extend_from_slice(&client_flags.to_be_bytes());
+    bytes.extend_from_slice(&IHAVEOPT.to_be_bytes());
+    bytes.extend_from_slice(&NBD_OPT_GO.to_be_bytes());
+    // The option's data: an empty name (the default export), then no
+    // information requests.
+    bytes.extend_from_slice(&6u32.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes
 }
 
 /// Run the handshake on `stream`, which has just connected to the server,
@@ -113,6 +127,287 @@ pub fn client_request(server_flags: u16) -> Vec<u8> {
 /// A protocol violation or refusal is `InvalidData`, a deadline that
 /// passed `TimedOut` and a stream that ended early `UnexpectedEof`.
 pub fn negotiate(stream: &UnixStream, deadline: Instant) -> io::Result<Export> {
-    let _ = (stream, deadline);
-    todo!("negotiate")
+    let mut session = Session {
+        fd: stream.as_raw_fd(),
+        deadline,
+        read: 0,
+    };
+    let mut greeting = [0; 8];
+    session.read(&mut greeting)?;
+    if u64::from_be_bytes(greeting) != NBDMAGIC {
+        return Err(invalid(
+            "the server's greeting does not start with the NBD magic",
+        ));
+    }
+    session.read(&mut greeting)?;
+    match u64::from_be_bytes(greeting) {
+        IHAVEOPT => {}
+        OLDSTYLE_MAGIC => {
+            return Err(invalid(
+                "the server speaks the oldstyle protocol; fixed-newstyle negotiation is required",
+            ))
+        }
+        _ => {
+            return Err(invalid(
+                "the server's greeting carries an unknown second magic",
+            ))
+        }
+    }
+    let mut flags = [0; 2];
+    session.read(&mut flags)?;
+    let server_flags = u16::from_be_bytes(flags);
+    if server_flags & NBD_FLAG_FIXED_NEWSTYLE == 0 {
+        return Err(invalid(
+            "the server does not offer fixed-newstyle negotiation, which NBD_OPT_GO requires",
+        ));
+    }
+    session.write(&client_request(server_flags))?;
+
+    let mut export = None;
+    loop {
+        let mut header = [0; 20];
+        session.read(&mut header)?;
+        let word = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().unwrap());
+        let (option, kind, length) = (word(8), word(12), word(16));
+        if u64::from_be_bytes(header[..8].try_into().unwrap()) != REPLY_MAGIC {
+            return Err(invalid("an option reply carries the wrong magic"));
+        }
+        if option != NBD_OPT_GO {
+            return Err(invalid(format!(
+                "the server replied to option {option}, which the client did not send"
+            )));
+        }
+        // Checked before anything of the reply is read.
+        if length > MAX_REPLY_LENGTH {
+            return Err(invalid(format!(
+                "the server announced a {length}-byte option reply, longer than the \
+                 {MAX_REPLY_LENGTH}-byte limit"
+            )));
+        }
+        let mut data = vec![0; length as usize];
+        session.read(&mut data)?;
+        match kind {
+            NBD_REP_ACK if !data.is_empty() => {
+                return Err(invalid(
+                    "the server's acknowledgement of NBD_OPT_GO carries data",
+                ))
+            }
+            NBD_REP_ACK => {
+                return export.ok_or_else(|| {
+                    invalid("the server acknowledged NBD_OPT_GO without NBD_INFO_EXPORT")
+                })
+            }
+            NBD_REP_INFO => {
+                let Some((info, value)) = data.split_first_chunk::<2>() else {
+                    return Err(invalid(
+                        "the server sent an information reply shorter than its type",
+                    ));
+                };
+                // Information the client did not ask for is skipped.
+                if u16::from_be_bytes(*info) != NBD_INFO_EXPORT {
+                    continue;
+                }
+                let Ok(value) = <[u8; 10]>::try_from(value) else {
+                    return Err(invalid(format!(
+                        "the server sent a {}-byte NBD_INFO_EXPORT; it has 12 bytes",
+                        data.len()
+                    )));
+                };
+                if export.is_some() {
+                    return Err(invalid("the server sent NBD_INFO_EXPORT more than once"));
+                }
+                let (size, flags) = value.split_at(8);
+                export = Some(checked_export(
+                    u64::from_be_bytes(size.try_into().unwrap()),
+                    u16::from_be_bytes(flags.try_into().unwrap()),
+                )?);
+            }
+            kind if kind & NBD_REP_FLAG_ERROR != 0 => {
+                // The message is the daemon's text: not shown to root's log.
+                return Err(invalid(format!(
+                    "the server refused NBD_OPT_GO with {} (its {}-byte message is not \
+                     shown); NBD_OPT_EXPORT_NAME is not tried",
+                    error_name(kind),
+                    data.len()
+                )));
+            }
+            kind => {
+                return Err(invalid(format!(
+                    "the server sent reply type {kind} to NBD_OPT_GO"
+                )))
+            }
+        }
+    }
+}
+
+/// The export, if the kernel may use it.
+fn checked_export(size: u64, flags: u16) -> io::Result<Export> {
+    if size == 0 {
+        return Err(invalid("the export's size is 0"));
+    }
+    if size > MAX_EXPORT_SIZE {
+        return Err(invalid(format!(
+            "the export's size {size} exceeds the kernel's limit of {MAX_EXPORT_SIZE} bytes"
+        )));
+    }
+    let missing: Vec<&str> = [
+        (NBD_FLAG_HAS_FLAGS, "NBD_FLAG_HAS_FLAGS"),
+        (NBD_FLAG_SEND_FLUSH, "NBD_FLAG_SEND_FLUSH"),
+        (NBD_FLAG_SEND_FUA, "NBD_FLAG_SEND_FUA"),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| flags & flag == 0)
+    .map(|(_, name)| name)
+    .collect();
+    if !missing.is_empty() {
+        return Err(invalid(format!(
+            "the export does not advertise {} (transmission flags {flags:#06x}): the kernel \
+             would complete FLUSH and FUA requests without sending them to the server",
+            missing.join(", ")
+        )));
+    }
+    Ok(Export {
+        size,
+        transmission_flags: flags,
+    })
+}
+
+fn error_name(kind: u32) -> String {
+    let name = match kind {
+        NBD_REP_ERR_UNSUP => "NBD_REP_ERR_UNSUP",
+        NBD_REP_ERR_POLICY => "NBD_REP_ERR_POLICY",
+        NBD_REP_ERR_INVALID => "NBD_REP_ERR_INVALID",
+        NBD_REP_ERR_PLATFORM => "NBD_REP_ERR_PLATFORM",
+        NBD_REP_ERR_TLS_REQD => "NBD_REP_ERR_TLS_REQD (TLS, which the kernel client cannot use)",
+        NBD_REP_ERR_UNKNOWN => "NBD_REP_ERR_UNKNOWN (no default export)",
+        NBD_REP_ERR_SHUTDOWN => "NBD_REP_ERR_SHUTDOWN",
+        NBD_REP_ERR_BLOCK_SIZE_REQD => "NBD_REP_ERR_BLOCK_SIZE_REQD",
+        NBD_REP_ERR_TOO_BIG => "NBD_REP_ERR_TOO_BIG",
+        NBD_REP_ERR_EXT_HEADER_REQD => {
+            "NBD_REP_ERR_EXT_HEADER_REQD (extended headers, which the kernel client cannot use)"
+        }
+        _ => return format!("error {kind:#010x}"),
+    };
+    name.to_string()
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// One handshake's socket, its deadline and the bytes read so far.
+struct Session {
+    fd: RawFd,
+    deadline: Instant,
+    read: usize,
+}
+
+/// Wait until `events` is ready on `fd`, or fail with `TimedOut` once
+/// `deadline` has passed; `what` names what did not finish.
+pub(crate) fn wait_for(
+    fd: RawFd,
+    events: libc::c_short,
+    deadline: Instant,
+    what: &str,
+) -> io::Result<()> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{what} did not finish by its deadline"),
+            ));
+        }
+        // Rounded up: a wait never ends before the deadline.
+        let milliseconds = i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
+        let mut poll = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Session {
+    fn wait(&self, events: libc::c_short) -> io::Result<()> {
+        wait_for(self.fd, events, self.deadline, "the NBD handshake")
+    }
+
+    /// Fill `buffer`, within the deadline and the handshake's byte limit.
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<()> {
+        if buffer.len() > MAX_HANDSHAKE_BYTES - self.read {
+            return Err(invalid(format!(
+                "the server's handshake exceeds the byte limit of {MAX_HANDSHAKE_BYTES} bytes"
+            )));
+        }
+        let mut filled = 0;
+        while filled < buffer.len() {
+            self.wait(libc::POLLIN)?;
+            let rest = &mut buffer[filled..];
+            // SAFETY: the pointer and length describe the unfilled part of
+            // `buffer`; MSG_DONTWAIT never blocks, whatever poll reported.
+            let received = unsafe {
+                libc::recv(
+                    self.fd,
+                    rest.as_mut_ptr().cast(),
+                    rest.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match usize::try_from(received) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the server closed the connection during the NBD handshake",
+                    ))
+                }
+                Ok(count) => filled += count,
+                Err(_) => retry_or_fail(io::Error::last_os_error())?,
+            }
+        }
+        self.read += buffer.len();
+        Ok(())
+    }
+
+    fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            self.wait(libc::POLLOUT)?;
+            let rest = &bytes[sent..];
+            // SAFETY: the pointer and length describe the unsent part of
+            // `bytes`. MSG_NOSIGNAL: a closed peer is an error, not SIGPIPE.
+            let written = unsafe {
+                libc::send(
+                    self.fd,
+                    rest.as_ptr().cast(),
+                    rest.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            match usize::try_from(written) {
+                Ok(count) => sent += count,
+                Err(_) => retry_or_fail(io::Error::last_os_error())?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Waiting again is the answer to a socket that was not ready after all.
+fn retry_or_fail(error: io::Error) -> io::Result<()> {
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+        _ => Err(error),
+    }
 }

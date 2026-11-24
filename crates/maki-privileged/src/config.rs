@@ -2,8 +2,9 @@
 //! review M-016) and argument hygiene for everything the helper hands to
 //! system utilities.
 //!
-//! The helper runs as root and execs `nbd-client`, `mount`, `vgchange` and
-//! friends with values that come from configuration or the command line.
+//! The helper runs as root, connects to the configured NBD socket and execs
+//! `mount`, `vgchange` and friends with values that come from configuration
+//! or the command line.
 //! Every such value is checked here: no leading dash (option injection), no
 //! control characters, absolute canonical paths, a well-formed UUID.
 

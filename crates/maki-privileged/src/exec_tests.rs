@@ -70,10 +70,38 @@ lv_uuid = 'hhhhhh-iiii-jjjj-kkkk-llll-mmmm-nnnnnn'
 }
 
 #[test]
-fn nbd_client_netlink_target_is_the_validated_kernel_name() {
-    assert_eq!(nbd_client_target("/dev/nbd15").unwrap(), "nbd15");
-    assert!(nbd_client_target("nbd15").is_err());
-    assert!(nbd_client_target("/dev/sda").is_err());
+fn nbd_steps_address_the_validated_kernel_index() {
+    assert_eq!(nbd_step_index("/dev/nbd15").unwrap(), 15);
+    for device in ["nbd15", "/dev/sda", "/dev/nbd01", "/dev/nbd"] {
+        assert!(nbd_step_index(device).is_err(), "{device}");
+    }
+}
+
+/// A step whose kernel answer could not be read stays an I/O error of its
+/// kind (a timeout is still a timeout), never a plain refusal: the callers
+/// decide from the device's backend identifier what is connected.
+#[test]
+fn an_unanswered_nbd_step_is_an_io_error_of_unknown_outcome() {
+    let step = PlannedStep::NbdDisconnect {
+        device: "/dev/nbd3".into(),
+    };
+    match nbd_step_error(
+        &step,
+        NbdError::Unknown(io::Error::new(io::ErrorKind::TimedOut, "no answer")),
+    ) {
+        ExecError::Io(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                error.to_string().contains("backend identifier decides"),
+                "{error}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        nbd_step_error(&step, NbdError::Failed("refused".into())),
+        ExecError::Step { message, .. } if message == "refused"
+    ));
 }
 
 /// The connect and disconnect steps start no program: the helper
@@ -2176,9 +2204,7 @@ mod workload_verify_tests;
 /// environment: a fixed PATH, `LC_ALL=C`, nothing inherited from the caller
 /// (`LD_*`, a hostile PATH, locale-dependent output). `recover` and the LVM
 /// preflight already did; the attach/detach/grow steps and their probes
-/// inherited everything. The PATH is systemd's default service PATH: a
-/// source-built nbd-client 3.27 lives in /usr/local/sbin (the 2026-10-03
-/// campaign found the first fixed PATH, without /usr/local, unable to find it).
+/// inherited everything. The PATH is systemd's default service PATH.
 #[test]
 fn step_commands_do_not_inherit_the_callers_environment() {
     std::env::set_var("MAKI_ENV_PROBE_LEAK", "leaked");

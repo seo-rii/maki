@@ -56,6 +56,23 @@ pub(crate) fn finish_by(deadline: Instant) -> Deadline {
     Deadline(FINISH_BY.replace(Some(deadline)))
 }
 
+/// When a step the helper performs itself, without an external command
+/// (the NBD connect and disconnect), must end: after the time an external
+/// step command may take, or at the thread's [`finish_by`] deadline when
+/// that comes first. No step starts once that deadline has passed.
+pub(crate) fn step_deadline() -> io::Result<Instant> {
+    let now = Instant::now();
+    let limit = now + Policy::STEP.timeout;
+    match FINISH_BY.get() {
+        Some(deadline) if deadline <= now => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no time left to start an NBD step",
+        )),
+        Some(deadline) => Ok(limit.min(deadline)),
+        None => Ok(limit),
+    }
+}
+
 /// The limit [`finish_by`] set for this thread, if any.
 #[cfg(test)]
 pub(super) fn finish_by_limit() -> Option<Instant> {
@@ -69,8 +86,7 @@ pub(crate) fn controlled(program: &str) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()
-        // systemd's default service PATH: root-controlled locations only,
-        // /usr/local included, where a source-built nbd-client 3.27 lives.
+        // systemd's default service PATH: root-controlled locations only.
         .env(
             "PATH",
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -135,7 +151,7 @@ pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<O
     // Orphans must be reaped here even on hosts whose PID 1 does not promptly
     // reap. This process-wide setting remains enabled for the helper's short
     // lifetime. Reaping below is restricted to this command's process group;
-    // successful daemonized nbd-client children are left running.
+    // the descendants a successful command leaves running are left alone.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
