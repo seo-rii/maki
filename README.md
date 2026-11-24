@@ -77,7 +77,7 @@ remaining steps, in outline:
 ```bash
 install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml
 install -d -o maki -g maki -m 0700 /var/lib/maki/demo
-sudo -u maki maki volume create /etc/maki/volumes/demo.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/demo.toml
 # one-time: pvcreate / vgcreate / lvcreate / mkfs.xfs on the export,
 # then pin the UUIDs in /etc/maki/attach/demo.toml  (docs/getting-started/first-volume.md)
 systemctl start maki-workload@demo.target

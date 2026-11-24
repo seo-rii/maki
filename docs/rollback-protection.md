@@ -246,7 +246,7 @@ volume:
 
 ```sh
 install -d -o maki -g maki -m 0700 /var/lib/maki/protected /mnt/maki-witness/protected
-sudo -u maki maki volume create /etc/maki/volumes/protected.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/protected.toml
 ```
 
 Creation writes the backing files and the witness files (`anchor`,
@@ -307,7 +307,7 @@ Use `maki check <config.toml> --deep` or `maki volume inspect <config.toml>` whi
 the volume is detached, as the daemon user or as root:
 
 ```sh
-sudo -u maki maki check /etc/maki/volumes/protected.toml --deep
+runuser -u maki -- maki check /etc/maki/volumes/protected.toml --deep
 ```
 
 These acquire the exclusive witness session and reestablish the selected
@@ -573,7 +573,7 @@ with the writer configuration as the daemon user (a process run as root
 refuses the daemon-owned writer key):
 
 ```sh
-sudo -u maki maki volume gc /etc/maki/protected-writer.toml
+runuser -u maki -- maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
