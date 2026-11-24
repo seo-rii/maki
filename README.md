@@ -57,6 +57,9 @@ privileged helper connects the kernel device itself), and the guide shows how
 to build and install the Maki package:
 
 - [Installing on Debian 12](docs/getting-started/installation-debian.md)
+- [Installing on RHEL 9](docs/getting-started/installation-rhel.md) and its
+  rebuilds: an RPM from BaseOS and AppStream packages; not qualified, CI
+  checks the userspace only
 
 No prebuilt packages are published yet.
 

@@ -58,6 +58,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block; on Ubuntu the root-only test targets also run as root |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
+| RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 | etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 
@@ -88,7 +89,10 @@ fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
 campaigns remain opt-in host qualification steps. The job runs every
 `scripts/test_*.py` (`scripts/test_ci_gate_validation.py` fails for a module
 the workflow would not run) and fails when those suites leave
-`scripts/__pycache__` in the checkout.
+`scripts/__pycache__` in the checkout. There, `scripts/test_rpm_package.py`
+also builds the Debian package from the same stub artifacts and compares the
+two packages file by file; `MAKI_TEST_REQUIRE_DPKG_DEB=1` makes a missing
+`dpkg-deb` a failure instead of a skip.
 
 The workspace tests run as the unprivileged runner user. Tests that give a
 fixture to another user, run a binary as the daemon user, enter a private
@@ -139,6 +143,34 @@ and bounded diagnostics as a CI artifact. It does not attach devices or qualify
 the Debian 12 NBD/LVM/XFS stack. The
 [first production campaign](deployment/first-production-candidate.md) requires
 those installed-package and workload results separately.
+
+The `rhel9` job runs in the `quay.io/centos/centos:stream9` container; CentOS
+Stream 9 is the public upstream of RHEL 9. It installs its tools from BaseOS
+and AppStream, plus `nbdkit-devel` from CRB for the ABI header, without EPEL:
+`nbdkit-server` and `nbdkit-basic-plugins` rather than the `nbdkit`
+metapackage the [RHEL guide](getting-started/installation-rhel.md#selinux)
+warns about, and the kernel UAPI headers. It builds the four packaged
+artifacts in release mode against glibc 2.34; runs `review_abi.rs` against
+EL9's `nbdkit-plugin.h`; runs the `maki-privileged`, `maki-attach` and
+`maki-nbdkit` suites through `run_cargo_tests.py` with `--no-fail-fast`, so
+the native tests load Maki's plugin into EL9's nbdkit 1.38; and runs
+`scripts/test_rpm_package.py`. It then builds the real RPM, requires that it
+depends on glibc and on `GLIBC_2.34` symbols, installs it with dnf (its
+`Requires` bring lvm2, xfsprogs and kmod; the metapackage and
+`nbdkit-selinux` must stay absent), checks its files and units (`rpm -V`,
+`systemd-analyze verify`), and requires `rpm -e` to refuse while an
+attachment record exists.
+
+The container's steps run as root, but the workspace, `RUNNER_TEMP` and
+`HOME` belong to the runner's uid 1001. `actions/checkout` trusts the
+workspace only in a temporary git configuration, so the job adds it to root's
+`safe.directory`, and because fixtures that require root-owned ancestors
+closed to others (`regression_mount_target.rs`) refuse the workspace, `HOME`
+and `/tmp`, the tests get a root-owned `0755` `TMPDIR` below `/var/lib`. The
+root-only targets of those crates therefore run inline; those that need a
+private mount namespace or a writable cgroup hierarchy print why they skip
+there, and the Ubuntu job runs them as root. The kernel is the runner's: the
+job covers RHEL 9's userspace, not its kernel, SELinux or an attachment.
 
 The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
 cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
@@ -369,6 +401,7 @@ packaged configuration without installing services or creating users.
 | Runtime logging (R4-001) | `maki-core/src/logging.rs` child-process tests, `maki-privileged/src/logging.rs` (the `maki-attach` sink: steps and halted rollbacks reach stderr) and `maki-nbdkit/tests/review_r4_native_logging.rs`: a real nbdkit run must show the store's `WARN` for an adopted orphan shard on its captured stderr, and `MAKI_LOG=error` must suppress it. `MAKI_LOG` values without a level (`warning`, `err`, a bare target, `target=`) fall back to `info` with one `WARN` naming the value, and an empty value means `info`, in both sinks and through `maki check` (`bins/maki/tests/review_log_filter.rs`) |
 | Guarded plaintext and keys (R4-002) | `maki-crypto-local/tests/review_r4_guarded_buffers.rs`: encryption, decryption, tampered-ciphertext failure and file/env key loading never wrap a bare `Vec` (`unguarded_wraps()` stays constant); `SecretBuffer::truncate` unit tests |
 | Package removal and inputs (R4-003, R4-007) | `scripts/test_debian_package.py`: `prerm` refuses removal under an attachment record or an active `maki@`/`maki-attach@`/`maki-workload@` unit or when `systemctl` cannot be queried but never blocks upgrades, no maintainer script starts/stops/restarts a service, ELF stubs of the wrong machine, class, type or a non-ELF file are refused, unknown architectures are refused, the dependency scan is on by default and fails closed on unanalysable artifacts or a missing `dpkg-shlibdeps`, `--no-shlibdeps` warns and keeps only the static `Depends` |
+| RPM package (RHEL 9) | `scripts/test_rpm_package.py`: the RPM installs the Debian package's files with the same modes and root ownership (compared file by file where `dpkg-deb` exists; the two deliberate differences are the unit's nbdkit path and the license text RHEL lacks), `maki@.service` runs `/usr/sbin/nbdkit` and a unit without exactly one Debian nbdkit `ExecStart=` is refused, `%preun` refuses an erase under an attachment record, an active unit or a failed `systemctl` query with the Debian `prerm`'s check and never blocks an upgrade, no scriptlet starts, stops or restarts a service, the Debian builder's artifact checks apply for `x86_64`, `aarch64`, `ppc64le` and `s390x`, a binary whose ELF interpreter no package of the build host owns is refused unless `--no-autoreq`, the plugin is not provided as a library, the package conflicts with `nbdkit-selinux`, versions rpm cannot express are refused and candidate versions keep their order, a missing `SOURCE_DATE_EPOCH` or one before 1990 (which rpm cannot put in the changelog) is refused, and the build is reproducible |
 | Deep-check verdict (R4-004) | `maki-core/tests/review_r4_check_verdict.rs`: recoverable slot damage passes with a warning and is repaired by recovery, damage without a journal source fails, mixed damage reports both classes, a healthy volume is `clean`, a damaged header on an unlisted slot is `unrecoverable` |
 | Overlay memory bound (R4-005) | `maki-core/tests/review_r4_overlay_bound.rs`, `maki-format/tests/review_r4_overlay_limits.rs`, `maki-nbdkit/tests/review_r4_overlay_options.rs`: bytes and entries stay under their limits without journal pressure, the worker checkpoints on the overlay watermark with a manual clock, a failed reclaim refuses the write and degrades, a concurrent volatile write during an inline reclaim does not cause ENOSPC (multi-thread, `checkpoint.slot_write` hook), defaults/zero/minimum validation, and the daemon mapping |
 | Inline reclaim fairness | `maki-core/tests/review_reclaim_fairness.rs`: eight concurrent writers of maximal, misaligned requests against a journal limit or an overlay limit at its validated minimum, with no injected fault, never get ENOSPC, keep the bound and read back their last data (multi-thread) |
