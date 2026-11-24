@@ -2,7 +2,8 @@
 """Run the test targets that need root as root, from an unprivileged build.
 
 Some regression tests give a fixture to another user, run a binary as the
-daemon user, enter a private mount namespace or set the immutable flag.
+daemon user, enter a private mount namespace, set the immutable flag or
+connect a kernel NBD device.
 Without root they print why they are skipped and pass, so the ordinary
 workspace run says nothing about the behaviour they protect. ROOT_TARGETS
 names every test target with such a case;
@@ -19,8 +20,11 @@ executables run as root, directly when the caller is root and through
 run fails before anything is compiled.
 
 Each executable starts in its package directory with a minimal environment
-and a scratch TMPDIR under /tmp that other users can search (the fixtures
-hand files to uid 65534) and that is removed as root afterwards. Some of
+(PATH, the test harness settings and the MAKI_TEST_REQUIRE_* switches that
+turn a missing second filesystem, nbdkit, NBD headers or kernel NBD from a
+skip into a failure) and a scratch TMPDIR under /tmp that other users can
+search (the fixtures hand files to uid 65534) and that is removed as root
+afterwards. Some of
 the targets run a built binary (`maki`, `maki-check`) as that user, so other
 users must be able to reach the built executables. A directory in the way
 (a 0750 home directory) fails the run; --open-build-tree adds search
@@ -252,7 +256,9 @@ def run(arguments):
         environment = [f"PATH={os.environ.get('PATH', os.defpath)}", f"TMPDIR={scratch}"]
         environment += [f"{name}={os.environ[name]}"
                         for name in ("RUST_BACKTRACE", "RUST_TEST_THREADS",
-                                     "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM")
+                                     "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM",
+                                     "MAKI_TEST_REQUIRE_NBD", "MAKI_TEST_REQUIRE_NBDKIT",
+                                     "MAKI_TEST_REQUIRE_NBD_HEADERS")
                         if name in os.environ]
         for target in ROOT_TARGETS:
             executable, package = tests[target]
