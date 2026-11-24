@@ -334,6 +334,42 @@ fn enrollment_recovery_makes_the_marker_durable_before_it_stages_the_binding() {
     complete_binding(&machine, "recovery died at the binding's rename");
 }
 
+/// The same when a staged binding is already there, left by an earlier
+/// interrupted recovery or creation: recovery writes over it, and it is as
+/// much "the next file" as one recovery creates. A power loss that drops
+/// everything not yet synced must still find the marker.
+#[test]
+fn enrollment_recovery_makes_the_marker_durable_before_it_writes_over_a_staged_binding() {
+    use crate::rollback::review_restore::crash_backing::FaultOp;
+    // A durable staged binding beside the staged marker; the creation that
+    // continues the root fails in the directory sync that publishes the
+    // marker.
+    let machine = binding_without_marker(super::super::enrollment::FILE_NEXT, true);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    machine.set_fault_hook(Some(Arc::new(move |op| {
+        (matches!(op, FaultOp::SyncDir { .. }) && !failed.swap(true, Ordering::SeqCst))
+            .then(|| io::Error::from_raw_os_error(libc::EIO))
+    })));
+    assert!(attempt_binding(&machine).is_err());
+    machine.set_fault_hook(None);
+    assert!(published(&machine));
+    assert!(machine
+        .process()
+        .exists(super::super::enrollment::FILE_NEXT)
+        .unwrap());
+
+    die_at(&machine, |op| matches!(op, FaultOp::Rename { .. }));
+    assert!(resume_binding(&machine).is_err());
+    machine.set_fault_hook(None);
+    machine.crash_all_lost();
+    assert!(
+        published(&machine),
+        "the staged binding outlived the marker; root: {:?}",
+        machine.process().list("").unwrap()
+    );
+    complete_binding(&machine, "recovery died at the binding's rename");
+}
+
 /// A binding that recovery finds and accepts is readable, which does not
 /// make its bytes durable: another process may just have written it. Until
 /// recovery has written and synced those bytes again, it must not sync the

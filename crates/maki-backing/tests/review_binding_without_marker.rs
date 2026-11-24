@@ -41,6 +41,7 @@ const NOT_EMPTY: &str = "remote enrollment requires an empty backing";
 const OCCUPIED: &str = "remote witness already enrolled or occupied";
 const CREATE_AGAIN: &str = "create the volume again";
 const ANOTHER_CREATION: &str = "binding of an interrupted creation for another authority";
+const MOVE_OUT: &str = "move that file out of the backing root, keep it, and create the volume";
 
 struct Authority(Mutex<CanonicalState>);
 
@@ -293,20 +294,103 @@ fn a_planted_staged_binding_is_never_read() {
     }
 }
 
-/// A staged binding that is a link is not written through.
+const NOT_A_FILE: &str = "which is not a regular file that can be written again";
+
+type Plant = fn(&Path, &Path);
+
+/// What can stand under a staged name instead of a file a creation may
+/// write again. The second path is a file beyond the root for a link to name.
+fn not_replaceable() -> [(&'static str, Plant); 4] {
+    [
+        ("a symbolic link", |entry, outside| {
+            std::os::unix::fs::symlink(outside, entry).unwrap()
+        }),
+        ("a directory", |entry, _| {
+            std::fs::create_dir(entry).unwrap()
+        }),
+        ("a FIFO", |entry, _| {
+            let made = std::process::Command::new("mkfifo")
+                .arg(entry)
+                .status()
+                .unwrap();
+            assert!(made.success());
+        }),
+        ("a second link to a file elsewhere", |entry, outside| {
+            std::fs::hard_link(outside, entry).unwrap()
+        }),
+    ]
+}
+
+/// The staged names are accepted because a creation writes those files again
+/// from the start. An entry it cannot write again is not one of them: a
+/// link, a directory, a FIFO, a file with a second name. A creation that
+/// found out only when it opened the entry had already published its marker
+/// and left a root that failed the same way for good. Both commands refuse
+/// such a root before they change anything, name the entry, and write
+/// through no link; once the entry is removed, creation continues the root.
 #[test]
-fn a_staged_binding_that_is_a_link_leaves_its_target_alone() {
-    let dir = private_dir::tempdir().unwrap();
-    let outside = dir.path().join("outside");
-    std::fs::write(&outside, b"not a binding").unwrap();
-    let root = root_with(dir.path(), &[(STAGED_MARKER, MARKER)]);
-    std::os::unix::fs::symlink(&outside, root.join(STAGED_BINDING)).unwrap();
-    let (writer, admin) = authority();
-    match RollbackBacking::create_remote(&root, writer, CAPACITY) {
-        Ok(_) => assert_enrolled(&root, admin.as_ref(), "a linked staged binding"),
-        Err(_) => assert!(inspect(admin.as_ref()).current.is_none()),
+fn control_a_staged_entry_that_cannot_be_written_again_is_refused_and_left() {
+    for staged in [STAGED_BINDING, STAGED_MARKER] {
+        for (what, plant) in not_replaceable() {
+            let context = format!("{what} as {staged}");
+            let dir = private_dir::tempdir().unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, b"not a staged file").unwrap();
+            let other: &[(&str, &[u8])] = if staged == STAGED_BINDING {
+                &[(STAGED_MARKER, MARKER)]
+            } else {
+                &[]
+            };
+            let root = root_with(dir.path(), other);
+            let entry = root.join(staged);
+            plant(&entry, &outside);
+            let kind = std::fs::symlink_metadata(&entry).unwrap().file_type();
+            let (writer, admin) = authority();
+            assert_create_refuses(&root, &writer, &admin, NOT_A_FILE, &context);
+            assert_create_refuses(&root, &writer, &admin, staged, &context);
+            assert_recovery_refuses(&root, &admin, NOT_A_FILE, &context);
+            assert!(!root.join("rollback.format").exists(), "{context}");
+            assert_eq!(
+                std::fs::symlink_metadata(&entry).unwrap().file_type(),
+                kind,
+                "{context}"
+            );
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"not a staged file",
+                "{context}"
+            );
+
+            if kind.is_dir() {
+                std::fs::remove_dir(&entry).unwrap();
+            } else {
+                std::fs::remove_file(&entry).unwrap();
+            }
+            RollbackBacking::create_remote(&root, writer, CAPACITY)
+                .map(drop)
+                .unwrap_or_else(|error| panic!("{context}, removed: volume create: {error}"));
+            assert_enrolled(&root, admin.as_ref(), &context);
+            assert_eq!(std::fs::read(&outside).unwrap(), b"not a staged file");
+        }
     }
-    assert_eq!(std::fs::read(&outside).unwrap(), b"not a binding");
+}
+
+/// Enrollment recovery writes a staged binding again too, in a root whose
+/// marker is published. It refuses one it cannot write again before it
+/// writes anything, instead of failing on it at every run.
+#[test]
+fn control_recovery_refuses_a_staged_binding_that_cannot_be_written_again() {
+    for (what, plant) in not_replaceable() {
+        let dir = private_dir::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"not a staged file").unwrap();
+        let root = root_with(dir.path(), &[("rollback.format", MARKER)]);
+        plant(&root.join(STAGED_BINDING), &outside);
+        let (_, admin) = authority();
+        assert_recovery_refuses(&root, &admin, NOT_A_FILE, what);
+        assert_recovery_refuses(&root, &admin, STAGED_BINDING, what);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not a staged file");
+    }
 }
 
 /// A binding for another authority or another capacity is not this
@@ -354,18 +438,18 @@ fn control_an_unreadable_binding_without_a_marker_is_refused_and_left() {
         let root = root_with(dir.path(), &[(STAGED_MARKER, MARKER), (BINDING, bytes)]);
         let (writer, admin) = authority();
         assert_create_refuses(&root, &writer, &admin, NOT_EMPTY, &context);
-        let before = contents(&root);
-        let record = inspect(admin.as_ref());
-        let error =
-            RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
-                .err()
-                .unwrap();
-        assert!(
-            !error.to_string().contains(CREATE_AGAIN),
-            "{context}: {error}"
-        );
-        assert_eq!(contents(&root), before, "{context}");
-        assert_eq!(inspect(admin.as_ref()), record, "{context}");
+        // Recovery has no marker to continue from and says what does: the
+        // binding is moved out and kept, and the volume is created again.
+        assert_recovery_refuses(&root, &admin, MOVE_OUT, &context);
+        std::fs::rename(
+            root.join(BINDING),
+            dir.path().join("remote.enrollment.kept"),
+        )
+        .unwrap();
+        RollbackBacking::create_remote(&root, writer, CAPACITY)
+            .map(drop)
+            .unwrap_or_else(|error| panic!("{context}, moved out: volume create: {error}"));
+        assert_enrolled(&root, admin.as_ref(), &context);
     }
 }
 
@@ -377,13 +461,8 @@ fn control_a_directory_under_the_binding_s_name_is_refused_and_left() {
     std::fs::create_dir(root.join(BINDING)).unwrap();
     let (writer, admin) = authority();
     assert_create_refuses(&root, &writer, &admin, NOT_EMPTY, "a directory");
-    let before = contents(&root);
-    let record = inspect(admin.as_ref());
-    let error = RollbackBacking::recover_enrollment_remote(&root, admin.clone(), CAPACITY, &record)
-        .err()
-        .unwrap();
-    assert!(!error.to_string().contains(CREATE_AGAIN), "{error}");
-    assert_eq!(contents(&root), before);
+    assert_recovery_refuses(&root, &admin, MOVE_OUT, "a directory");
+    assert!(root.join(BINDING).is_dir());
 }
 
 /// The binding names an authority, and says nothing about what that
