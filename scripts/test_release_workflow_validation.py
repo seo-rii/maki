@@ -122,6 +122,13 @@ class Workflow(unittest.TestCase):
                 self.assertRegex(job, r"(?m)^    timeout-minutes: \d+$")
                 self.assertNotRegex(job, r"(?m)^    (?:if|continue-on-error):")
 
+    def test_every_run_step_uses_bash(self):
+        # In a container job a step without `shell:` runs under `sh -e`, which
+        # is dash in debian:12: `set -o pipefail` is an illegal option there
+        # (the first release run failed so). Every step runs under bash.
+        self.assertIn("\ndefaults:\n  run:\n    shell: bash\n", self.text)
+        self.assertNotRegex(self.text, r"(?m)^\s+shell: (?!bash$)")
+
     def test_jobs_containers_and_order(self):
         self.assertEqual(list(self.jobs), ["check", "deb", "rpm", "publish"])
         expected = {"check": None, "deb": "debian:12", "rpm": "quay.io/centos/centos:stream9", "publish": None}
