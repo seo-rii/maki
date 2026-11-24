@@ -9,6 +9,8 @@ volume_uuid = "00000000-0000-0000-0000-000000000000"
 
 # Omit to allocate the lowest free /dev/nbdN at attach time (the helper
 # serializes allocation through /run/maki-attach/attach.lock). Set to pin one.
+# A device that another volume's attachment record names is skipped, and
+# refused when pinned.
 # nbd_device = "/dev/nbd0"
 
 # Defaults: /run/maki/<volume>/nbd.sock, vg_maki_<volume>, data, /srv/<volume>.
@@ -17,7 +19,7 @@ volume_uuid = "00000000-0000-0000-0000-000000000000"
 # lv_name = "data"
 # mountpoint = "/srv/postgres-prod"
 
-# Block size handed to nbd-client -b and blockdev --setbsz.
+# The NBD device's logical block size at connect, also set with blockdev --setbsz.
 device_block_size = 4096
 
 # Pin the XFS filesystem UUID once the filesystem exists (`blkid`). Any

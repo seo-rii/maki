@@ -8,6 +8,10 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[cfg(unix)]
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -94,7 +98,7 @@ fn control_commands_keep_applying_timeout() {
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let socket = socket.to_str().unwrap();
     let config = write_config(

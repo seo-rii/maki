@@ -29,10 +29,19 @@ Formatting and strict Clippy block CI. The release gates are expensive; run
 them after touching recovery, journal, overlay, store or checkpoint code (the
 default suite did not catch every ordering bug in the past).
 
-Unix-only suites (control socket, `statvfs`, privileged executor, process
-hardening, nbdkit ABI probe) are skipped on Windows and macOS. Run them on
+Unix-only suites (control socket, `statvfs`) are skipped on Windows;
+Linux-only suites (privileged executor, process hardening, nbdkit ABI probe)
+are skipped on Windows and macOS. Run them on
 Linux before claiming a change is verified. The Linux CI job installs
 `nbdkit`, `nbdkit-plugin-dev` and `libnbd-bin` for the native tests.
+
+Tests that need root (a fixture given to another user, a binary run as the
+daemon user, a private mount namespace) skip in an unprivileged run. The
+Linux CI job runs their targets as root with `scripts/run_root_tests.py`;
+locally, `python3 -B scripts/run_root_tests.py --workspace --locked` does the
+same as root or with passwordless `sudo`. A new test that probes its
+privilege must be listed in that script's `ROOT_TARGETS` or classified in
+`scripts/test_root_tests_validation.py`, which fails otherwise.
 
 ## Test-first, always
 

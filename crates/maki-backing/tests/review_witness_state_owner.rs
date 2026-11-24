@@ -201,6 +201,7 @@ fn state_files_another_user_owns_or_can_write_are_refused() {
         let temp = tempfile::tempdir().unwrap();
         let fresh = temp.path().join("fresh");
         std::fs::create_dir(&fresh).unwrap();
+        chmod(&fresh, 0o700);
         std::fs::write(fresh.join("remote.lock"), b"").unwrap();
         chown(&fresh.join("remote.lock"), NOBODY);
         assert_refused(

@@ -12,6 +12,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -101,30 +104,36 @@ maximum_io = "64KiB"
 
 struct Fixture {
     directory: tempfile::TempDir,
-    // Explicit roots keep the witness on an independent filesystem.
     witness_parent: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
     /// Temporary directories root owns, as `tempfile` creates them, and the
     /// configuration. Neither the backing root nor the witness exists.
-    fn bare(rollback: bool) -> Self {
+    /// `None` when a rollback fixture finds no second filesystem.
+    fn bare(rollback: bool) -> Option<Self> {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let witness_parent = if rollback {
+            Some(other_filesystem::reachable_tempdir(directory.path())?)
+        } else {
+            None
+        };
         let fixture = Self {
-            directory: tempfile::tempdir_in("/tmp").unwrap(),
-            witness_parent: rollback.then(|| tempfile::tempdir_in("/dev/shm").unwrap()),
+            directory,
+            witness_parent,
         };
         volume_config::write(
             fixture.config(),
             config(&fixture.root(), fixture.witness().as_deref()),
         )
         .unwrap();
-        fixture
+        Some(fixture)
     }
 
     /// The backing root and witness directory created for the daemon user,
     /// as the guides do before `maki volume create`.
-    fn for_daemon(rollback: bool) -> Self {
-        let fixture = Self::bare(rollback);
+    fn for_daemon(rollback: bool) -> Option<Self> {
+        let fixture = Self::bare(rollback)?;
         let mut directories = vec![fixture.directory.path().to_path_buf(), fixture.root()];
         if let (Some(parent), Some(witness)) = (&fixture.witness_parent, fixture.witness()) {
             directories.extend([parent.path().to_path_buf(), witness]);
@@ -133,7 +142,7 @@ impl Fixture {
             fs::create_dir_all(&directory).unwrap();
             std::os::unix::fs::chown(&directory, Some(DAEMON.0), Some(DAEMON.1)).unwrap();
         }
-        fixture
+        Some(fixture)
     }
 
     fn root(&self) -> PathBuf {
@@ -196,7 +205,9 @@ fn root_deep_check_recreates_a_missing_volume_lock_for_the_daemon() {
     if skip_unless_root("root_deep_check_recreates_a_missing_volume_lock_for_the_daemon") {
         return;
     }
-    let fixture = Fixture::for_daemon(false);
+    let Some(fixture) = Fixture::for_daemon(false) else {
+        return;
+    };
     let config = fixture.config();
     let config = config.to_str().unwrap();
     succeeded(
@@ -230,7 +241,9 @@ fn root_inspect_and_check_recreate_missing_rollback_files_for_the_daemon() {
     if skip_unless_root("root_inspect_and_check_recreate_missing_rollback_files_for_the_daemon") {
         return;
     }
-    let fixture = Fixture::for_daemon(true);
+    let Some(fixture) = Fixture::for_daemon(true) else {
+        return;
+    };
     let config = fixture.config();
     let config = config.to_str().unwrap();
     succeeded(
@@ -270,7 +283,9 @@ fn root_create_into_daemon_owned_directories_leaves_nothing_to_hand_back() {
     for rollback in [false, true] {
         // Every file and directory is created inside the two directories
         // the daemon user owns.
-        let fixture = Fixture::for_daemon(rollback);
+        let Some(fixture) = Fixture::for_daemon(rollback) else {
+            continue;
+        };
         let config = fixture.config();
         let config = config.to_str().unwrap();
         let output = maki(&["volume", "create", config], None);
@@ -300,7 +315,9 @@ fn root_create_names_a_volume_directory_it_had_to_create() {
     // The volume directory does not exist and its parent is root's (as
     // `/var/lib/maki` is): root creates it for itself, and the whole tree
     // is root's.
-    let fixture = Fixture::bare(false);
+    let Some(fixture) = Fixture::bare(false) else {
+        return;
+    };
     let output = maki(
         &["volume", "create", fixture.config().to_str().unwrap()],
         None,

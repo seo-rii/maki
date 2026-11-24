@@ -7,7 +7,7 @@ use local AES-256-GCM-SIV or a remote HTTP, WebSocket or gRPC crypto service.
 ```text
  database / files            root-owned helper: attach, verify, detach, grow
         │                                     │
-   XFS on LVM on /dev/nbdN  ◀── nbd-client ◀──┘
+   XFS on LVM on /dev/nbdN  ◀─── netlink ◀────┘
         │
    nbdkit + maki plugin (unprivileged `maki` user)
         │   ciphertext journal ─ checkpoint ─ A/B metadata
@@ -52,13 +52,18 @@ remain open.
 
 ## Installation
 
-Debian 12 is the primary platform. The stock `nbd-client` 3.24 is too old;
-3.27.0 or later is required, and the guide shows how to build the backport
-and the Maki package:
+Debian 12 is the primary platform. No NBD client package is needed (the
+privileged helper connects the kernel device itself), and the guide shows how
+to build and install the Maki package:
 
 - [Installing on Debian 12](docs/getting-started/installation-debian.md)
+- [Installing on RHEL 9](docs/getting-started/installation-rhel.md) and its
+  rebuilds: an RPM from BaseOS and AppStream packages; not qualified, CI
+  checks the userspace only
 
-No prebuilt packages are published yet.
+Release candidates are published only as unsigned GitHub pre-releases by the
+[release workflow](docs/releasing.md#publishing-a-pre-release); otherwise
+build the packages from source as the guides show.
 
 ## Quick start
 

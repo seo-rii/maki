@@ -48,15 +48,41 @@ pub struct GcCounts {
     pub removed: u64,
     pub skipped_live: u64,
     pub skipped_unrecognized: u64,
+    pub skipped_unreadable: u64,
+    pub unfinished: u64,
     pub retained: u64,
 }
 
-/// Each name array contains at most the first 4,096 entries in its category.
+/// A lower-fence namespace, or the tombstone of one, that a pass could not
+/// open or examine, with the error that stopped it. The pass changed nothing
+/// about it and went on; a later pass examines it again.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct GcUnreadable {
+    pub name: String,
+    pub error: String,
+}
+
+/// A lower-fence namespace, or the tombstone of one, that passed
+/// examination and whose retirement stopped at a step that changes it alone
+/// (renaming it to its tombstone when its own directory is immutable or
+/// append-only, an unlink in it, the sync of its directory, removing it),
+/// with the error, which names the step. `name` is
+/// the entry as the pass left it: the namespace if renaming it failed, its
+/// tombstone otherwise. The pass went on; a later pass resumes it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct GcUnfinished {
+    pub name: String,
+    pub error: String,
+}
+
+/// Each array contains at most the first 4,096 entries in its category.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
     pub removed: Vec<String>,
     pub skipped_live: Vec<String>,
     pub skipped_unrecognized: Vec<String>,
+    pub skipped_unreadable: Vec<GcUnreadable>,
+    pub unfinished: Vec<GcUnfinished>,
     pub retained: Vec<String>,
     pub counts: GcCounts,
     pub details_truncated: bool,
@@ -87,6 +113,30 @@ impl GcReport {
             self.details_truncated = true;
         }
     }
+
+    fn unreadable(&mut self, name: String, error: &io::Error) {
+        self.counts.skipped_unreadable += 1;
+        if self.skipped_unreadable.len() < REPORT_DETAIL_LIMIT {
+            self.skipped_unreadable.push(GcUnreadable {
+                name,
+                error: error.to_string(),
+            });
+        } else {
+            self.details_truncated = true;
+        }
+    }
+
+    fn unfinished(&mut self, name: String, error: &io::Error) {
+        self.counts.unfinished += 1;
+        if self.unfinished.len() < REPORT_DETAIL_LIMIT {
+            self.unfinished.push(GcUnfinished {
+                name,
+                error: error.to_string(),
+            });
+        } else {
+            self.details_truncated = true;
+        }
+    }
 }
 
 /// Every physical remote fork holds this guard until activation completes.
@@ -106,6 +156,25 @@ impl<'a> OperationGuard<'a> {
     /// Reclaim only lower fencing sessions whose lifetime lock is no longer
     /// held. The caller's root guard excludes every concurrent physical fork.
     /// Authority outages or changes stop reclamation before the next candidate.
+    ///
+    /// What ends a pass with an error is a failure that leaves it unable to
+    /// tell what may be deleted, or to delete it durably: the authority
+    /// (unavailable, invalid, or changed since the pass began), the root (its
+    /// marker, the authority's current generation in it, its binding, its
+    /// listing, its mount identity, its syncs, a rename it or its
+    /// filesystem refuses), and an entry that changed identity while the
+    /// pass retired it, which names that namespace. A
+    /// lower-fence namespace the pass cannot open or examine is not such a
+    /// failure: nothing about it has been changed and every other candidate
+    /// is judged on its own lock and contents, so it is kept, reported under
+    /// `skipped_unreadable` with the error, and the pass goes on. Nor is a
+    /// step of a retirement that changes that candidate alone (renaming it
+    /// when its own directory is immutable or append-only, which changes
+    /// nothing, an unlink in it, the sync of its directory, removing it):
+    /// once renamed, its tombstone is durable, and
+    /// every other candidate's deletion rests on its own examination, lock
+    /// and durable tombstone. It is kept as the step left it, reported under
+    /// `unfinished` with the error, and a later pass resumes it.
     pub fn collect(&self, rpc: &dyn Rpc) -> io::Result<GcReport> {
         self.collect_within(rpc, None)
     }
@@ -166,8 +235,10 @@ impl<'a> OperationGuard<'a> {
                 break;
             }
             // Save the original name before retirement can rename it. A
-            // successful retirement removes its tombstone in this pass; an
-            // error stops collection, and the next pass starts at the root.
+            // successful retirement removes its tombstone in this pass, and
+            // an unfinished one leaves it before this cursor (tombstones sort
+            // first) for the next pass; an error stops collection, and the
+            // next pass starts at the root.
             after = page.last().cloned();
             for entry in page {
                 // Namespaces, tombstones and root files are ASCII. A name
@@ -211,10 +282,25 @@ impl<'a> OperationGuard<'a> {
                         "GC authority changed",
                     ));
                 }
-                match self.disk.gc_retire(original, retired)? {
+                let removal = self.disk.gc_retire(original, retired).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("GC stopped while retiring {entry}: {error}"),
+                    )
+                })?;
+                match removal {
                     GcRemoval::Removed => report.record(Disposition::Removed, original.to_owned()),
                     GcRemoval::Live => report.record(Disposition::Live, entry),
                     GcRemoval::Unrecognized => report.record(Disposition::Unrecognized, entry),
+                    GcRemoval::Unreadable(error) => report.unreadable(entry, &error),
+                    GcRemoval::Unfinished { tombstone, error } => {
+                        let name = if tombstone && !retired {
+                            format!("{TOMBSTONE}{original}")
+                        } else {
+                            entry
+                        };
+                        report.unfinished(name, &error)
+                    }
                 }
             }
         }

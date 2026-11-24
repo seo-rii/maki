@@ -2,6 +2,7 @@
 //! already verified descriptor; symlinks and non-root writable ancestors
 //! are refused before any lock or record is opened.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -9,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,9 @@ const CONFIG_MAX_BYTES: u64 = 64 * 1024;
 // verified 64 KiB LVM report/topology. Allow JSON escaping and envelope
 // overhead while keeping reads and serialization strictly bounded.
 const RECORD_MAX_BYTES: u64 = 4 * CONFIG_MAX_BYTES;
+// No host has more attachments than NBD devices; allocation reads at most
+// this many block devices too.
+const STATE_MAX_ENTRIES: usize = 65_536;
 
 #[derive(Default)]
 struct RecordBuffer(Vec<u8>);
@@ -46,8 +51,9 @@ pub(crate) struct BoundDeviceRecord {
     pub volume: String,
     pub attachment: AttachmentIdentity,
     pub device: String,
-    /// Passed to nbd-client's netlink identifier and checked against the
-    /// live kernel backend attribute, including before rollback.
+    /// Set as the device's kernel backend identifier when the helper
+    /// connects it, and checked against the live kernel backend attribute,
+    /// including before rollback.
     pub connection_id: String,
     /// Kernel identity captured with this backend still connected, before mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,12 +235,82 @@ impl TrustedState {
         Ok(Self { directory, owner })
     }
 
-    pub fn lock(&self) -> io::Result<StateLock> {
+    fn lock_file(&self) -> io::Result<File> {
         let name = CString::new("attach.lock").unwrap();
         let file = openat(&self.directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
         private_regular_file(&file, self.owner)?;
+        Ok(file)
+    }
+
+    pub fn lock(&self) -> io::Result<StateLock> {
+        let file = self.lock_file()?;
         file.lock()?;
         Ok(StateLock(file))
+    }
+
+    /// Take the lock in turn, but give up at `deadline` rather than wait for
+    /// as long as the helpers ahead of this one run.
+    ///
+    /// Requests that block in `flock` form a queue that the kernel serves in
+    /// order, and every other helper blocks. A caller that only retried a
+    /// non-blocking attempt would get the lock only when nobody is queued,
+    /// so every helper that queued meanwhile would overtake it. The blocking
+    /// request therefore runs on a thread of its own. At the deadline it is
+    /// abandoned: a lock granted to it later is dropped with the channel it
+    /// is sent into, which releases it, and the helper's exit ends a request
+    /// that is still queued.
+    pub fn lock_until(&self, deadline: Instant) -> io::Result<StateLock> {
+        let file = self.lock_file()?;
+        match file.try_lock() {
+            Ok(()) => return Ok(StateLock(file)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        let held = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the attach lock is held by another helper",
+            )
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(held());
+        }
+        let (granted, answer) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("attach-lock".into())
+            .spawn(move || {
+                let _ = granted.send(file.lock().map(|()| StateLock(file)));
+            })?;
+        match answer.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(held()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "the attach lock request ended without an answer",
+            )),
+        }
+    }
+
+    /// How many lock requests of this process wait for `attach.lock`, from
+    /// `/proc/locks`. Only the inode number is compared, not the device, so
+    /// the process id keeps a blocked request on another filesystem's file
+    /// with the same inode number out of the count.
+    #[cfg(test)]
+    pub(crate) fn lock_waiters(&self) -> usize {
+        let inode = format!(":{}", self.lock_file().unwrap().metadata().unwrap().ino());
+        let pid = std::process::id().to_string();
+        std::fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(1) == Some(&"->")
+                    && fields.contains(&pid.as_str())
+                    && fields
+                        .iter()
+                        .any(|field| field.matches(':').count() == 2 && field.ends_with(&inode))
+            })
+            .count()
     }
 
     /// Verification joins the same exclusive lock without creating a file.
@@ -281,6 +357,72 @@ impl TrustedState {
             return Err(invalid("attach record belongs to a different volume"));
         }
         Ok(Some(record))
+    }
+
+    /// The NBD device each other volume's trusted record names, by device.
+    ///
+    /// A record can outlive its connection: a helper killed after publishing
+    /// it and before connecting, or after disconnecting and before retiring
+    /// it, leaves one whose device shows no backend, holder or mount. Such a
+    /// device is still that volume's, so sysfs alone cannot show a device to
+    /// be unclaimed. Call with the attach lock held, which every writer of
+    /// these records holds.
+    ///
+    /// Every `<volume>.nbd` entry must be a readable trusted record. One that
+    /// is not may name any device, so the listing fails and names the entry
+    /// instead of leaving it out. Other names (the lock, a temporary record
+    /// of a killed write) are not records.
+    pub fn devices_of_other_volumes(&self, volume: &str) -> io::Result<BTreeMap<String, String>> {
+        let mut devices = BTreeMap::new();
+        for record in self.records_of_other_volumes(volume)? {
+            devices.entry(record.device).or_insert(record.volume);
+        }
+        Ok(devices)
+    }
+
+    /// Every other volume's trusted record, by volume name, read as
+    /// [`Self::devices_of_other_volumes`] reads them: an entry that cannot
+    /// be read fails the listing and is named.
+    pub fn records_of_other_volumes(&self, volume: &str) -> io::Result<Vec<BoundDeviceRecord>> {
+        // List the directory this descriptor holds, wherever its path now
+        // leads; each record is then opened relative to the descriptor.
+        let listing = format!("/proc/self/fd/{}", self.directory.as_raw_fd());
+        let mut names = Vec::new();
+        for (count, entry) in std::fs::read_dir(listing)?.enumerate() {
+            if count >= STATE_MAX_ENTRIES {
+                return Err(invalid("attach state directory exceeds the listing limit"));
+            }
+            let name = entry?.file_name();
+            if name.as_bytes().ends_with(b".nbd") {
+                names.push(name);
+            }
+        }
+        names.sort();
+        let mut records = Vec::new();
+        for name in names {
+            let unreadable = |error: io::Error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "attach record {:?} cannot be read: {error}. It may name any NBD device, \
+                         so no device is chosen while it exists; resolve that volume's \
+                         attachment, or remove the record once nothing of it remains",
+                        Path::new(BOUND_DEVICE_RECORD_DIR).join(&name),
+                    ),
+                )
+            };
+            let other = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".nbd"))
+                .filter(|other| check_instance_name(other).is_ok())
+                .ok_or_else(|| unreadable(invalid("not a volume's record name")))?;
+            if other == volume {
+                continue;
+            }
+            // An entry removed since the listing reserves nothing.
+            records.extend(self.read(other).map_err(unreadable)?);
+        }
+        Ok(records)
     }
 
     pub fn write(&self, record: &BoundDeviceRecord) -> io::Result<()> {

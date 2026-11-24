@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // regressions. A dev dependency on maki-test-support would form a cycle.
 #[allow(dead_code)]
 #[path = "../../../maki-test-support/src/crash_backing.rs"]
-mod crash_backing;
+pub(crate) mod crash_backing;
 use crash_backing::{CrashableBacking, FaultOp};
 
 struct Restore {
@@ -20,9 +20,9 @@ struct Restore {
 }
 
 impl Restore {
-    fn new(dirty: Option<&str>, dirty_length: bool) -> Self {
+    fn new(dirty: Option<&str>, dirty_length: bool) -> Option<Self> {
         let source = tempfile::tempdir().unwrap();
-        let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+        let witness = crate::other_filesystem::tempdir(source.path())?;
         let backing = RollbackBacking::create(source.path(), witness.path(), 3 * PAGE).unwrap();
         let file = backing.open("payload", true).unwrap();
         let original = vec![0x59; 2 * PAGE as usize];
@@ -61,13 +61,13 @@ impl Restore {
             }
         }
         disk.sync_dir("").unwrap();
-        Self {
+        Some(Self {
             disk,
             witness,
             snapshots,
             selected,
             original,
-        }
+        })
     }
 
     fn open(&self) -> io::Result<RollbackBacking> {
@@ -122,7 +122,9 @@ impl Restore {
 
 #[test]
 fn restored_arena_failed_open_then_plain_restart_and_sync_survives_power_loss() {
-    let restore = Restore::new(Some(ARENA), false);
+    let Some(restore) = Restore::new(Some(ARENA), false) else {
+        return;
+    };
     let anchor = std::fs::read(restore.witness.path().join("anchor")).unwrap();
     restore.fail_syncs(ARENA, 1);
     assert_eq!(
@@ -144,7 +146,9 @@ fn restored_arena_failed_open_then_plain_restart_and_sync_survives_power_loss() 
 
 #[test]
 fn healthy_restore_and_later_sync_survive_power_loss() {
-    let restore = Restore::new(Some(ARENA), false);
+    let Some(restore) = Restore::new(Some(ARENA), false) else {
+        return;
+    };
     let backing = restore.open().unwrap();
     restore.acknowledge_later_write(&backing);
     drop(backing);
@@ -154,7 +158,9 @@ fn healthy_restore_and_later_sync_survive_power_loss() {
 
 #[test]
 fn caller_rewrite_after_failed_sync_is_a_durability_control() {
-    let restore = Restore::new(Some(ARENA), false);
+    let Some(restore) = Restore::new(Some(ARENA), false) else {
+        return;
+    };
     restore.fail_syncs(ARENA, 1);
     assert!(restore.open().is_err());
     restore
@@ -172,7 +178,9 @@ fn caller_rewrite_after_failed_sync_is_a_durability_control() {
 
 #[test]
 fn selected_manifest_and_its_length_survive_prior_failed_restore_writeback() {
-    let restore = Restore::new(Some("selected"), true);
+    let Some(restore) = Restore::new(Some("selected"), true) else {
+        return;
+    };
     restore.fail_syncs(&restore.selected, 1);
     assert_eq!(
         restore
@@ -193,7 +201,9 @@ fn selected_manifest_and_its_length_survive_prior_failed_restore_writeback() {
 
 #[test]
 fn arena_length_survives_failed_restore_writeback_before_ready() {
-    let restore = Restore::new(Some(ARENA), true);
+    let Some(restore) = Restore::new(Some(ARENA), true) else {
+        return;
+    };
     restore.fail_syncs(ARENA, 1);
     assert!(restore.open().is_err());
     let backing = restore.open().unwrap();
@@ -205,7 +215,9 @@ fn arena_length_survives_failed_restore_writeback_before_ready() {
 
 #[test]
 fn format_marker_and_its_length_survive_prior_failed_restore_writeback() {
-    let restore = Restore::new(Some(MARKER), true);
+    let Some(restore) = Restore::new(Some(MARKER), true) else {
+        return;
+    };
     restore.fail_syncs(MARKER, 1);
     assert_eq!(
         restore
@@ -224,7 +236,9 @@ fn format_marker_and_its_length_survive_prior_failed_restore_writeback() {
 
 #[test]
 fn repeated_readiness_sync_failures_refuse_then_preserve_restored_pages() {
-    let restore = Restore::new(Some(ARENA), true);
+    let Some(restore) = Restore::new(Some(ARENA), true) else {
+        return;
+    };
     restore.fail_syncs(ARENA, 3);
     for _ in 0..3 {
         assert_eq!(
@@ -241,7 +255,9 @@ fn repeated_readiness_sync_failures_refuse_then_preserve_restored_pages() {
 
 #[test]
 fn partial_restore_rewrite_is_retryable_without_advancing_the_witness() {
-    let restore = Restore::new(Some(ARENA), false);
+    let Some(restore) = Restore::new(Some(ARENA), false) else {
+        return;
+    };
     let anchor = std::fs::read(restore.witness.path().join("anchor")).unwrap();
     let first = AtomicBool::new(true);
     restore
@@ -272,7 +288,9 @@ fn partial_restore_rewrite_is_retryable_without_advancing_the_witness() {
 
 #[test]
 fn all_pages_are_authenticated_before_any_restore_mutation() {
-    let restore = Restore::new(None, false);
+    let Some(restore) = Restore::new(None, false) else {
+        return;
+    };
     let backing = restore.open().unwrap();
     let page = backing
         .state
@@ -315,7 +333,9 @@ fn all_pages_are_authenticated_before_any_restore_mutation() {
 #[test]
 fn acknowledged_restore_survives_deterministic_torn_write_crash_sweep() {
     for seed in 0..8 {
-        let restore = Restore::new(Some(ARENA), true);
+        let Some(restore) = Restore::new(Some(ARENA), true) else {
+            return;
+        };
         restore.fail_syncs(ARENA, 1);
         assert!(restore.open().is_err());
         let backing = restore.open().unwrap();

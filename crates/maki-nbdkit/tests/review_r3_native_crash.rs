@@ -12,6 +12,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixDatagram;
@@ -102,23 +105,25 @@ finally:
     close(h)
 "#;
 
+/// Whether the native tools can run here, probed once. Every test that
+/// cannot run says so in its own output: a notice from the first caller
+/// alone left the others reporting a bare `ok`.
 fn prerequisites() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
+    static MISSING: std::sync::OnceLock<Option<&str>> = std::sync::OnceLock::new();
+    let missing = *MISSING.get_or_init(|| {
         for program in ["nbdkit", "nbdinfo", "python3"] {
             match Command::new(program).arg("--version").output() {
                 Ok(output) => assert!(output.status.success(), "installed {program} cannot run"),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "{program} unavailable; skipping optional native crash qualification"
-                    );
-                    return false;
-                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(program),
                 Err(error) => panic!("native prerequisite {program} failed: {error}"),
             }
         }
-        true
-    })
+        None
+    });
+    if let Some(program) = missing {
+        eprintln!("{program} unavailable; skipping optional native crash qualification");
+    }
+    missing.is_none()
 }
 
 struct Fixture {
@@ -132,7 +137,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = short_dir::tempdir().unwrap();
         let root = directory.path().join("volume");
         let config = directory.path().join("config.toml");
         let socket = directory.path().join("nbd.sock");

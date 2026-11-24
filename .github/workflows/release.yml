@@ -1,0 +1,247 @@
+# Publish a release candidate as a GitHub pre-release (docs/releasing.md,
+# "Publishing a pre-release"). Run by hand from main with the tag to create,
+# v<workspace version>-rc.<n>. Final releases are refused while production
+# approval is pending (docs/status.md). Nothing here signs or qualifies the
+# artifacts.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create: v<workspace version>-rc.<n>, for example v0.1.0-rc.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Every step under bash: in a container job a step without `shell:` runs under
+# `sh -e`, which is dash in debian:12 and refuses `set -o pipefail`.
+defaults:
+  run:
+    shell: bash
+
+# One release at a time: the existence checks and the publication must not
+# interleave with another run's.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # Refuse before anything is built: a run from another ref, a tag that is
+    # not a release candidate of the workspace version, or one that is taken.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: tag, workspace version and ref
+        env:
+          TAG: ${{ inputs.tag }}
+        run: python3 -B scripts/release_assets.py check-tag --tag "$TAG" --ref "$GITHUB_REF"
+      - name: no release and no tag of that name
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate > dist/releases.json
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" > dist/refs.json
+          existing="$(python3 -B scripts/release_assets.py state --tag "$TAG" --releases dist/releases.json --refs dist/refs.json)"
+          if [ "$existing" != "$(printf 'release=none\ntag=none')" ]; then
+            echo "$TAG is taken:" $existing >&2
+            exit 1
+          fi
+
+  deb:
+    # The documented build distribution (docs/releasing.md): the package
+    # inherits its native library requirements from the build host.
+    needs: check
+    runs-on: ubuntu-latest
+    container: debian:12
+    timeout-minutes: 90
+    steps:
+      - name: build dependencies
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            build-essential dpkg-dev python3 git curl ca-certificates
+      # Candidate versions count the commits below the source: the whole
+      # history, which prepare_release.py refuses to do without.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      # The steps run as root, but the workspace belongs to the runner's uid
+      # 1001, and actions/checkout trusts it only in a temporary git config:
+      # root's git would refuse it ("dubious ownership"). No test fixture runs
+      # here, so the rhel9 job's root-owned TMPDIR is not needed.
+      - name: root in the runner-owned workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: release candidate bundle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B scripts/prepare_release.py --output dist/deb
+      - name: verify the bundle
+        run: |
+          set -euo pipefail
+          (cd dist/deb && sha256sum --check --strict SHA256SUMS)
+          dpkg-deb --info dist/deb/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/deb
+          if-no-files-found: error
+          retention-days: 7
+
+  rpm:
+    needs: check
+    runs-on: ubuntu-latest
+    container: quay.io/centos/centos:stream9
+    timeout-minutes: 90
+    steps:
+      # python3.11 for prepare_release.py --print-version (tomllib); the RPM
+      # builder runs on RHEL 9's python3 (3.9).
+      - name: build dependencies
+        run: |
+          dnf install -y -q --setopt=install_weak_deps=False \
+            gcc git-core python3 python3.11 rpm-build findutils diffutils
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: root in the runner-owned workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: packaged binaries
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo build --release --locked --target "$host" -p maki -p maki-attach -p maki-check -p maki-nbdkit
+      # The RPM carries the Debian package's candidate version unchanged:
+      # rpm 4.16 accepts '~' and '+' and orders candidates as dpkg does.
+      - name: RPM bundle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(python3.11 -B scripts/prepare_release.py --print-version)"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          arch="$(rpm --eval '%{_arch}')"
+          package="dist/rpm/maki-$version-1.$arch.rpm"
+          mkdir -p dist/rpm
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python3 -B packaging/rpm/build-rpm.py \
+            --release-dir "target/$host/release" --version "$version" --architecture "$arch" \
+            --output "$package"
+          python3 -B scripts/release_assets.py rpm-manifest --package "$package" --version "$version" \
+            --commit "$GITHUB_SHA"
+      - name: verify the bundle
+        run: |
+          set -euo pipefail
+          (cd dist/rpm && sha256sum --check --strict SHA256SUMS)
+          rpm -qip dist/rpm/*.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/rpm
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [check, deb, rpm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: dist/deb
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm
+          path: dist/rpm
+      - name: assets and notes
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/release_assets.py assemble --tag "$TAG" --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" --deb-bundle dist/deb --rpm-bundle dist/rpm \
+            --template .github/release-notes.md --output dist/release --notes dist/notes.md
+          (cd dist/release && sha256sum --check --strict SHA256SUMS)
+      # A draft with every asset first: GitHub creates the tag only when the
+      # release is published, so a failure before that leaves no tag.
+      - name: publish
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          state() {
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate > dist/releases.json
+            gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" > dist/refs.json
+            python3 -B scripts/release_assets.py state --tag "$TAG" --releases dist/releases.json --refs dist/refs.json
+          }
+          before="$(state)"
+          if [ "$before" != "$(printf 'release=none\ntag=none')" ]; then
+            echo "refusing to publish $TAG:" $before >&2
+            exit 1
+          fi
+          touch dist/draft-requested
+          gh release create "$TAG" --draft --prerelease --latest=false --target "$GITHUB_SHA" \
+            --title "Maki $TAG" --notes-file dist/notes.md dist/release/*
+          gh release view "$TAG" --json assets > dist/uploaded.json
+          python3 -B scripts/release_assets.py uploaded --view dist/uploaded.json --assets dist/release
+          gh release edit "$TAG" --draft=false
+          after="$(state)"
+          if [ "$after" != "$(printf 'release=prerelease\ntag=%s' "$GITHUB_SHA")" ]; then
+            echo "after publishing $TAG:" $after "(expected a pre-release and the tag at $GITHUB_SHA)" >&2
+            exit 1
+          fi
+      - name: what a failed publication left
+        if: failure()
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          report() { echo "$*" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" >&2; }
+          if [ ! -e dist/draft-requested ]; then
+            report "Nothing was created for $TAG: the run failed before the release was requested."
+            exit 0
+          fi
+          left="unknown"
+          if gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate > dist/releases.json &&
+              gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" > dist/refs.json; then
+            left="$(python3 -B scripts/release_assets.py state --tag "$TAG" --releases dist/releases.json --refs dist/refs.json)" || left="unknown"
+          fi
+          release="$(printf '%s\n' "$left" | sed -n 's/^release=//p')"
+          tag="$(printf '%s\n' "$left" | sed -n 's/^tag=//p')"
+          if [ "$release" = draft ] && [ "$tag" = none ]; then
+            # This run created the draft (no release of that name existed
+            # before); it has no tag and was never published.
+            if gh release delete "$TAG" --yes; then
+              report "Deleted the incomplete draft release $TAG; no tag was created."
+            else
+              report "An incomplete draft release $TAG is left (no tag). Delete it: gh release delete $TAG --yes"
+            fi
+          elif [ "$release" = none ] && [ "$tag" = none ]; then
+            report "Nothing is left for $TAG."
+          elif [ -z "$release" ]; then
+            report "Could not read what is left for $TAG. Check gh release view $TAG and git ls-remote --tags origin $TAG."
+          else
+            report "Left for $TAG: release $release, tag $tag. A published release is not deleted automatically."
+            report "To remove the release and its tag: gh release delete $TAG --cleanup-tag --yes"
+            report "To remove a tag without a release: git push --delete origin $TAG"
+          fi

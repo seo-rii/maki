@@ -30,6 +30,42 @@ fn malformed_options_fail_before_config_or_plan() {
     }
 }
 
+/// A volume name outside the instance-name rule (or, for `attach` and
+/// `verify`, longer than 64 bytes) is misuse for every verb, refused before
+/// any configuration is read. With a `--config` that cannot be read it was
+/// reported as that read's failure, status 1, and `recover-failed-start`
+/// refused every malformed name with status 1.
+#[test]
+fn a_malformed_volume_name_is_refused_before_any_configuration_is_read() {
+    let long = "v".repeat(65);
+    let mut cases = Vec::new();
+    for verb in ["attach", "detach", "recover", "cleanup", "grow", "verify"] {
+        for name in ["a.b", "../other", "pg.service"] {
+            cases.push((verb, name, true));
+        }
+    }
+    for name in ["a.b", "../other", "pg.service"] {
+        cases.push(("recover-failed-start", name, false));
+    }
+    cases.push(("attach", long.as_str(), true));
+    cases.push(("verify", long.as_str(), true));
+    for (verb, name, with_config) in cases {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_maki-attach"));
+        command.env_clear().args([verb, "--volume", name, "--plan"]);
+        if with_config {
+            command.args(["--config", "/nonexistent-maki-attach/attach.toml"]);
+        }
+        if verb == "grow" {
+            command.args(["--size-bytes", "4096"]);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{verb} {name}: {stderr}");
+        assert!(stderr.contains("volume name"), "{verb} {name}: {stderr}");
+        assert!(output.stdout.is_empty(), "{verb} {name} printed a plan");
+    }
+}
+
 #[test]
 fn flags_specific_to_another_verb_are_rejected() {
     for (verb, flag, value) in [
@@ -120,4 +156,49 @@ fn grow_size_must_be_a_multiple_of_512() {
             "{size}: the refusal names the rule"
         );
     }
+}
+
+/// The former relative option is refused with its reason, not as an unknown
+/// flag: `unsupported argument "--add-bytes"` does not tell an operator
+/// following an old runbook that the absolute `--size-bytes` replaces it, or
+/// why. Strict validation refused the flag first and left the explanation
+/// unreachable.
+#[test]
+fn relative_growth_is_refused_with_its_reason() {
+    for arguments in [
+        &["--add-bytes", "1073741824"][..],
+        &["--add-bytes", "1073741824", "--size-bytes", "2147483648"],
+        &["--size-bytes", "2147483648", "--add-bytes", "1073741824"],
+        &["--add-bytes"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+            .args(["grow", "--volume", "strict-audit-missing-config", "--plan"])
+            .args(arguments)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{arguments:?} printed a plan");
+        assert!(
+            stderr.contains(
+                "error: relative growth is unsupported; use --size-bytes with the absolute \
+                 desired LV size and reuse it on retry"
+            ),
+            "{arguments:?}: {stderr}"
+        );
+    }
+    // Only `grow` ever had the option.
+    let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .args([
+            "attach",
+            "--volume",
+            "strict-audit-missing-config",
+            "--plan",
+        ])
+        .args(["--add-bytes", "1073741824"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("unsupported argument \"--add-bytes\" for attach"));
 }

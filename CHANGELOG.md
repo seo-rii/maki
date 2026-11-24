@@ -11,6 +11,267 @@ documents.
 
 ### Breaking changes
 
+- **The privileged helper connects and disconnects NBD devices itself; no NBD
+  client is used** (AUD-147, AUD-151, AUD-153, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). `maki-attach` starts no
+  program for its NBD steps: it negotiates with the volume daemon's socket
+  (fixed-newstyle `NBD_OPT_GO` for the default export) and sends
+  `NBD_CMD_CONNECT` and `NBD_CMD_DISCONNECT` to the kernel's `nbd`
+  generic-netlink family, setting the attachment's connection identifier as
+  the device's backend identifier, as `nbd-client -identifier` did. The Debian
+  package's `Depends` no longer lists `nbd-client (>= 1:3.27.0)`; its static
+  list is `nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod`,
+  followed by the library packages `dpkg-shlibdeps` finds. A source-built
+  `nbd-client` is no longer used and may be removed, and attachments it
+  connected stay detachable. A kernel whose `nbd` family takes no backend
+  identifier is refused before anything is connected. The plan prints `connect
+  nbdN to <socket> over netlink (block size B, backend identifier
+  '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)` and
+  `disconnect nbdN over netlink` instead of the `nbd-client` command lines. A
+  disconnect that the kernel cannot complete (a daemon that stopped reading
+  with a full send buffer) now holds the helper and the attach lock until the
+  daemon reads again or its socket closes, where the helper used to abandon a
+  stuck `nbd-client` at the 120 s step limit; the unmount and the VG
+  deactivation before it fail first in that case, and the unit's timeout is
+  the outer bound. This replaces the `nbd-client` 3.27.0 requirement listed
+  further down ([prerequisites](docs/operations.md#prerequisites),
+  [Debian](docs/getting-started/installation-debian.md#nbd-client-327-or-later)).
+- **An NBD export without FLUSH and FUA is refused** (AUD-149, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). Before the kernel sees
+  the socket, the helper refuses an export that does not advertise
+  `NBD_FLAG_HAS_FLAGS`, `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`, an
+  export of size 0 or above 2^63 − 1 bytes, and a server that offers no
+  fixed-newstyle negotiation or does not answer `NBD_OPT_GO`, with no fallback
+  to `NBD_OPT_EXPORT_NAME`. `SEND_FLUSH` is required for durability: without
+  it the kernel gives the device no write cache, so FLUSH requests complete
+  without reaching the server and FUA writes go out as plain writes.
+  `SEND_FUA` is required by policy (without it the block layer emulates each
+  FUA write with a full flush) and `HAS_FLAGS` by the NBD protocol.
+  `nbd-client` accepted such exports. Maki's own plugin always advertises
+  FLUSH and FUA, and nbdkit answers `NBD_OPT_GO` in every release the project
+  documents (SPEC §6).
+- **Provisioning connects a new volume's export with `maki-attach nbd-connect`
+  and `nbd-disconnect`** (AUD-152, 2026-11-24;
+  [#375](https://github.com/seo-rii/maki/pull/375)). `maki-attach nbd-connect
+  --nbd-device /dev/nbdN --socket <path> --identifier <id> [--block-size <n>]`
+  and `maki-attach nbd-disconnect --nbd-device /dev/nbdN --identifier <id>`
+  replace the `nbd-client` commands of the provisioning procedure and the
+  privileged validation runner. They refuse an identifier of the attach-record
+  form (`maki-` and a UUID); `nbd-connect` refuses a device that shows a
+  connection, whose backend cannot be read or that a trusted attach record
+  names, and `nbd-disconnect` touches only a device connected under its own
+  identifier. Neither takes the attach lock, which the procedure holds for its
+  whole run ([provisioning](docs/getting-started/first-volume.md),
+  `maki-attach(8)`).
+
+- **The command-line binaries exit 2 for misuse, and `maki-attach` actions
+  exit 3 off Linux** (AUD-137, AUD-144, 2026-11-23;
+  [#363](https://github.com/seo-rii/maki/pull/363)). `maki-witness` exits 2
+  instead of 1 for an unknown command, a missing or extra argument and a
+  volume identity that is not a UUID, and for an argument that is not UTF-8,
+  where it panicked with 101. `maki` exits 2 instead of 1 for `--timeout`
+  without a positive number of seconds, `--socket` without a path, beside a
+  configuration or on a command without a control round trip, a malformed
+  `reload cache` option, and a malformed fence, root or storage identity
+  given to `volume takeover`, `restore` or `resume-enrollment`, which is now
+  refused before the configuration is read. `maki-attach` exits 2 for a
+  malformed `--volume` before it reads any file (it exited 1 for
+  `recover-failed-start`, and for the other verbs with an unreadable
+  `--config`), and off Linux `recover-failed-start` without `--plan` exits 3
+  like every other action, where it exited 0 or 1. The messages are those
+  printed before, but `maki-attach` now follows a malformed `--volume` with
+  the usage for every verb, `recover-failed-start` included, and `maki`
+  reports a malformed approval before a missing or unreadable configuration.
+  A command that fails still exits 1: a script that detects misuse by
+  status 1 must test for 2. `maki(8)` and `maki-attach(8)` have an
+  EXIT STATUS section.
+- **The three remote crypto transports trust one set of TLS roots: the
+  host's trust store, the public roots compiled into the binary and
+  `ca_file`** (AUD-133, [#369](https://github.com/seo-rii/maki/pull/369)).
+  `remote-http` now also trusts the host's trust store (the system bundle, or
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` when set), so a private CA installed
+  there authenticates an HTTP endpoint without a TLS section, where it was
+  refused with `EndpointFatal`. `remote-grpc` now also trusts the compiled-in
+  public roots (webpki-roots) and no longer fails to build its provider on a
+  host whose trust store is empty: a public endpoint is reachable from such
+  an image, and a private endpoint that none of the roots vouches for is
+  refused at the TLS handshake instead of when the provider is built (with
+  a single endpoint attach still fails, now at the self-test's handshake). A
+  gRPC deployment with
+  `ca_file` on a host whose trust store is empty (a distroless image,
+  `SSL_CERT_FILE` naming an empty bundle) trusted that CA alone; it now also
+  accepts a server whose certificate chains to a public root and matches the
+  endpoint's name, and no setting restores CA-only trust. `remote-websocket`
+  is unchanged. `ca_file` still adds to the roots and is parsed strictly; the
+  CA bundle errors read the same in all three transports, and an HTTP client
+  identity that rustls rejects is reported as `bad client identity: …`. The
+  remote witness still trusts only its own CA
+  ([providers](docs/configuration.md#providers)).
+- **Attach reserves the NBD devices that other volumes' attach records name**
+  (AUD-120, [#354](https://github.com/seo-rii/maki/pull/354)). Under the
+  attach lock, attach reads every `/run/maki-attach/<volume>.nbd` record
+  before it chooses a device: automatic allocation skips a device another
+  volume's record names, and a pinned `nbd_device` that such a record names
+  is refused even when the device is free in sysfs. A record that outlived
+  its connection (a helper killed before the connect or after the
+  disconnect) keeps its device until that volume's next attach, cleanup,
+  detach or recover, or until `/run` is cleared; when every device is
+  connected, in use or recorded, attach fails with "no free /dev/nbdN
+  device", which now mentions records. An attach is refused, naming the
+  file, while any `<volume>.nbd` entry cannot be read as a trusted record.
+  Before, another volume could be handed the device, and every verb of the
+  first volume then refused it as a foreign backend
+  ([privileged helper](docs/operations.md#privileged-helper)).
+- **Detach, cleanup, recovery and grow run LVM only on the recorded devices**
+  (AUD-135, [#368](https://github.com/seo-rii/maki/pull/368)). The
+  deactivation of a record with a mapping proof, or of one from before
+  proofs and intents, runs `vgchange --devices <recorded PVs> --activate n
+  --select vg_uuid=<recorded> --config "devices {
+  allow_changes_with_duplicate_pvs=0 }" <vg>` (the selection where the
+  record names a VG UUID), and growth runs `lvextend --devices <recorded
+  PVs> --config "…" -L <n>b <vg>/<lv>`, instead of `vgchange -an <vg>` and
+  `lvextend -L <n>b <vg>/<lv>` resolved over LVM's own device scan. The
+  deactivation of an activation intent, like activation and its rollback,
+  was already scoped. A VG of the same name on another disk is never
+  extended or deactivated: grow used to report success after extending the
+  other disk's LV when the volume's PV was outside LVM's scan, and cleanup
+  after a daemon death deactivated the other VG instead of reaching its
+  `dmsetup` fallback. A devices file or filter that leaves `/dev/nbd*` out no
+  longer stops grow and detach. A record from before mapping proofs and
+  activation intents is scoped to its NBD device alone, so such an
+  attachment whose PV is a partition now fails detach with "not found" and
+  keeps the record; a mapping proof whose uuids do not name one VG UUID is
+  refused before any command. The plan and step texts name the scope
+  ([privileged helper](docs/operations.md#privileged-helper)).
+- **The failed-start hook rolls back an interrupted LVM activation itself**
+  (AUD-118, AUD-119, AUD-142, AUD-143;
+  [#356](https://github.com/seo-rii/maki/pull/356),
+  [#370](https://github.com/seo-rii/maki/pull/370)). When an attach dies
+  between LVM activation and its mapping proof, `maki-attach
+  recover-failed-start` now deactivates the VG within the recorded scope,
+  disconnects the NBD device and retires the record under the attach lock,
+  while the daemon still serves and never with an unmount; before, it only
+  queued `maki-recover@`, which stops the daemon first, so the mapping had to
+  be removed by hand. The hook reads the trusted record first and stops there
+  when it holds no activation intent, writing no journal line; with one it
+  reads `/etc/maki/attach/<volume>.toml` like `cleanup` (`--config` is still
+  refused), waits up to 15 s for the attach unit's control group to settle,
+  waits up to 40 s in turn for the attach lock and gives its commands 30 s
+  once it holds it, so it can take up to about 87 s within the unit's
+  `TimeoutStopSec=120`. Its journal lines name what they are about ("cannot
+  tell whether volume pg has an interrupted LVM activation to roll back",
+  "did not roll back the interrupted LVM activation of volume pg: …", "could
+  not roll back the interrupted LVM activation …"), and `--plan` prints one
+  more line. Cleanup's `dmsetup` fallback no longer runs after a `vgchange
+  -an` killed by a signal, only after one that exited nonzero, and the
+  refusal for an intent whose deactivation fails says what is left. A daemon
+  that stops inside that window still needs the documented manual step
+  ([systemd deployment](docs/operations.md#systemd-deployment),
+  [interrupted activation](docs/operations.md#interrupted-activation-after-the-daemon-stopped)).
+
+- **A volume configuration must be a regular file that no other user can
+  change** (AUD-106, 2026-11-23;
+  [#339](https://github.com/seo-rii/maki/pull/339)). The daemon, every `maki`
+  command that takes a configuration and `maki-benchmark` refuse, before
+  parsing it, a file that is a symlink, has a second hard link, is owned by a
+  user other than root and the user the process runs as, or is writable by
+  its group or others (a file written under `umask 002`, or one with a POSIX
+  ACL that grants write access); the daemon fails attach on such a file.
+  Group and other read stay allowed. Before upgrading, list the affected
+  files and reinstall each with `install -m 0640 -o root -g maki`. A file
+  owned by the daemon user is still accepted by the daemon, but refused by
+  commands run as root
+  ([configuration file](docs/configuration.md#configuration-file),
+  [upgrade](docs/operations.md#upgrading-the-runtime-layout)).
+- **A root process creates backing and witness entries for the owner of
+  their directory, and fails when it cannot** (AUD-111,
+  [#344](https://github.com/seo-rii/maki/pull/344)). On Linux, a command run
+  as root (`maki check --deep`, `maki-check --deep`, `maki volume inspect`,
+  `create`, `takeover`, `restore` or `resume-enrollment`) creates each file
+  and directory below a backing root or a local witness directory for the
+  owner of the directory it is created in. A root run on a volume the daemon
+  user owns therefore no longer leaves root-owned files that stop the next
+  attach, and the procedures drop their `chown -R maki:maki` step. A root
+  process that cannot change the owner (CAP_CHOWN dropped) now fails instead
+  of creating a root-owned entry.
+  Opening a local rollback witness as root gives a root-owned anchor in the
+  daemon's directory back to the daemon user, refuses an anchor a third user
+  owns, and removes a leftover `anchor.next` instead of publishing it; a
+  file a third user puts back under that name is refused. A hand-back is
+  still needed for a restored copy whose files lost their owners, for a
+  volume or witness directory root had to create itself (the `volume create`
+  warning, now printed only then, names it) and after a root run that a
+  crash interrupted ([volume lifecycle](docs/operations.md#volume-lifecycle),
+  [rollback
+  protection](docs/rollback-protection.md#local-configuration-and-creation)).
+- **Candidate builds refuse release-profile and unstable-toolchain overrides,
+  and `maki-nbdkit` requires unwinding panics** (AUD-103,
+  [#336](https://github.com/seo-rii/maki/pull/336)).
+  `scripts/prepare_release.py` stops before building when its environment
+  holds a `CARGO_PROFILE_RELEASE_*`, `RUSTC_BOOTSTRAP`, `CARGO_UNSTABLE_*` or
+  `__CARGO_*` variable, or when Cargo configuration outside the committed
+  source (above the build directory or in `CARGO_HOME`) has a
+  `[profile.release]` or `[unstable]` table or an `include`: unset the
+  variable, or commit the profile change. The manifest also records
+  `CARGO_INCREMENTAL`, the C toolchain inputs of the native dependencies and
+  each external Cargo configuration file with its digest. `maki-nbdkit` no
+  longer compiles with `panic = "abort"`, however that strategy is selected,
+  because the plugin would lose its panic boundary
+  ([releasing](docs/releasing.md#prepare-and-inspect)).
+- **A crypto call that ends at its `bounded-error` deadline returns the last
+  endpoint error, and `maki_crypto_deadline_exceeded_total` counts every
+  expired call once** (AUD-109,
+  [#342](https://github.com/seo-rii/maki/pull/342)). Wherever the deadline
+  expires, the call returns the last error an endpoint returned before it for
+  the RPC batch in progress, with that error's class (`throttled: HTTP 429`,
+  for example), or `operation deadline exceeded` when no endpoint failed that
+  batch. Before, an RPC cut off by the deadline got the bare deadline error
+  whatever the endpoints had answered, and so did a caller whose budget ran
+  out in the batch scheduler before the dispatcher's, the usual case on a
+  remote volume. The counter no longer follows the error text: it counts each
+  call whose own deadline expired exactly once, including one that returns an
+  endpoint error and the exit right after a failed RPC. Alert on the counter
+  rather than on the error text
+  ([metrics](docs/operations.md#metrics-and-health)).
+- **A quarantined endpoint is validated again after an inconclusive failure
+  instead of staying excluded until the daemon restarts** (AUD-110,
+  [#343](https://github.com/seo-rii/maki/pull/343)). A malformed or truncated
+  reply during background validation (a proxy error page, an endpoint
+  restarting mid-response) used to mark the endpoint `rejected` for the life
+  of the process. Only proof that it serves another contract does so now:
+  another key, compatibility id or canary, a claimed capability it does not
+  honour, or an explicit refusal of the volume's context. An endpoint that
+  refuses the volume's key canary with an integrity failure is rejected; it
+  used to be deferred and validated again forever. Inconclusive attempts are
+  repeated after `circuit_breaker.open_initial`, the spacing doubling up to
+  `circuit_breaker.open_max`, instead of at a fixed interval, so an endpoint
+  that was unreachable for long can take up to `open_max` to return after it
+  recovers ([endpoint
+  validation](docs/configuration.md#websocket-and-grpc-contracts)).
+- **With `crypto.random_prefix_bytes`, the attach self-test's
+  compatibility-id probe reaches the provider** (AUD-107,
+  [#340](https://github.com/seo-rii/maki/pull/340)). The random-prefix
+  wrapper used to answer that probe itself, so a remote provider that
+  declares context binding but ignores the compatibility id, or a transport
+  mapping that drops the field, attached with a prefix and was refused
+  without one. It is now refused at attach in both cases ("compatibility id
+  decrypts to the original plaintext"); fix the provider or the mapping. A
+  prefixed volume's self-test sends one more decrypt request ([random
+  plaintext
+  prefixes](docs/random-plaintext-prefix.md#existing-volumes-and-endpoint-compatibility)).
+- **A lock ends when its holder releases it, even while a forked child still
+  holds its descriptor** (AUD-108,
+  [#341](https://github.com/seo-rii/maki/pull/341)). The volume, rollback,
+  witness, attach and control-socket directory locks were released only by
+  closing their descriptor, so a child forked by another thread kept them
+  held until its `exec`: an attach right after a detach or a create could
+  fail with `VOLUME_ALREADY_ATTACHED`, and a closed rollback backing or
+  witness store could refuse to reopen. Every lock is now unlocked before its
+  descriptor closes. As a consequence, remote GC no longer treats a namespace
+  as live because a forked child inherited the descriptor of a lifetime lock
+  its holder has dropped; a held lifetime lock still keeps its namespace
+  ([backing namespace](docs/architecture.md#backing-namespace)).
+
 - **The `maki-witness` configuration, state directory and state files must be
   owned by root or by the user that runs the command** (AUD-075, AUD-076,
   2026-11-17; [#170](https://github.com/seo-rii/maki/pull/170)). `serve`,
@@ -168,6 +429,9 @@ documents.
   helper verifies the kernel NBD backend identifier over netlink and fails
   closed otherwise. Debian 12's 3.24 is too old
   ([installation](docs/getting-started/installation-debian.md)).
+  *Superseded by AUD-147
+  ([#375](https://github.com/seo-rii/maki/pull/375)): the helper connects
+  NBD devices itself and needs no NBD client.*
 - **Credential sources no longer fall back**: `credential`, `file` and `env`
   are each read only from the source they declare; the same name may not be
   declared with different sources in one configuration.
@@ -183,6 +447,51 @@ documents.
   `--add-bytes` is rejected because a retry could not identify itself.
 
 ### Added
+
+- **Release workflow**: `.github/workflows/release.yml`, dispatched by hand on `main` with a
+  tag `v<workspace version>-rc.<n>`, builds the Debian 12 candidate bundle with
+  `scripts/prepare_release.py` and the RHEL 9 RPM with `packaging/rpm/build-rpm.py`
+  from the same commit, and publishes them with the source, both manifests and one
+  `SHA256SUMS` as an unsigned GitHub pre-release. Final tags are refused while
+  production approval is pending; a run that fails before publication leaves no
+  tag ([publishing a pre-release](docs/releasing.md#publishing-a-pre-release)).
+
+- **An RPM package for RHEL 9 and its rebuilds** (AUD-148, AUD-154,
+  2026-11-24; [#374](https://github.com/seo-rii/maki/pull/374)).
+  `packaging/rpm/build-rpm.py` packages the prebuilt release artifacts like
+  the Debian builder, with the same files, owners and modes, units, sysusers
+  and tmpfiles rules and scriptlet behaviour (`%preun` refuses an erase under
+  a live attachment and never blocks an upgrade). It declares `Requires:
+  nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod` and
+  `Conflicts: nbdkit-selinux`: by the targeted policy, that module's label on
+  `/usr/sbin/nbdkit` keeps systemd from starting `maki@` under enforcing
+  SELinux, and the `nbdkit` metapackage installs it, so dnf refuses to install
+  Maki beside it and refuses a later transaction that would add it. Maki
+  therefore cannot be installed on a host that needs the module for libvirt or
+  virt-v2v. The package's `maki@.service` runs `/usr/sbin/nbdkit`: the builder
+  rewrites the one `ExecStart=/usr/bin/nbdkit` line, and SPEC §10 requires the
+  unit to name nbdkit by its absolute path, never by a bare name that systemd
+  would look up in `/usr/local` first. `SOURCE_DATE_EPOCH` must be given, 1990
+  or later ([packaging/rpm/README.md](packaging/rpm/README.md)).
+
+- **A RHEL 9 installation guide** (AUD-158, 2026-11-24;
+  [#374](https://github.com/seo-rii/maki/pull/374)): BaseOS and AppStream
+  only, the toolchain, the build and installation, `modprobe nbd`, the LVM
+  devices file and SELinux. RHEL 9 is not qualified: nothing has run on a RHEL
+  kernel or with SELinux enforcing, and nothing has attached a device there
+  ([RHEL 9 installation](docs/getting-started/installation-rhel.md)).
+
+- **CI checks a RHEL 9 userspace and connects a kernel NBD device** (AUD-155,
+  AUD-156, 2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375),
+  [#374](https://github.com/seo-rii/maki/pull/374)). A `rhel9` job in a CentOS
+  Stream 9 container builds the packaged binaries, checks the plugin ABI
+  against EL9's nbdkit header, runs the `maki-privileged`, `maki-attach` and
+  `maki-nbdkit` suites with EL9's nbdkit 1.38, and builds, installs, verifies
+  and removes the RPM, on the runner's Ubuntu kernel. The Ubuntu job loads the
+  `nbd` module and connects and disconnects a real `/dev/nbdN` through the
+  helper as root; `MAKI_TEST_REQUIRE_NBD=1`, `MAKI_TEST_REQUIRE_NBDKIT=1` and
+  `MAKI_TEST_REQUIRE_NBD_HEADERS=1` make the NBD tests fail there instead of
+  skipping ([automated CI](docs/testing.md#automated-ci)).
 
 - **Concurrent and mixed benchmark workloads**: configurable concurrency,
   sequential/random access, read ratio, working set, FUA and periodic drained
@@ -300,7 +609,215 @@ documents.
   `SECURITY.md`, `CONTRIBUTING.md`, this changelog, and a documentation link
   checker in CI (2026-09-23).
 
+### Changed
+
+- **A connect retries while the kernel reports the NBD device busy** (AUD-150,
+  2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375)). The kernel
+  refuses `NBD_CMD_CONNECT` with `EBUSY` while anything has the unconnected
+  device open, as udev's probe does right after a disconnect, so an attach
+  right after a detach of the same device could fail, with `nbd-client` too.
+  The helper retries every 100 ms for up to 5 s within the step's deadline, on
+  a fresh connection to the daemon and only while the device still shows no
+  connection; a device held open longer still fails as busy
+  ([prerequisites](docs/operations.md#prerequisites)).
+
+- **A displaced attach record is retired automatically once nothing of its
+  attachment remains** (AUD-134, 2026-11-23;
+  [#367](https://github.com/seo-rii/maki/pull/367)). A trusted record whose
+  NBD device is connected under another identity (an NBD client started
+  outside the helper, or two volumes left sharing a device by an older
+  helper) was refused by every verb until root removed it by hand. Attach,
+  cleanup, recover and detach now retire it under the attach lock, without
+  running a command or touching the device, when the record names its VG
+  UUID, no device-mapper device of that VG exists on the host, every holder
+  of the device and its partitions is an LVM mapping of another VG, nothing
+  is mounted at the recorded mountpoint or from a mapping of that VG, no
+  other record names the device with the same VG UUID or with none, the
+  backend stays the same across two observations, and every observation can
+  be read. Otherwise the refusal adds `The record is not retired
+  automatically: <reason>`. A record that names no VG UUID (an attach without
+  `[lvm_identity]` pins that stopped before the connect) keeps the manual
+  step. Cleanup with a configuration that does not match the record is
+  refused with "cleanup configuration does not match the trusted attach
+  record" ([privileged helper](docs/operations.md#privileged-helper)).
+- **`maki volume gc` goes on past a namespace it cannot examine or finish
+  retiring** (AUD-113, AUD-138;
+  [#357](https://github.com/seo-rii/maki/pull/357),
+  [#365](https://github.com/seo-rii/maki/pull/365)). A stale namespace that
+  GC cannot open or examine (a root-owned leftover of an interrupted root
+  `takeover`, an entry it may not read) is kept and listed in a new
+  `skipped_unreadable` array of `{"name", "error"}` objects. One whose
+  retirement stopped at a step that changes it alone (an unlink, its
+  directory sync or removal, or its rename when its own directory is
+  immutable or append-only and the root is neither) is kept as the step left
+  it and listed in a new `unfinished` array; a later pass resumes it.
+  `counts` gains `skipped_unreadable` and `unfinished`. Both cases used to
+  end the pass with an error, leaving every higher-fence namespace on disk
+  with a full arena; `maki volume gc` now exits 0 with the entries listed.
+  A pass still ends with an error for an authority failure or a changed
+  record, a root whose marker, current generation, binding, listing or mount
+  identity cannot be read, a rename the root or its filesystem refuses, a
+  failed sync of the root directory and an entry that changed identity while
+  it was being retired. The automatic pass after an activation, which was
+  silent, logs a `WARN` when it did not complete and names the first entry
+  it could not examine or finish
+  ([retire old writer namespaces](docs/remote-witness-service.md#retire-old-writer-namespaces)).
+- **An interrupted creation can be run again** (AUD-114, AUD-115, AUD-136,
+  AUD-139; [#358](https://github.com/seo-rii/maki/pull/358),
+  [#366](https://github.com/seo-rii/maki/pull/366)). A remote `maki volume
+  create` writes its format marker and its binding under a temporary name
+  (`rollback.format.next`, `remote.enrollment.next`) and renames them into
+  place. `create` completes a root that holds only an unwritten or staged
+  marker, and `resume-enrollment` continues a creation cut while it wrote
+  the binding, which needed the file moved out by hand; an invalid binding
+  that an older binary left keeps that step. `maki-witness init` no longer
+  creates an empty `remote.state` first, so an interrupted `init` can be run
+  again; an empty `remote.state` is still refused, now with its causes and
+  the way out. A local-witness `maki volume create` completes a backing and
+  witness directory that hold only what an interrupted creation leaves (the
+  marker, the arena, a first manifest slot that holds only zeros or the
+  initial empty manifest and a second that holds only zeros, `anchor.next`),
+  where it refused every pair that was not empty, for example after the arena
+  reservation ran out of space. It still never creates over an existing
+  `anchor` or over a backing that committed data, short of both manifest
+  slots lost or zeroed entirely, and a creation that stopped after
+  publishing the anchor is still refused. The local witness
+  no longer installs an empty anchor first; an empty `anchor` that an
+  earlier release left is refused with an explanation
+  ([local creation](docs/rollback-protection.md#local-configuration-and-creation),
+  [remote enrollment](docs/rollback-protection.md#resume-interrupted-initial-enrollment),
+  [witness initialization](docs/remote-witness-service.md#initialize-a-local-authority)).
+- **Background validation of a quarantined endpoint treats a generic refusal
+  or a provider failure as inconclusive** (AUD-116, AUD-140;
+  [#350](https://github.com/seo-rii/maki/pull/350),
+  [#364](https://github.com/seo-rii/maki/pull/364)). A request refused
+  without an integrity verdict (over HTTP every 4xx the transport classifies
+  as a request error, such as 400, 421 or a 422 without the
+  `maki-crypto-error` header; a WebSocket `bad-request`; a gRPC
+  `InvalidArgument`, `NotFound`, `OutOfRange` or bare `FailedPrecondition`),
+  a validation RPC that the endpoint set's own byte budget refuses, and a
+  `ProviderFatal` error of the candidate's own provider no longer mark the
+  endpoint `rejected` for the life of the daemon. It stays quarantined and is
+  validated again every `circuit_breaker.open_initial`, doubling up to
+  `open_max`, with a warning per attempt. Only proof of another contract
+  excludes it: an integrity refusal of the other endpoint's ciphertext or of
+  the key canary, a wrong plaintext, a foreign compatibility id, a claimed
+  capability it does not honour or an explicit refusal of the volume's
+  context. An endpoint that always answers so is still never admitted and is
+  now probed for as long as the daemon runs. Attach is unchanged
+  ([endpoint validation](docs/configuration.md#websocket-and-grpc-contracts)).
+- **An `EndpointSet` bound to one plaintext size reports only that size**
+  (AUD-117, [#351](https://github.com/seo-rii/maki/pull/351)). With
+  `with_plaintext_size`, as the daemon builds its set, the reported
+  capabilities list the bound size alone (`[512]` instead of `[512, 4096]`,
+  or `[512 + prefix]` with a random prefix), so the batch scheduler refuses a
+  unit of another size alone at admission instead of letting it fail a
+  coalesced call. Limits and security claims are still the intersection over
+  every endpoint.
+
 ### Fixed
+
+- **2026-11-23 fifth audit: command-line output** (AUD-122, AUD-123;
+  [#353](https://github.com/seo-rii/maki/pull/353)). The five binaries no
+  longer exit 101 with a panic when stdout or stderr cannot be written. A
+  closed stdout is not an error, and the command keeps its own status: a
+  clean `maki check … | grep -q …` under `pipefail` passes again and a failed
+  check still exits 1. Another failure to write a command's result exits 1
+  and names the verdict, a command that has already changed something
+  (`volume takeover`, `gc`, `restore`, `maki-attach verify`) only warns, and a
+  diagnostic stderr cannot take is dropped. An executing `maki-attach` verb no
+  longer panics at a log line or a device announcement nobody reads, and an
+  unwritable copy of its plan never decides the outcome. `maki-attach --help`,
+  `-h`, `help`, `--version` and `-V`, `maki-witness --version` and `-V`, and
+  `maki-benchmark --version` and `-V` exit 0, each only as the sole argument.
+  `maki --help` says that the helper verbs only print the `maki-attach`
+  command, `maki-attach grow --add-bytes` is refused with the reason, and two
+  validation messages lost a stray line break.
+- **2026-11-23 fifth audit: privileged helper** (AUD-121). A volume group of
+  64 logical volumes, which preflight admits, no longer fails proof capture
+  and rolls back on every attach: the inventory behind the mapping proof
+  holds 64 devices and 64 mappings, and the preflight refusal of a 65th LV
+  names the limit ([#355](https://github.com/seo-rii/maki/pull/355);
+  [checking LVM](docs/storage-recovery.md#checking-lvm-before-activation)).
+- **2026-11-23 follow-ups: command line and plugin** (AUD-144). The nbdkit
+  plugin's five stderr lines (configuration refusals, a failed startup or
+  shutdown) no longer turn a log pipe whose reader has gone into a caught
+  panic and EIO, and `cargo doc` no longer documents the `maki-witness`
+  binary over the `maki_witness` library
+  ([#363](https://github.com/seo-rii/maki/pull/363)).
+- **2026-11-23 follow-ups: CI on Windows** (AUD-146). The CI formatting step
+  runs on Linux only: on Windows `cargo fmt --all --check` passes every
+  target's root file to one rustfmt command line, which the workspace has
+  outgrown ("The filename or extension is too long", os error 206), so from
+  #369's merge `main`'s Windows jobs stopped before their clippy and test
+  steps; each pull request's own run passed them. Formatting does not
+  depend on the platform; check it on Windows one package at a time with
+  `cargo fmt -p <package> --check`
+  ([#372](https://github.com/seo-rii/maki/pull/372);
+  [running checks](docs/testing.md#run-checks-locally)).
+- **2026-11-23 fifth audit and follow-ups: tests and CI** (AUD-128 to
+  AUD-132, AUD-145). Eight golden vectors freeze the allocation map, the
+  shard catalog, the checkpoint state, the durable proof, the journal
+  segment and record headers and the v2 and v3 superblock envelopes, and an
+  inventory test requires a vector for every record magic
+  ([#352](https://github.com/seo-rii/maki/pull/352)). The Linux CI job runs
+  the test targets that need root as root (`scripts/run_root_tests.py`),
+  fails when a Python suite leaves bytecode in the checkout and runs every
+  script test module ([#360](https://github.com/seo-rii/maki/pull/360));
+  since [#366](https://github.com/seo-rii/maki/pull/366) the root step also
+  runs maki-backing's unit tests. Tests that passed without asserting (the
+  mount-target rule, the release of locked pages, the memory-budget path
+  bytes), a test that used failpoints without their lock and native tests
+  that skipped without a notice are fixed
+  ([#361](https://github.com/seo-rii/maki/pull/361)). Fixtures no longer
+  depend on the umask, a `TMPDIR` private to root or a host trust store
+  ([#362](https://github.com/seo-rii/maki/pull/362)), nor on `/dev/shm` or a
+  short `TMPDIR`, and the Python campaign tests no longer leave a `0077`
+  umask behind; `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1`, which CI sets, makes
+  a missing second filesystem fail the rollback tests instead of skipping
+  them ([#371](https://github.com/seo-rii/maki/pull/371); [running
+  checks](docs/testing.md#automated-ci)). See the remediation log's
+  [fifth](docs/review-remediation.md#internal-audit-fifth-round-2026-11-23-aud-113aud-132)
+  and
+  [sixth](docs/review-remediation.md#sixth-round-follow-ups-2026-11-23-aud-133aud-146)
+  rounds.
+
+- **2026-11-23 audit: privileged helper and daemon admission** (AUD-101,
+  AUD-102). A mount with an empty source (`mount -t tmpfs '' /dir`) anywhere
+  in the namespace no longer fails NBD allocation, attach, detach, cleanup,
+  recovery, grow and the workload verify gate for every volume, or the start
+  of a memory-budgeted daemon: both mount-table parsers split a record by
+  field position. Memory-budget admission reads the table as a stream, so a
+  host with thousands of mounts is no longer refused with "oversized kernel
+  field /proc/self/mountinfo"; one record longer than 1 MiB still is
+  ([#337](https://github.com/seo-rii/maki/pull/337); [memory
+  budget](docs/configuration.md#measured-memory-budget)). See the
+  [remediation
+  log](docs/review-remediation.md#internal-audit-fourth-round-2026-11-23-aud-098aud-112).
+- **2026-11-23 audit: storage, remote providers and secrets** (AUD-098 to
+  AUD-100). A file whose name is not UTF-8 in a volume's `data/` or
+  `journal/` directory no longer fails every attach or leaves `maki check`
+  inconclusive: the scans skip it like any other unknown name, while volume
+  creation and rollback enrollment still refuse it
+  ([#338](https://github.com/seo-rii/maki/pull/338)). A request with a unit
+  that is refused before anything is sent (an empty ciphertext recorded by a
+  damaged slot, a ciphertext above the provider's maximum, plaintext of a
+  size the provider does not accept) now fails alone at scheduler admission;
+  with a provider that is not retry-safe it used to fail every request
+  coalesced with it, so one such slot gave healthy reads EIO
+  ([#334](https://github.com/seo-rii/maki/pull/334);
+  [batching](docs/configuration.md#batching-and-pending-bounds)). The search
+  of each encrypt result for its own plaintext no longer builds a table
+  derived from that plaintext in ordinary heap memory, where it was not
+  page-locked and was freed without erasure
+  ([#335](https://github.com/seo-rii/maki/pull/335); [transport
+  memory](docs/transport-memory.md#local-providers-and-key-material)).
+- **2026-11-23 audit: tests** (AUD-112). The preserve-first rule of the A/B
+  metadata stores is pinned for every record type by the copy a torn retry
+  keeps, and for the checkpoint state at the volume level
+  ([#345](https://github.com/seo-rii/maki/pull/345)). The memory-budget
+  admission recheck, which no test covered, has one
+  ([#337](https://github.com/seo-rii/maki/pull/337)).
 
 - **2026-11-17 audit: durability and recovery** (AUD-052 to AUD-062, AUD-091).
   A worker pass started by the interval, the overlay bound or a write refused
@@ -702,6 +1219,74 @@ observable behaviour:
 
 ### Documentation
 
+- **2026-11-24 seventh round** (AUD-147, AUD-148, AUD-151, AUD-157, AUD-158).
+  SPEC §6 gains an "NBD connection" section: the handshake, the netlink
+  requests, the refusals, the busy retry, the provisioning connection's rules,
+  and exactly what the time bound covers (the helper's own waits, not the
+  kernel's work on a request); §8 says that the live backend is the device's
+  kernel backend identifier, and §10 that the daemon unit names nbdkit by its
+  absolute path ([#375](https://github.com/seo-rii/maki/pull/375),
+  [#374](https://github.com/seo-rii/maki/pull/374)). The status page, the
+  support matrix and operations say that every external campaign that attached
+  a kernel NBD device did so through `nbd-client` (3.27.1 where the report
+  names the version, 3.24 in the 2026-09-02 privileged run) and predates the
+  helper's own connect; the Debian guide's `nbd-client` section is one
+  sentence, kept under its old anchor. The support matrix has RHEL 9, Fedora
+  and RHEL 8 rows, and the testing guide describes the new tests, the CI
+  switches and the `rhel9` job. SPEC §6, the helper's documentation and its
+  refusal message say why each export flag is required (`SEND_FLUSH` for
+  durability, `SEND_FUA` by policy, `HAS_FLAGS` by the protocol), where they
+  said that without any of them the kernel completes FLUSH and FUA without
+  sending them ([#376](https://github.com/seo-rii/maki/pull/376)). The
+  remediation log records the seventh round and marks the statements it
+  supersedes.
+
+- **2026-11-23 fifth audit and follow-ups** (AUD-124 to AUD-127, AUD-141).
+  SPEC §43 classifies journal damage by the durable proof and mark instead of
+  refusing corruption before a valid successor record, and SPEC, the
+  architecture, testing and status pages match the code on envelope v3, the
+  discard maps, the conditional swap check, the module layout, recovery's
+  replay and discard admission
+  ([#347](https://github.com/seo-rii/maki/pull/347)). The configuration guide
+  names the nine byte keys that take only plain integers and says what the
+  batch byte limit and the cache keys do, and the reclamation, latency and
+  key-rotation pages match the code; a test loads every documented volume
+  configuration ([#349](https://github.com/seo-rii/maki/pull/349)). The
+  guides say that the stop after `maki drain` depends on cleanup's
+  single-mapping fallback (detach an attachment with an additional LV before
+  the drain), give the key-rotation runbook's stop order for backups and the
+  PostgreSQL default-cluster precondition, and the manual pages document
+  every option ([#348](https://github.com/seo-rii/maki/pull/348)). SPEC §18
+  and a new [provider error
+  signals](docs/configuration.md#provider-error-signals) section give the
+  integrity tokens a provider must send and each transport's complete error
+  classification, and SPEC gives the byte layout of every on-disk record
+  ([#359](https://github.com/seo-rii/maki/pull/359)). What an inexact
+  WebSocket probe error envelope, an upgrade reply that is not a valid
+  upgrade and an HTTP/2 reset or GOAWAY under a gRPC call are classified as
+  is documented and pinned, and SPEC §7 lists the remote-volume commands
+  ([#364](https://github.com/seo-rii/maki/pull/364),
+  [#363](https://github.com/seo-rii/maki/pull/363)). The remediation log
+  records the fifth and sixth rounds and marks the statements they
+  supersede.
+
+- **2026-11-23 audit** (AUD-104, AUD-105): the nbd-client 3.27 backport
+  recipe in the Debian guide stops at the first failed step, builds in a new
+  directory, refuses a tarball that does not match the digest the operator
+  verified against the upstream signature (`NBD_TARBALL_SHA256`) and installs
+  exactly the package it built for the host's architecture; the quoted
+  `Depends` line includes `systemd (>= 249)`
+  ([installation](docs/getting-started/installation-debian.md#nbd-client-327-or-later),
+  [#336](https://github.com/seo-rii/maki/pull/336)). The link checker counts
+  a tab after a block quote or list margin to the line's next tab stop, so
+  links on such lines are no longer skipped as indented code
+  ([#333](https://github.com/seo-rii/maki/pull/333)). The remediation log
+  records the fourth audit and marks the statements it supersedes; SPEC §8
+  says that non-Unix hosts also hold a volume configuration to 1 MiB, SPEC
+  §34 that a quarantined endpoint serves no volume request before its
+  validation succeeds, and the architecture page that the echo check finds
+  the plaintext anywhere in an encrypt result.
+
 - **2026-11-17 audit** (AUD-081, AUD-084 to AUD-090, AUD-096, AUD-097): the
   link checker verifies reference-style link definitions and references
   ([#171](https://github.com/seo-rii/maki/pull/171)). A copy-on-write backing
@@ -762,8 +1347,8 @@ observable behaviour:
 - [Cross-host remote transports under the sandbox](docs/qualification/cross-host-sandbox-validation-2026-10-05.md).
 - [Provider host reset under a writing client](docs/qualification/provider-host-reset-validation-2026-10-05.md).
 - The quick start and first-volume bootstrap passed `/dev/nbd0` to
-  `nbd-client`; version 3.27, which Maki requires, connects over netlink and
-  refuses it ("Invalid nbd device target"). They now pass the kernel name
+  `nbd-client`; version 3.27, which Maki then required, connects over netlink
+  and refuses it ("Invalid nbd device target"). They now pass the kernel name
   (`nbd0`); found by the 2026-10-03 packaged-lifecycle campaign.
 - Validation reports moved to `docs/qualification/`; the README now links to
   [status](docs/status.md) instead of carrying the campaign history.

@@ -9,6 +9,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_control::protocol::{read_response, send_command, Request};
 use std::path::Path;
 use std::process::Command;
@@ -86,7 +89,7 @@ fn foreground_nbdkit_reports_failed_drain_and_failed_unload() {
             return;
         }
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("volume");
     let socket = dir.path().join("control.sock");
     let config_path = dir.path().join("volume.toml");

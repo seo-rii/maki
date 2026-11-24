@@ -90,8 +90,10 @@ maki check "$config"
 connection_id="maki-bootstrap-$(cat /proc/sys/kernel/random/uuid)"
 systemctl start "maki@$volume.service"
 systemctl is-active "maki@$volume.service"
-# A background nbd-client must not inherit the helper's lock descriptor.
-nbd-client -unix "$socket" "$nbd" -b "$block_size" -identifier "$connection_id" 9>&-
+# The helper's own NBD connect, outside any attachment; it takes no lock,
+# since this shell holds it, and inherits no lock descriptor.
+maki-attach nbd-connect --nbd-device "$dev" --socket "$socket" \
+    --block-size "$block_size" --identifier "$connection_id" 9>&-
 
 verify_backend() {
     local backend bytes
@@ -134,7 +136,7 @@ fs_uuid=$(blkid --probe --cache-file /dev/null --match-tag UUID --output value "
 verify_backend
 vgchange --devices "$dev" -an "$vg"
 verify_backend
-nbd-client -d "$nbd"
+maki-attach nbd-disconnect --nbd-device "$dev" --identifier "$connection_id" 9>&-
 systemctl stop "maki@$volume.service"
 install -d -m 0700 -o root -g root /etc/maki/attach "$mountpoint"
 # noclobber prevents replacing a configuration created during this procedure.
@@ -158,9 +160,13 @@ printf 'Created %s; review it before starting the lifecycle.\n' "$attach_config"
 BASH
 ```
 
-`nbd-client` 3.27+ takes the kernel name (`nbd0`) with netlink, while block
-and LVM tools take `/dev/nbd0`. Its unique `-identifier` must appear unchanged
-in the kernel's `backend` attribute. A missing or unreadable attribute is a
+`maki-attach nbd-connect` negotiates with the daemon's socket and connects the
+device over netlink with the helper's own code, the same as an attach; no
+`nbd-client` is needed. Its unique `--identifier` must appear unchanged in the
+kernel's `backend` attribute, and an identifier of the form attach records use
+(`maki-<uuid>`) is refused. It refuses a device that shows a connection or that
+an attach record names, and `nbd-disconnect` disconnects only a device
+connected under its identifier. A missing or unreadable attribute is a
 failure. LVM queries and mutations after connection are restricted to that
 one device. Before formatting, the device-mapper UUID must contain the newly
 observed VG and LV UUIDs and its only backing device must be that NBD device.

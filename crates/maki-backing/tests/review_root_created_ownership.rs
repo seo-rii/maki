@@ -10,6 +10,12 @@
 //! without it these tests print why they are skipped (as in CI).
 #![cfg(target_os = "linux")]
 
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -262,9 +268,10 @@ fn root_reopen_recreates_missing_rollback_files_for_the_daemon() {
     if skip_unless_root("root_reopen_recreates_missing_rollback_files_for_the_daemon") {
         return;
     }
-    // Explicit roots keep the witness on an independent filesystem.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     drop(RollbackBacking::create(root.path(), witness.path(), 8 * 4096).unwrap());
     give(root.path(), DAEMON);
     give(witness.path(), DAEMON);
@@ -375,6 +382,44 @@ fn root_never_publishes_a_temporary_record_another_user_put_in_the_witness() {
     drop(FileWitness::open(dir.path()).unwrap());
 }
 
+/// The first record is published the same way: a temporary record that
+/// another user left in a witness directory the daemon user owns is
+/// never published as the anchor, and is not given away.
+#[test]
+fn root_create_never_publishes_a_temporary_record_another_user_left_in_the_witness() {
+    if skip_unless_root(
+        "root_create_never_publishes_a_temporary_record_another_user_left_in_the_witness",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    give(dir.path(), DAEMON);
+    let planted = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.path().join("anchor.next"))
+        .unwrap();
+    std::os::unix::fs::fchown(&planted, Some(OTHER.0), Some(OTHER.1)).unwrap();
+
+    drop(FileWitness::create(dir.path(), *b"volume-identity!", [0x11; 32]).unwrap());
+    let anchor = dir.path().join("anchor");
+    assert_ne!(
+        fs::metadata(&anchor).unwrap().ino(),
+        planted.metadata().unwrap().ino(),
+        "the other user's file was published as the anchor"
+    );
+    assert_eq!(owner(&anchor), (DAEMON, 0o600));
+    let metadata = planted.metadata().unwrap();
+    assert_eq!((metadata.uid(), metadata.gid()), OTHER);
+    let published = fs::read(&anchor).unwrap();
+    planted.write_all_at(&[0xa5; 104], 0).unwrap();
+    assert_eq!(fs::read(&anchor).unwrap(), published);
+    drop(FileWitness::open(dir.path()).unwrap());
+}
+
 /// The authority in process, answering for one role.
 struct LocalRpc {
     store: Arc<Mutex<StateStore>>,
@@ -393,7 +438,7 @@ fn root_takeover_and_reopen_create_the_writer_namespace_for_the_daemon() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let state = private_dir::tempdir().unwrap();
     let store = Arc::new(Mutex::new(
         StateStore::create(state.path(), [1; 16]).unwrap(),
     ));

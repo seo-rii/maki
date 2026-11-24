@@ -7,7 +7,8 @@ use crate::error::FormatError;
 pub const ALLOCATION_MAGIC: &[u8; 8] = b"MAKIALC1";
 pub const ALLOCATION_VERSION: u32 = 1;
 pub(crate) const ENCODED_FIXED_BYTES: u64 = ALLOCATION_MAGIC.len() as u64 + 4 + 8 + 8 + 4;
-/// Hard cap: 64 GiB shard at 4 KiB units = 16 Mi units = 2 MiB of bitmap.
+/// Hard cap on one map: 2^32 units, a 512 MiB bitmap. Geometry validation
+/// keeps `units_per_shard` at or below `u32::MAX`, inside this cap.
 const MAX_UNITS: u64 = 1 << 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

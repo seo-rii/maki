@@ -161,7 +161,8 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(package_version, f"0.1.0~rc+rev1.git{self.commit[:12]}")
         self.assertEqual(package_version, self.print_version().stdout.strip())
         self.assertIn("libc6", manifest["package"]["depends"])
-        self.assertIn("nbd-client (>= 1:3.27.0)", manifest["package"]["depends"])
+        self.assertIn("nbdkit", manifest["package"]["depends"])
+        self.assertNotIn("nbd-client", manifest["package"]["depends"])
         with tarfile.open(output / manifest["source"]["filename"], "r:gz") as archive:
             names = archive.getnames()
             self.assertTrue(any(name.endswith("/Cargo.lock") for name in names))

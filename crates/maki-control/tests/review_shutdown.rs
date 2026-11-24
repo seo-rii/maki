@@ -7,6 +7,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +40,7 @@ impl ControlBackend for Fake {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_drains_when_all_session_slots_are_busy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let listener = bind_control_socket(&path, None).unwrap();
 

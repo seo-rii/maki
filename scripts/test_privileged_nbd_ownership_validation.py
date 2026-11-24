@@ -1,7 +1,8 @@
 """Exercise raw NBD ownership with mocked commands and private sysfs fixtures.
 
-The shell fragments come from the runner, but sudo, nbd-client, system locks,
-LVM, mounts, and process cleanup are replaced. No kernel device is opened.
+The shell fragments come from the runner, but sudo, the helper's raw NBD
+verbs (maki-attach nbd-connect and nbd-disconnect), system locks, LVM, mounts,
+and process cleanup are replaced. No kernel device is opened.
 """
 import contextlib
 import importlib.util
@@ -18,6 +19,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).with_name("privileged-linux-validation.sh")
 WRAPPER = Path(__file__).with_name("privileged_validation_nbd.py")
+HELPER = "/not-opened/maki-attach"
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux shell validation runner")
@@ -78,15 +80,17 @@ def command(arguments, **kwargs):
         if os.environ.get("REPLACE_AFTER_LVM") == arguments[0]:
             (sysfs / "backend").write_text("foreign\\n")
         return subprocess.CompletedProcess(arguments, 0)
-    assert arguments[0] == "nbd-client", arguments
-    if arguments[1] == "-d":
+    assert arguments[0] == "/not-opened/maki-attach", arguments
+    assert arguments[1] in ("nbd-connect", "nbd-disconnect"), arguments
+    assert arguments[arguments.index("--nbd-device") + 1] == "/dev/nbd15", arguments
+    if arguments[1] == "nbd-disconnect":
         backend = (sysfs / "backend").read_text().strip() if (sysfs / "backend").exists() else "missing"
         record(["disconnect", backend])
         (sysfs / "pid").unlink(missing_ok=True)
         (sysfs / "backend").unlink(missing_ok=True)
         return subprocess.CompletedProcess(arguments, 0)
-    assert arguments[1] == "-unix", arguments
-    identifier = arguments[arguments.index("-identifier") + 1] if "-identifier" in arguments else "unidentified"
+    assert arguments[arguments.index("--block-size") + 1] == "4096", arguments
+    identifier = arguments[arguments.index("--identifier") + 1] if "--identifier" in arguments else "unidentified"
     record(["connect", identifier])
     mode = os.environ["CONNECT_MODE"]
     if mode != "failed-empty":
@@ -120,8 +124,6 @@ if args[0] == "env":
         (sysfs / "pid").unlink(missing_ok=True)
         (sysfs / "backend").unlink(missing_ok=True)
     sys.exit(int(os.environ.get("HELPER_" + action.upper() + "_RESULT", "0")))
-if args[0] == "nbd-client":
-    sys.exit(command(args).returncode)
 assert args.pop(0) == "python3", args
 wrapper = args.pop(0)
 assert Path(wrapper) == Path(os.environ["WRAPPER"]), wrapper
@@ -186,6 +188,8 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
         body += after + "\n"
         result = subprocess.run(["/bin/bash", "-c", body],
                                 env=dict(os.environ, FIXTURE=str(self.root),
+                                         # The driver imports the wrapper from scripts/.
+                                         PYTHONDONTWRITEBYTECODE="1",
                                          CONNECT_MODE=mode, PYTHON=sys.executable,
                                          WRAPPER=str(WRAPPER), DRIVER=str(self.driver),
                                          REPO_ROOT=str(SCRIPT.parent.parent)),
@@ -193,6 +197,15 @@ stop_process_normally() { printf '["stop", "%s"]\n' "$1" >> "$FIXTURE/calls.json
                                 capture_output=True, timeout=5)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         return result, calls
+
+    def test_fixture_interpreters_write_no_bytecode_next_to_the_wrapper(self):
+        bytecode = (WRAPPER.with_name("__pycache__"), WRAPPER.stem + ".*")
+        for stale in bytecode[0].glob(bytecode[1]):
+            stale.unlink()
+        result, calls = self.run_case()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(call[0] == "connect" for call in calls), calls)
+        self.assertEqual(list(bytecode[0].glob(bytecode[1])), [], "the driver compiled into the checkout")
 
     def device_state(self, backend):
         (self.sysfs / "pid").write_text("12345\n")
@@ -375,7 +388,8 @@ class LockedNbdOperations(unittest.TestCase):
             self.events.append("unlock")
 
     def invoke(self, action, **kwargs):
-        options = ["--device", "/dev/nbd15", "--identifier", self.identifier, action]
+        options = ["--device", "/dev/nbd15", "--identifier", self.identifier, "--helper", HELPER,
+                   action]
         for key, value in kwargs.items():
             options += ["--" + key, value]
         with mock.patch.object(self.module, "attach_lock", self.lock), \
@@ -433,7 +447,8 @@ class LockedNbdOperations(unittest.TestCase):
         (self.sysfs / "backend").write_text(self.identifier + "\n")
         result, command = self.invoke("disconnect")
         self.assertNotEqual(result, 0)
-        command.assert_called_once_with(["nbd-client", "-d", "nbd15"])
+        command.assert_called_once_with([HELPER, "nbd-disconnect", "--nbd-device", "/dev/nbd15",
+                                         "--identifier", self.identifier])
 
     def test_owned_lvm_command_is_issued_inside_shared_lock(self):
         (self.sysfs / "backend").write_text(self.identifier + "\n")
@@ -444,7 +459,7 @@ class LockedNbdOperations(unittest.TestCase):
         with mock.patch.object(self.module, "attach_lock", self.lock), \
                 mock.patch.object(self.module.subprocess, "run", command):
             result = self.module.main(["--device", "/dev/nbd15", "--identifier", self.identifier,
-                                       "remove-pv"])
+                                       "--helper", HELPER, "remove-pv"])
         self.assertEqual(result, 0)
         self.assertEqual(self.events, ["lock", ["pvremove", "--yes", "--force", "/dev/nbd15"], "unlock"])
 
@@ -454,7 +469,7 @@ class LockedNbdOperations(unittest.TestCase):
                 mock.patch.object(self.module.subprocess, "run") as command, \
                 contextlib.redirect_stderr(io.StringIO()):
             result = self.module.main(["--device", "/dev/nbd15", "--identifier", self.identifier,
-                                       "disconnect"])
+                                       "--helper", HELPER, "disconnect"])
         self.assertNotEqual(result, 0)
         backend.assert_not_called()
         command.assert_not_called()

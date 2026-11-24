@@ -14,11 +14,12 @@ Last updated: 2026-11-17. External campaign evidence below runs through
 
 | Item | Value |
 |---|---|
-| Version | `0.1.0` (workspace `Cargo.toml`); no tagged release yet |
+| Version | `0.1.0` (workspace `Cargo.toml`). No final release; release candidates `v0.1.0-rc.<n>` are tagged only by the [release workflow](releasing.md#publishing-a-pre-release), as GitHub pre-releases |
 | Production approval | **Pending.** No configuration of Maki is production-qualified |
 | Recommended use | Evaluation and development on disposable Linux hosts |
 | Primary platform | Debian 12 (bookworm), Linux 6.1, systemd 252, on Google Compute Engine VMs |
-| Prebuilt packages | None published; build the Debian package from source ([installation guide](getting-started/installation-debian.md)) |
+| Prebuilt packages | Only in GitHub pre-releases from the [release workflow](releasing.md#publishing-a-pre-release): a Debian 12 amd64 `.deb`, a RHEL 9 x86_64 `.rpm` and the source, unsigned, with `SHA256SUMS`; otherwise build from source ([Debian](getting-started/installation-debian.md), [RHEL 9](getting-started/installation-rhel.md)) |
+| RHEL 9 | Not qualified: an RPM and an [installation guide](getting-started/installation-rhel.md) exist, and CI checks the userspace in a CentOS Stream 9 container; no kernel attachment or campaign has run there |
 
 ## Volume formats
 
@@ -151,7 +152,8 @@ See [cache reload](operations.md#growth-and-cache-reload).
   with all three remote transports under the shipped sandbox, with latency
   and packet loss, and NBD zeroing
   ([record](qualification/debian13-remote-transport-validation-2026-10-04.md)).
-  It needs `fc8d697` or later and nbd-client 3.27 built from source. That
+  It needs `fc8d697` or later; it ran with nbd-client 3.27 built from source,
+  which the helper no longer uses (see below). That
   campaign's per-item HTTP mapping was slow under latency (one round trip
   per 4 KiB unit, in sequence); a request's units now go out concurrently
   (R5-039). On Debian 13 a per-item HTTP volume then did 0.61 MiB/s of
@@ -171,13 +173,26 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Below the backing's emergency reserve plus checkpoint headroom, writes are
   refused. A filesystem on the volume can then neither delete files nor run
   `fstrim` (XFS returned EIO for both); recover by freeing space on the
-  backing filesystem. Raw discards are still admitted there.
+  backing filesystem. Raw discards need no checkpoint headroom and are still
+  admitted while free space covers the emergency reserve and their journal
+  records.
 - Automatic dead-daemon cleanup supports the pinned single-PV/single-data-LV
   XFS topology. A sidecar LV passed attach/detach, but multi-mapping and other
   device-mapper recovery layouts fail closed and need operator diagnosis
   ([storage recovery limits](storage-recovery.md#remaining-recovery-limits)).
-- Debian 12's stock `nbd-client` 3.24 is too old; 3.27.0 or later is required
-  ([installation guide](getting-started/installation-debian.md#nbd-client-327-or-later)).
+  A daemon that stops while an attach is between LVM activation and its
+  mapping record, with the helper gone as well, leaves an unused mapping that
+  takes [one manual step](operations.md#interrupted-activation-after-the-daemon-stopped)
+  to remove.
+- No NBD client package is needed: the privileged helper negotiates with the
+  daemon's socket and connects the kernel device over netlink itself, and
+  refuses an export without FLUSH and FUA. Every external campaign that
+  attached a kernel NBD device did so through nbd-client (3.27.1 where the
+  report names the version; 3.24 in the 2026-09-02 privileged run) and
+  predates the helper's own connect; the others attached none. Unit
+  tests, tests against a real nbdkit and Maki's plugin, and a root-only kernel
+  test in CI (whose runners load the `nbd` module) cover the helper's connect;
+  no external campaign has run it yet.
 
 ## Where the evidence lives
 

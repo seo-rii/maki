@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::command::{capture, Policy};
+use super::command::{capture, finish_by, step_deadline, Policy};
 
 /// Fixture directories are named by pid + wall clock; the clock can repeat
 /// within one process (coarse ticks), so a per-process sequence keeps them
@@ -97,6 +97,38 @@ fn hung_command_has_a_deadline_and_is_reaped() {
     fixture.assert_reaped("parent");
 }
 
+/// A caller with its own time limit bounds every command it starts: one
+/// that would otherwise be allowed to run longer is ended at that limit, and
+/// none is started once it has passed.
+#[test]
+fn a_callers_deadline_ends_a_command_before_its_own_timeout() {
+    let patient = Policy {
+        timeout: Duration::from_secs(3),
+        ..policy()
+    };
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    {
+        let _bounded = finish_by(Instant::now() + Duration::from_millis(150));
+        let error = capture(&mut fixture.command("hang"), patient).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fixture.assert_reaped("parent");
+
+        // Past the deadline nothing is spawned: a program that does not
+        // exist is not even looked up.
+        std::thread::sleep(Duration::from_millis(150));
+        let error = capture(&mut Command::new("/nonexistent/maki-command"), patient).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    // The limit ends with its guard.
+    let error = capture(&mut Command::new("/nonexistent/maki-command"), patient).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let fixture = Fixture::new();
+    let output = capture(&mut fixture.command("failure"), patient).unwrap();
+    assert_eq!(output.status.code(), Some(7));
+}
+
 #[test]
 fn excessive_stdout_is_rejected_and_child_is_reaped() {
     let fixture = Fixture::new();
@@ -182,4 +214,34 @@ fn child_fixture() {
         _ => panic!("unknown fixture scenario"),
     }
     std::process::exit(0);
+}
+
+/// A step the helper runs itself (the NBD connect and disconnect) ends at the
+/// step limit, or at the thread's `finish_by` deadline when that is sooner:
+/// the failed-start hook bounds its NBD disconnect that way.
+#[test]
+fn an_nbd_steps_deadline_is_the_step_limit_or_an_earlier_finish_by() {
+    let before = Instant::now();
+    let unbounded = step_deadline().unwrap();
+    assert!(
+        unbounded >= before + Policy::STEP.timeout
+            && unbounded <= Instant::now() + Policy::STEP.timeout,
+        "{:?}",
+        unbounded - before
+    );
+    let limit = Instant::now() + Duration::from_secs(1);
+    {
+        let _bounded = finish_by(limit);
+        assert_eq!(step_deadline().unwrap(), limit);
+    }
+    // A later finish_by deadline leaves the step limit.
+    {
+        let later = Instant::now() + Policy::STEP.timeout * 2;
+        let _bounded = finish_by(later);
+        assert!(step_deadline().unwrap() < later);
+    }
+    {
+        let _bounded = finish_by(Instant::now());
+        assert_eq!(step_deadline().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
 }

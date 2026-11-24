@@ -66,7 +66,9 @@ not invent a free-space observation.
 | `maki_journal_sync_seconds` | Actual explicit storage-barrier time, including failed FLUSH/FUA, inline admission barriers and the background checkpoint worker |
 | `maki_flush_seconds`, `maki_fua_seconds` | Existing successful storage-only series; their names and sample semantics remain compatible |
 
-Latency series export `_sum`, `_count` and `_max`. Complete request series
+The latency series in this table export `_sum`, `_count` and `_max`; the
+dispatcher's `maki_crypto_latency_seconds` exports `_sum` and `_count` only.
+Complete request series
 include successful, failed and cancelled calls. For example, an FUA write that
 spends 2s at the provider and 4s in a failed sync contributes 6s to complete FUA
 request time and 4s to journal sync time, while the legacy successful-FUA count

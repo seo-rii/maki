@@ -51,12 +51,10 @@ install the new package, update root-controlled configuration if required, and
 start the lifecycle target explicitly as described in
 [the runtime-layout upgrade procedure](../../docs/operations.md#upgrading-the-runtime-layout).
 
-The package requires `nbd-client` 3.27.0 or later ([how to obtain it on
-Debian 12](../../docs/getting-started/installation-debian.md#nbd-client-327-or-later))
-because trusted attachment
-identity uses its netlink identifier. A target distribution must supply that
-version as a package or a separately reviewed backport. Replacing the binary
-outside the package database does not satisfy this dependency.
+The package needs no NBD client: `maki-attach` negotiates with the volume
+daemon's socket and connects the kernel device over netlink itself, with the
+trusted attachment identity as the device's backend identifier. The kernel's
+`nbd` module (loaded with `modprobe`, from `kmod`) is required.
 
 Run the package contract tests with:
 

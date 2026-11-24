@@ -15,7 +15,7 @@ limits still need a deployment-specific decision before execution.
 | Field | Required value |
 |---|---|
 | Software | Commit, candidate package SHA-256, Rust/build profile, dependencies |
-| Host | Distribution, kernel, systemd, CPU/RAM, nbdkit and nbd-client versions |
+| Host | Distribution, kernel, systemd, CPU/RAM, nbdkit version |
 | Storage | Backing filesystem/device/storage class, mount options, NBD/PV/VG/LV/fs UUID pins, v2 or v3, virtual size, shard/unit sizes |
 | Crypto | Provider and contract version, key/profile reference, transport/mapping, endpoints, batch/retry/concurrency limits |
 | Security | Credential version references (no secret values), TLS trust policy, memory-lock/swap/core-dump policy, installed unit/drop-ins |

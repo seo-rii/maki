@@ -25,6 +25,19 @@ use parking_lot::Mutex;
 
 use crate::adapter::{AdapterError, NbdAdapter};
 
+/// `eprintln!` that cannot panic, for the lines this shim writes to stderr,
+/// which nbdkit forwards to its log. `eprintln!` panics when the write fails
+/// (a log pipe whose reader has gone, a full log file). Every caller is
+/// inside a panic boundary, which would then fail the callback with EIO and
+/// log a caught panic in place of the reason, and in `unload` skip the
+/// `tracing` event that follows. A line stderr cannot take is dropped.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 #[path = "startup.rs"]
 mod startup;
 
@@ -165,13 +178,13 @@ unsafe extern "C" fn config(key: *const c_char, value: *const c_char) -> c_int {
         if key == "config" {
             // A lossy conversion would store a different path (BUG-120).
             let Ok(path) = value.to_str() else {
-                eprintln!("maki-nbdkit: config=<path> must be valid UTF-8");
+                diagnostic!("maki-nbdkit: config=<path> must be valid UTF-8");
                 return -1;
             };
             *CONFIG_PATH.lock() = Some(path.to_owned());
             0
         } else {
-            eprintln!("maki-nbdkit: unknown parameter {key}");
+            diagnostic!("maki-nbdkit: unknown parameter {key}");
             -1
         }
     })
@@ -184,7 +197,7 @@ unsafe extern "C" fn config_complete() -> c_int {
         // (R4-001).
         maki_core::logging::install_default_logging();
         if CONFIG_PATH.lock().is_none() {
-            eprintln!("maki-nbdkit: missing config=<path> parameter");
+            diagnostic!("maki-nbdkit: missing config=<path> parameter");
             return -1;
         }
         0
@@ -276,7 +289,7 @@ unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
     NBDKIT_FUA_NATIVE
 }
 
-/// What [`can_fua`] answers (exposed for the ABI test).
+/// What `can_fua` answers (exposed for the ABI test).
 pub fn can_fua_value() -> c_int {
     // SAFETY: the handle is unused.
     unsafe { can_fua(std::ptr::null_mut()) }
@@ -385,7 +398,7 @@ fn unload_adapter() {
         // already uses for `open`-path failures (FUP-005) — as well as emitted
         // as a `tracing` event for hosts that do install one.
         if let Err(e) = a.shutdown() {
-            eprintln!("maki-nbdkit: shutdown during unload failed: {e}");
+            diagnostic!("maki-nbdkit: shutdown during unload failed: {e}");
             tracing::error!(error = %e, "maki-nbdkit: shutdown during unload failed");
         }
     }
@@ -661,5 +674,74 @@ mod tests {
     fn plugin_version_is_the_crate_version() {
         let version = unsafe { CStr::from_ptr(PLUGIN.version) };
         assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
+    }
+
+    const UNREAD_STDERR_CHILD: &str = "MAKI_NBDKIT_PLUGIN_TEST_UNREAD_STDERR";
+
+    /// Runs in a copy of this test binary whose stderr is a pipe nobody
+    /// reads (see the test below): each callback refuses and reports why,
+    /// and nothing panics.
+    #[test]
+    fn child_reports_refusals_to_an_unread_stderr() {
+        if std::env::var_os(UNREAD_STDERR_CHILD).is_none() {
+            return;
+        }
+        static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        std::panic::set_hook(Box::new(|info| PANICS.lock().push(info.to_string())));
+        let statuses = [
+            ("unknown parameter", unsafe {
+                config(c"volume".as_ptr(), c"example".as_ptr())
+            }),
+            ("non-UTF-8 config path", unsafe {
+                config(c"config".as_ptr(), c"/tmp/\xff.toml".as_ptr())
+            }),
+            ("missing config path", unsafe { config_complete() }),
+            (
+                "failed startup",
+                startup::Startup::new().run(|| Err("fixture startup error".into())),
+            ),
+        ];
+        let panics = PANICS.lock().clone();
+        let accepted: Vec<_> = statuses
+            .iter()
+            .filter(|(_, status)| *status != -1)
+            .collect();
+        println!("panics: {panics:?}; not refused: {accepted:?}");
+        std::process::exit(if panics.is_empty() && accepted.is_empty() {
+            0
+        } else {
+            1
+        });
+    }
+
+    /// nbdkit forwards the plugin's stderr to its log. The configuration
+    /// and startup callbacks reported a refusal with `eprintln!`, which
+    /// panics when that write fails (a log pipe whose reader has gone, a
+    /// full log file): the callback still failed, but through its panic
+    /// boundary, which set EIO and logged a caught panic in place of the
+    /// reason.
+    #[test]
+    fn refusals_reach_an_unread_stderr_without_a_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "plugin::tests::child_reports_refusals_to_an_unread_stderr",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UNREAD_STDERR_CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .env_remove(maki_core::logging::LOG_ENV)
+            .stderr(writer)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 }

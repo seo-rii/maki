@@ -5,6 +5,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -67,7 +70,7 @@ fn status(socket: &Path) -> serde_json::Value {
 
 #[test]
 fn second_attach_refuses_a_live_address_and_leaves_the_first_volume_operable() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("shared.sock");
     let first_config = create_config(directory.path(), &socket, "first");
     let second_config = create_config(directory.path(), &socket, "second");
@@ -88,7 +91,7 @@ fn second_attach_refuses_a_live_address_and_leaves_the_first_volume_operable() {
 
 #[test]
 fn predecessor_shutdown_does_not_remove_a_successor_address() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("shared.sock");
     let first_config = create_config(directory.path(), &socket, "first");
     let second_config = create_config(directory.path(), &socket, "second");

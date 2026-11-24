@@ -197,16 +197,21 @@ impl fmt::Display for PlannedStep {
                 block_size,
             } => write!(
                 f,
-                "nbd-client -unix {} {} -b {block_size} -identifier '<generated-connection-uuid>'",
-                shell_word(socket),
-                shell_word(device.strip_prefix("/dev/").unwrap_or(device))
+                "connect {} to {} over netlink (block size {block_size}, backend identifier \
+                 '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)",
+                shell_word(device.strip_prefix("/dev/").unwrap_or(device)),
+                shell_word(socket)
             ),
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {}", shell_word(device))
             }
             PlannedStep::LvmActivate { vg_name } => write!(f,
                 "preflight all PVs of {vg_name}; activate by verified VG UUID with verified devices and complete mode"),
-            PlannedStep::LvmDeactivate { vg_name } => write!(f, "vgchange -an {vg_name}"),
+            PlannedStep::LvmDeactivate { vg_name } => write!(
+                f,
+                "vgchange -an {vg_name}, on the recorded PVs only and by the recorded VG UUID \
+                 where the record names one"
+            ),
             PlannedStep::VerifyFilesystemIdentity { device, fs_uuid } => write!(
                 f,
                 "verify XFS identity on {device} before mount (fs uuid {})",
@@ -242,7 +247,7 @@ impl fmt::Display for PlannedStep {
             PlannedStep::Umount { mountpoint } => write!(f, "umount {}", shell_word(mountpoint)),
             PlannedStep::NbdDisconnect { device } => write!(
                 f,
-                "nbd-client -d {}",
+                "disconnect {} over netlink",
                 shell_word(device.strip_prefix("/dev/").unwrap_or(device))
             ),
             PlannedStep::LvExtend {
@@ -250,7 +255,10 @@ impl fmt::Display for PlannedStep {
                 lv_name,
                 target_bytes,
                 ..
-            } => write!(f, "lvextend -L {target_bytes}b {vg_name}/{lv_name}"),
+            } => write!(
+                f,
+                "lvextend -L {target_bytes}b {vg_name}/{lv_name}, on the recorded PVs only"
+            ),
             PlannedStep::XfsGrowfs { mountpoint } => write!(f, "xfs_growfs {}", shell_word(mountpoint)),
         }
     }

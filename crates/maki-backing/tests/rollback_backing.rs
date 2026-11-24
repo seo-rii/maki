@@ -1,19 +1,25 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use maki_backing::{Backing, RollbackBacking};
 use std::io;
 
-fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
-    (
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir_in("/dev/shm").unwrap(),
-    )
+/// The backing root and a witness on another filesystem, or `None` when
+/// there is none and the test is skipped.
+fn dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+    let root = tempfile::tempdir().unwrap();
+    let witness = other_filesystem::tempdir(root.path())?;
+    Some((root, witness))
 }
 
 #[test]
 fn partial_overwrite_preserves_mapped_edges_and_zeroes_sparse_edges() {
     const PAGE: usize = 4096;
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 8 * PAGE as u64).unwrap();
     let file = backing.open("data", true).unwrap();
     file.write_at(0, &[0x41; 2 * PAGE]).unwrap();
@@ -29,7 +35,9 @@ fn partial_overwrite_preserves_mapped_edges_and_zeroes_sparse_edges() {
 
 #[test]
 fn only_explicitly_synced_data_and_names_survive() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     let a = b.open("a", true).unwrap();
     a.write_at(0, b"old").unwrap();
@@ -50,7 +58,9 @@ fn only_explicitly_synced_data_and_names_survive() {
 
 #[test]
 fn directory_sync_does_not_promote_unsynced_file_bytes() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     b.open("a", true).unwrap().write_at(0, b"pending").unwrap();
     b.sync_dir("").unwrap();
@@ -66,7 +76,9 @@ fn directory_sync_does_not_promote_unsynced_file_bytes() {
 
 #[test]
 fn old_whole_backing_cannot_replace_witnessed_generation() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let saved = tempfile::tempdir().unwrap();
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     let f = b.open("a", true).unwrap();
@@ -89,7 +101,9 @@ fn old_whole_backing_cannot_replace_witnessed_generation() {
 
 #[test]
 fn namespace_changes_do_not_redirect_existing_handles() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     let old = b.open("a", true).unwrap();
     old.write_at(0, b"old").unwrap();
@@ -114,7 +128,9 @@ fn namespace_changes_do_not_redirect_existing_handles() {
 
 #[test]
 fn reservations_survive_restart_and_rewrites_need_no_more_capacity() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 2 * 4096).unwrap();
     let f = b.open("a", true).unwrap();
     b.sync_dir("").unwrap();
@@ -137,7 +153,9 @@ fn reservations_survive_restart_and_rewrites_need_no_more_capacity() {
 #[test]
 fn corrupt_committed_data_and_conflicting_writers_are_refused() {
     use std::os::unix::fs::FileExt;
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 64 * 4096).unwrap();
     assert!(RollbackBacking::open(root.path(), witness.path()).is_err());
     let f = b.open("a", true).unwrap();
@@ -159,7 +177,7 @@ fn corrupt_committed_data_and_conflicting_writers_are_refused() {
 
 #[test]
 fn witness_must_be_independent_and_existing_authority_is_never_reenrolled() {
-    let (root, witness) = dirs();
+    let root = tempfile::tempdir().unwrap();
     let same_fs = tempfile::tempdir().unwrap();
     assert_eq!(
         RollbackBacking::create(root.path(), same_fs.path(), 4096)
@@ -168,6 +186,9 @@ fn witness_must_be_independent_and_existing_authority_is_never_reenrolled() {
             .kind(),
         io::ErrorKind::InvalidInput
     );
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let b = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
     drop(b);
     assert!(RollbackBacking::create(root.path(), witness.path(), 4096).is_err());
@@ -178,7 +199,9 @@ fn witness_must_be_independent_and_existing_authority_is_never_reenrolled() {
 
 #[test]
 fn full_page_punch_releases_a_short_final_page_only_after_sync() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
     let file = backing.open("short", true).unwrap();
     file.write_at(0, b"x").unwrap();
@@ -210,7 +233,9 @@ fn full_page_punch_releases_a_short_final_page_only_after_sync() {
 
 #[test]
 fn sparse_punch_visits_reservations_including_unwritten_pages() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 3 * 4096).unwrap();
     let file = backing.open("sparse", true).unwrap();
     let far = 1 << 30;
@@ -230,7 +255,9 @@ fn sparse_punch_visits_reservations_including_unwritten_pages() {
 
 #[test]
 fn locking_requires_and_creates_a_file_in_the_rollback_namespace() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
     assert_eq!(
         backing.try_lock("sub/lock").err().unwrap().kind(),
@@ -254,7 +281,9 @@ fn locking_requires_and_creates_a_file_in_the_rollback_namespace() {
 
 #[test]
 fn namespace_lookups_distinguish_files_from_missing_ancestors() {
-    let (root, witness) = dirs();
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
     let backing = RollbackBacking::create(root.path(), witness.path(), 4096).unwrap();
     backing.create_dir_all("dir").unwrap();
     backing.open("dir/file", true).unwrap();

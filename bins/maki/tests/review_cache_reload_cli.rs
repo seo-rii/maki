@@ -3,11 +3,14 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use serde_json::{json, Value};
 use std::process::Command;
 
 async fn reload(flags: &[&str]) -> Value {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let config = dir.path().join("volume.toml");
     volume_config::write(

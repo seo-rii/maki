@@ -4,6 +4,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::Barrier;
 
@@ -14,7 +17,7 @@ fn bind_preserves_concurrent_directory_permissions() {
     // SAFETY: this isolated test binary establishes its filesystem policy
     // before starting either worker. The worker code must leave it alone.
     let original_umask = unsafe { libc::umask(0o022) };
-    let root = tempfile::tempdir().unwrap();
+    let root = short_dir::tempdir().unwrap();
     let socket = root.path().join("control.sock");
     let directory = root.path().join("concurrent-directory");
     let start = Barrier::new(2);

@@ -331,6 +331,136 @@ fn connected_detach_rechecks_the_backend_before_intent_deactivation() {
     assert_eq!(state.read("pg").unwrap(), Some(record));
 }
 
+/// The hook's rollback carries no unmount step at all. Even an observer that
+/// reported a mount for an activation intent (the production one refuses
+/// that state outright) could only stop it.
+#[test]
+fn the_failed_start_rollback_has_no_unmount_to_run() {
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.mounted = true;
+
+    let result = finish_interrupted_activation_with(&plan_detach(&req), &state, &mut system.fake);
+
+    assert!(result.is_err(), "{result:?}");
+    assert!(system.fake.steps.is_empty(), "{:?}", system.fake.steps);
+    assert!(system.fake.mounted && system.fake.vg_active);
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    system.fake.mounted = false;
+    assert!(finish_interrupted_activation_with(&plan_detach(&req), &state, &mut system).unwrap());
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    assert_eq!(system.fake.scoped_lvm_deactivations, 1);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+/// The hook must neither queue behind another volume's helper when it has
+/// nothing to do, nor hold up the coordinator beyond its deadline when it has.
+#[test]
+fn the_failed_start_rollback_queues_for_the_attach_lock_only_with_an_intent() {
+    let (_fixture, state, req, mut system) = attached();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    let busy = state.lock().unwrap();
+    let patient = || Instant::now() + Duration::from_secs(3);
+    let started = Instant::now();
+
+    // A complete attachment, then no record at all: not this path's.
+    assert!(
+        !finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
+    state.remove("pg").unwrap();
+    assert!(
+        !finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(system.fake.steps.is_empty());
+
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    drop(busy);
+    let busy = state.lock().unwrap();
+    let started = Instant::now();
+    let soon = started + Duration::from_millis(150);
+    let error =
+        finish_interrupted_activation_by(&plan, &state, &mut system, soon, COMMANDS).unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Io(error) if error.kind() == io::ErrorKind::TimedOut),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(system.fake.steps.is_empty());
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    drop(busy);
+    assert!(
+        finish_interrupted_activation_by(&plan, &state, &mut system, patient(), COMMANDS).unwrap()
+    );
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    assert!(state.read("pg").unwrap().is_none());
+}
+
+/// The command budget the failed-start tests give the rollback.
+const COMMANDS: Duration = Duration::from_secs(20);
+
+/// The lock wait and the rollback's commands have separate budgets: the
+/// commands' time starts once the lock is held. With one deadline for both,
+/// a lock granted late in its wait (the helpers queued ahead of the hook
+/// took their time) left the scoped deactivation too little or nothing.
+#[test]
+fn the_failed_start_rollback_has_its_command_budget_once_it_holds_the_lock() {
+    let (_fixture, state, req, mut system) = activation_crashed();
+    let plan = plan_detach(&req);
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.command_limits.clear();
+    let lock_deadline = Instant::now() + Duration::from_secs(60);
+    let busy = state.lock().unwrap();
+    let (released, result) = std::thread::scope(|scope| {
+        let rollback = scope.spawn(|| {
+            finish_interrupted_activation_by(&plan, &state, &mut system, lock_deadline, COMMANDS)
+        });
+        let started = Instant::now();
+        while state.lock_waiters() == 0 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let released = Instant::now();
+        drop(busy);
+        (released, rollback.join().unwrap())
+    });
+    let finished = Instant::now();
+    assert!(result.unwrap());
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    for limit in &system.fake.command_limits {
+        let limit = limit.expect("every rollback command runs under the hook's limit");
+        assert!(
+            limit >= released + COMMANDS,
+            "the command budget was counted from before the lock was granted"
+        );
+        assert!(
+            limit <= finished + COMMANDS,
+            "the commands may run past their budget from the lock: {:?} too late",
+            limit - (finished + COMMANDS)
+        );
+    }
+}
+
 #[test]
 fn connected_detach_cleans_a_verified_partial_activation() {
     let (fixture, state, req, mut system) = activation_crashed();
@@ -507,6 +637,39 @@ fn cleanup_does_not_fallback_when_lvm_did_not_return_a_nonzero_status() {
 
     assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
     assert_eq!(state.read("pg").unwrap(), Some(record));
+}
+
+/// A `vgchange` that a signal terminated never reported whether it could
+/// deactivate the volume group, and may have stopped halfway. Only LVM's own
+/// nonzero exit lets cleanup remove the mapping directly; the next cleanup
+/// runs LVM again.
+#[test]
+fn cleanup_does_not_fallback_when_lvm_was_killed_by_a_signal() {
+    let (_fixture, state, req, mut system) = attached();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.signalled_at = Some("lvm-deactivate");
+
+    let error = cleanup_with(&plan_detach(&req), &state, &mut system).unwrap_err();
+
+    assert!(error.to_string().contains("status None"), "{error}");
+    assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
+    assert!(system.fake.vg_active, "the mapping was removed directly");
+    assert_eq!(state.read("pg").unwrap(), Some(record));
+
+    // LVM exits this time: nonzero enters the fallback as before.
+    system.fake.signalled_at = None;
+    system.fake.nonzero_at = Some("lvm-deactivate");
+    system.fake.steps.clear();
+    cleanup_with(&plan_detach(&req), &state, &mut system).unwrap();
+    assert_eq!(
+        system.fake.steps,
+        ["lvm-deactivate", "dm-proof-deactivate", "nbd-disconnect"]
+    );
+    assert!(state.read("pg").unwrap().is_none());
 }
 
 #[test]
@@ -820,4 +983,112 @@ fn the_workload_gate_refuses_records_with_other_empty_fields() {
     ] {
         assert!(gate(extra).is_err(), "{extra:?}");
     }
+}
+
+/// Preflight admits a volume group on up to 64 candidate devices (the NBD
+/// device and 63 partitions) holding up to 64 logical volumes. The proof
+/// taken after activation has to hold every one of them, the trusted record
+/// has to store it, and the later observers have to accept the same
+/// topology. Here every LV spans every partition PV and carries a name as
+/// long as device-mapper allows, the largest record an admitted VG produces.
+#[test]
+fn the_largest_inventory_preflight_admits_is_proven_and_recorded() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let sysfs = fixture.0.join("sys");
+    let block = |name: &str, number: String| {
+        for directory in ["holders", "slaves"] {
+            std::fs::create_dir_all(sysfs.join(name).join(directory)).unwrap();
+        }
+        std::fs::write(sysfs.join(name).join("dev"), number).unwrap();
+    };
+    let partition = |index: usize| {
+        let name = format!("nbd3p{index}");
+        block(&name, format!("43:{}\n", 48 + index));
+        std::fs::write(sysfs.join(&name).join("partition"), format!("{index}\n")).unwrap();
+        name
+    };
+    block("nbd3", "43:48\n".into());
+    let partitions: Vec<_> = (1..=63).map(partition).collect();
+    for index in 0..64 {
+        let lv = if index == 0 {
+            "data".to_string()
+        } else {
+            format!("{:x<116}", format!("lv{index}_"))
+        };
+        let kernel = format!("dm-{index}");
+        block(&kernel, format!("253:{index}\n"));
+        std::fs::create_dir_all(sysfs.join(&kernel).join("dm")).unwrap();
+        std::fs::write(
+            sysfs.join(&kernel).join("dm/name"),
+            format!("vg_maki_pg-{lv}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sysfs.join(&kernel).join("dm/uuid"),
+            format!("LVM-aaaaaabbbbccccddddeeeeffffgggggg{index:06}iiiijjjjkkkkllllmmmmnnnnnn\n"),
+        )
+        .unwrap();
+        for partition in &partitions {
+            std::fs::write(sysfs.join(&kernel).join("slaves").join(partition), "").unwrap();
+            std::fs::write(sysfs.join(partition).join("holders").join(&kernel), "").unwrap();
+        }
+    }
+    let mut record = BoundDeviceRecord {
+        version: 1,
+        volume: "pg".into(),
+        attachment: (&request()).into(),
+        device: "/dev/nbd3".into(),
+        connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),
+        recovery: None,
+        recovery_intent: None,
+    };
+
+    let proof = recover::capture(&record, b"", &sysfs)
+        .expect("the proof holds what preflight admits: 64 devices and 64 logical volumes");
+    record.recovery = Some(proof);
+    let encoded = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        encoded["recovery"]["nodes"].as_array().map(Vec::len),
+        Some(128)
+    );
+    state.write(&record).unwrap();
+    assert_eq!(state.read("pg").unwrap(), Some(record.clone()));
+    assert!(
+        recover::observe(&record, b"", &sysfs).unwrap().vg_active,
+        "recovery accepts the recorded topology"
+    );
+
+    // A 65th candidate device is more than preflight admits, and more than
+    // the proof is sized for.
+    partition(64);
+    assert!(recover::capture(&record, b"", &sysfs).is_err());
+}
+
+/// The same inventory is taken when an activation outlived the helper: the
+/// persisted intent names all 64 LVs, and recovery has to see every one of
+/// their mappings before it deactivates them and retires the record.
+#[test]
+fn an_interrupted_64_lv_activation_is_recovered_from_its_intent() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let mut system = inventory_system(&fixture, 64, false);
+    system.inner.fake.process_death_after_activation = true;
+    let death = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = execute_with(&plan_attach(&request()), Some(&state), &mut system);
+    }));
+    assert!(death.is_err(), "fixture must stop after activation");
+    system.inner.fake.process_death_after_activation = false;
+    let record = state.read("pg").unwrap().unwrap();
+    assert!(record.recovery.is_none() && record.recovery_intent.is_some());
+    assert!(system.inner.sysfs.join("dm-63").exists());
+    // The backend went away with the helper; the 64 mappings remain.
+    system.inner.fake.backends.clear();
+    system.inner.fake.steps.clear();
+
+    cleanup_with(&plan_detach(&request()), &state, &mut system).unwrap();
+
+    assert_eq!(system.inner.fake.steps, ["lvm-deactivate"]);
+    assert!(!system.inner.sysfs.join("dm-63").exists());
+    assert!(state.read("pg").unwrap().is_none());
 }

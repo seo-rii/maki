@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use maki_backing::remote_witness::{
-    Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
+    namespace, Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
 };
 use maki_backing::{Backing, RollbackBacking};
 use maki_witness::{Client, ClientOptions, Principal, Server, ServerOptions, TlsFiles};
@@ -334,6 +334,100 @@ fn takeover_requires_admin_exact_fence_and_current_root_and_revokes_old_writer()
     assert_eq!(read(&reopened), b"ciphertext-current");
 }
 
+fn run_with_stdout(args: &[&str], stdout: std::process::Stdio) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(args)
+        .env("RUST_BACKTRACE", "0")
+        .stdout(stdout)
+        .output()
+        .unwrap()
+}
+
+/// `println!` panicked on the record: with a stdout reader that had gone,
+/// an inspection exited 101, and so did a takeover that had already moved
+/// the fence. The reader has what it wanted; the command's status stands.
+#[test]
+fn a_closed_stdout_fails_neither_an_inspection_nor_a_completed_takeover() {
+    let closed_pipe = || -> std::process::Stdio {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer.into()
+    };
+    let fixture = Fixture::new();
+    let old = fixture.create();
+    write(&old, b"ciphertext-current");
+    let before = inspect(fixture.writer.as_ref());
+
+    let inspected = run_with_stdout(&["volume", "witness", fixture.path(false)], closed_pipe());
+    let stderr = String::from_utf8_lossy(&inspected.stderr);
+    assert_eq!(inspected.status.code(), Some(0), "{stderr}");
+    assert!(inspected.stderr.is_empty(), "{stderr}");
+    assert_eq!(inspect(fixture.writer.as_ref()), before);
+
+    let taken = run_with_stdout(
+        &[
+            "volume",
+            "takeover",
+            fixture.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ],
+        closed_pipe(),
+    );
+    let stderr = String::from_utf8_lossy(&taken.stderr);
+    assert_eq!(taken.status.code(), Some(0), "{stderr}");
+    assert!(taken.stderr.is_empty(), "{stderr}");
+    let after = inspect(fixture.writer.as_ref());
+    assert_eq!(after.phase, Phase::Released);
+    assert_eq!(after.fence, before.fence + 1);
+    assert!(old.check_freshness().is_err());
+}
+
+/// A record that cannot be written (a full destination) fails an inspection,
+/// whose output is its result. A takeover has already moved the fence, and
+/// the same approval would be refused on a retry: it reports the failure and
+/// still succeeds, like `volume create`.
+#[test]
+fn an_unwritable_record_fails_an_inspection_but_not_a_completed_takeover() {
+    let full = || -> std::process::Stdio {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap()
+            .into()
+    };
+    let fixture = Fixture::new();
+    let old = fixture.create();
+    let before = inspect(fixture.writer.as_ref());
+
+    let inspected = run_with_stdout(&["volume", "witness", fixture.path(false)], full());
+    let stderr = String::from_utf8_lossy(&inspected.stderr);
+    assert_eq!(inspected.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: writing the output failed"),
+        "{stderr}"
+    );
+
+    let taken = run_with_stdout(
+        &[
+            "volume",
+            "takeover",
+            fixture.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ],
+        full(),
+    );
+    let stderr = String::from_utf8_lossy(&taken.stderr);
+    assert_eq!(taken.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("warning: volume takeover completed, but writing its result failed"),
+        "{stderr}"
+    );
+    assert_eq!(inspect(fixture.writer.as_ref()).fence, before.fence + 1);
+    drop(old);
+}
+
 #[test]
 fn restore_requires_approved_snapshot_root_and_advances_epoch_without_lowering_generation() {
     let fixture = Fixture::new();
@@ -647,6 +741,181 @@ fn gc_keeps_live_revoked_writer_and_reclaims_it_after_drop() {
     assert_eq!(report["counts"]["skipped_live"], 0);
     assert_eq!(report["details_truncated"], false);
 }
+/// A stale namespace GC cannot examine is kept and does not end the pass:
+/// `maki volume gc` names it with the reason, and the automatic pass after
+/// an activation says in the log what it left behind.
+#[test]
+fn gc_reports_a_namespace_it_cannot_examine_and_reclaims_the_rest() {
+    let f = Fixture::new();
+    drop(f.create());
+    // A quiescent stale namespace holding a directory where its arena file
+    // belongs, whose name sorts before the created one: whoever runs GC
+    // cannot open that arena as a file.
+    let mut session = [0; 16];
+    session[15] = 1;
+    let odd = namespace(1, session);
+    std::fs::create_dir(f.root.join(&odd)).unwrap();
+    std::fs::write(f.root.join(&odd).join("rollback.lock"), b"").unwrap();
+    std::fs::create_dir(f.root.join(&odd).join("rollback.arena")).unwrap();
+    let namespaces = || {
+        let mut names: Vec<String> = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("remote-0"))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let before = inspect(f.writer.as_ref());
+    let takeover = success(&[
+        "volume",
+        "takeover",
+        f.path(true),
+        &before.fence.to_string(),
+        &root_hex(&before),
+    ]);
+    let current = inspect(f.writer.as_ref()).current.unwrap().namespace;
+    assert_eq!(
+        namespaces(),
+        [odd.clone(), current],
+        "the automatic pass must retire the predecessor"
+    );
+    let log = String::from_utf8_lossy(&takeover.stderr);
+    assert!(
+        log.contains("WARN") && log.contains(&odd) && log.contains("Is a directory"),
+        "the automatic pass must log the namespace it kept and why: {log}"
+    );
+
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unreadable = report["skipped_unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1, "{report}");
+    assert_eq!(unreadable[0]["name"], odd.as_str());
+    let error = unreadable[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("rollback.arena") && error.contains("Is a directory"),
+        "{error}"
+    );
+    assert_eq!(report["counts"]["skipped_unreadable"], 1);
+    assert_eq!(report["counts"]["skipped_unrecognized"], 0);
+    assert_eq!(report["counts"]["removed"], 0);
+    assert_eq!(report["details_truncated"], false);
+    assert!(f.root.join(&odd).join("rollback.arena").is_dir());
+}
+/// Run `maki` with `args` as a caller file modes apply to: a root test drops
+/// CAP_DAC_OVERRIDE from the command's bounding set before it runs. `None`,
+/// with the reason printed, where that cannot be done.
+fn run_under_modes(args: &[&str]) -> Option<Output> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
+    command.args(args);
+    // SAFETY: runs in the forked child before exec and only makes raw
+    // system calls.
+    unsafe {
+        command.pre_exec(|| {
+            const CAP_DAC_OVERRIDE: libc::c_ulong = 1;
+            if libc::geteuid() == 0
+                && libc::prctl(libc::PR_CAPBSET_DROP, CAP_DAC_OVERRIDE, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.output() {
+        Ok(output) => Some(output),
+        Err(error) => {
+            eprintln!("skipping: cannot drop CAP_DAC_OVERRIDE for the command ({error})");
+            None
+        }
+    }
+}
+/// A predecessor namespace GC may examine but not empty is renamed to a
+/// tombstone that every later pass meets first. That must not end the
+/// pass: `maki volume gc` names the tombstone with the step that failed,
+/// and the namespaces behind it are reclaimed.
+#[test]
+fn gc_reports_a_tombstone_it_cannot_empty_and_reclaims_the_rest() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    drop(f.create());
+    let namespaces = || {
+        let mut names: Vec<String> = std::fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("remote-0"))
+            .collect();
+        names.sort();
+        names
+    };
+    let set_mode = |name: &str, mode| {
+        std::fs::set_permissions(f.root.join(name), std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let stuck = namespaces().pop().unwrap();
+    let tombstone = format!(".remote-gc-{stuck}");
+    set_mode(&stuck, 0o500);
+    let takeover = || {
+        let before = inspect(f.writer.as_ref());
+        run_under_modes(&[
+            "volume",
+            "takeover",
+            f.path(true),
+            &before.fence.to_string(),
+            &root_hex(&before),
+        ])
+    };
+    let succeeded = |output: &Output| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let Some(first) = takeover() else {
+        set_mode(&stuck, 0o700);
+        return;
+    };
+    succeeded(&first);
+    assert!(f.root.join(&tombstone).is_dir());
+    let second = takeover().unwrap();
+    succeeded(&second);
+    let current = inspect(f.writer.as_ref()).current.unwrap().namespace;
+    assert_eq!(
+        namespaces(),
+        [current],
+        "the automatic pass must retire the predecessor past the tombstone"
+    );
+    let log = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        log.contains("WARN")
+            && log.contains(&tombstone)
+            && log.contains("unlinking rollback.arena"),
+        "the automatic pass must log the tombstone it could not empty and why: {log}"
+    );
+
+    let output = run_under_modes(&["volume", "gc", f.path(false)]).unwrap();
+    succeeded(&output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unfinished = report["unfinished"].as_array().unwrap();
+    assert_eq!(unfinished.len(), 1, "{report}");
+    assert_eq!(unfinished[0]["name"], tombstone.as_str());
+    assert_eq!(
+        unfinished[0]["error"],
+        "unlinking rollback.arena: Permission denied (os error 13)"
+    );
+    assert_eq!(report["counts"]["unfinished"], 1);
+    assert_eq!(report["counts"]["skipped_unreadable"], 0);
+    assert_eq!(report["counts"]["removed"], 0);
+    assert!(f.root.join(&tombstone).join("rollback.arena").is_file());
+
+    set_mode(&tombstone, 0o700);
+    let output = success(&["volume", "gc", f.path(false)]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["removed"], serde_json::json!([stuck]));
+    assert_eq!(report["counts"]["unfinished"], 0);
+}
 struct LoseClaims(Arc<dyn Rpc>);
 impl Rpc for LoseClaims {
     fn call(&self, request: &Request) -> std::io::Result<Record> {
@@ -720,6 +989,48 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
         drop(backing);
         assert!(!run(&args).status.success());
     }
+}
+
+/// A `volume create` that fails while it writes the format marker (a full
+/// disk; here a zero file-size limit refuses the write) has claimed nothing
+/// from the authority, and running the same command again completes it.
+#[test]
+fn volume_create_whose_marker_write_failed_can_be_run_again() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    let mut create = Command::new(env!("CARGO_BIN_EXE_maki"));
+    create.args(["volume", "create", f.path(false)]);
+    // SAFETY: the closure makes two async-signal-safe calls between fork
+    // and exec. An ignored SIGXFSZ and the limit are kept across exec.
+    unsafe {
+        create.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                || libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let failed = create.output().unwrap();
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(error.contains("File too large"), "{error}");
+    let untouched = inspect(f.writer.as_ref());
+    assert_eq!((untouched.fence, untouched.phase), (0, Phase::Released));
+
+    let output = success(&["volume", "create", f.path(false)]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("created volume admin-test"),
+        "{output:?}"
+    );
+    let created = inspect(f.writer.as_ref());
+    assert_eq!((created.fence, created.phase), (1, Phase::Released));
+    assert!(created.current.is_some());
 }
 
 /// Whether this `maki` binary has the test-only `fake` provider compiled in.

@@ -13,7 +13,8 @@ hold everywhere:
 
 | Task | Document |
 |---|---|
-| Install on Debian 12, including `nbd-client` 3.27+ | [Installation](getting-started/installation-debian.md) |
+| Install on Debian 12 | [Installation](getting-started/installation-debian.md) |
+| Install on RHEL 9 or a rebuild (RPM; not qualified) | [RHEL 9 installation](getting-started/installation-rhel.md) |
 | Run one volume end to end and survive a restart | [Quick start](getting-started/quickstart.md) |
 | Create the first LVM/XFS layout on a new export | [Provisioning the first volume](getting-started/first-volume.md) |
 

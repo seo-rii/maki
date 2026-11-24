@@ -1,6 +1,9 @@
 # Fail-closed recovery coordinator for one Maki workload lifecycle. Starting
 # this unit first stops the registered workloads, attach helper, and daemon.
 # Cleanup must succeed before OnSuccess can start a fresh lifecycle.
+# Cleanup therefore runs without the daemon and cannot use LVM on the volume:
+# the attach unit's failed-start hook rolls back an unrecorded activation
+# before this unit's stop of the daemon runs.
 
 [Unit]
 Description=Recover Maki workload lifecycle %i

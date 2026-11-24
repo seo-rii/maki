@@ -121,7 +121,11 @@ fn patterns(unit_size: usize) -> Vec<PlaintextUnit> {
 /// - a malformed reply (`Contract`) is not an answer at all and is returned
 ///   unchanged: it fails the self-test without proving that the provider
 ///   lacks the capability;
-/// - any other error is not integrity evidence and refuses attach.
+/// - any other error is not integrity evidence and refuses attach. That
+///   includes a request refused without an integrity verdict (a generic
+///   bad request) and a provider failure; background validation of a
+///   quarantined endpoint, which must not take either for proof, relabels
+///   them before they get here (`ValidationProvider` in `endpoint.rs`).
 fn classify_probe_err(e: CryptoError, what: &str) -> Result<(), CryptoError> {
     if matches!(e, CryptoError::Integrity(_)) {
         return Ok(());
@@ -448,9 +452,14 @@ pub async fn cross_endpoint_self_test_attributed(
         for range in batch_ranges(&cts, caps_dec, |_| unit_size as u64) {
             let chunk = &cts[range.clone()];
             let got = dec.decrypt_batch(context, chunk).await.map_err(|error| {
-                // A refusal of the peer's ciphertext proves the endpoints
-                // differ; a transport failure or a malformed reply
-                // (`Contract`) only shows that this exchange failed.
+                // A refusal of the peer's ciphertext leaves the endpoints
+                // unproven and refuses attach; a transport failure or a
+                // malformed reply (`Contract`) only shows that this
+                // exchange failed. Background validation, where this
+                // verdict excludes the candidate for good, lets only an
+                // integrity failure, or the candidate's explicit refusal of
+                // the volume's context, reach it as a refusal (see
+                // `ValidationProvider` in `endpoint.rs`).
                 let error = if error.is_retryable()
                     || matches!(error.class(), ErrorClass::EndpointFatal)
                     || matches!(error, CryptoError::Contract(_))

@@ -48,6 +48,35 @@ impl RecoveryProof {
         }
         Ok(())
     }
+
+    /// The NBD device and the partitions of it that attach recorded: the
+    /// candidate PVs of the volume group.
+    pub(super) fn candidate_devices(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|node| node.dm_name.is_none())
+            .map(|node| format!("/dev/{}", node.name))
+            .collect()
+    }
+
+    /// The VG UUID that every recorded mapping's device-mapper uuid
+    /// (`LVM-<VG UUID><LV UUID>[-suffix]`) carries, without dashes. `None`
+    /// unless the proof has a mapping and all of them agree.
+    pub(super) fn vg_uuid(&self) -> Option<String> {
+        let mut uuids = self
+            .nodes
+            .iter()
+            .filter_map(|node| node.dm_uuid.as_deref())
+            .map(|uuid| {
+                uuid.strip_prefix("LVM-")
+                    .and_then(|identity| identity.get(..32))
+                    .filter(|vg| vg.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            });
+        let first = uuids.next()??;
+        uuids
+            .all(|uuid| uuid == Some(first))
+            .then(|| first.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,14 +115,23 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// The inventory holds every node of a topology that preflight admits: its
+/// candidate devices and one mapping for each logical volume. A smaller
+/// bound would let preflight activate a volume group whose proof, and whose
+/// cleanup from the persisted intent, is then refused.
+const MAX_NODES: usize = lvm_preflight::MAX_DEVICES + lvm_preflight::MAX_LVS;
+
+/// One node's holders or slaves: every mapping on a device, or every device
+/// (or lower mapping) under a mapping.
 fn names(directory: &Path) -> io::Result<Vec<String>> {
+    let limit = lvm_preflight::MAX_DEVICES.max(lvm_preflight::MAX_LVS);
     let mut result = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let name = entry?
             .file_name()
             .into_string()
             .map_err(|_| invalid("invalid kernel block name"))?;
-        if result.len() >= 64 {
+        if result.len() >= limit {
             return Err(invalid("recovery topology exceeds the supported bound"));
         }
         result.push(name);
@@ -134,7 +172,7 @@ fn inventory(record: &BoundDeviceRecord, sysfs: &Path) -> io::Result<Vec<BlockId
         } else {
             continue;
         };
-        if nodes.len() >= 64 {
+        if nodes.len() >= MAX_NODES {
             return Err(invalid("recovery topology exceeds the supported bound"));
         }
         nodes.push(BlockIdentity {
@@ -536,15 +574,25 @@ pub(super) fn observe_complete(
     verified_mount.ok_or_else(|| invalid("workload mount is missing"))
 }
 
-fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+/// Recovery needs the recorded device without a backend. One under the
+/// recorded identity is a live attachment; another identity is returned.
+fn backend_other_than_recorded(
+    record: &BoundDeviceRecord,
+    system: &impl System,
+) -> Result<Option<String>, ExecError> {
     match system.backend(&record.device)? {
-        None => Ok(()),
+        None => Ok(None),
         Some(identifier) if identifier == record.connection_id => Err(identity_error(
             "backend is still connected; use detach for a live attachment",
         )),
-        Some(_) => Err(identity_error(
-            "recorded NBD device now has a foreign backend; refusing recovery",
-        )),
+        Some(identifier) => Ok(Some(identifier)),
+    }
+}
+
+fn absent_backend(record: &BoundDeviceRecord, system: &impl System) -> Result<(), ExecError> {
+    match backend_other_than_recorded(record, system)? {
+        None => Ok(()),
+        Some(_) => Err(super::other_identity(record, "recovery")),
     }
 }
 
@@ -566,8 +614,16 @@ pub(super) fn execute(
             "recovery configuration does not match the trusted attachment",
         ));
     }
-    for _ in 0..4 {
-        absent_backend(&record, system)?;
+    for attempt in 0..4 {
+        if let Some(identifier) = backend_other_than_recorded(&record, system)? {
+            // Found on entry, the device is another connection's: the record
+            // goes if nothing of its attachment remains. Later, a changed
+            // backend means the storage changed under this recovery.
+            if attempt == 0 {
+                return super::retire_displaced(&record, &identifier, "recovery", state, system);
+            }
+            return Err(super::other_identity(&record, "recovery"));
+        }
         let observed = system.disconnected_recovery_observation(&record)?;
         absent_backend(&record, system)?;
         let step = if observed.mounted {
@@ -598,14 +654,14 @@ pub(super) fn execute(
         };
         // A failed command may already have applied its effect. Keep the
         // original record; a retry observes which upper layers remain.
-        if matches!(step, PlannedStep::LvmDeactivate { .. }) && record.recovery.is_none() {
-            if let Some(intent) = &record.recovery_intent {
-                system.recover_deactivate_lvm(&record, intent.verified())?;
-            } else {
-                system.run_step(&step, None)?;
+        match (&step, &record.recovery_intent) {
+            (PlannedStep::LvmDeactivate { .. }, Some(intent)) => {
+                system.recover_deactivate_lvm(&record, intent.verified())?
             }
-        } else {
-            system.run_step(&step, None)?;
+            (PlannedStep::LvmDeactivate { .. }, None) => {
+                super::run_recorded_lvm(system, &step, &record)?
+            }
+            _ => system.run_step(&step, None)?,
         }
     }
     Err(identity_error(
@@ -701,5 +757,91 @@ mod force_deactivation_tests {
                 .collect::<Vec<_>>(),
             ["remove", "vg-data"]
         );
+    }
+}
+
+#[cfg(test)]
+mod recorded_scope_tests {
+    use super::*;
+    use crate::plan::AttachmentIdentity;
+
+    const VG: &str = "aaaaaabbbbccccddddeeeeffffgggggg";
+    const LV: &str = "hhhhhhiiiijjjjkkkkllllmmmmnnnnnn";
+
+    fn node(name: &str, mapping: Option<&str>, slaves: &[&str]) -> BlockIdentity {
+        BlockIdentity {
+            name: name.into(),
+            device: (43, 0),
+            dm_name: mapping.map(str::to_owned),
+            dm_uuid: mapping.map(|_| format!("LVM-{VG}{LV}")),
+            slaves: slaves.iter().map(|name| (*name).into()).collect(),
+        }
+    }
+
+    fn record(nodes: Vec<BlockIdentity>) -> BoundDeviceRecord {
+        BoundDeviceRecord {
+            version: 1,
+            volume: "pg".into(),
+            attachment: AttachmentIdentity {
+                volume_uuid: "0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c".into(),
+                nbd_socket: "/run/maki/pg/nbd.sock".into(),
+                mountpoint: "/srv/pg".into(),
+                vg_name: "vg_maki_pg".into(),
+                lv_name: "data".into(),
+                lvm_identity: None,
+            },
+            device: "/dev/nbd3".into(),
+            connection_id: "maki-11111111-2222-4333-8444-555555555555".into(),
+            recovery: Some(RecoveryProof {
+                nodes,
+                mount_permitted: true,
+            }),
+            recovery_intent: None,
+        }
+    }
+
+    /// A proof keeps every candidate device attach recorded, partitions
+    /// included, so detach and recovery find a partition PV's VG; its
+    /// mappings name the VG UUID, spelled for `--select` as LVM spells it.
+    #[test]
+    fn a_proof_scopes_lvm_to_its_recorded_devices_and_vg_uuid() {
+        let proven = record(vec![
+            node("dm-0", Some("vg_maki_pg-data"), &["nbd3p1"]),
+            node("nbd3", None, &[]),
+            node("nbd3p1", None, &[]),
+        ]);
+        let scope = lvm_preflight::recorded_scope(&proven).unwrap();
+        let args: Vec<String> = lvm_preflight::recorded_deactivation_command(&scope, "vg_maki_pg")
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--devices",
+                "/dev/nbd3,/dev/nbd3p1",
+                "--activate",
+                "n",
+                "--select",
+                "vg_uuid=aaaaaa-bbbb-cccc-dddd-eeee-ffff-gggggg",
+                "--config",
+                "devices { allow_changes_with_duplicate_pvs=0 }",
+                "vg_maki_pg"
+            ]
+        );
+
+        // Mappings that disagree on their VG, or none at all, name no VG UUID.
+        let mut other = node("dm-1", Some("vg_maki_pg-meta"), &["nbd3"]);
+        other.dm_uuid = Some(format!("LVM-{}{LV}", "z".repeat(32)));
+        for nodes in [
+            vec![
+                node("dm-0", Some("vg_maki_pg-data"), &["nbd3"]),
+                other,
+                node("nbd3", None, &[]),
+            ],
+            vec![node("nbd3", None, &[])],
+        ] {
+            assert!(lvm_preflight::recorded_scope(&record(nodes)).is_err());
+        }
     }
 }

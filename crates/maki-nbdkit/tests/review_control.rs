@@ -8,6 +8,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Value};
@@ -71,7 +74,7 @@ impl Client {
 
 #[test]
 fn control_socket_is_created_served_and_removed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().into_owned();
     let socket = dir
         .path()
@@ -150,7 +153,7 @@ mode = \"read\"
 
 #[test]
 fn missing_control_socket_directory_fails_attach() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().into_owned();
     let socket = dir
         .path()
@@ -174,7 +177,7 @@ fn missing_control_socket_directory_fails_attach() {
 /// the size. It must refuse explicitly.
 #[test]
 fn reload_cache_without_a_cache_is_refused_not_silently_accepted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path().join("vol").to_string_lossy().into_owned();
     let socket = dir
         .path()

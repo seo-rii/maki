@@ -32,6 +32,32 @@ Initialization refuses existing state. Local `serve` holds the authority's
 exclusive process lock until exit. Copied local directories are separate
 histories; they cannot be used as failover replicas.
 
+`init` publishes the first record the way `serve` publishes every later one:
+it writes and syncs `remote.next`, renames it to `remote.state` and syncs the
+directory. An `init` that fails (on a full disk, for example), is killed or
+loses power before the rename leaves no `remote.state`. Nothing was enrolled:
+run the same `init` command again. Whatever it left in `remote.next` is
+written over and is never read as state, and `serve` on such a directory
+answers `remote witness is not initialized`. If `init` did not report success
+and `remote.state` exists, the record was published: a second `init` answers
+`remote witness already enrolled`, and `serve` makes the record durable
+before it answers a request.
+
+An empty `remote.state` is the one state neither command continues. `init`
+and `serve` both refuse it, change nothing and say so:
+`remote witness state file remote.state is empty`. The files cannot show
+which of two things happened. Either an `init` of an older binary, which
+created the file before writing it, stopped in between, or an enrolled
+authority's state file was truncated. Only you can tell them apart. If this
+authority has never been served (no `serve` ever reported readiness for this
+directory), no volume can have been enrolled with it: remove `remote.state`
+and `remote.next` from the state directory and run `init` again. If it has
+served a volume, or you cannot rule that out, remove nothing and do not
+initialize it again. A new authority starts at fence 0 without a current
+root, so it accepts none of the volume's existing backing: attach, takeover,
+restore and enrollment recovery all refuse, and the record of which state
+was current is gone with the old file.
+
 Whoever can write the state directory or its `remote.*` files can put an older
 record back and roll the authority back. On Unix, `init` and `serve` therefore
 require the directory (checked on the opened directory, without following a
@@ -519,9 +545,11 @@ investigation.
 
 If activation actually succeeded, use exact-current takeover and inspect the
 selected state. This command does not reset it or automatically finish inner
-volume initialization that stopped after outer activation. See
+volume initialization that stopped after outer activation. A creation that
+stopped before it published `rollback.format` claimed nothing and is not
+resumed this way: run `maki volume create` again. See
 [enrollment recovery](rollback-protection.md#resume-interrupted-initial-enrollment)
-for the compatibility and initialization limits.
+for both cases and the compatibility and initialization limits.
 
 ## Retire old writer namespaces
 
@@ -534,13 +562,52 @@ sudo -u maki maki volume gc /etc/maki/volume-writer.toml
 ```
 
 The JSON report separates `removed`, `skipped_live`, `skipped_unrecognized`
-and `retained` namespace arrays. Each array retains at most the first 4,096
-names in that category. The corresponding fields in `counts` give the total
+and `retained` namespace arrays, and `skipped_unreadable` and `unfinished`,
+arrays of `{"name", "error"}` objects. Each array retains at most the first 4,096
+entries in that category. The corresponding fields in `counts` give the total
 numbers processed, including any omitted details; `details_truncated` is true
-if any array omitted names. Use `counts`, not array lengths, for totals.
+if any array omitted entries. Use `counts`, not array lengths, for totals.
 An entry whose name is not valid UTF-8 is never a namespace: GC keeps it,
 lists it under `skipped_unrecognized` with U+FFFD in place of each invalid
 byte sequence, and goes on.
+
+A lower-fence namespace, or the tombstone of one, that GC cannot open or
+examine is kept and listed under `skipped_unreadable` with the step that
+failed and the system error, for example
+`opening the namespace directory: Permission denied (os error 13)` or
+`opening rollback.arena: Is a directory (os error 21)`, and GC goes on to the
+next entry. Nothing about such a namespace has been changed, and a later pass
+examines it again. A lifetime lock file that cannot be opened or tried is
+such an error, never a free lock. The usual cause is an owner: a `takeover`,
+`restore` or `resume-enrollment` run as root that a crash interrupted while
+it was creating the new namespace leaves an empty root-owned `0700`
+directory, which the daemon user's GC then reports with `Permission denied`
+on every pass. Remove that directory with `rmdir`, which removes only an
+empty one, or hand the tree back with `chown -R`
+([volume lifecycle](operations.md#volume-lifecycle)); an empty namespace
+directory without a lock file is then listed under `skipped_unrecognized`
+until it is removed.
+
+A namespace that passed examination and whose retirement stopped at a step
+that changes it alone is kept as that step left it and listed under
+`unfinished`, and GC goes on to the next entry. The step is renaming it to
+its tombstone when its own directory is immutable or append-only and the
+root is neither, which changes nothing
+(`renaming the immutable or append-only namespace directory to its tombstone: Operation not permitted (os error 1)`),
+or, once the durable tombstone exists, unlinking one of its files, syncing
+its directory or removing it (for a directory the daemon user may read but
+not write, `unlinking rollback.arena: Permission denied (os error 13)`).
+`name` is the entry as GC left it: the namespace if the rename failed, its
+`.remote-gc-` tombstone otherwise. Tombstones sort before every namespace,
+so a later pass meets the entry first and resumes its retirement. Correct
+the mode, owner or flag the error points to on that entry (`chmod u+w`,
+`chown -R`, `chattr -i` or `-a`) and run GC again, rather than removing the
+files by hand: GC removes them only while it holds the namespace's lifetime
+lock. Renaming a namespace needs write permission on the root, not on the
+namespace, so a rename that fails for any other reason (no write permission
+on the root, a read-only or full filesystem, an append-only or immutable
+root, an I/O error) concerns the root and ends the pass, as described
+below.
 
 GC walks the root in sorted pages of at most 4,096 names and continues past
 pages containing only retained, live or unrecognized entries. Each page scans
@@ -557,9 +624,21 @@ closed. The current arena's fixed footprint remains allocated.
 A root operation lock excludes source-copy races. A retired namespace is
 renamed without replacement to a tombstone and the root directory is synced
 before unlinking its contents. Later passes can finish partial tombstones.
-Authority failure, a changed record, unsafe paths, unexpected files or storage
-errors postpone reclamation; a failed automatic pass does not turn successful
-activation into an unacknowledged commit. GC never removes external backups.
+Unsafe paths, unexpected files, namespaces that cannot be examined and
+retirements stopped at a step that changes that namespace alone postpone the
+reclamation of that namespace only: every other namespace is retired on its
+own examination, lifetime lock and durable tombstone. A pass ends with an
+error, keeping every namespace it has not yet retired, when it cannot tell
+what may be deleted or cannot delete it durably: an authority failure or a
+changed record, a root whose marker, current generation, binding, listing or
+mount identity it cannot read, a rename into a tombstone that the root or its
+filesystem refuses, a failed sync of the root directory, or an entry that
+changed identity while GC was retiring it, which the error names.
+A failed automatic pass does not turn successful activation into an
+unacknowledged commit, and only the log reports it: a `WARN` event gives the
+error that ended the pass, and one names the first namespace the pass could
+not examine, or the first whose retirement it could not finish, and says how
+many there were. GC never removes external backups.
 
 The confined retirement path requires Linux kernel 5.8 or later with `statx`
 mount identity support, a local backing filesystem and same-host lifetime

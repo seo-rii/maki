@@ -12,6 +12,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use serde_json::Value;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -68,7 +71,7 @@ async fn run(socket: &Path, args: Vec<String>) -> (Output, Option<Value>) {
 
 #[tokio::test]
 async fn socket_option_reaches_the_daemon_without_any_configuration() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let args = ["status", "--socket"]
         .iter()
@@ -86,7 +89,7 @@ async fn socket_option_reaches_the_daemon_without_any_configuration() {
 
 #[tokio::test]
 async fn socket_option_works_for_reload_cache() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let args = vec![
         "reload".into(),
@@ -110,7 +113,7 @@ async fn socket_option_works_for_reload_cache() {
 
 #[tokio::test]
 async fn drain_reaches_the_daemon_although_the_edited_configuration_is_invalid() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     // Parses, but fails attach-time validation (multi-connection is refused).
     let path = config(dir.path(), &socket, "[nbd]\nconnections = 2\n");
@@ -125,7 +128,7 @@ async fn drain_reaches_the_daemon_although_the_edited_configuration_is_invalid()
 
 #[test]
 fn socket_and_configuration_together_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let path = config(dir.path(), &socket, "");
     let output = Command::new(env!("CARGO_BIN_EXE_maki"))
@@ -143,7 +146,7 @@ fn socket_and_configuration_together_are_refused() {
 
 #[test]
 fn socket_option_is_refused_outside_control_commands() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let path = config(dir.path(), &socket, "");
     let output = Command::new(env!("CARGO_BIN_EXE_maki"))
@@ -163,7 +166,7 @@ fn checkpoint_output(ok: bool, stdout: std::process::Stdio) -> Output {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let daemon = std::thread::spawn(move || {

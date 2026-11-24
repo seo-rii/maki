@@ -3,6 +3,10 @@
 //! refuse plaintext transports to non-loopback hosts, and prove the shipped
 //! production sample is attachable as written.
 
+#[cfg(unix)]
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_format::config::{is_loopback_host, parse_config, parse_endpoint_url, VolumeConfig};
 
 const SAMPLE: &str = include_str!("../../../packaging/examples/postgres-prod.toml");
@@ -63,14 +67,22 @@ fn parse(raw: &str) -> VolumeConfig {
     parse_config(raw).unwrap_or_else(|e| panic!("parse: {e}\n{raw}"))
 }
 
+/// The rejection of `raw`. Every binary prints it after `error: ` and the
+/// journal stores it as one record, so each rejection in this file is also
+/// held to that layout: one line, without a run of spaces.
 fn err(raw: &str) -> String {
-    match parse_config(raw) {
+    let message = match parse_config(raw) {
         Err(e) => e.to_string(),
         Ok(cfg) => cfg
             .validate()
             .expect_err(&format!("expected rejection for:\n{raw}"))
             .to_string(),
-    }
+    };
+    assert!(
+        !message.contains(['\n', '\r', '\t']) && !message.contains("  "),
+        "a rejection must be one line of single-spaced text: {message:?}"
+    );
+    message
 }
 
 fn ok(raw: &str) {
@@ -553,6 +565,26 @@ fn zero_and_inverted_bounds_are_rejected() {
     }
 }
 
+/// An escaped newline where a string continuation was meant put a line
+/// break and a run of indentation into both messages.
+#[test]
+fn memory_hardening_rejections_are_one_line() {
+    assert_eq!(
+        err(&with("[security]\ndisable_core_dump = false")),
+        "config invalid: security.madv_dontdump is honoured through disable_core_dump \
+         (a non-dumpable process writes no core); enable disable_core_dump or set \
+         madv_dontdump = false"
+    );
+    assert_eq!(
+        err(&with("[security]\nmemory_lock_mode = \"off\"")),
+        "config invalid: cache.lock_memory requires security.memory_lock_mode = \
+         secure-buffers or all (cache plaintext lives in secret buffers)"
+    );
+    // Parse failures go through the same printers.
+    assert!(err("config_schema_version = 1\n[volume\n")
+        .starts_with("config parse error: invalid TOML or configuration schema at line 2"));
+}
+
 #[test]
 fn capability_mode_and_availability_policy_are_checked() {
     let bad_mode = base().replace(
@@ -738,7 +770,7 @@ fn control_and_nbd_sockets_must_differ() {
 #[cfg(unix)]
 #[test]
 fn socket_aliases_use_the_actual_parent_directory_before_binding() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = short_dir::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("other/sub")).unwrap();
     std::os::unix::fs::symlink(root.join("other/sub"), root.join("link")).unwrap();

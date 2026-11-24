@@ -13,11 +13,29 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+/// Memory this process holds page-locked, in KiB, as the kernel accounts it
+/// (`VmLck` in `/proc/self/status`). It counts every locked page once, so
+/// it does not depend on which addresses the allocator hands out, and it
+/// moves whether or not `RLIMIT_MEMLOCK` binds this process.
+#[cfg(target_os = "linux")]
+fn locked_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmLck:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("/proc/self/status reports VmLck in kB")
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_locked_buffers_releases_their_pages() {
     use maki_crypto::secret::{page_lock_failures, set_page_locking};
     use maki_crypto::SecretBuffer;
+
+    const BUFFER: usize = 64 << 10;
+    const ALIVE: usize = 8;
 
     let _serial = serial();
     // A small lock limit for this process only (the test has its own
@@ -31,21 +49,41 @@ fn dropping_locked_buffers_releases_their_pages() {
     assert_eq!(rc, 0, "setrlimit failed");
 
     set_page_locking(true);
-    let probe = SecretBuffer::zeroed(64 << 10);
+    let baseline = locked_kib();
+    let probe = SecretBuffer::zeroed(BUFFER);
     if !probe.is_page_locked() {
-        eprintln!("mlock unavailable in this environment; skipping");
+        eprintln!(
+            "dropping_locked_buffers_releases_their_pages: skipped: mlock is unavailable in \
+             this environment"
+        );
         set_page_locking(false);
         return;
     }
     drop(probe);
+    // The limit does not bind a privileged process, and buffers dropped one
+    // after another get the same addresses back, so pages that stay locked
+    // never add up to a failed `mlock`. The kernel's own count shows them:
+    // it must rise while buffers are alive and return to where it started
+    // once they are dropped. Each round holds eight buffers at once (half
+    // the limit); eight rounds lock four times the limit in all.
     let before = page_lock_failures();
-    for _ in 0..64 {
-        let buffer = SecretBuffer::zeroed(64 << 10);
+    for round in 0..8 {
+        let buffers: Vec<SecretBuffer> = (0..ALIVE).map(|_| SecretBuffer::zeroed(BUFFER)).collect();
         assert!(
-            buffer.is_page_locked(),
-            "lock failed mid-run (pages leaked?)"
+            buffers.iter().all(SecretBuffer::is_page_locked),
+            "round {round}: lock failed (pages leaked?)"
         );
-        drop(buffer);
+        let held = locked_kib();
+        assert!(
+            held >= baseline + (ALIVE * BUFFER / 1024) as u64,
+            "round {round}: {held} KiB locked with {ALIVE} buffers alive, {baseline} KiB before"
+        );
+        drop(buffers);
+        assert_eq!(
+            locked_kib(),
+            baseline,
+            "round {round}: dropped buffers left their pages locked"
+        );
     }
     assert_eq!(
         page_lock_failures(),

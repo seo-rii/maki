@@ -1,8 +1,11 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use maki_backing::remote_witness::{
     namespace, Action, CanonicalState, Descriptor, Phase, Record, Request, Role, StateStore,
 };
 use maki_backing::witness::Anchor;
-use tempfile::tempdir;
+use private_dir::tempdir;
 
 const ID: [u8; 16] = [11; 16];
 fn request(n: u8, expected: &Record, action: Action) -> Request {

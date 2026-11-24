@@ -6,7 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-maki-crypto.workspace = true
+# `tls-trust`: the roots every remote transport trusts.
+maki-crypto = { workspace = true, features = ["tls-trust"] }
 # The method-path rule configuration validation applies.
 maki-format.workspace = true
 thiserror.workspace = true
@@ -15,12 +16,11 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 # Select tonic's explicit ring fallback when no process-global provider exists.
-# Roots alone leave rustls to infer one, which panics if another dependency
-# enables aws-lc alongside our ring backend.
-tonic = { version = "0.13", features = ["tls-native-roots", "tls-ring"] }
-# Probes whether the host trust store has any roots before asking tonic for
-# them (tonic refuses an empty store even when a CA is configured).
-rustls-native-certs = "0.8"
+# Without it rustls infers one, which panics if another dependency enables
+# aws-lc alongside our ring backend. No `tls-*-roots` feature: the provider
+# hands tonic its roots as trust anchors (tonic's native-root loader refuses
+# an empty host store, and its webpki feature pulls the 0.26 webpki-roots line).
+tonic = { version = "0.13", features = ["tls-ring"] }
 # Preserve typed TLS handshake failures through tonic/hyper error wrappers.
 rustls.workspace = true
 prost = "0.13"

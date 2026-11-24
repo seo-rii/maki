@@ -98,16 +98,15 @@ fn privileged_validation_uses_production_crypto_and_pinned_attach_identity() {
         "\"$attach_bin\" verify --volume",
         "\"$attach_bin\" cleanup --volume",
         "--config \"$attach_config_path\"",
-        "nbd-client 3.27.0 or later",
         "control_runtime_dir_candidate=\"/run/maki-control/$volume_name\"",
         "control_socket_path=\"$control_runtime_dir/control.sock\"",
         "rmdir \"$control_runtime_dir\"",
         "nbd_target=\"$(basename \"$device\")\"",
         "sudo -n python3 \"$REPO_ROOT/scripts/privileged_validation_nbd.py\"",
-        "--device \"$device\" --identifier \"$nbd_connection_id\" \"$@\"",
+        "--device \"$device\" --identifier \"$nbd_connection_id\" --helper \"$attach_bin\" \"$@\"",
         "test_nbd_action connect --socket \"$socket_path\"",
         "test_nbd_action disconnect",
-        "nbd-client -d \"$nbd_target\"",
+        "\"$attach_bin\" nbd-disconnect --nbd-device \"$device\" --identifier \"$nbd_connection_id\"",
     ] {
         assert!(
             runner.contains(required),

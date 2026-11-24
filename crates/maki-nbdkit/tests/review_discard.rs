@@ -7,6 +7,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_nbdkit::adapter::{NbdAdapter, EINVAL, ESHUTDOWN};
 
 fn config(root: &std::path::Path, socket: &std::path::Path) -> String {
@@ -57,7 +60,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(discard: bool) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = short_dir::tempdir().unwrap();
         let root = directory.path().join("volume");
         let socket = directory.path().join("control.sock");
         let raw = config(&root, &socket);
@@ -184,7 +187,10 @@ fn native_nbd_negotiates_and_executes_trim() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        // The child reports a missing tool on its standard error; without
+        // it this test would show a bare `ok` for a run that checked nothing.
         print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
 

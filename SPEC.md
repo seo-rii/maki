@@ -217,7 +217,7 @@ Responsibilities:
 
 ```text
 allocate an NBD device
-connect the NBD device to the Unix socket
+negotiate with the volume's NBD socket and connect the kernel NBD device to it
 configure device block size
 verify NBD candidates and complete LVM membership
 activate the discovered VG UUID within the verified NBD device list
@@ -225,7 +225,7 @@ mount XFS
 verify mount identity
 grow LVM
 run xfs_growfs
-detach the NBD device
+disconnect the kernel NBD device
 ```
 
 The helper MUST NOT handle:
@@ -241,6 +241,94 @@ crypto request bodies
 ```
 
 The privileged helper is therefore strictly a **storage connection and control-plane component**.
+
+## NBD connection
+
+The helper connects and disconnects the kernel NBD device itself and runs no
+NBD client program. To connect, it opens the volume's NBD Unix socket,
+performs the NBD fixed-newstyle handshake with the volume daemon, and passes
+the negotiated socket to the kernel in one generic-netlink `NBD_CMD_CONNECT`
+request of the `nbd` family, for the device it allocated, with the export
+size, the configured block size, the export's transmission flags and the
+backend identifier. To disconnect, it sends `NBD_CMD_DISCONNECT` for that
+device. The daemon runs as an unprivileged user, so every byte the helper
+reads from its socket is untrusted input to a root process.
+
+The helper MUST:
+
+- set the trusted record's unique connection identifier as the device's
+  kernel backend identifier (`NBD_ATTR_BACKEND_IDENTIFIER`), which the kernel
+  shows as `/sys/block/nbdN/backend`, and refuse to connect when the kernel's
+  `nbd` family does not accept that attribute. The identity rule of §8 is
+  unchanged: the identifier must match the live backend before detach,
+  immediately before every disconnect, and in rollback;
+- select the default export (the empty name) with `NBD_OPT_GO` and no
+  information requests, and refuse a server that does not offer
+  fixed-newstyle negotiation, that does not answer with exactly one
+  `NBD_INFO_EXPORT` before `NBD_REP_ACK`, or that sends a reply to another
+  option or of another type. It MUST NOT fall back to `NBD_OPT_EXPORT_NAME`:
+  the volume's server is always nbdkit, which answers `NBD_OPT_GO` in every
+  release the project documents (1.32.5 and later), and a server that cannot
+  is not Maki's;
+- never negotiate structured replies, extended headers, metadata contexts or
+  TLS: the kernel's NBD client implements none of them;
+- forward the export's 16-bit transmission flags to the kernel unchanged
+  (`NBD_ATTR_SERVER_FLAGS`), and refuse, before the kernel sees the socket,
+  an export that does not advertise `NBD_FLAG_HAS_FLAGS`,
+  `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`. `SEND_FLUSH` is required
+  for durability: without it the kernel gives the device no write cache, so
+  FLUSH requests complete without reaching the server and FUA writes go out
+  as plain writes, and a filesystem barrier would never reach the journal
+  (§12, §24, §25). `SEND_FUA` is required by policy: without it the block
+  layer emulates every FUA write with a full flush, which reaches the server
+  but costs a flush per FUA write. `HAS_FLAGS` is required by the NBD
+  protocol, without which the other bits mean nothing; the kernel itself
+  ignores it. Maki's plugin always advertises FLUSH and FUA;
+- refuse an export whose size is 0 or larger than 2^63 − 1 bytes;
+- bound the handshake in bytes, checking every reply's length before reading
+  it: no reply longer than 4098 bytes (a 4096-byte string and its type) and
+  no more than 64 KiB read in all;
+- bound its own waits in each connect and disconnect (the socket connect, the
+  handshake, the retries below and the wait for the kernel's answer) by the
+  limit of an external step command and by the deadline its caller set for all
+  of its commands (the failed-start hook's command budget);
+- retry a connect the kernel refuses with `EBUSY`, which it answers while
+  anything holds the unconnected device open (udev's probe after a
+  disconnect, any other opener), every 100 ms for up to 5 s within that time
+  bound, each time on a fresh connection to the daemon and only after checking
+  that the device still shows no connection; every other refusal is final;
+- create every descriptor close-on-exec, hand the kernel the socket without a
+  send or receive timeout (the kernel's own I/O on it would fail once the
+  device has been idle that long), and close its own descriptor of the socket
+  in every outcome: after a connect the kernel holds its own reference;
+- treat a kernel error reply as a failed step, and a request whose answer it
+  could not read (a timeout, a lost or malformed reply) as a step whose effect
+  is unknown. What is connected is then decided as after any other failed
+  step, by the backend identifier the kernel shows, never by assuming that
+  nothing changed.
+
+Provisioning a new volume connects its export once outside any attachment
+(`maki-attach nbd-connect`, then `nbd-disconnect`), with the same handshake and
+request. Such a connection MUST NOT use an identifier of the form attach records
+use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
+a trusted record names, and its disconnect MUST touch only a device connected
+under its own identifier.
+
+The kernel's own work on a request is not bounded: it runs inside the send of
+the request, and its mutex waits are uninterruptible, so no deadline or signal
+ends them; the kernel runs the `nbd` family's requests one at a time.
+`NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
+`NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
+that stopped reading with a full send buffer holds the helper, with the attach
+lock, until it reads again or its socket closes. In the helper's flows the
+unmount and the VG deactivation, bounded commands that need the daemon to serve
+I/O, run first when they are needed and fail first in that case; the outer
+bound is the unit's start or stop timeout, and a helper in an uninterruptible
+wait ends only when that wait does.
+
+The helper logs the process and user IDs of its socket peer when it connects,
+for diagnostics only: the documented flows may run nbdkit outside the
+volume's unit.
 
 `maki-attach verify` supplies a repeatable read-only workload-start check using
 existing trusted state and root-controlled configuration. Both volume and XFS
@@ -261,6 +349,12 @@ Administrative CLI:
 ```text
 maki volume create
 maki volume inspect
+maki volume witness
+maki volume gc
+maki volume snapshot
+maki volume takeover
+maki volume restore
+maki volume resume-enrollment
 
 maki attach
 maki detach
@@ -268,11 +362,37 @@ maki detach
 maki status
 maki metrics
 
+maki checkpoint
+maki drain
+
 maki reload
 maki check
 
 maki grow
 ```
+
+`maki checkpoint` and `maki drain` are control-socket commands: `checkpoint`
+requests a graceful checkpoint, and `drain` closes I/O admission, waits for
+the requests in progress, then flushes and checkpoints. `maki attach`,
+`maki detach` and `maki grow` do not perform the operation: `maki` prints the
+`maki-attach` command to run (the same verb and arguments) on standard error
+and exits with status 3. The operation runs only when the operator runs that
+privileged helper (§6).
+
+The `maki volume` commands after `inspect` administer a backing protected by
+a remote witness (§21) and, except `witness`, need Linux. They do not use the
+control socket: each reads the volume configuration and contacts the witness
+itself. `witness` inspects the authority without claiming a writer, `gc`
+reclaims quiescent writer namespaces, and `snapshot` copies the committed
+state of a stopped volume to a backup directory. `takeover` moves the current
+state to a new writer namespace under a higher fence, which fences out the
+writer that held it, `restore` makes a snapshot the current state, and
+`resume-enrollment` recovers an initial enrollment whose activation never
+completed. These three need administrator credentials and an approval of the
+authority's exact current state: its fence and current root (`restore` also
+the snapshot's root), or for `resume-enrollment` its fence and storage
+identity. The [remote witness service guide](docs/remote-witness-service.md)
+gives the procedures.
 
 Normal status and runtime configuration operations are performed over the daemon control socket:
 
@@ -298,6 +418,7 @@ credential reload
 cache resize
 retry/backpressure configuration reload
 graceful checkpoint
+drain (close I/O admission, then flush and checkpoint)
 ```
 
 The following operations MUST require the privileged helper:
@@ -382,17 +503,17 @@ A volume configuration decides where plaintext goes: the provider and its
 endpoints, TLS trust, credential references, the backing root and the rollback
 witness. Every loader (the data-plane daemon, `maki` and `maki-benchmark`)
 MUST open it without following a final symlink and MUST refuse, before parsing
-it, anything but a regular file with exactly one link, owned by root or by the
-user the loading process runs as, with no group or other write permission. The
-checks MUST describe the opened descriptor that is then read. Group and other
-read MAY be granted: a configuration holds credential references, never
-secrets (§9). The recommended `root:maki 0640` is accepted by root and by the
-daemon user, which reads it through its group; a file owned by the daemon user
-is refused by commands run as root. The directory holding it SHOULD be
-root-owned and not writable by others. This is the witness configuration's
-owner and mode rule plus the single link; secret files (§9) have the same
-owner rule and a stricter mode rule. Non-Unix hosts check only that the file
-is regular.
+it, anything but a regular file of at most 1 MiB with exactly one link, owned
+by root or by the user the loading process runs as, with no group or other
+write permission. The checks MUST describe the opened descriptor that is then
+read. Group and other read MAY be granted: a configuration holds credential
+references, never secrets (§9). The recommended `root:maki 0640` is accepted
+by root and by the daemon user, which reads it through its group; a file owned
+by the daemon user is refused by commands run as root. The directory holding
+it SHOULD be root-owned and not writable by others. This is the witness
+configuration's owner and mode rule plus the single link; secret files (§9)
+have the same owner rule and a stricter mode rule. Non-Unix hosts check only
+that it is a regular file of at most 1 MiB.
 
 The NBD Unix Domain Socket:
 
@@ -427,9 +548,30 @@ Privileged attachment state MUST be opened through root-controlled directory
 descriptors without following symlinks. Detach MUST verify its requested
 volume UUID, socket, mountpoint, VG, LV, and device against a trusted record
 before executing any step. The record's unique connection identifier MUST
-match the live NBD backend before detach and immediately before disconnect,
-including rollback. A missing or invalid record MUST fail closed, even when
+match the live NBD backend (the device's kernel backend identifier, §6) before
+detach and immediately before disconnect, including rollback. A missing or invalid record MUST fail closed, even when
 the caller supplies an explicit NBD device.
+
+A trusted record reserves the NBD device it names for its volume, connected
+or not, until one of that volume's own operations replaces or retires the
+record. Under the attach lock, attach MUST read every record before it
+chooses or connects a device, MUST NOT allocate or connect a device that
+another volume's record names, and MUST refuse while a record cannot be read.
+
+A record whose device is connected under an identity other than the recorded
+one MUST be kept, and every verb of its volume MUST refuse without a command,
+unless observation under the attach lock proves that nothing of the recorded
+attachment remains: the record names its VG UUID (mapping proof, activation
+intent or administrator pins); no device-mapper device on the host belongs to
+that VG; every holder of the device and of its partitions is an LVM mapping
+of another VG (a device-mapper uuid of `LVM-` and another VG UUID), not any
+other device-mapper or block device; nothing is mounted at the recorded
+mountpoint and no mount is of a mapping of that VG; no other volume's record
+names the device with the same VG UUID or with none; and the device's backend
+stays the same across the observation. Every such observation MUST be
+readable. Attach, cleanup, recover and detach MAY then retire the record
+without any command and without touching the device or its connection; grow
+MUST refuse.
 
 A detach retry MAY skip a step whose completion is verified from current mount
 and block-device observations. Destructive steps still require matching live
@@ -533,6 +675,14 @@ ReadWritePaths=/run/maki/%i
 ReadWritePaths=/run/maki-control/%i
 ```
 
+The unit MUST name nbdkit by the absolute path where the distribution's
+nbdkit package installs it: `/usr/bin/nbdkit` in the Debian package,
+`/usr/sbin/nbdkit` in the RHEL 9 RPM, which installs the same unit with that
+one line changed. It MUST NOT give a bare program name: systemd resolves one
+through a fixed search path that starts with `/usr/local/sbin` and
+`/usr/local/bin`, so an unpackaged binary there would receive the volume's
+configuration and crypto credential.
+
 The exact sandbox options MUST be finalized after compatibility testing with nbdkit and all required shared libraries.
 
 The native plugin initializes its adapter in `after_fork`, so recovery,
@@ -555,27 +705,38 @@ provide continuous health monitoring or container reattachment.
 maki/
 ├── crates/
 │   ├── maki-core/
-│   │   ├── io/
-│   │   ├── scheduler/
-│   │   ├── barrier/
-│   │   ├── admission/
-│   │   ├── recovery/
-│   │   ├── state/
-│   │   └── volume/
+│   │   ├── engine
+│   │   ├── volume
+│   │   ├── journal
+│   │   ├── overlay
+│   │   ├── store
+│   │   ├── recovery
+│   │   └── check
 │   │
 │   ├── maki-format/
-│   │   ├── superblock/
-│   │   ├── slot/
-│   │   ├── journal/
-│   │   ├── allocation/
-│   │   └── checksum/
+│   │   ├── superblock
+│   │   ├── slot
+│   │   ├── journal
+│   │   ├── allocation
+│   │   ├── catalog
+│   │   ├── checkpoint
+│   │   ├── durable_proof
+│   │   ├── canary
+│   │   ├── ab
+│   │   ├── codec
+│   │   ├── geometry
+│   │   └── config
 │   │
 │   ├── maki-crypto/
-│   │   ├── provider/
-│   │   ├── batching/
-│   │   ├── retry/
-│   │   ├── circuit_breaker/
-│   │   └── endpoint/
+│   │   ├── provider
+│   │   ├── checked
+│   │   ├── selftest
+│   │   ├── scheduler
+│   │   ├── endpoint
+│   │   ├── retry
+│   │   ├── breaker
+│   │   ├── flow
+│   │   └── secret
 │   │
 │   ├── maki-crypto-local/
 │   ├── maki-crypto-http/
@@ -586,20 +747,26 @@ maki/
 │   ├── maki-nbdkit/
 │   ├── maki-control/
 │   ├── maki-privileged/
+│   ├── maki-witness/
 │   └── maki-test-support/
 │
 ├── bins/
 │   ├── maki
 │   ├── maki-attach
 │   ├── maki-check
-│   └── maki-benchmark
+│   ├── maki-benchmark
+│   └── maki-witness
 │
 └── packaging/
     ├── systemd/
     ├── tmpfiles.d/
     ├── sysusers.d/
+    ├── debian/
     └── examples/
 ```
+
+The entries under `maki-core`, `maki-format` and `maki-crypto` are those
+crates' principal source modules (`src/<name>.rs`), not directories.
 
 ---
 
@@ -695,6 +862,29 @@ Alignment             512
 
 Slot size            4608
 ```
+
+A slot holds a 64-byte header followed by the unit's ciphertext; the rest of
+the slot is not read. Slot `i` of a shard holds unit
+`shard_index * units_per_shard + i` of the volume and starts at byte
+`i * slot_size` of `data/shard-<index>.dat`, where `<index>` is the shard
+index as eight lowercase hexadecimal digits. The header (record notation in
+§21):
+
+```text
+magic[8] = MAKISLT1
+unit_index u64          the unit's index in the volume, not in the shard
+write_sequence u64      journal sequence of the write the slot holds; never 0
+ciphertext_len u32      at most max_ciphertext_size
+flags u32 = 0
+ciphertext_crc u32      CRC-32 of the ciphertext
+reserved[24] = 0
+crc32
+```
+
+The header has no version field: its magic, which ends in the format version
+`1`, is its only format identifier, and a header with another magic does not
+decode. Writers set `flags` and the reserved bytes to zero, and readers do not
+interpret them.
 
 Maximum fully allocated layout sizes are calculated from the immutable
 geometry with checked arithmetic:
@@ -904,6 +1094,19 @@ For HTTP this is the `item_index_path` response mapping (required for batch
 layouts), for WebSocket the `unit` field of each response item, and for gRPC
 the `unit_index` field of `CryptoItem`.
 
+TLS trust: every remote transport verifies the server's certificate chain and
+the endpoint's host name, and all of them trust the same roots: the host's
+trust store (the system CA bundle, or the files `SSL_CERT_FILE` and
+`SSL_CERT_DIR` name when either is set, read best effort, so a certificate that
+does not parse is skipped), the public roots compiled into the binary, and the
+configured `ca_file`. A configured CA bundle adds to the other roots and MUST
+NOT replace them; every certificate in it MUST parse, and a bundle without one
+MUST be refused. The compiled-in roots keep the set from ever being empty, so an
+endpoint that none of the roots vouches for fails at the TLS handshake as an
+endpoint failure, not at provider construction. No setting disables
+certificate or host-name verification. The remote witness (§21) is not a crypto
+transport: it trusts only its configured CA.
+
 Retry safety: a provider whose capabilities do not declare `retry_safe` is
 sent each request at most once. No retry, failover, or transport-level resend
 happens after the request may have been sent. A request that the transport
@@ -950,6 +1153,115 @@ Missing, unknown, duplicated, or conflicting classification fields are never
 context evidence. These tokens denote a field refusal, not an authentication
 failure; they cannot satisfy unit-index, volume-UUID, or tamper probes. Remote
 error text is ignored.
+
+Integrity failures use the same carriers with their own tokens: HTTP status
+`422` or gRPC status `FailedPrecondition` with exactly one `maki-crypto-error`
+header/metadata value, `auth-tag-mismatch` (the ciphertext failed
+authentication) or `context-mismatch` (the ciphertext is not bound to the
+context it was presented under). WebSocket uses `error.class = "integrity"`
+and one of the same two `error.reason` values. Either token yields
+`CryptoError::Integrity`. A token is compared exactly: a missing, unknown,
+repeated or comma-joined value is not an integrity failure, and neither is a
+token under any other HTTP or gRPC status.
+
+A provider that declares integrity MUST answer a ciphertext it cannot
+authenticate with an integrity failure; the attach self-test accepts nothing
+else from its tamper probe. A negative probe (the tamper probe and the
+context probes above) is judged by its classified result alone:
+
+- `CryptoError::Integrity` satisfies the tamper probe and every context probe.
+- A successful reply never satisfies the tamper probe, whatever plaintext it
+  carries. It satisfies a context probe only when it is well formed and its
+  plaintext differs from the original.
+- `CryptoError::UnsupportedContext` satisfies only the probe that changed the
+  field it names.
+- A `Retryable`, `Throttled` or `EndpointFatal` error is inconclusive and is
+  returned unchanged: the endpoint is not validated (§34).
+- A contract violation (a malformed or mislabelled reply) is not an answer:
+  the self-test fails without a verdict on the capability.
+- Every other result leaves the capability unproven and refuses attach: a
+  generic bad request (an HTTP `400`, a `422` without one recognised token,
+  a gRPC `InvalidArgument`, a WebSocket `bad-request`), a refusal of another
+  field, or a provider failure.
+
+The cross-endpoint check (§34) reads a refusal the other way: an endpoint
+that answers its peer's ciphertext with anything but a transport failure or a
+contract violation, an integrity failure included, fails the check as not
+interchangeable, and attach is refused. These are the verdicts at attach; §34
+states what each means for a quarantined endpoint that is validated later.
+
+Each transport classifies a provider's answer as follows (classes in §31).
+`Integrity` has the class `NonRetryableRequest`; `UnsupportedContext` and a
+contract violation (`CryptoError::Contract`) have the class `ProviderFatal`.
+In each table a row applies only when no row above it does.
+
+| HTTP response status | Result |
+| --- | --- |
+| 2xx | Success; a body that does not satisfy the response mapping is a contract violation |
+| `422` with exactly one `maki-crypto-error` header, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `429` | `Throttled` |
+| `408` | `Retryable` |
+| 3xx, `401`, `403`, `404`, `405`, `407`, `410` | `EndpointFatal`; a redirect is never followed |
+| Any other 4xx | `NonRetryableRequest` |
+| Any other status | `Retryable` |
+
+| gRPC status | Result |
+| --- | --- |
+| `OK` | Success; a reply that is not one message answering the request's items is a contract violation |
+| `FailedPrecondition` with exactly one `maki-crypto-error` metadata value, holding a token | `Integrity` or `UnsupportedContext`, by the token |
+| `ResourceExhausted` | `Throttled` |
+| `Unauthenticated`, `PermissionDenied`, `Unimplemented` | `EndpointFatal` |
+| `InvalidArgument`, `NotFound`, `OutOfRange`, any other `FailedPrecondition` | `NonRetryableRequest` |
+| Any other status (`Unavailable`, `DeadlineExceeded`, `Aborted`, `Internal`, `Cancelled`, `Unknown`, `AlreadyExists`, `DataLoss`) | `Retryable` |
+
+A gRPC response with an HTTP status other than 200 and no `grpc-status` is
+taken as an intermediary's answer, not the provider's, and is classified by
+that HTTP status: `401`, `403` and `404` are `EndpointFatal`, every other
+status is `Retryable`.
+
+| WebSocket `error.class` | Result |
+| --- | --- |
+| `integrity` with `error.reason` `auth-tag-mismatch` or `context-mismatch` | `Integrity` |
+| `unsupported-context` with `error.reason` `unsupported-format-version` or `unsupported-compatibility-id` | `UnsupportedContext` |
+| `throttled` | `Throttled` |
+| `retryable` | `Retryable` |
+| `bad-request` | `NonRetryableRequest` |
+| Anything else, a missing class included | Contract violation |
+
+A member that a WebSocket response repeats is read from its last occurrence,
+so a frame's class is the last `class` member of its last `error` member. An
+`integrity` or `unsupported-context` class selected this way is a contract
+violation as well when its `reason` is not one of that class's two tokens, or
+when the frame does not hold exactly one `id`, `error`, `class` and `reason`
+member with a numeric `id` and a string `reason`. A WebSocket error frame has
+no class for an endpoint failure; the upgrade that opens a connection reports
+one. A refused upgrade with status `429` is `Throttled`, with `408` or a 5xx
+status `Retryable`, and with any other 3xx or 4xx status `EndpointFatal`; so
+is a reply that is not a valid upgrade (a `101` without the upgrade headers or
+with the wrong accept key, a status below 300 or above 599, a head that is not
+HTTP). An upgrade reply cut short by a lost connection is `Retryable`.
+
+Without a classified answer, every transport reports a timeout or a lost
+connection, also one that cuts a reply short, as `Retryable`, and a TLS
+authentication or protocol failure as `EndpointFatal`. On an established
+connection, a reply that breaks the framing of the transport's messages or
+their size limit is a contract violation: an HTTP/1.1 response head or chunked
+body that does not parse, or a body that only the connection's close ends; a
+gRPC message whose length prefix, count or final status breaks the gRPC
+protocol, or a stream that ends inside a message; a WebSocket frame that breaks
+the WebSocket protocol or is not a JSON text frame with a numeric `id`. Two
+protocol failures are classified otherwise. A WebSocket upgrade reply that is
+not a valid upgrade is `EndpointFatal`, as above. An HTTP/2 error below the
+gRPC messages, a reset stream or a GOAWAY, is no framing violation: it reaches
+Maki as the gRPC status that the gRPC library derives from it and is classified
+by the gRPC table. A reset, and a GOAWAY that refuses the call (its last stream
+ID is below the call's stream, so the server did not process it), is classified
+by its error code: `ENHANCE_YOUR_CALM` is `Throttled` (`ResourceExhausted`),
+`INADEQUATE_SECURITY` is `EndpointFatal` (`PermissionDenied`), and every other
+code is `Retryable`. A GOAWAY that accepted the call and then closes the
+connection under it is `Retryable` whatever its code. Either way the request
+was handed to the connection and counts as sent: a call that a GOAWAY refused
+is not resent or failed over unless the provider is `retry_safe`.
 
 ---
 
@@ -1035,6 +1347,11 @@ the change was not applied; use the restart and self-test procedure above.
 ├── canary.a
 ├── canary.b
 ├── data/
+│   ├── shard-<index>.dat
+│   ├── shard-<index>.alloc.a
+│   ├── shard-<index>.alloc.b
+│   ├── shard-<index>.discard.a   (envelope v3 only)
+│   └── shard-<index>.discard.b   (envelope v3 only)
 ├── journal/
 │   ├── seg-<index>
 │   ├── durable-proof.a
@@ -1045,12 +1362,16 @@ the change was not applied; use the restart and self-test procedure above.
     └── state.b
 ```
 
-New volumes MUST use superblock envelope v2 and require
-`journal/durable-proof.{a,b}`. The envelope version is separate from the crypto
-context's `format_version`; changing the envelope MUST NOT silently change AAD.
-Both initial proof copies and their directory entries MUST be durable before
-publishing the v2 superblock. `checkpoint/state.{a,b}` are also written at
-creation (sequence 0), and recovery requires a valid checkpoint copy.
+New volumes MUST use superblock envelope v2, or envelope v3 when created with
+discard support; both require `journal/durable-proof.{a,b}`. Envelope v3 adds
+a replicated per-shard discard map, `data/shard-<index>.discard.{a,b}`, and
+journal records with an empty payload as discards
+([space reclamation](docs/space-reclamation.md)). The envelope version is
+separate from the crypto context's `format_version`; changing the envelope
+MUST NOT silently change AAD. Both initial proof copies and their directory
+entries MUST be durable before publishing the superblock.
+`checkpoint/state.{a,b}` are also written at creation (sequence 0), and
+recovery requires a valid checkpoint copy.
 
 A durable proof is exactly 64 bytes:
 
@@ -1079,12 +1400,52 @@ FUA/FLUSH acknowledgement advances. Both copies then attest that horizon even
 though their generations differ. The highest valid proof MUST be preserved
 before replacing the lower or invalid side. One missing/stale/corrupt copy may
 be tolerated when another retains the current horizon; both invalid/absent
-copies MUST refuse v2 recovery, including on an empty-looking volume.
+copies MUST refuse v2 and v3 recovery, including on an empty-looking volume.
 
 The single `journal/durable-mark` remains advisory and MAY be absent or stale.
-It MUST NOT replace or weaken required v2 evidence. Local CRC records do not
+It MUST NOT replace or weaken the required proof. Local CRC records do not
 authenticate metadata, prevent coordinated valid rollback, or provide separate
 physical failure domains.
+
+Record notation: a layout in this document lists a record's fields in file
+order, with no padding between them unless it names some. Integers are
+unsigned and little-endian. `magic[n]` is `n` ASCII bytes. A UUID is its 16
+bytes in the order of its text form, not a little-endian integer. `crc32` is
+the CRC-32 of IEEE 802.3 and zlib over every byte of the record before it,
+stored little-endian like any other integer. Every A/B record of this layout
+(`*.a`, `*.b`) begins with `magic[8]`, `version u32` and `generation u64`.
+
+A superblock copy is exactly 4096 bytes:
+
+```text
+magic[8] = MAKISB01
+version u32             envelope version: 1 (legacy), 2 or 3
+generation u64
+volume_uuid[16]
+device_block_size u32
+crypto_unit_size u32
+slot_alignment u32
+max_ciphertext_size u32
+slot_header_size u32 = 64
+slot_size u64
+max_virtual_size u64
+shard_logical_size u64
+format_version u32 = 1  the crypto context's format version
+created_unix u64        creation time in seconds since the Unix epoch
+flags u64 = 0
+provider_type           string
+crypto_compatibility_id string
+key_identity            string
+zero padding up to byte 4092
+crc32
+```
+
+A string is a `u16` byte length followed by that many bytes of UTF-8, at most
+128. The envelope version is the only field in which the v1, v2 and v3 images
+of one superblock differ. A decoder MUST refuse an envelope version, a
+`format_version` or a `flags` bit it does not know, and a stored
+`slot_header_size` or `slot_size` that differs from the value §14 derives
+from the other fields.
 
 An optional, experimental outer backing format can anchor the authenticated
 namespace and retained COW pages in an independent trusted local or remote
@@ -1171,7 +1532,8 @@ slot header bytes are all zero
 allocation bit = 0
 slot holds a valid header for this unit
 → allocation copy is behind the slot: treat as bit = 1
-  (served; bit repaired in memory, persisted by the next checkpoint)
+  (served; the open-time audit below repairs the bit in memory and the
+  next checkpoint persists it, a read alone repairs nothing)
 
 allocation bit = 0
 slot header bytes are neither zero nor a valid header for this unit
@@ -1193,9 +1555,9 @@ grown back), so it reads as allocated-but-invalid, EIO, until it is
 rewritten. The only legitimately short data file belongs to a shard that was
 never checkpointed into: not named by the loaded catalog copy and with an
 empty allocation map (a stale empty copy from an earlier creation attempt
-proves nothing). Its creation (§27) never finished, so no slot of it holds
+proves nothing). Its creation (§14) never finished, so no slot of it holds
 data and its holes stay holes. Nothing proves such a file's size durable —
-not even a full-size page-cache view after a restart (§12 K-01) — so the
+not even a full-size page-cache view after a restart (§27) — so the
 size is set and synced again before the shard is written to or cataloged.
 
 ```text
@@ -1207,6 +1569,10 @@ allocation bit = 1
 slot valid
 → decrypt
 ```
+
+On an envelope-v3 volume the shard's discard map (record layout below) is
+consulted before the allocation map and the slot: a unit whose discard bit is
+set reads as zero, whatever they hold.
 
 Slot headers are authoritative; the shard catalog and the allocation maps
 are accelerators. An A/B record legitimately falls back to its older
@@ -1221,6 +1587,45 @@ slots the last checkpoint filled. Therefore:
   marked allocated;
 - a cataloged shard with *no* valid allocation copy refuses attach
   (offline repair territory), as does a missing data file.
+
+Record layouts (notation in §21). A shard's allocation map is stored A/B as
+`data/shard-<index>.alloc.a` and `data/shard-<index>.alloc.b`, with `<index>`
+written as for the data file (§14):
+
+```text
+magic[8] = MAKIALC1
+version u32 = 1
+generation u64
+units u64               units_per_shard
+bitmap[ceil(units / 8)]
+crc32
+```
+
+Unit `u` of the shard (`0 <= u < units`) is bit `u % 8` of bitmap byte
+`u / 8`, counting from the least significant bit: unit 0 is `0x01` of byte 0
+and unit 9 is `0x02` of byte 1. A set bit means allocated. The bits of the
+last byte beyond `units` name no unit; writers leave them clear and readers
+ignore them. `units` is the volume's `units_per_shard` in every shard, so a
+copy is `32 + ceil(units_per_shard / 8)` bytes; attach accepts no map of
+another size.
+
+The discard map of an envelope-v3 volume (§21) is stored A/B as
+`data/shard-<index>.discard.a` and `data/shard-<index>.discard.b`. It is the
+same record, with the same magic, version and bit order; a set bit marks a
+discarded unit.
+
+The shard catalog (`shard-catalog.a`, `shard-catalog.b`):
+
+```text
+magic[8] = MAKICAT1
+version u32 = 1
+generation u64
+count u32               at most 2^24
+shard_index u64         count times, in strictly ascending order
+crc32
+```
+
+A copy is `28 + 8 * count` bytes. Both decoders refuse trailing bytes.
 
 ---
 
@@ -1263,6 +1668,49 @@ next_sequence
 appended_sequence
 durable_sequence
 active_segment
+```
+
+On-disk layout (record notation in §21). A segment is the file
+`journal/seg-<index>`, with its index written as 16 lowercase hexadecimal
+digits. It begins with a 48-byte header:
+
+```text
+magic[8] = MAKIJSG1
+version u32 = 1
+segment_index u64       the index in the file name
+volume_uuid[16]
+base_sequence u64       sequence of the segment's first record
+crc32
+```
+
+Records follow the header back to back, their sequences increasing by one
+from `base_sequence`; the first record of a volume has sequence 1. A record is
+a 32-byte header followed by its payload, the ciphertext of one unit:
+
+```text
+magic[4] = MJR1
+sequence u64
+unit_index u64
+payload_len u32         at most max_ciphertext_size (itself at most 16 MiB)
+payload_crc u32         CRC-32 of the payload
+header_crc u32          CRC-32 of the 28 header bytes before it
+payload[payload_len]
+```
+
+The record header has no version field: its magic, which ends in the format
+version `1`, is its only format identifier. On an envelope-v3 volume a record
+with an empty payload discards its unit.
+
+The advisory durable mark (`journal/durable-mark`, §21) is 32 bytes. It names
+the prefix of one segment file, bytes `[0, durable_size)`, that a data sync
+covered:
+
+```text
+magic[8] = MAKIJDM1
+version u32 = 1
+segment_index u64
+durable_size u64
+crc32
 ```
 
 ---
@@ -1386,6 +1834,20 @@ wait behind that write instead of appending into it, so concurrent writers
 cannot turn a reclaimable bound into ENOSPC. A failed checkpoint
 MUST be visible as a degraded volume state until a later checkpoint succeeds.
 
+Checkpoint state is the A/B record `checkpoint/state.a` and
+`checkpoint/state.b`, exactly 32 bytes (record notation in §21):
+
+```text
+magic[8] = MAKICKP1
+version u32 = 1
+generation u64
+checkpoint_sequence u64
+crc32
+```
+
+Every journal record with a sequence at or below `checkpoint_sequence` has
+been applied by a checkpoint.
+
 ---
 
 # 27. Recovery
@@ -1397,7 +1859,7 @@ acquire volume lock
  ↓
 select valid superblock
  ↓
-require envelope v2 and load valid durable proof (both missing/invalid = error)
+require envelope v2 or v3 and load valid durable proof (both missing/invalid = error)
  ↓
 read shard catalog and allocation metadata
  ↓
@@ -1498,6 +1960,19 @@ the same compatibility ID therefore refuses attach; for unauthenticated
 ciphers this comparison is the only wrong-key detection. A volume that holds
 data but no canary is probed by decrypting one existing unit with an
 integrity-capable provider; without integrity it MUST refuse attach.
+
+The canary record (record notation in §21):
+
+```text
+magic[8] = MAKICNY1
+version u32 = 1
+generation u64
+volume_uuid[16]
+unit_index u64          the reserved index, 0x0010_0000_4D41_4B49
+ciphertext_len u32      at most 16 MiB
+ciphertext[ciphertext_len]
+crc32
+```
 
 ---
 
@@ -1717,26 +2192,39 @@ ciphertext encrypted by B must decrypt on A
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
 An endpoint that is unreachable when these self-tests run at attach is
-quarantined. A quarantined endpoint MUST NOT receive a request until
+quarantined. A quarantined endpoint MUST NOT serve a volume request until
 the same validation, run against a validated endpoint under the real volume
-context, succeeds in full. The set's common contract covers every configured
-endpoint, quarantined ones included, so admitting one never changes it.
+context, succeeds in full; the validation itself sends it requests. The set's
+common contract covers every configured endpoint, quarantined ones included,
+so admitting one never changes it.
 
 Validation evidence is either conclusive or inconclusive:
 
 ```text
 conclusive (excluded for the life of the set):
   replies that passed validation show another key (either peer
-  refuses or misdecrypts the other's ciphertext, or the volume canary
-  is refused or decrypts to the wrong plaintext), another
-  compatibility id, or a claimed capability that is not honoured; an
-  explicit refusal of the volume's real context
+  refuses the other's ciphertext, or the candidate the volume canary,
+  with a definitive integrity failure, or decrypts it to the wrong
+  plaintext), another compatibility id, or a claimed capability that
+  is not honoured; an explicit refusal of the volume's real context
 
 inconclusive (validated again later):
   a transport error, timeout or admission limit; a reply that does
-  not parse, is truncated or has the wrong shape; any other failure
-  of the validated peer
+  not parse, is truncated or has the wrong shape; a request refused
+  without an integrity failure (a generic bad request) or a fatal
+  error that the endpoint's own provider reports, by either peer and
+  whatever the request, a negative self-test probe included; any
+  other failure of the validated peer
 ```
+
+A definitive integrity failure is `CryptoError::Integrity`, the evidence a
+negative self-test probe requires (§18); a generic refusal, such as an HTTP
+4xx that the transport does not classify as one, never is. This distinction
+applies to validation after attach. At attach an endpoint whose self-test or
+cross-endpoint check fails with anything but a transport failure refuses the
+attach: there a generic refusal of a negative probe leaves the capability
+unproven, and one of the other endpoint's ciphertext leaves the pair
+unproven.
 
 After an inconclusive attempt the endpoint stays quarantined and is
 validated again after `open_initial`; the spacing doubles after each further
@@ -1860,9 +2348,12 @@ zram configured to write back to an unencrypted device
 any swap device that cannot be classified (the check fails closed)
 ```
 
-The daemon decides by what a swap device *is* (`/dev/zramN` and its
-`backing_dev`, the device-mapper UUID), never by its name, and refuses to
-attach when `/proc/swaps` cannot be read or parsed.
+The daemon enforces this at attach only with
+`security.require_secure_swap_policy = true` (default `false`; the §57 example
+enables it); without it no swap check runs. When enforcing, it decides by what
+a swap device *is* (`/dev/zramN` and its `backing_dev`, the device-mapper
+UUID), never by its name, and refuses to attach when `/proc/swaps` cannot be
+read or parsed.
 
 ---
 
@@ -1923,7 +2414,13 @@ for compatibility; that does not establish the filesystem UUID match required
 by this production profile. The filesystem probe follows LVM activation.
 The separate pre-activation check compares independently probed PV labels
 with complete LVM metadata and scopes the helper's activation to verified
-NBD candidates and the discovered VG UUID. For the production profile, the
+NBD candidates and the discovered VG UUID. Detach and recovery MUST deactivate
+the VG within the same scope, as the trusted record holds it: its candidate
+devices and, where the record names it, its VG UUID. Growth MUST extend the LV
+within the recorded candidate devices, after the live check that the mapping
+is the recorded one; `lvextend` cannot select a VG by UUID. These commands
+MUST NOT resolve the VG name over the host's own LVM device scan, where
+another disk's VG can carry the same name. For the production profile, the
 root-owned attachment configuration MUST also provide the complete PV UUID set,
 VG UUID and configured target-LV UUID in `[lvm_identity]`; any mismatch MUST
 refuse activation. These administrator pins are part of the trusted attachment
@@ -2030,7 +2527,8 @@ exclude adapter work before Engine entry. `maki_journal_sync_seconds` measures
 explicit storage barriers, including failures and background/inline barriers;
 automatic segment-roll syncs remain inside overall request duration. Existing
 `maki_flush_seconds` and `maki_fua_seconds` retain successful storage-only sample
-semantics. Latency series expose sum/count/max; monitoring samples need not be
+semantics. These latency series expose sum/count/max, and
+`maki_crypto_latency_seconds` sum/count; monitoring samples need not be
 transactional across independent counters.
 
 High-cardinality identifiers such as LBA and request IDs MUST NOT be used as metric labels.
@@ -2093,15 +2591,23 @@ retry sleeps do not retain scarce permits
 
 Configuration and binary metadata decoders MUST reject malformed input without
 panicking. Geometry uses checked arithmetic. Superblocks, allocation maps,
-shard catalogs, slots, journal records, and checkpoint state use versioned,
-CRC-protected encodings with frozen golden vectors.
+shard catalogs, slots, journal records, and checkpoint state use
+CRC-protected encodings with frozen golden vectors. Superblocks, allocation
+and discard maps, shard catalogs, checkpoint state, durable proofs, key
+canaries, journal segment headers and the durable mark carry a `version`
+field after their magic. Slot headers and journal record headers have none:
+their magic (`MAKISLT1`, `MJR1`) is their only format identifier. The layouts
+are given in §14, §21–§23, §26 and §27.
 
 A/B metadata MUST fall back to the highest valid generation. Each store advances
 a generation by one; recovery and the deep check MUST refuse, before any
 recovery write, A/B metadata (superblock, shard catalog, allocation and discard
 maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
-is above `u64::MAX - 2^62`. Torn final journal tails may be truncated;
-corruption before a valid successor record MUST refuse recovery.
+is above `u64::MAX - 2^62`. Torn final journal tails may be truncated. Damage
+inside a non-final segment, or inside the part of the final segment that the
+durable proof or the durable mark covers, MUST refuse recovery. Beyond that
+part, a record that fails its checksum is a torn tail whether or not an intact
+record follows it (§27).
 
 ---
 

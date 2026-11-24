@@ -1,7 +1,14 @@
 //! Local or quorum-backed witness process. Initialization is always explicit.
+
+// Output goes through `diagnostic!` and the stdout helpers below: the
+// `print!` family panics when a write fails (a closed pipe, a full disk),
+// which replaces the exit status with 101.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use maki_backing::remote_witness::{Action, Record, Request, Role, Rpc, StateStore};
@@ -13,8 +20,19 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use uuid::Uuid;
 
-const HELP: &str = "maki-witness init STATE_DIRECTORY VOLUME_UUID\nmaki-witness init-etcd ETCD_CONFIG.toml VOLUME_UUID\nmaki-witness serve SERVER_CONFIG.toml\nmaki-witness inspect CLIENT_CONFIG.toml\nmaki-witness fingerprint CERTIFICATE.pem\n\ninit and init-etcd refuse existing state; serve never initializes missing state.\nserve requires exactly one state_dir or pinned etcd quorum configuration.\nTLS 1.3 and certificate allow-list authentication are mandatory.\n";
+const HELP: &str = "maki-witness init STATE_DIRECTORY VOLUME_UUID\nmaki-witness init-etcd ETCD_CONFIG.toml VOLUME_UUID\nmaki-witness serve SERVER_CONFIG.toml\nmaki-witness inspect CLIENT_CONFIG.toml\nmaki-witness fingerprint CERTIFICATE.pem\nmaki-witness --help | --version\n\ninit and init-etcd refuse existing state; serve never initializes missing state.\nserve requires exactly one state_dir or pinned etcd quorum configuration.\nTLS 1.3 and certificate allow-list authentication are mandatory.\n";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// `eprintln!` that cannot panic. The macro panics when the write fails,
+/// and stderr can be a pipe whose reader has gone: the panic would replace
+/// the command's exit status with 101. A diagnostic that cannot be
+/// delivered is dropped instead.
+macro_rules! diagnostic {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +110,21 @@ fn inspect_request() -> Request {
     }
 }
 
+/// Print what a command reports. A reader that has gone (`| head -1`) has
+/// what it wanted, so a closed pipe is not an error; `println!` would panic
+/// on it and replace the exit status with 101. Any other failure to write
+/// is the command's failure.
+fn print_result(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(io::Error::new(
+            error.kind(),
+            format!("writing the output failed: {error}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn report_initialization(record: &Record) -> io::Result<()> {
     let json = serde_json::to_string(record)?;
     let mut stdout = io::stdout().lock();
@@ -106,16 +139,34 @@ fn report_initialization(record: &Record) -> io::Result<()> {
     Ok(())
 }
 
-fn run(args: &[String]) -> io::Result<()> {
+/// Why a command did not complete.
+enum Failure {
+    /// The command line was refused before anything was done (status 2,
+    /// as in the other binaries).
+    Usage(String),
+    /// The command failed (status 1).
+    Failed(io::Error),
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn volume_identity(text: &str) -> Result<Uuid, Failure> {
+    Uuid::parse_str(text).map_err(|_| Failure::Usage("volume identity must be a UUID".into()))
+}
+
+fn run(args: &[String]) -> Result<(), Failure> {
     match args {
-        [help] if help == "--help" || help == "-h" => print!("{HELP}"),
+        [help] if help == "--help" || help == "-h" => print_result(HELP)?,
+        // BUG-112: every deployed binary reports its revision.
+        [version] if version == "--version" || version == "-V" => {
+            print_result(concat!("maki-witness ", env!("CARGO_PKG_VERSION"), "\n"))?;
+        }
         [command, directory, identity] if command == "init" => {
-            let identity = Uuid::parse_str(identity).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "volume identity must be a UUID",
-                )
-            })?;
+            let identity = volume_identity(identity)?;
             let mut store = StateStore::create(Path::new(directory), *identity.as_bytes())?;
             let record = store.handle(Role::Admin, &inspect_request())?;
             report_initialization(&record)?;
@@ -126,13 +177,16 @@ fn run(args: &[String]) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "serve requires exactly one local or etcd authority",
-                ));
+                )
+                .into());
             }
             // Each pending handshake and worker holds descriptors; systemd's
             // default soft limit of 1024 is reachable at max_connections =
             // 256 (BUG-124 raised it for the other binaries).
             if let Err(error) = maki_backing::raise_open_file_limit() {
-                eprintln!("maki-witness: warning: cannot raise the open-file soft limit: {error}");
+                diagnostic!(
+                    "maki-witness: warning: cannot raise the open-file soft limit: {error}"
+                );
             }
             // Validate credentials before opening state; never create state during serve.
             let server = Arc::new(Server::new(config.server)?);
@@ -144,17 +198,15 @@ fn run(args: &[String]) -> io::Result<()> {
                 )?)
             };
             let listener = TcpListener::bind(config.listen)?;
-            println!("maki-witness listening {}", listener.local_addr()?);
-            io::stdout().flush()?;
+            // Nobody reading the address is no reason not to serve.
+            print_result(&format!(
+                "maki-witness listening {}\n",
+                listener.local_addr()?
+            ))?;
             server.serve(listener, handler)?;
         }
         [command, path, identity] if command == "init-etcd" => {
-            let identity = Uuid::parse_str(identity).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "volume identity must be a UUID",
-                )
-            })?;
+            let identity = volume_identity(identity)?;
             let store = EtcdStore::create(
                 read_config::<EtcdOptions>(Path::new(path))?,
                 *identity.as_bytes(),
@@ -165,20 +217,42 @@ fn run(args: &[String]) -> io::Result<()> {
         [command, path] if command == "inspect" => {
             let client = Client::new(read_config::<ClientOptions>(Path::new(path))?)?;
             let record = Rpc::call(&client, &inspect_request())?;
-            serde_json::to_writer(io::stdout().lock(), &record)?;
-            println!();
+            let json = serde_json::to_string(&record).map_err(io::Error::from)?;
+            print_result(&format!("{json}\n"))?;
         }
         [command, path] if command == "fingerprint" => {
-            println!("{}", certificate_file_fingerprint(Path::new(path))?);
+            print_result(&format!(
+                "{}\n",
+                certificate_file_fingerprint(Path::new(path))?
+            ))?;
         }
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP)),
+        _ => return Err(Failure::Usage(HELP.into())),
     }
     Ok(())
 }
 
-fn main() {
-    if let Err(error) = run(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        eprintln!("maki-witness: {error}");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    // `std::env::args` panics on an argument that is not UTF-8 (status
+    // 101). Such an argument is misuse, as in `maki`: the state directory
+    // and the certificates are also named in configuration files, which are
+    // UTF-8.
+    let Ok(args) = std::env::args_os()
+        .skip(1)
+        .map(OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        diagnostic!("maki-witness: command-line arguments must be valid UTF-8");
+        return ExitCode::from(2);
+    };
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Usage(message)) => {
+            diagnostic!("maki-witness: {message}");
+            ExitCode::from(2)
+        }
+        Err(Failure::Failed(error)) => {
+            diagnostic!("maki-witness: {error}");
+            ExitCode::FAILURE
+        }
     }
 }

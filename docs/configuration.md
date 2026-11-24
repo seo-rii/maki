@@ -20,14 +20,24 @@ HTTP example is available at
 | `limits` | Request, byte, queue, batch, endpoint concurrency, and in-memory overlay bounds |
 | `backing` | Backing root, slot alignment, journal sizing, and reserves |
 | `backing.rollback_protection` | Experimental Linux COW format: preallocated logical-page `capacity` and exactly one independent local `witness_root` or mTLS `remote` authority (new volumes only; [remote service](remote-witness-service.md)) |
-| `cache` | Read-cache mode, size, TTL, locking, and zeroization |
+| `cache` | Read-cache mode, size, TTL, and hit verification (`lock_memory` and `zeroize_on_evict` are accepted but select nothing; see [read cache](#read-cache)) |
 | `nbd` | Socket, negotiated I/O geometry, and Tokio runtime worker count |
 | `control` | Administrative socket and group |
 | `security` | Core-dump, memory-lock, and secure-swap policy |
 
-Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`.
+Byte sizes use values such as `4096`, `256KiB`, `64MiB`, or `16TiB`: a bare
+integer number of bytes, or a quoted string with the unit `B`, `KiB`, `MiB`,
+`GiB` or `TiB`. Nine byte-valued keys are plain integers and take only the
+bare number (`4096`, never `"4KiB"`): `volume.device_block_size`,
+`volume.crypto_unit_size`, `crypto.random_prefix_bytes`,
+`crypto.capabilities.supported_plaintext_sizes`,
+`crypto.capabilities.max_ciphertext_size`, `backing.slot_alignment`,
+`nbd.device_block_size`, `nbd.minimum_io` and `nbd.preferred_io`. A string
+there is a schema error, reported with its line and column only.
 Durations use values such as `150us`, `50ms`, `5s`, or `2m` (minutes), always
 as a quoted string with a unit. Unlike byte sizes, a bare integer is rejected.
+(The remote witness `timeout_ms` is not such a duration: it is an integer
+number of milliseconds.)
 
 `volume.name` is an operational identifier of 1–64 ASCII bytes, using only
 letters, digits, `_` and `-`, and must not start with `-`, matching the
@@ -132,9 +142,27 @@ before the backing or a remote witness changes. Enable the `fake-provider`
 feature of `maki-nbdkit` only for development and benchmark builds.
 
 All three remote transports verify server certificates and the hostname in the
-endpoint URL. The TLS section is optional when system/default trust is enough.
-A custom `ca_file` adds trust; it does not disable the built-in roots. There is
-no certificate-verification bypass setting.
+endpoint URL, and all three trust the same roots:
+
+- the host's trust store: the system CA bundle, or the files that
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` name when either is set. It is read best
+  effort: a missing store adds nothing and a certificate in it that does not
+  parse is skipped;
+- the public roots compiled into the binary (the `webpki-roots` set);
+- the certificates of a configured `ca_file`, which add to the other two and
+  replace neither. Every certificate in it must parse, and a file without one
+  is refused at attach.
+
+The TLS section is therefore optional when the endpoint's chain leads to a
+public root or to a private CA installed in the host's trust store. Because the
+compiled-in roots are always there, a provider is built even on a host whose
+trust store is empty; an endpoint that none of the roots vouches for is refused
+at the TLS handshake. The roots are read when the provider is built at daemon
+start, so a CA added to the host's store later takes effect at the next
+restart (a WebSocket provider without a TLS section also reads the host's
+store again for each new connection). There is no certificate-verification
+bypass setting. The [remote witness](#remote-witness-endpoint-sets) is
+different: it trusts only its own `ca_file`.
 
 For example, a WebSocket endpoint with private-CA trust and mutual TLS uses:
 
@@ -210,8 +238,9 @@ Beyond schema, geometry, and secret-literal checks validation rejects:
   negative `retry_ratio`, a `minimum_probe_rate` outside `(0, 1000]/s` or whose reciprocal cannot
   be represented by `Duration`, an
   `initial_delay` above `max_delay`, an `open_initial` above `open_max`, batch
-  targets above their maxima, or a batch byte limit smaller than one crypto
-  unit;
+  targets above their maxima, or a `crypto.batch.max_bytes` smaller than one
+  provider plaintext unit (`volume.crypto_unit_size +
+  crypto.random_prefix_bytes`);
 - a retry strategy other than `exponential-full-jitter`, a
   `capabilities.mode` other than `declared`, `availability_policy = "bounded-error"` without a
   positive `max_operation_time`, and a `security.memory_lock_mode` outside
@@ -476,6 +505,9 @@ configured pointer reaches are validated but not kept, so the size limit also
 bounds the memory a response takes, not only its wire bytes.
 Transport error messages omit the request URL, including its query values,
 for connection failures, timeouts, and response-body failures.
+How each response status is classified, and the `maki-crypto-error` header
+that reports an integrity failure or a context refusal, is listed under
+[provider error signals](#provider-error-signals).
 
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
@@ -489,8 +521,15 @@ when available, and establish throughput and tail latency with the
 WebSocket uses one JSON request per text frame with a correlation ID. Unknown or
 stale response IDs are discarded; a binary frame, a text frame that is not JSON,
 or a response without a numeric ID breaks the contract and fails every request
-on that connection at once as a contract error. Ping and pong frames are
-ignored, and a close frame ends the connection. Pending requests are scoped to a connection
+on that connection at once as a contract error. An `integrity` or
+`unsupported-context` error frame whose envelope is not exact (see
+[provider error signals](#provider-error-signals)) fails only the request it
+answers, as a contract error, and that request is not sent again; the
+connection then takes no new request and is released once the requests already
+on it finish, as after a cancelled request (below). Any other malformed answer
+to one request, such as an unknown error class or reason or a missing item, is
+a contract error for that request and leaves the connection in use. Ping and
+pong frames are ignored, and a close frame ends the connection. Pending requests are scoped to a connection
 generation, and both inbound and outbound frame sizes are bounded. Each
 response item must carry the `unit` of the request item it answers, in request
 order; a missing, reordered, or mislabelled item is a contract error.
@@ -562,17 +601,22 @@ budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
 owns these validation tasks and cancels them when its final owner is dropped.
 Only proof that the candidate serves another contract excludes it until the
 daemon restarts (`rejected: true` in its status): another key (either endpoint
-refuses or misdecrypts the other's ciphertext, or the volume canary fails
-authentication or decrypts to the wrong plaintext), another compatibility id,
-a claimed capability it does not honour, or an explicit refusal of the
-volume's context. Anything else shows only that an exchange failed and is
-inconclusive: a transport error or timeout, a reply that does not parse or is
-truncated (a proxy error page, an endpoint restarting mid-response) from
-either endpoint, or any other failure of the validated reference. The
+refuses the other's ciphertext with an integrity failure or decrypts it to the
+wrong plaintext, or the candidate does so with the volume canary), another
+compatibility id, a claimed capability it does not honour, or an explicit
+refusal of the volume's context. Anything else shows only that an exchange
+failed and is inconclusive: a transport error or timeout, a reply that does
+not parse or is truncated (a proxy error page, an endpoint restarting
+mid-response) or a request refused without an integrity failure (a generic 4xx
+such as 400 or 421, a WebSocket `bad-request`, a gRPC `InvalidArgument`) from
+either endpoint, whatever the request, or any other failure of the validated
+reference. The
 candidate then stays quarantined and is validated again after
 `circuit_breaker.open_initial`, the spacing doubling after each further
 inconclusive attempt up to `circuit_breaker.open_max`; it serves only once a
-later validation succeeds in full.
+later validation succeeds in full. Attach itself is stricter: a generic
+refusal of a tamper or context probe, or of the other endpoint's ciphertext,
+refuses the attach.
 HalfOpen breaker probes return their admission slots on every exit, including
 operation deadlines, cancellation, request/provider errors, and refusal by the
 retry budget. These neutral outcomes leave the endpoint's failure count
@@ -608,6 +652,142 @@ details (`grpc-status-details-bin`) are discarded before the status is read:
 an error's class follows only its `grpc-status` code and `maki-crypto-error`
 metadata, and text or details that do not decode neither change that class nor
 turn an OK status into an error.
+
+## Provider error signals
+
+A remote provider reports a failure through its transport's status, never
+through text: an HTTP error body, a gRPC status message or its details, and a
+WebSocket `error.message` are ignored. This section lists every signal the
+transports recognise and the error each becomes
+([SPEC §18](../SPEC.md#18-remote-crypto) is normative).
+
+Two failures carry an explicit token:
+
+| Failure | Token | Meaning |
+|---|---|---|
+| Integrity | `auth-tag-mismatch` | The ciphertext failed authentication |
+| Integrity | `context-mismatch` | The ciphertext is not bound to the context it was presented under |
+| Context refusal | `unsupported-format-version` | The provider does not accept the request's format version |
+| Context refusal | `unsupported-compatibility-id` | The provider does not accept the request's compatibility ID |
+
+| Transport | Where the token goes |
+|---|---|
+| HTTP | Status 422 with exactly one `maki-crypto-error` response header whose value is the token |
+| gRPC | Status `FailedPrecondition` with exactly one `maki-crypto-error` metadata value |
+| WebSocket | `{"id": n, "error": {"class": "integrity", "reason": "<token>"}}`, or `"class": "unsupported-context"` for a context refusal |
+
+A token is compared exactly. A missing, unknown, repeated or comma-joined
+value, or a token on any other HTTP or gRPC status, is not one of these
+signals: the response is classified by its status alone. A WebSocket frame
+that repeats a member is read from its last occurrence, so its class is the
+last `class` of its last `error`. An `integrity` or `unsupported-context`
+class selected this way is a contract error when its `reason` is absent, is
+not a string or is not one of that class's two tokens, or when the frame
+repeats `id`, `error`, `class` or `reason`.
+
+In each table below a row applies only when no row above it does.
+
+| HTTP response | Error |
+|---|---|
+| 2xx | None; the body must satisfy the response mapping, or it is a contract error |
+| 422 with exactly one `maki-crypto-error` header, holding a token | Integrity failure or unsupported context, by the token |
+| 429 | Throttled |
+| 408 | Retryable |
+| 3xx, 401, 403, 404, 405, 407, 410 | Endpoint failure; a redirect is never followed |
+| Any other 4xx, such as 400, 409, 413 or a 422 without one token | Request error |
+| Any other status, such as 500, 502, 503 or 504 | Retryable |
+
+| gRPC status | Error |
+|---|---|
+| `OK` | None; the reply must be one message that answers the request's items, or it is a contract error |
+| `FailedPrecondition` with exactly one `maki-crypto-error` metadata value, holding a token | Integrity failure or unsupported context, by the token |
+| `ResourceExhausted` | Throttled |
+| `Unauthenticated`, `PermissionDenied`, `Unimplemented` | Endpoint failure |
+| `InvalidArgument`, `NotFound`, `OutOfRange`, any other `FailedPrecondition` | Request error |
+| Any other status: `Unavailable`, `DeadlineExceeded`, `Aborted`, `Internal`, `Cancelled`, `Unknown`, `AlreadyExists`, `DataLoss` | Retryable |
+
+A gRPC response with an HTTP status other than 200 and no `grpc-status`, such
+as a proxy's error page, is classified by that HTTP status: 401, 403 and 404
+are endpoint failures and every other status is retryable.
+
+| WebSocket `error.class` | Error |
+|---|---|
+| `integrity` with one of its two `reason` tokens | Integrity failure |
+| `unsupported-context` with one of its two `reason` tokens | Unsupported context |
+| `throttled` | Throttled |
+| `retryable` | Retryable |
+| `bad-request` | Request error |
+| Anything else, a missing class included | Contract error |
+
+A WebSocket error frame cannot report an endpoint failure. The upgrade that
+opens a connection can, as described [above](#websocket-and-grpc-contracts).
+
+A failure without such an answer is classified the same way on all three
+transports: a timeout or a lost connection, also one that cuts a reply short,
+is retryable, and a TLS authentication or protocol failure is an endpoint
+failure. On an established connection, a reply that breaks the framing of the
+transport's messages or its size limit (`max_response_bytes`,
+`max_message_bytes`, `max_frame_bytes`) is a contract error: an HTTP/1.1
+response head or chunked body that does not parse, or a body that only the
+connection's close ends; a gRPC message whose length prefix, count or final
+status breaks the gRPC protocol, or a stream that ends inside a message; a
+WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
+with a numeric ID. Two protocol failures are classified otherwise:
+
+- A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
+  upgrade headers or with the wrong accept key, a status below 300 or above
+  599, a head that is not HTTP) is an endpoint failure, like a refused upgrade.
+  An upgrade reply cut short by a lost connection is retryable.
+- An HTTP/2 error under a gRPC call, a reset stream or a GOAWAY, becomes the
+  gRPC status that the gRPC library derives from it and is classified by the
+  gRPC table above. A reset, and a GOAWAY that refuses the call (its last
+  stream ID is below the call's stream, so the server did not process it), is
+  classified by its error code: `ENHANCE_YOUR_CALM` is throttled
+  (`ResourceExhausted`; a gRPC server's keepalive policy sends it to a client
+  that pings too often), `INADEQUATE_SECURITY` is an endpoint failure
+  (`PermissionDenied`), and every other code is retryable. A GOAWAY that
+  accepted the call and then closes the connection under it is retryable
+  whatever its code. Either way the request was handed to the connection and
+  counts as sent, so a call that a GOAWAY refused is sent to another endpoint
+  only when the provider is `retry_safe`. The next call opens a new
+  connection.
+
+Each error's message carries a fixed prefix, and the dispatcher handles each
+kind differently:
+
+| Error | Message prefix | What the dispatcher does |
+|---|---|---|
+| Retryable | `retryable:` | Counts a failure on the endpoint's circuit breaker, fails over to another endpoint, then retries with backoff under the availability policy |
+| Throttled | `throttled:` | The same as retryable, with no extra backoff |
+| Endpoint failure | `endpoint fatal:` | Opens the endpoint's circuit at once; the request fails over like a retryable one |
+| Request error | `non-retryable request:` | Fails the operation at once: no retry, no failover, no breaker charge |
+| Integrity failure | `integrity failure:` | The same as a request error |
+| Unsupported context | `unsupported crypto context:` | Fails the operation at once: no retry, no failover, no breaker charge |
+| Contract error | `provider contract violation:` | Counts a failure on the breaker and never sends this operation to that endpoint again; it moves to another validated endpoint only when the provider is `retry_safe` |
+
+With `retry_safe = false`, a retryable, throttled or endpoint-failure error on
+a request that may have been sent is returned without another attempt (see
+[above](#websocket-and-grpc-contracts)).
+
+At attach, a provider that declares `integrity` or `context_binding` is
+given negative probes: a tampered ciphertext to decrypt, and an intact one to
+decrypt under a changed unit index, volume UUID, format version or
+compatibility ID. Only these answers pass:
+
+| Probe | Passes with |
+|---|---|
+| Tampered ciphertext (`integrity`) | An integrity failure. Any successful reply fails the probe, whatever plaintext it carries |
+| Changed unit index or volume UUID (`context_binding`) | An integrity failure, or a well-formed reply whose plaintext differs from the original |
+| Changed format version or compatibility ID (`context_binding`) | The same, or a context refusal that names the changed field |
+
+A retryable, throttled or endpoint-failure answer to a probe is inconclusive:
+the endpoint is quarantined, or the attach fails when no other endpoint is
+reachable. A contract error fails the self-test and the attach. Any other
+answer, such as a 400, a 422 without a token, a gRPC `InvalidArgument` or a
+WebSocket `bad-request`, refuses the attach, because the declared capability
+was not proven. The cross-endpoint check reads a refusal the other way: an
+endpoint that answers another endpoint's ciphertext with an integrity failure
+or a request error is not interchangeable with it, and the attach is refused.
 
 ## Backing directory identity
 
@@ -681,7 +861,12 @@ outside the configured constraints fail cleanly.
 
 `cache.mode = "read"` keeps decrypted units in a versioned LRU keyed by
 `(unit, write_sequence)`, bounded by `cache.max_bytes` and `cache.ttl`, with
-entries in zeroizing (and, with `lock_memory`, page-locked) buffers. A read
+entries in zeroizing buffers that are page-locked as
+`security.memory_lock_mode` selects. `cache.lock_memory` and
+`cache.zeroize_on_evict` are accepted but select neither: an entry is zeroized
+when its last owner drops it whatever `zeroize_on_evict` says, and
+`lock_memory = false` does not unlock entries (validation only refuses
+`lock_memory = true` with `memory_lock_mode = "off"`). A read
 first establishes each unit's current version — the overlay entry, or the
 64-byte slot header — and serves a hit without reading the ciphertext
 payload or calling the provider; a miss reads, verifies and decrypts the
@@ -829,7 +1014,8 @@ space.
 The serving endpoint set is bound to the selected provider plaintext unit:
 `volume.crypto_unit_size + crypto.random_prefix_bytes`. Encrypt inputs and
 decrypt results must match that size even when the provider profile advertises
-other supported sizes. Decrypt batching uses the selected logical plaintext
+other supported sizes, and the set reports that size alone to the layers above
+it. Decrypt batching uses the selected logical plaintext
 size; actual ciphertext bytes still count toward memory and dispatch admission
 limits. A larger unused supported size does not prevent a smaller volume from
 using its valid batch limit.
@@ -848,8 +1034,9 @@ provider call never carries a unit twice. A single request with a repeated unit
 number is rejected before queue admission. So is a request with a unit that the
 dispatcher or the random-prefix wrapper refuses before sending anything: an
 empty ciphertext (a damaged slot can record one), a ciphertext above the
-provider's maximum, or plaintext of a size the provider does not accept. Such a
-request fails alone. A rejection the provider itself returns for a coalesced
+provider's maximum, or plaintext of a size the provider does not accept or
+that is not the selected unit. Such a request fails alone.
+A rejection the provider itself returns for a coalesced
 call reaches each request separately only when the provider is `retry_safe`
 (each request is then re-sent alone); otherwise it reaches every request in
 the call. Each lane keeps up to `limits.max_crypto_inflight_batches`

@@ -96,8 +96,10 @@ JSON pointer lookup along the configured pointers, duplicate last-value-wins
 behavior, number validation and recursion limits are unchanged.
 
 Request mapping keys, credential-value strings and combined identity PEMs still
-have zeroizing ownership without per-allocation page locks. Plain source
-configuration strings and copies made inside reqwest, hyper or the kernel
+have zeroizing ownership without per-allocation page locks. The HTTP provider
+splits a combined identity PEM itself and erases a decoded private key that
+rustls does not take. Plain source configuration strings, the PEM decoder's
+scratch buffer and copies made inside reqwest, hyper, rustls or the kernel
 remain separate owners. The pinned parser and TLS patches described below
 extend erasure to their application-data heap buffers, including unfinished
 escaped strings rejected before the visitor sees them. Admission does not

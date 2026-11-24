@@ -482,8 +482,10 @@ impl Drop for WithoutCapability {
     }
 }
 
+/// An unlink that fails once the tombstone is durable is reported for that
+/// tombstone, and the pass goes on; a later pass finishes it.
 #[test]
-fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current() {
+fn unlink_failure_keeps_the_durable_tombstone_for_a_later_pass_without_touching_current() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, disk) = root();
     // The unlink failure is a directory without write permission, which
@@ -509,9 +511,21 @@ fn unlink_failure_keeps_durable_retirement_and_restarts_without_touching_current
         "a mode-0500 directory must refuse new entries for this test to inject an unlink failure"
     );
     let rpc = authority(&disk, record(3));
-    let result = OperationGuard::acquire(&disk).unwrap().collect(&rpc);
-    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+    let report = OperationGuard::acquire(&disk)
+        .unwrap()
+        .collect(&rpc)
+        .unwrap();
     let retired = format!(".remote-gc-{old}");
+    assert!(report.removed.is_empty());
+    assert_eq!(report.counts.unfinished, 1);
+    assert_eq!(report.unfinished[0].name, retired);
+    assert!(
+        report.unfinished[0]
+            .error
+            .starts_with("unlinking rollback.arena: "),
+        "{:?}",
+        report.unfinished
+    );
     assert!(!disk.exists(&old).unwrap());
     assert!(disk.exists(&format!("{retired}/rollback.arena")).unwrap());
     assert!(disk.exists(&format!("{current}/rollback.arena")).unwrap());

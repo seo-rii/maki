@@ -2362,12 +2362,14 @@ impl VolumeConfig {
         }
         if self.security.madv_dontdump && !self.security.disable_core_dump {
             return Err(invalid(
-                "security.madv_dontdump is honoured through disable_core_dump (a non-dumpable \n                 process writes no core); enable disable_core_dump or set madv_dontdump = false",
+                "security.madv_dontdump is honoured through disable_core_dump (a non-dumpable \
+                 process writes no core); enable disable_core_dump or set madv_dontdump = false",
             ));
         }
         if self.cache.lock_memory && lock == "off" {
             return Err(invalid(
-                "cache.lock_memory requires security.memory_lock_mode = secure-buffers or all \n                 (cache plaintext lives in secret buffers)",
+                "cache.lock_memory requires security.memory_lock_mode = secure-buffers or all \
+                 (cache plaintext lives in secret buffers)",
             ));
         }
         if let Some(budget) = &self.security.memory_budget {

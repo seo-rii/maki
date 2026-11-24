@@ -5,6 +5,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -46,7 +49,7 @@ lock_memory = false
 
 #[test]
 fn maximum_length_name_attaches_writes_and_returns_official_status() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let socket = directory.path().join("control.sock");
     let name = "v".repeat(64);
     let raw = config(&directory.path().join("volume"), &socket, &name);
@@ -83,7 +86,7 @@ fn maximum_length_name_attaches_writes_and_returns_official_status() {
 
 #[test]
 fn an_overlong_name_is_rejected_before_attach_opens_the_backing() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let root = directory.path().join("missing-volume");
     let socket = directory.path().join("control.sock");
     let path = directory.path().join("volume.toml");

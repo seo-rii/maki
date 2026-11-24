@@ -6,6 +6,7 @@ use super::*;
 static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
 struct Fixture(PathBuf);
 
@@ -219,6 +220,8 @@ fn verify_config_loading_pins_trusted_descriptors_and_bounds_content() {
     let owner = fixture.0.metadata().unwrap().uid();
     let config = fixture.0.join("volume.toml");
     std::fs::write(&config, "volume_uuid = 'test'\n").unwrap();
+    // The umask must not decide whether the file is group-writable.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
     let load = || {
         read_config_beneath(
             File::open(&fixture.0).unwrap(),
@@ -296,6 +299,81 @@ impl Drop for PausedChild {
     }
 }
 
+/// The failed-start hook must not queue behind another volume's helper for
+/// as long as that one runs: its lock attempt ends at its deadline, and
+/// succeeds once the lock is free. A wait that gave up holds nothing.
+#[test]
+fn a_bounded_lock_attempt_gives_up_at_its_deadline() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    drop(
+        state
+            .lock_until(Instant::now())
+            .expect("a free lock is taken at once"),
+    );
+    let held = state.lock().unwrap();
+    let started = Instant::now();
+    let error = state
+        .lock_until(started + Duration::from_millis(150))
+        .err()
+        .expect("the lock is held");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let started = Instant::now();
+    assert!(state.lock_until(started).is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // The abandoned request is granted the lock now, and must let it go.
+    drop(held);
+    until(|| state.lock_waiters() == 0);
+    let lock = state
+        .lock_until(Instant::now() + Duration::from_secs(5))
+        .expect("an abandoned lock request kept the lock it was granted");
+    assert!(
+        state.lock_until(Instant::now()).is_err(),
+        "a bounded attempt took a lock that is held"
+    );
+    drop(lock);
+}
+
+/// Wait until `condition` holds, or give up after a few seconds.
+fn until(condition: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !condition() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Helpers wait for the attach lock in a queue that the kernel serves in
+/// order. The failed-start hook's bounded wait must keep its place in it: a
+/// wait that only retried a non-blocking attempt got the lock only once
+/// nobody was queued, so every helper that queued meanwhile overtook it,
+/// and on a host attaching several volumes the hook ran out of time.
+#[test]
+fn a_bounded_lock_wait_is_served_before_helpers_that_queue_after_it() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let held = state.lock().unwrap();
+    let order = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let lock = state.lock_until(Instant::now() + Duration::from_secs(15));
+            order.lock().unwrap().push(("bounded", lock.is_ok()));
+        });
+        until(|| state.lock_waiters() >= 1);
+        scope.spawn(|| {
+            let _lock = state.lock().unwrap();
+            order.lock().unwrap().push(("later", true));
+        });
+        until(|| state.lock_waiters() >= 2);
+        drop(held);
+    });
+    assert_eq!(
+        order.into_inner().unwrap(),
+        [("bounded", true), ("later", true)]
+    );
+}
+
 /// The attach lock is a `flock` on `attach.lock`, which belongs to the open
 /// file description. A command forked meanwhile shares that description until
 /// its `exec`; when releasing only closed the helper's descriptor, the next
@@ -321,5 +399,93 @@ fn a_released_attach_lock_is_free_while_a_forked_child_holds_its_descriptor() {
             "existing={existing}: a released attach lock stayed held for a forked child"
         );
         drop((probe, child));
+    }
+}
+
+/// Allocation asks which devices other volumes' records name. The lock, a
+/// temporary record of a killed write and the asking volume's own record are
+/// not such records.
+#[test]
+fn recorded_devices_of_other_volumes_are_listed_by_device() {
+    let fixture = Fixture::new();
+    let state = fixture.state().unwrap();
+    let _lock = state.lock().unwrap();
+    assert!(state.devices_of_other_volumes("db").unwrap().is_empty());
+    let mut entry = record();
+    state.write(&entry).unwrap();
+    entry.volume = "minio".into();
+    entry.device = "/dev/nbd7".into();
+    state.write(&entry).unwrap();
+    std::fs::write(
+        fixture
+            .0
+            .join("state/.pg.4242.maki-11111111-2222-4333-8444-555555555555.tmp"),
+        b"{\"version\":1,\"vol",
+    )
+    .unwrap();
+
+    let devices = |volume: &str| {
+        state
+            .devices_of_other_volumes(volume)
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        devices("db"),
+        [
+            ("/dev/nbd3".to_string(), "pg".to_string()),
+            ("/dev/nbd7".to_string(), "minio".to_string()),
+        ]
+    );
+    assert_eq!(
+        devices("pg"),
+        [("/dev/nbd7".to_string(), "minio".to_string())]
+    );
+    // The listing follows the held descriptor, not the directory's path.
+    std::fs::rename(fixture.0.join("state"), fixture.0.join("moved")).unwrap();
+    assert_eq!(
+        devices("minio"),
+        [("/dev/nbd3".to_string(), "pg".to_string())]
+    );
+}
+
+/// A `<volume>.nbd` entry that is not a readable trusted record could name
+/// any device: the listing fails and names it instead of leaving it out.
+#[test]
+fn an_unreadable_record_fails_the_listing_and_is_named() {
+    for (name, content, mode) in [
+        ("pg.nbd", b"/dev/nbd3\n".to_vec(), 0o600),
+        ("pg.nbd", serde_json::to_vec(&record()).unwrap(), 0o640),
+        ("minio.nbd", serde_json::to_vec(&record()).unwrap(), 0o600),
+        ("pg vol.nbd", serde_json::to_vec(&record()).unwrap(), 0o600),
+        (".nbd", Vec::new(), 0o600),
+    ] {
+        let fixture = Fixture::new();
+        let state = fixture.state().unwrap();
+        let path = fixture.0.join("state").join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let error = state.devices_of_other_volumes("db").unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("/{name}\"")),
+            "{name:?}: {error}"
+        );
+    }
+    // A symlink and a directory under a record's name are refused too.
+    for obstruct in ["symlink", "directory"] {
+        let fixture = Fixture::new();
+        let state = fixture.state().unwrap();
+        state.write(&record()).unwrap();
+        let path = fixture.0.join("state/minio.nbd");
+        if obstruct == "symlink" {
+            symlink("pg.nbd", &path).unwrap();
+        } else {
+            std::fs::create_dir(&path).unwrap();
+        }
+        assert!(
+            state.devices_of_other_volumes("db").is_err(),
+            "accepted a {obstruct} as a record"
+        );
     }
 }

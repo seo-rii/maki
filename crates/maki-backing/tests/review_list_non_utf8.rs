@@ -6,6 +6,9 @@
 //! entries fall in the directory's order.
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
@@ -55,7 +58,9 @@ fn skipping_listing_returns_each_utf8_name_exactly_and_no_other() {
 #[test]
 fn rollback_enrollment_still_refuses_a_root_holding_a_non_utf8_entry() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     plant(root.path(), b"caf\xe9.bak");
     let error = RollbackBacking::create(root.path(), witness.path(), 64 * 4096)
         .err()

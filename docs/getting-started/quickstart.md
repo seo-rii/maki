@@ -11,7 +11,7 @@ after this page.
 
 Before you start:
 
-- Maki is [installed](installation-debian.md), including `nbd-client` 3.27+.
+- Maki is [installed](installation-debian.md).
 - `/srv/demo` and `/dev/nbd0` are unused. The host has at least 10 GiB free
   under `/var/lib/maki`.
 - You have read the [status page](../status.md): nothing here is
@@ -183,6 +183,10 @@ far is durable. First close every file on the demo mount, verify its identity,
 and unmount while admission is still open: unmount may write filesystem data
 or metadata even after `sync`. Only after unmount succeeds, drain, stop the
 target, and wait for every unit to become inactive before an offline check.
+A drained daemon refuses reads too, LVM's included, so this target stop
+depends on a cleanup fallback that covers only a volume group with one LV, as
+provisioned here; with more LVs, detach before draining
+([planned stop](../operations.md#privileged-helper)).
 For a normal stop without a separate acknowledgement, stop the target directly;
 successful cleanup unmounts before requesting daemon shutdown and final drain.
 If cleanup fails, the daemon stays running for the remaining mount; follow the

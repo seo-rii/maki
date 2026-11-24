@@ -13,6 +13,13 @@ maki \- administer Maki encrypted block volumes
 .B maki
 .I control-command config.toml
 .RI [ options ]
+.br
+.B maki
+.I control-command
+.BI \-\-socket " path"
+.RI [ options ]
+.br
+.BR "maki \-\-help" " | " \-\-version
 .SH DESCRIPTION
 .B volume create
 initializes the backing described by the configuration.
@@ -29,11 +36,26 @@ An attached daemon exposes the
 control commands. Use a volume configuration or specify the control endpoint
 with
 .BI \-\-socket " path" .
+A control command waits up to 60 seconds for the daemon's answer, or 600
+seconds for
+.BR checkpoint " and " drain ;
+.BI \-\-timeout " seconds"
+sets another bound. The
+.BR volume " and " check
+commands accept neither option.
 Draining closes I/O admission and checkpoints the volume.
 .PP
 Run
 .B maki \-\-help
 for the full command list and remote-volume operations.
+.SH EXIT STATUS
+Zero indicates success. A failing check, an error and a request the daemon
+refuses return 1. Invalid command usage, including a malformed option value
+or approval, returns 2 before anything is read.
+.BR attach ", " detach " and " grow
+return 3: they print the
+.B maki-attach
+command to run.
 .SH SEE ALSO
 .BR maki-attach (8),
 .BR maki-check (8)

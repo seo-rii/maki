@@ -10,6 +10,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/witness_config.rs"]
+mod witness_config;
+
 use std::io::{BufRead, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -116,7 +119,7 @@ fn server_config(dir: &Path, state: &Path) -> std::path::PathBuf {
         &serde_json::json!({"state_dir": state, "listen": "127.0.0.1:0", "server": options}),
     )
     .unwrap();
-    std::fs::write(&config, text).unwrap();
+    witness_config::write(&config, text).unwrap();
     config
 }
 

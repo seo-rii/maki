@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import signal
 import subprocess
@@ -23,6 +24,11 @@ def load(name, filename):
 
 class HostContracts(unittest.TestCase):
     def setUp(self):
+        # The entry points under test set the process umask to 0077 for the
+        # files they write; give later tests the caller's umask back.
+        umask = os.umask(0o077)
+        os.umask(umask)
+        self.addCleanup(os.umask, umask)
         self.host = load("gcp_reset_host", "gcp-reset-validation.py")
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -495,10 +501,14 @@ spec=importlib.util.spec_from_file_location("host", {source!r})
 host=importlib.util.module_from_spec(spec); spec.loader.exec_module(host)
 host.record_ack(pathlib.Path({str(self.ledger)!r}), {{"event":"ready"}}, 0, token={"a"*32!r})
 '''
-        result = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, timeout=5)
+        bytecode = (pathlib.Path(source).with_name("__pycache__"), pathlib.Path(source).stem + ".*")
+        for stale in bytecode[0].glob(bytecode[1]):
+            stale.unlink()
+        result = subprocess.run([sys.executable, "-B", "-O", "-c", code], capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"ValueError", result.stderr)
         self.assertFalse(self.ledger.exists())
+        self.assertEqual(list(bytecode[0].glob(bytecode[1])), [], "the child compiled into the checkout")
 
 
 class ResourceIdentityContracts(unittest.TestCase):

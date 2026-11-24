@@ -249,25 +249,55 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
     Ok(disk)
 }
 
-fn require_empty_remote_root(disk: &FileBacking) -> io::Result<()> {
-    if disk
-        .list("")?
-        .iter()
-        .any(|name| !matches!(name.as_str(), super::ENROLL_LOCK | OPERATION_LOCK))
-    {
-        return Err(input("remote enrollment requires an empty backing"));
+/// Refuse a root in which a creation has published anything. What may be
+/// there is what a creation leaves before its format marker is published:
+/// the root locks, the marker under its staging name, and, from a release
+/// that wrote the marker in place, a marker that was created and never
+/// completely written. Such a root holds no namespace, tombstone or binding,
+/// so no volume data and nothing that names a volume, and no authority has
+/// accepted anything in it: a creation claims its authority only once the
+/// marker and the binding are durable. For rollback protection it is an
+/// empty directory. A complete marker is a creation that got further, which
+/// enrollment recovery continues.
+fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
+    for name in disk.list("")? {
+        let unpublished = match name.as_str() {
+            super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
+            MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
+            _ => false,
+        };
+        if !unpublished {
+            return Err(input("remote enrollment requires an empty backing"));
+        }
     }
     Ok(())
 }
 
-/// Called with both root operation and enrollment locks held.
-fn initialize_remote_root(disk: &FileBacking) -> io::Result<()> {
+/// Publish the format marker. Called with both root operation and
+/// enrollment locks held. Until it is published the creation can simply be
+/// run again (`super::publish_marker`).
+fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
     require_empty_remote_root(disk)?;
-    let marker = disk.open(MARKER, true)?;
-    marker.write_at(0, REMOTE_MAGIC)?;
-    marker.set_len(REMOTE_MAGIC.len() as u64)?;
-    marker.sync_data()?;
-    disk.sync_dir("")
+    super::publish_marker(disk, REMOTE_MAGIC)
+}
+
+/// Say what to do with a root that enrollment recovery cannot open because
+/// its creation stopped before the marker was published, while the approved
+/// authority is still one a creation accepts (released, never activated).
+/// Recovery continues a published root with the administrator's approval;
+/// this one needs none. Under a claimed authority a root without a marker
+/// is not an interrupted creation, and keeps its own refusal.
+fn unpublished(root: &Path, expected: &Record, error: io::Error) -> io::Error {
+    let nothing_published = expected.phase == Phase::Released
+        && FileBacking::read_only(root).is_ok_and(|disk| require_empty_remote_root(&disk).is_ok());
+    if !nothing_published {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        "this backing root's creation stopped before it published the format marker: create \
+         the volume again instead of resuming",
+    )
 }
 
 fn collect_after_activation(
@@ -277,7 +307,36 @@ fn collect_after_activation(
 ) {
     // An accepted root is already durable. GC failure postpones reclamation;
     // it must not turn a successful activation into an ambiguous writer loss.
-    let _ = guard.collect_within(rpc, only);
+    // Nothing else reports this pass, and every namespace it leaves behind
+    // keeps a whole arena, so say what it could not do. The events carry
+    // namespace names and error text only.
+    match guard.collect_within(rpc, only) {
+        Ok(report) => {
+            if let Some(first) = report.skipped_unreadable.first() {
+                tracing::warn!(
+                    count = report.counts.skipped_unreadable,
+                    namespace = %first.name,
+                    error = %first.error,
+                    "automatic remote GC kept retired writer namespaces it could not examine; \
+                     `maki volume gc` lists each with its error"
+                );
+            }
+            if let Some(first) = report.unfinished.first() {
+                tracing::warn!(
+                    count = report.counts.unfinished,
+                    namespace = %first.name,
+                    error = %first.error,
+                    "automatic remote GC could not finish retiring writer namespaces; \
+                     `maki volume gc` lists each with its error"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "automatic remote GC did not complete; retired writer namespaces stay on the \
+             backing until a pass completes (`maki volume gc`)"
+        ),
+    }
 }
 
 /// The only manifest a never-activated authority's session can have written:
@@ -519,7 +578,7 @@ impl RollbackBacking {
                 "cannot recover enrollment after its first activation",
             ));
         }
-        let disk = remote_root(root, false)?;
+        let disk = remote_root(root, false).map_err(|error| unpublished(root, expected, error))?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
@@ -816,3 +875,7 @@ impl RollbackBacking {
 #[cfg(test)]
 #[path = "remote_load_tests.rs"]
 mod load_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "remote_creation_tests.rs"]
+mod creation_tests;

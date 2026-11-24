@@ -23,6 +23,11 @@ python3 -B scripts/run_cargo_tests.py --workspace --locked
 cargo test --workspace --release --locked -- --ignored
 ```
 
+CI checks formatting on Linux only: on Windows `cargo fmt --all` hands every
+target's root file to a single rustfmt command line, which the workspace has
+outgrown ("The filename or extension is too long", os error 206). There,
+check one package at a time with `cargo fmt -p <package> --check`.
+
 On Linux, `run_cargo_tests.py` first compiles the same selection with
 `--no-run --message-format=json` and passes the exact reported nbdkit cdylib
 path into the test run. Windows cross-target tests use Cargo's configured
@@ -50,10 +55,12 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 
 | Tier | Trigger | Platform | Enforcement |
 |---|---|---|---|
-| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block |
+| Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block; on Ubuntu the root-only test targets also run as root |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
+| RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
+| etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
 cancel the Windows evidence. The pinned baseline is reproducible; latest stable
@@ -67,16 +74,61 @@ golden format vectors, provider conformance, transport chaos, failpoints,
 manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
 power-loss simulations, and real-process tests for all five binaries (`maki`,
 `maki-attach`, `maki-check`, `maki-benchmark` and `maki-witness`).
-The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, and `libnbd-bin`
-before the workspace tests and checks their executables. This runs the native
-startup, negotiation, drain, process-crash, and ABI regressions instead of relying on optional
-tool availability. Native startup uses disposable files and Unix sockets; it
+The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, `libnbd-bin` and
+`linux-libc-dev` before the workspace tests and checks their executables. This
+runs the native startup, negotiation, drain, process-crash, and ABI regressions
+instead of relying on optional tool availability. The workflow sets
+`MAKI_TEST_REQUIRE_NBDKIT=1` and `MAKI_TEST_REQUIRE_NBD_HEADERS=1`, so the
+helper's NBD handshake tests against nbdkit and its check of the NBD constants
+against the UAPI headers fail there instead of skipping. Native startup uses disposable files and Unix sockets; it
 does not attach a kernel NBD device or mount a filesystem. On developer hosts
 without nbdkit, native cases explicitly report that they were skipped; such a
 run is not native execution evidence.
 The Linux baseline also runs the Python cgroup, Firecracker, and GCE reset
 fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
-campaigns remain opt-in host qualification steps.
+campaigns remain opt-in host qualification steps. The job runs every
+`scripts/test_*.py` (`scripts/test_ci_gate_validation.py` fails for a module
+the workflow would not run) and fails when those suites leave
+`scripts/__pycache__` in the checkout. There, `scripts/test_rpm_package.py`
+also builds the Debian package from the same stub artifacts and compares the
+two packages file by file; `MAKI_TEST_REQUIRE_DPKG_DEB=1` makes a missing
+`dpkg-deb` a failure instead of a skip.
+
+The workspace tests run as the unprivileged runner user. Tests that give a
+fixture to another user, run a binary as the daemon user, enter a private
+mount namespace, set the immutable flag or connect a kernel NBD device print
+why they are skipped there and pass. The Linux baseline therefore loads the
+`nbd` module (from `linux-modules-extra` when the runner's kernel keeps it
+there; the step fails when neither loads) and runs
+`python3 -B scripts/run_root_tests.py --open-build-tree --workspace --locked`
+next. The script reuses the compilation of the workspace run as the runner
+user and starts only the test executables in its `ROOT_TARGETS` list as root
+through `sudo -n`, each with a scratch `TMPDIR` under `/tmp` that other users
+can search and that it removes afterwards. It fails when root is not
+available (nothing is compiled or skipped), when a test that ran as root
+still reports that it needs root, and when the run leaves an entry owned by
+root in the checkout or the build tree. That step sets
+`MAKI_TEST_REQUIRE_NBD=1`, and the script passes it and the other
+`MAKI_TEST_REQUIRE_*` switches on, so the kernel NBD test fails instead of
+skipping there. `--open-build-tree` lets the fixture
+user (uid 65534) reach the built `maki` and `maki-check` binaries, and the
+test executables that re-execute themselves as that user, below a `0750`
+home directory for the duration of the run.
+`scripts/test_root_tests_validation.py` fails for a test source that probes
+its privilege (`geteuid`, a "needs root" notice, `chown`, `unshare`) and is
+neither in `ROOT_TARGETS` nor classified in that test as not needing root, so
+a new root-only test cannot be left out. Run the same command without
+`--open-build-tree` locally as root or as a user with passwordless `sudo`.
+
+Root does not make every host capable. The memory-budget mount-table tests
+reach the final admission check only where root can create a group in a
+single cgroup-v2 hierarchy with the memory controller; elsewhere they compare
+earlier verdicts, which they print, or skip with a notice. The
+immutable-snapshot restore test needs a filesystem under `/tmp` that accepts
+the immutable flag, and the mount-namespace tests need a kernel that lets
+root unshare one; otherwise they print why they skip. The script repeats
+every skip notice at the end of its output, and a run with notices is not
+evidence for the cases they name.
 
 The independent `systemd-lifecycle` job builds the actual `maki-attach` hook
 and runs `scripts/systemd-lifecycle-validation.py` on its disposable runner.
@@ -84,11 +136,41 @@ Random instance units preserve the packaged lifecycle dependency graph; marker
 processes replace storage and workload commands. Cases cover failed start,
 timeout, SIGKILL, refusal of recovery cleanup, a simulated foreign resource,
 start-rate limiting, duplicate start, planned stop, failed stop and cancelled
-startup. The fixture removes only its own unit links and retains case results
+startup. A marker command after the hook checks that no daemon stop precedes
+the end of the attach unit's stop phase, during which the hook rolls back an
+interrupted activation. The fixture removes only its own unit links and retains case results
 and bounded diagnostics as a CI artifact. It does not attach devices or qualify
 the Debian 12 NBD/LVM/XFS stack. The
 [first production campaign](deployment/first-production-candidate.md) requires
 those installed-package and workload results separately.
+
+The `rhel9` job runs in the `quay.io/centos/centos:stream9` container; CentOS
+Stream 9 is the public upstream of RHEL 9. It installs its tools from BaseOS
+and AppStream, plus `nbdkit-devel` from CRB for the ABI header, without EPEL:
+`nbdkit-server` and `nbdkit-basic-plugins` rather than the `nbdkit`
+metapackage the [RHEL guide](getting-started/installation-rhel.md#selinux)
+warns about, and the kernel UAPI headers. It builds the four packaged
+artifacts in release mode against glibc 2.34; runs `review_abi.rs` against
+EL9's `nbdkit-plugin.h`; runs the `maki-privileged`, `maki-attach` and
+`maki-nbdkit` suites through `run_cargo_tests.py` with `--no-fail-fast`, so
+the native tests load Maki's plugin into EL9's nbdkit 1.38; and runs
+`scripts/test_rpm_package.py`. It then builds the real RPM, requires that it
+depends on glibc and on `GLIBC_2.34` symbols, installs it with dnf (its
+`Requires` bring lvm2, xfsprogs and kmod; the metapackage and
+`nbdkit-selinux` must stay absent), checks its files and units (`rpm -V`,
+`systemd-analyze verify`), and requires `rpm -e` to refuse while an
+attachment record exists.
+
+The container's steps run as root, but the workspace, `RUNNER_TEMP` and
+`HOME` belong to the runner's uid 1001. `actions/checkout` trusts the
+workspace only in a temporary git configuration, so the job adds it to root's
+`safe.directory`, and because fixtures that require root-owned ancestors
+closed to others (`regression_mount_target.rs`) refuse the workspace, `HOME`
+and `/tmp`, the tests get a root-owned `0755` `TMPDIR` below `/var/lib`. The
+root-only targets of those crates therefore run inline; those that need a
+private mount namespace or a writable cgroup hierarchy print why they skip
+there, and the Ubuntu job runs them as root. The kernel is the runner's: the
+job covers RHEL 9's userspace, not its kernel, SELinux or an attachment.
 
 The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
 cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
@@ -115,7 +197,7 @@ The current vendored pin is 0.23.46, which includes the subsequent
 `RUSTSEC-2026-0346` through `RUSTSEC-2026-0349` fixes while retaining the local
 plaintext-erasure patch and its allocator-observed regressions.
 
-The scheduled job runs:
+The scheduled `nightly-gates` job runs:
 
 | Test identifier | Workload |
 |---|---|
@@ -129,7 +211,8 @@ The scheduled job runs:
 | `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
 | `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
-| `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on `/dev/shm`) |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
+| `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on a second filesystem) |
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
 without a name filter, so every ignored test runs, including any new gate; the
@@ -137,7 +220,11 @@ without a name filter, so every ignored test runs, including any new gate; the
 one failing gate binary from hiding the result of every binary after it.
 
 Gates that need operator-provided infrastructure refuse to skip, so they are
-compiled only with an opt-in feature and are not part of the scheduled run:
+compiled only with an opt-in feature and are not part of that `-- --ignored`
+run. The etcd gate has its own scheduled job, `etcd-qualification`, which
+installs a digest-pinned etcd v3.6.5 and builds `maki-witness`; no CI job
+provides the delegated cgroup, so the cgroup gate runs only on an operator's
+host:
 
 | Feature | Gate | Requires |
 |---|---|---|
@@ -151,11 +238,19 @@ MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witn
   --test etcd_ha -- --ignored --nocapture
 ```
 
-It also builds the Linux cdylib, verifies the global `plugin_init` symbol,
+The `nightly-gates` job also builds the Linux cdylib, verifies the global
+`plugin_init` symbol,
 installs `nbdkit-plugin-dev` and runs `review_abi.rs`, which compiles a C probe
 against the distribution's `nbdkit-plugin.h` and compares every field offset
 and `NBDKIT_*` constant the shim depends on. The same test runs under WSL
 when the header is installed there, and skips with a message otherwise.
+
+The last step of the `nightly-gates` job builds `maki` alone in release mode
+and requires `maki volume create` to refuse a configuration with
+`provider = "fake"`: the command must fail with `provider "fake" is not
+compiled into this build` and leave no `superblock.a`. The workspace test run
+cannot show this, because feature unification compiles the fake provider into
+`maki-nbdkit` for that crate's own tests.
 
 ## Test model
 
@@ -190,7 +285,13 @@ See [space reclamation](space-reclamation.md) for supported semantics and limits
 `maki-crypto-websocket/tests/wss_tls.rs` and
 `maki-crypto-grpc/src/tls_tests.rs` run local TLS/mTLS peers, verify trust and
 hostname rejection, and preserve the transport request contracts. The WSS suite
-also uses a TLS-1.2-only peer and checks the exact upgrade URI.
+also uses a TLS-1.2-only peer and checks the exact upgrade URI. Each transport
+crate's `tests/review_default_trust.rs` checks the shared default trust against
+servers of three test CAs: one in the host's trust store, one in `ca_file` and
+one in neither, then with the host's store emptied. It points `SSL_CERT_FILE`
+and `SSL_CERT_DIR` at a test bundle, which is process-global, so each is a test
+binary of its own with a single test. Unit tests in the same crates check that
+the roots each transport builds hold every compiled-in public root.
 `maki-nbdkit/tests/review_wss_tls_daemon.rs` and
 `review_grpc_tls_daemon.rs` connect the configured provider through real daemon
 construction, attach self-test/canary, adapter write/read and shutdown. The gRPC
@@ -265,6 +366,12 @@ packaged configuration without installing services or creating users.
 | A/B retry durability (BUG-001) | `review_ab_retry.rs` in `maki-format` and `maki-core`: failed data/directory sync, repeated retries and restart, sector tearing, writeback that loses dirty bits, preservation across metadata types, and recovery of durable volume data |
 | Required attach configuration (BUG-002) | `maki-privileged/tests/regression_missing_attach_config.rs`: required assertion in the unit and actual offline systemd assertion evaluation for missing/present temporary configuration |
 | Trusted helper state (BUG-003) | `maki-privileged/src/state_tests.rs`, `exec_tests.rs`, and `tests/regression_attach_state.rs`: protected state ancestors/files, configuration and live backend identity, stale records, fail-before-side-effects ordering, rollback, and cleanup failure; device operations are simulated |
+| Stale and displaced attach records | `maki-privileged/src/review_stale_attach_record.rs` and `review_displaced_attach_record.rs`: the production executor, allocation, observers and trusted state for several volumes over one simulated kernel. A record that outlived its connection keeps its device from other volumes' attaches. A record whose device carries another connection (another volume, or an NBD client outside the helper) is retired by attach, cleanup, recover and detach without a command only when it names its VG UUID and the host shows no mapping of that VG, no holder of the device or its partitions other than an LVM mapping of another VG, no mount at the mountpoint or of such a mapping, and no other record on the device with the same or no VG UUID; each of these, an unreadable observation, a changed backend and a mismatched cleanup configuration keeps the record, and grow always refuses. No real LVM, device-mapper or NBD is involved |
+| LVM scope of detach and grow | `maki-privileged/src/review_lvm_device_scope.rs`: an LVM model in the same simulated kernel resolves VG names over the volumes' NBD exports and another disk whose inactive VG carries pg's name, on hosts whose LVM scan includes or leaves out the NBD devices. Grow, detach, cleanup (also after the daemon died, through its fallback) and recovery act only on the recorded VG; the commands built from a proof, an intent, pins or an old record carry its devices, and its VG UUID in the deactivation where the record names one (`lvextend` takes no selection). The command forms were also run against LVM 2.03.16 on loop devices without device-mapper; no activation, NBD or real attachment is involved |
+| Golden vectors for every record | `maki-format/tests/review_golden_vectors.rs`: the allocation map, shard catalog, checkpoint state, durable proof, segment and journal record headers and the v2 and v3 superblock envelopes, each also assembled byte by byte from its documented layout and read back, and an inventory that fails for a record magic without a vector or a vector without a record; maki-backing's inline vectors for a populated manifest, a witness state with a descriptor and the local marker with a manifest slot |
+| Documented configurations | `maki-format/tests/review_docs_config_examples.rs`: every complete volume configuration in README.md, SPEC.md, docs/ (without the dated reports), examples/ and packaging/ passes `parse_config` and `validate` as written, every fragment loads merged into the quick-start example, blocks of another schema are listed, and the configuration guide names exactly the byte keys that take only plain integers |
+| Remote GC progress | `maki-backing/tests/review_remote_gc_unreadable.rs`: GC goes on past a stale namespace it cannot open or examine (`skipped_unreadable`) and past a retirement stopped at a step that changes one namespace alone (`unfinished`), while a root it cannot read, a rename the root refuses and a failed authority still end the pass; the automatic pass logs both; a root takeover killed between `mkdirat` and `fchown`, and the immutable and append-only cases, need root |
+| Interrupted creation | `maki-backing/tests/review_interrupted_enrollment.rs` and `review_interrupted_local_create.rs`: a real remote or local creation and a real witness initialization in a child process, killed by a seccomp filter or failed with ENOSPC, then the command that must continue it, with controls that a published or committed state is never created over. The crash models `maki-backing/src/rollback/remote_creation_tests.rs`, `src/rollback/local_creation_tests.rs` and `src/remote_witness_init_tests.rs` end each creation before every backing operation as a process death, a power loss with torn writes and a failed operation, and require one documented command to continue it; `maki-witness/tests/review_interrupted_init.rs` runs the binary |
 | HalfOpen probe lifetime (BUG-004) | `maki-crypto/tests/review_probe_lifetime.rs`: request/provider errors, operation deadline, future cancellation, and exhausted retry budget all leave a slot for a healthy recovery request |
 | WebSocket connection lifetime (BUG-005) | `maki-crypto-websocket/tests/review_connection_lifetime.rs`: server-observed socket closure after timeout, outer cancellation, and idle provider drop; a healthy successor remains reusable |
 | Secret-buffer page ownership (BUG-006) | `maki-crypto/tests/review_secret_page_lifetime.rs`: shared-page drop, `into_vec`, and duplicate lifetimes; last-owner unlock, lock failures, and full-capacity zeroization before deallocation, with process-wide settings isolated in child processes |
@@ -276,16 +383,27 @@ packaged configuration without installing services or creating users.
 | Scheduler cancellation (BUG-012) | `maki-crypto/tests/review_scheduler_cancellation.rs`: queued payload and admission release, cancellation behind a live blocked group, active-RPC cancellation, cancellation of one group in a coalesced batch, and continued service for live callers; `review_r5_scheduler_resend.rs`: no per-request re-send to a provider that is not retry-safe, and an abandoned re-send releases its lane slot (R5-004); `review_scheduler_local_refusal.rs`: with such a provider, a request with a unit the endpoint set or random-prefix wrapper refuses before sending (empty or oversized ciphertext, unsupported plaintext size) fails alone at admission, while a rejection after sending still reaches the whole batch; `maki-core/tests/review_coalesced_empty_slot.rs`: a read of a slot recording an empty ciphertext does not fail a healthy read coalesced with it |
 | Queue deadlines (BUG-013) | `maki-crypto/tests/review_queued_deadline.rs`: ManualClock deadlines cover admission, coalescing, slot wait, and RPC under one caller budget; a live peer retains its own budget and stall mode remains unbounded |
 | Deadline exits | `maki-crypto/tests/review_deadline_exits.rs`: with ManualClock, an operation with no time left, the top of a pass, right after a failed RPC, admission with no time left, a cut-off RPC, scheduler callers on their own timer (both lanes, with and without the random prefix, coalesced, or re-sent alone after a request-specific rejection) and a dispatcher deadline reaching a scheduler caller all return the last endpoint error of the RPC batch in progress with its class (else the deadline error) and count once; a call split into several RPC batches, directly or through the scheduler, reports only the current one; a failure the dispatcher receives, or a batch it starts, at or after a scheduler caller's deadline but before the caller's task runs does not change the caller's answer; a nested set's expiry counts only in that set and never as a scheduler caller's deadline. `maki-nbdkit/tests/review_deadline_metrics.rs` checks the exported counter for an endpoint error at the deadline |
+| Endpoint revalidation and transport errors | `maki-crypto/tests/review_endpoint_revalidation.rs` (ManualClock): only proof of another contract excludes a quarantined endpoint, while a malformed reply, a generic refusal from either peer, the set's admission refusal and the candidate's own provider failure defer it with backoff, and attach keeps its verdicts. `maki-crypto-websocket/tests/review_probe_envelope.rs`: an inexact probe error envelope fails only its request and retires the connection. `maki-crypto-grpc/tests/review_http2_errors.rs`: HTTP/2 resets and GOAWAY under a call, from a raw HTTP/2 peer, and failover of a refused call only when the provider is retry-safe |
 | Concurrent socket permissions (BUG-014) | `maki-control/tests/review_uds_umask.rs`: bind concurrently with private directory creation and verify mode 0700 is preserved; `review_uds.rs` also checks prepared socket mode/group, preservation on failed group lookup, cleanup on failed publication, and actual Linux connection at the maximum public path length |
 | Partial journal writes (BUG-020) | `maki-core/tests/review_journal_retry.rs`: a BackingFile that writes a prefix then returns EIO, shorter retries, roll/FLUSH without retry, cleanup failure, and recovery after sealing the segment |
 | Journal writeback errors (BUG-021) | `maki-core/tests/review_journal_writeback.rs`: clean-but-unpersisted cache after EIO (failed inside `CrashableBacking`, so no later sync of other bytes persists it), retry, and full-replay process recovery followed by power loss, changes after the scan (refused before any proof covers them), valid-header mutation despite unchanged CRC residue, and pending ranges larger than the 64 KiB rewrite buffer; `review_recovery_prefix_rewrite.rs`: power loss after every backing operation of a recovery that adopted such bytes after a restart, including the window in which the synced mark and proof already cover records that only the journal segment holds |
 | gRPC authentication evidence (TEST-002) | `maki-nbdkit/tests/phase9_daemon.rs`: attach without metadata must fail after the server actually rejects it with Unauthenticated; valid metadata roundtrips with no authentication rejection, independently of which deadline's error text wins |
-| Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs`, `recover.rs`, and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record. The proof-scoped fallback runs only after an exited `vgchange` returns nonzero, accepts one exact closed target mapping, rechecks the backend, and rejects changed identity, multi-mapping topology, open count, or force/deferred/retry removal |
+| Convergent privileged cleanup (R3-007) | `maki-privileged/src/exec_tests.rs`, `recover.rs`, and `maki-attach/tests/e2e.rs`: no record succeeds without probing, an owned connected backend selects detach, an absent backend selects recovery, and a foreign or unreadable backend preserves the record. The proof-scoped fallback runs only after an exited `vgchange` returns nonzero, accepts one exact closed target mapping, rechecks the backend, and rejects changed identity, multi-mapping topology, open count, or force/deferred/retry removal. A record that names its VG UUID is retired instead, beside a foreign backend, when nothing of its attachment remains (see the stale and displaced records row) |
+| Privileged step faults | `maki-privileged/src/review_step_faults.rs`: the production executor, observers and trusted state over a simulated kernel (fake sysfs tree and mount table; LVM needs the device served, `dmsetup` does not). Every command of attach, detach, cleanup and the failed-start hook's rollback exits nonzero, is killed by a signal, times out or loses its helper, before and after its effect, and every observation fails or loses its helper; the packaged order (hook, daemon stop, cleanup, new attach) must converge, with the interrupted activation nothing serves as the one documented refusal. No real LVM, device-mapper, NBD or systemd is involved |
+| Command-line output and exit status | `review_closed_output.rs` in all five binaries: stdout or stderr is a pipe whose read end is closed before the child starts, or `/dev/full`; a closed stdout keeps the command's own verdict, another failure to write a result exits 1 and names the verdict, a completed change only warns, and a diagnostic nobody reads leaves the status. `review_cli_help.rs` (`maki-attach`, `maki-witness`, `maki-benchmark`): `--help` and `--version` only as the sole argument. `review_misuse_status.rs` (`maki`, `maki-witness`): misuse exits 2 before anything is read, a failed command 1, an argument that is not UTF-8 2. `scripts/test_doc_output_validation.py`: no two workspace targets document into one directory |
+| Test fixture locations | `maki-backing/tests/review_other_filesystem.rs`: the five copies of `tests/support/other_filesystem.rs` are identical, and a fixture without a second filesystem skips unless `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1`, which makes it fail. `tests/support/short_dir.rs` keeps socket paths short; `tests/support/private_dir.rs`, `shared_dir.rs` and `witness_config.rs` set fixture modes explicitly, whatever the umask |
 | Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
-| Current privileged runner contract | `regression_nbd_client_version_probe.rs` and `phase7_priv.rs`: a 3.27.1 help banner with nonzero exit is accepted, netlink receives `nbdN`, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice |
+| Current privileged runner contract | `regression_runner_without_nbd_client.rs` and `phase7_priv.rs`: the runner neither requires nor installs nbd-client, its raw fixture connects and disconnects with `maki-attach nbd-connect`/`nbd-disconnect`, the unprivileged disconnect probe runs the helper's own request, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice; `scripts/test_privileged_denial_validation.py` accepts only the kernel's `Operation not permitted` for `NBD_CMD_DISCONNECT` as denial evidence |
+| Helper NBD handshake and netlink (SPEC §6) | `maki-privileged/src/nbd_kernel/handshake_tests.rs`: against scripted servers on a socketpair, the exact bytes sent (client flags, one `NBD_OPT_GO` for the default export), `NO_ZEROES` echoed only when offered, no fixed newstyle, oldstyle and bad magic, every GO error reply without an `EXPORT_NAME` fallback, a missing, repeated or malformed `NBD_INFO_EXPORT`, skipped information, unknown reply types and options, a reply over 4098 bytes refused before it is read, the 64 KiB total, truncation, stalls at the deadline, exports without `HAS_FLAGS`, `SEND_FLUSH` or `SEND_FUA`, size 0, and a negotiated socket left without timeouts. `netlink_tests.rs`: golden bytes of `CTRL_CMD_GETFAMILY`, `NBD_CMD_CONNECT` (libnl's order and `NLA_F_NESTED` nesting) and `NBD_CMD_DISCONNECT`, and the reading of replies (family id, connect index, ack, negative errno, truncation, sequence numbers, ports, senders). `header_tests.rs`: every constant against the installed UAPI headers through a C probe (`MAKI_TEST_REQUIRE_NBD_HEADERS=1` fails instead of skipping). `retry_tests.rs`, against a scripted kernel and a manual clock: an `EBUSY` connect retried every 100 ms on a fresh request after checking that the device still shows no connection, refused as busy after 5 s or at an earlier deadline, not retried once the device shows a connection, every other answer final; the family check (highest attribute 9 refused, 10 accepted). `tests.rs`, `command_tests.rs` and `exec_tests.rs`: flags and size forwarded unchanged, a blocking close-on-exec socket, the deadline, the step limit and an earlier `finish_by` deadline, no program started for either step, and an unanswered request kept as an I/O error of unknown outcome |
+| Helper NBD handshake against nbdkit | `maki-privileged/tests/review_nbd_handshake_nbdkit.rs`: a real `nbdkit memory` export negotiates, and eval exports without FLUSH or FUA are refused. `maki-nbdkit/tests/review_helper_nbd_handshake.rs` compiles the helper's handshake source by path and runs it against Maki's plugin: FLUSH, FUA and write zeroes always, TRIM exactly with discard, never read-only. Both skip without nbdkit unless `MAKI_TEST_REQUIRE_NBDKIT=1`; maki-privileged's tests start nbdkit on a private socket through `tests/support/nbdkit.rs` |
+| Kernel NBD connect (root) | `maki-privileged/tests/review_nbd_kernel.rs`, a root-only target: nbdkit serves a memory export, the helper connects a free `/dev/nbdN`, sysfs must show the backend identifier, the size, `queue/write_cache` `write back` and `queue/fua` 1, a second connect is the kernel's refusal, a write and an fsync pass, and the disconnect frees the device; the provisioning path (`connect_raw`/`disconnect_raw`) refuses another identifier's disconnect. The two tests take different devices (the lowest and the highest free one), so neither waits for udev's probe of the other's device. It skips without root, the `nbd` module or nbdkit unless `MAKI_TEST_REQUIRE_NBD=1`, which CI's root-only step sets |
+| Provisioning connects | `maki-attach/tests/review_nbd_provisioning.rs` and `exec_tests.rs`: `nbd-connect`/`nbd-disconnect` plans, strict options and value checks, an attach-record identifier refused, a connected, unreadable or record-reserved device refused before anything is connected, and a disconnect only of the device's own connection; `scripts/test_docs_provisioning_validation.py` runs the provisioning guide with them |
 | Runtime logging (R4-001) | `maki-core/src/logging.rs` child-process tests, `maki-privileged/src/logging.rs` (the `maki-attach` sink: steps and halted rollbacks reach stderr) and `maki-nbdkit/tests/review_r4_native_logging.rs`: a real nbdkit run must show the store's `WARN` for an adopted orphan shard on its captured stderr, and `MAKI_LOG=error` must suppress it. `MAKI_LOG` values without a level (`warning`, `err`, a bare target, `target=`) fall back to `info` with one `WARN` naming the value, and an empty value means `info`, in both sinks and through `maki check` (`bins/maki/tests/review_log_filter.rs`) |
 | Guarded plaintext and keys (R4-002) | `maki-crypto-local/tests/review_r4_guarded_buffers.rs`: encryption, decryption, tampered-ciphertext failure and file/env key loading never wrap a bare `Vec` (`unguarded_wraps()` stays constant); `SecretBuffer::truncate` unit tests |
 | Package removal and inputs (R4-003, R4-007) | `scripts/test_debian_package.py`: `prerm` refuses removal under an attachment record or an active `maki@`/`maki-attach@`/`maki-workload@` unit or when `systemctl` cannot be queried but never blocks upgrades, no maintainer script starts/stops/restarts a service, ELF stubs of the wrong machine, class, type or a non-ELF file are refused, unknown architectures are refused, the dependency scan is on by default and fails closed on unanalysable artifacts or a missing `dpkg-shlibdeps`, `--no-shlibdeps` warns and keeps only the static `Depends` |
+| RPM package (RHEL 9) | `scripts/test_rpm_package.py`: the RPM installs the Debian package's files with the same modes and root ownership (compared file by file where `dpkg-deb` exists; the two deliberate differences are the unit's nbdkit path and the license text RHEL lacks), `maki@.service` runs `/usr/sbin/nbdkit` and a unit without exactly one Debian nbdkit `ExecStart=` is refused, `%preun` refuses an erase under an attachment record, an active unit or a failed `systemctl` query with the Debian `prerm`'s check and never blocks an upgrade, no scriptlet starts, stops or restarts a service, the Debian builder's artifact checks apply for `x86_64`, `aarch64`, `ppc64le` and `s390x`, a binary whose ELF interpreter no package of the build host owns is refused unless `--no-autoreq`, the plugin is not provided as a library, the package conflicts with `nbdkit-selinux`, versions rpm cannot express are refused and candidate versions keep their order, a missing `SOURCE_DATE_EPOCH` or one before 1990 (which rpm cannot put in the changelog) is refused, and the build is reproducible |
+| Release workflow | `scripts/test_release_workflow_validation.py`: `.github/workflows/release.yml` runs only when dispatched with a tag, from `main`, and accepts only `v<workspace version>-rc.<n>` (a final tag is refused while production approval is pending); a taken tag or release is refused before anything is built; only the publish job may write; the Debian bundle comes from `prepare_release.py` in `debian:12` and the RPM from `build-rpm.py` in CentOS Stream 9, both from the dispatched commit with its whole history and no cache, and only first-party actions and the baseline toolchain are used; `scripts/release_assets.py` refuses bundles whose sums, manifests, commit or version disagree, gives the assets names GitHub keeps and writes one `SHA256SUMS`; the notes name every asset and its distribution and say that nothing is signed and the release is not qualified; against a stand-in `gh` the release is a draft pre-release until every asset is uploaded, a failure before publication leaves no release and no tag, and one after it is reported, not deleted |
+| RHEL 9 installation guide | `scripts/test_docs_rhel_installation_validation.py`: the guide and `packaging/rpm/README.md` quote the spec's static `Requires` and its `Conflicts` exactly, every `dnf` command of the guide installs from BaseOS and AppStream only (no `--enablerepo`, `config-manager`, COPR or EPEL) and never the `nbdkit` metapackage, the one RPM builder call in each uses only options the builder accepts and keeps the automatic requirements, the guide says RHEL 9 is not qualified as the support matrix's row does, and the README, the documentation index, the status page and the support matrix link it |
 | Deep-check verdict (R4-004) | `maki-core/tests/review_r4_check_verdict.rs`: recoverable slot damage passes with a warning and is repaired by recovery, damage without a journal source fails, mixed damage reports both classes, a healthy volume is `clean`, a damaged header on an unlisted slot is `unrecoverable` |
 | Overlay memory bound (R4-005) | `maki-core/tests/review_r4_overlay_bound.rs`, `maki-format/tests/review_r4_overlay_limits.rs`, `maki-nbdkit/tests/review_r4_overlay_options.rs`: bytes and entries stay under their limits without journal pressure, the worker checkpoints on the overlay watermark with a manual clock, a failed reclaim refuses the write and degrades, a concurrent volatile write during an inline reclaim does not cause ENOSPC (multi-thread, `checkpoint.slot_write` hook), defaults/zero/minimum validation, and the daemon mapping |
 | Inline reclaim fairness | `maki-core/tests/review_reclaim_fairness.rs`: eight concurrent writers of maximal, misaligned requests against a journal limit or an overlay limit at its validated minimum, with no injected fault, never get ENOSPC, keep the bound and read back their last data (multi-thread) |
@@ -445,7 +563,7 @@ Disk power-loss campaign.
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
 | Debian package install and upgrade | Clean install, stopped-volume upgrade, and exact reattach | Pass for one generated-package Debian 12 profile | Pre-upgrade and current packages preserved volume/attach configs, all token hashes and two SQLite logical hashes, did not auto-start volumes, and reattached both after upgrade |
-| Multi-mapping and foreign-backend refusal | Refuse ambiguous fallback and changed backend identity before mutation | Pass for one two-LV and one same-NBD foreign-backend topology | Packaged recovery preserved both mappings and proof after daemon death; cleanup preserved a foreign backend identifier and trusted record until explicit disconnect |
+| Multi-mapping and foreign-backend refusal | Refuse ambiguous fallback and changed backend identity before mutation | Pass for one two-LV and one same-NBD foreign-backend topology | Packaged recovery preserved both mappings and proof after daemon death; cleanup preserved a foreign backend identifier and trusted record until explicit disconnect. Keeping the record beside a foreign backend was superseded for a record that names its VG UUID and leaves nothing of its attachment: cleanup now retires it without touching the backend, which has not been re-qualified on a real kernel |
 | DB-native and legacy-v1 migration | Reject corrupt restore; old-reader backup into a fresh v2 volume | Pass for stopped-source SQLite profiles | Corrupt native restore failed before clean retry; current writer refused byte-stable v1 superblocks and the old-reader backup restored with the exact logical hash |
 | Docker bind lifecycle | Functional rebind and start gate | Pass for one Debian 12 GCE topology | Four distinct default-`rprivate` containers preserved the exact external ACK prefix; the failed cleanup created no replacement container |
 | Fresh-host backing restore | Graceful backup, new host, continued writes and restart | Pass for one unchanged v2/local-provider/SQLite topology | Distinct source and target VMs recovered 32 exact ACK rows, advanced to 48, retained 48 after restart, and passed SQLite integrity and offline checks |
@@ -660,13 +778,17 @@ cargo test -p maki-nbdkit --test rollback_config
 ```
 
 Linux storage fixtures place the backing on the normal temporary filesystem and
-the witness under `/dev/shm`, which must have a different device identity. This
-fixture is deliberately not a persistent witness deployment. Tests cover old
-whole-image rejection, page authentication, immutable predecessor retention,
-namespace sync boundaries and open handles, witness failures and reopen
-durability, full-capacity acknowledged-write recovery, cache/overlay freshness,
-concurrent checkpoint/FUA and v3 discard/rewrite. Fixed SHA-256 encoding vectors
-cover the witness record, manifest and page domains.
+the witness in the first of `/dev/shm`, `/run/user/<uid>`, `/var/tmp`, `/tmp`,
+`TMPDIR` and `/run` that is on another filesystem (a different device
+identity); where there is none, each such test prints that it is skipped and
+why, or fails when `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1` is set, as CI and the
+background runner's `rollback` profile set it. This fixture is deliberately not
+a persistent witness deployment. Tests cover old whole-image rejection, page
+authentication, immutable predecessor retention, namespace sync boundaries and
+open handles, witness failures and reopen durability, full-capacity
+acknowledged-write recovery, cache/overlay freshness, concurrent checkpoint/FUA
+and v3 discard/rewrite. Fixed SHA-256 encoding vectors cover the witness
+record, manifest and page domains.
 
 The file model adds 1,600 deterministic operations against independent working
 and durable byte images, plus capacity reuse and unlink/handle-lifetime checks.
@@ -684,7 +806,8 @@ these results for the new format.
 
 ## External qualification checklist
 
-Scoped campaigns already cover Debian 12 kernel NBD/LVM/XFS/fio, installed
+Scoped campaigns already cover Debian 12 kernel NBD/LVM/XFS/fio (attached
+with nbd-client, before the helper's own connect), installed
 systemd recovery with a Docker SQLite ACK oracle, package install/upgrade,
 fresh-host backing restore and SQLite migration. PostgreSQL 15 on Debian 12
 and PostgreSQL 17 on Debian 13 passed short crash and packaged lifecycle

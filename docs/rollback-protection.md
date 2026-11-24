@@ -125,6 +125,32 @@ old backing attach.
 
 ### Resume interrupted initial enrollment
 
+Which command continues an interrupted `maki volume create` depends on how far
+it got. Creation writes the format marker as `rollback.format.next`, syncs it,
+renames it to `rollback.format` and syncs the directory, and it asks the
+authority for a claim only after the marker and the binding are durable. A
+backing root without `rollback.format` (it holds `remote.enroll.lock`,
+`remote.operation.lock` and possibly `rollback.format.next`) is a creation
+that published nothing and claimed nothing, whether it was killed, lost power
+or failed on a full disk: run `maki volume create` again as before. An older
+binary wrote the marker in place; a root in which it left `rollback.format`
+empty or partly written beside nothing but those lock files is completed by
+`volume create` the same way. Nothing has to be removed by hand, and
+`resume-enrollment` refuses such a root with a message that says to create
+the volume again. Once `rollback.format` holds the marker, `volume create`
+refuses the root (`remote enrollment requires an empty backing`) and the
+procedure below continues it. The binding, the next file, is written the
+same way, as `remote.enrollment.next` renamed to `remote.enrollment` once it
+is synced: a creation that stopped while it wrote the binding leaves at most
+the staged file, which nothing reads, and `resume-enrollment` continues it
+and writes the binding for the approved identity and capacity. An older
+binary wrote the binding in place; a `remote.enrollment` it left empty or
+incomplete is refused as invalid enrollment metadata, because it cannot be
+told apart from a damaged binding: move that file out of the backing root,
+keep it, and resume. An interrupted
+`maki-witness init` is a separate case, described with
+[the authority's initialization](remote-witness-service.md#initialize-a-local-authority).
+
 Keep the volume detached and automatic restarts disabled. Preserve the failed
 backing and inspect the independently managed authority:
 
@@ -207,7 +233,7 @@ witness_root = "/mnt/maki-witness/protected"
 capacity = "128MiB"
 ```
 
-Both directories must be empty for creation. Provision the independent witness
+Start from two empty directories. Provision the independent witness
 mount first, create both per-volume directories for the daemon user, and run
 the creation as that user, as for any volume
 ([volume lifecycle](operations.md#volume-lifecycle)). Add `--discard` for a v3
@@ -227,6 +253,33 @@ it; the command then warns with the `chown -R maki:maki` of each such path to
 run before the first start. An existing raw or protected backing is refused;
 there is no implicit enrollment, in-place conversion or automatic witness
 recreation.
+
+The outer creation publishes the witness anchor last, and until then
+nothing can open the volume, so nothing was acknowledged. A `maki volume
+create` that is killed, loses power or fails before it publishes the anchor
+(a full disk while it reserves the arena, for example) is completed by
+running it again, with nothing to remove by hand. Once the anchor is
+published, the command initializes the volume inside the backing; one that
+stops there is refused by a later `create`, which never writes over an
+anchor: if the volume was never attached, empty both directories and create
+it again. The format marker and the anchor are each written under
+a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
+into place, so neither name ever holds an empty or torn file. `create` then
+accepts a backing directory that holds only what a creation writes (the
+lock, the marker, the arena and the two manifest slots) as long as the
+second slot holds only zeros and the first only zeros or the initial empty
+manifest, and a witness directory that holds only `witness.lock` and
+`anchor.next`. Every volume that committed anything wrote its second slot,
+so `create` never creates over one, whatever the witness directory holds
+and short of both slots lost or zeroed entirely (an all-zero slot is an
+unwritten one): a witness mount that is missing (an empty directory in its
+place) cannot get a used volume recreated, and neither can slots that
+damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
+the anchor empty before writing it: an empty `anchor` that such a release
+left is refused by `create` and by the daemon, which say that the creation
+did not complete or the witness lost its state. If the volume was never
+attached, remove that empty file and run `maki volume create` again;
+otherwise restore the witness directory.
 
 The packaged daemon uses `ProtectSystem=strict`. For this example, add a
 per-instance systemd drop-in to `maki@protected.service`:
@@ -367,8 +420,9 @@ complete recovery plan.
    secret material through its separate recovery process.
 2. Stop application writers and their supervisors. Follow the stopped sequence
    in [key rotation](key-rotation.md#rotate-a-credential-while-retaining-the-encryption-key):
-   detach while the daemon is available, obtain the explicit drain
-   acknowledgement, then stop the daemon. Keep automatic restart disabled for
+   unmount while the daemon is running, obtain the explicit drain
+   acknowledgement, then stop the lifecycle target and wait for every unit to
+   become inactive. Keep automatic restart disabled for
    the maintenance window and confirm that no process holds the volume. A
    live copy of the arena and manifest slots is not an atomic backup.
 3. Copy the complete protected backing tree while it is stopped and record
@@ -491,10 +545,15 @@ Current, pending and restore-source namespaces are always retained.
 A namespace's existing `rollback.lock` must be available. Open file handles keep
 the session and this lock alive even after their volume object drops. Cleanup
 skips unknown files, symlinks, hardlinks, mount boundaries and original
-namespaces missing their lock file. A Linux kernel supporting statx mount IDs
+namespaces missing their lock file. A namespace it cannot open or examine
+(one the daemon user does not own, for example), or one whose retirement
+stops at a step that changes it alone (a directory the daemon user may not
+write, so that its tombstone cannot be emptied), is kept and reported with
+the error, and cleanup goes on to the next one. A Linux kernel supporting statx mount IDs
 (5.8+) and consistent advisory locks for every writer are required; unsupported
 or failed automatic cleanup postpones reclamation without revoking the accepted
-new root. There is no fallback that deletes based only on a fence or filename.
+new root, and says so in a `WARN` log event. There is no fallback that deletes
+based only on a fence or filename.
 
 Quiescent namespaces are exclusively renamed into a durable `.remote-gc-`
 tombstone before unlinking known files. Interrupted retirement resumes on a
@@ -511,7 +570,11 @@ sudo -u maki maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and
-`retained` namespace arrays as JSON. Each array holds at most 4,096 names;
+`retained` namespace arrays as JSON, `skipped_unreadable`, which gives
+each namespace it could not open or examine with the error, and
+`unfinished`, which gives each namespace or tombstone whose retirement it
+could not finish with the step and the error. Each array holds
+at most 4,096 entries;
 use the corresponding `counts` fields for totals and `details_truncated` to
 detect omitted details. See [GC reports](remote-witness-service.md#retire-old-writer-namespaces).
 Authority outages or changes fail closed;

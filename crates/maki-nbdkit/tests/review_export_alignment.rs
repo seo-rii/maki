@@ -3,6 +3,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use maki_format::config::parse_config;
 use maki_nbdkit::adapter::NbdAdapter;
 use maki_nbdkit::daemon::{attach_from_config, create_volume_from_config_str};
@@ -60,7 +63,7 @@ fn configuration_rejects_an_export_with_an_unreachable_tail() {
 
 #[test]
 fn create_rejects_inaccessible_exports_before_creating_backing_files() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let root = directory.path().join("volume");
     let config = raw(&root, &directory.path().join("control.sock"), 4608, 4096);
     assert!(create_volume_from_config_str(&config).is_err());
@@ -72,7 +75,7 @@ fn create_rejects_inaccessible_exports_before_creating_backing_files() {
 
 #[tokio::test]
 async fn attach_rejects_minimum_io_incompatible_with_stored_geometry() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = short_dir::tempdir().unwrap();
     let raw = raw(
         &directory.path().join("volume"),
         &directory.path().join("control.sock"),
@@ -108,7 +111,7 @@ async fn attach_rejects_minimum_io_incompatible_with_stored_geometry() {
 #[test]
 fn aligned_export_sizes_are_fully_accessible() {
     for (size, minimum) in [(512, 512), (4608, 512), (4096, 4096), (8192, 4096)] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = short_dir::tempdir().unwrap();
         let raw = raw(
             &directory.path().join("volume"),
             &directory.path().join("control.sock"),

@@ -35,6 +35,26 @@ fn failed_start_plan_uses_the_workload_coordinator_without_configuration() {
     }
 }
 
+/// `maki-recover@` stops the daemon before its cleanup, and an activation
+/// whose helper died before recording the mapping can only be deactivated
+/// through LVM, which reads the volume group from the NBD device. The hook
+/// therefore finishes that rollback itself, while the daemon still serves it.
+#[test]
+fn failed_start_plan_finishes_an_interrupted_activation_before_the_daemon_stops() {
+    let output = plan("timeout", "killed", "TERM");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("roll back an interrupted LVM activation"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("while the daemon still serves the device"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("never unmounts"), "{stdout}");
+}
+
 #[test]
 fn successful_main_or_unknown_result_plans_do_not_restart() {
     for (result, code, status) in [
@@ -51,6 +71,8 @@ fn successful_main_or_unknown_result_plans_do_not_restart() {
     }
 }
 
+/// Each is misuse (status 2), with or without `--plan`. An instance name
+/// outside `[A-Za-z0-9_-]` was refused only inside the hook, with status 1.
 #[test]
 fn hook_rejects_device_overrides_and_invalid_instance_names() {
     for arguments in [
@@ -58,18 +80,47 @@ fn hook_rejects_device_overrides_and_invalid_instance_names() {
         vec!["--volume", "safe", "--mountpoint", "/tmp/fixture"],
         vec!["--volume", "../other"],
         vec!["--volume", "safe.service"],
+        vec!["--volume", "a.b"],
         vec!["--volume", "safe", "--volume", "other"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
-            .env_clear()
-            .arg("recover-failed-start")
-            .args(arguments)
-            .arg("--plan")
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        for plan in [true, false] {
+            let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+                .env_clear()
+                .arg("recover-failed-start")
+                .args(&arguments)
+                .args(plan.then_some("--plan"))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{arguments:?} plan={plan}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty());
+        }
     }
+}
+
+/// Without Linux there is no systemd to run the hook and nothing it could
+/// schedule: like every other action, it executes only on Linux (status 3
+/// elsewhere), and its plan still runs. On Linux, a run without evidence of
+/// a failed start does nothing and succeeds.
+#[test]
+fn the_hook_executes_only_on_linux() {
+    let output = Command::new(env!("CARGO_BIN_EXE_maki-attach"))
+        .env_clear()
+        .args(["recover-failed-start", "--volume", "recovery-fixture"])
+        .output()
+        .unwrap();
+    let expected = if cfg!(target_os = "linux") { 0 } else { 3 };
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

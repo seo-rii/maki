@@ -6,6 +6,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
+
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -138,7 +141,9 @@ fn rollback_process_child() {
 #[test]
 fn acknowledged_state_survives_repeated_process_interruption() {
     let root = tempfile::tempdir().unwrap();
-    let witness = tempfile::tempdir_in("/dev/shm").unwrap();
+    let Some(witness) = other_filesystem::tempdir(root.path()) else {
+        return;
+    };
     let oracle = tempfile::tempdir().unwrap();
     let oracle_path = oracle.path().join("acknowledgements.log");
     let mut oracle_file = OpenOptions::new()

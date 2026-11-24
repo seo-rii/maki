@@ -10,6 +10,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
@@ -19,19 +22,24 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(8);
 
+/// Whether nbdkit can run here, probed once. Every test that cannot run
+/// says so in its own output: a notice from the first caller alone left the
+/// others reporting a bare `ok`.
 fn native_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| match Command::new("nbdkit").arg("--version").output() {
-        Ok(output) => {
-            assert!(output.status.success(), "installed nbdkit cannot run");
-            true
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!("nbdkit unavailable; skipping optional native startup qualification");
-            false
-        }
-        Err(error) => panic!("nbdkit probe failed: {error}"),
-    })
+    let available =
+        *AVAILABLE.get_or_init(|| match Command::new("nbdkit").arg("--version").output() {
+            Ok(output) => {
+                assert!(output.status.success(), "installed nbdkit cannot run");
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => panic!("nbdkit probe failed: {error}"),
+        });
+    if !available {
+        eprintln!("nbdkit unavailable; skipping optional native startup qualification");
+    }
+    available
 }
 
 struct Fixture {
@@ -43,7 +51,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_dir::tempdir().unwrap();
         let root = dir.path().join("volume");
         let control = dir.path().join("control.sock");
         let config = dir.path().join("volume.toml");

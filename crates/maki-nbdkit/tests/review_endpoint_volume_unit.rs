@@ -91,9 +91,11 @@ async fn roundtrip(prefix: u32) {
         .expect("a supported 512-byte volume must attach under its own valid byte limit");
     assert!(stats.is_some(), "use the actual remote scheduler at attach");
     let set = set.unwrap();
+    // The set is bound to the volume's provider unit and reports that size
+    // alone: it refuses a 4096-byte unit although the endpoints declare it.
     assert_eq!(
         set.capabilities().await.unwrap().supported_plaintext_sizes,
-        vec![512 + prefix, 4096]
+        vec![512 + prefix]
     );
     let expected: Vec<_> = (0..1024).map(|n| (n % 251) as u8).collect();
     engine.write(0, &expected, true).await.unwrap();

@@ -31,9 +31,8 @@ secret store; the profile and general evidence contain references, not values.
 ## Freeze the candidate and evidence
 
 Build the final integrated commit with [release preparation](../releasing.md).
-Retain the Maki package, source archive, manifest and checksums, plus the exact
-versioned `nbd-client >= 3.27.0` package, its source/patches/build recipe and
-checksum. Verify both package hashes on each destination before installation.
+Retain the Maki package, source archive, manifest and checksums. Verify the
+package hash on each destination before installation.
 Install these artifacts for the campaign; a separate source build does not
 establish that the candidate package works.
 
@@ -67,7 +66,7 @@ its state before recovery; a later successful retry does not replace it.
 
 | Case | Execution | Required result and evidence |
 |---|---|---|
-| FPC-01: install and identity | Install the exact Maki/nbd-client packages on a fresh host; provision the pinned topology, start the lifecycle and execute the oracle control workload. | Package/config hashes match; effective sandbox and mount options are recorded; readiness and the per-start identity gate precede workload start; ACK contents and DB integrity match. |
+| FPC-01: install and identity | Install the exact Maki package on a fresh host; provision the pinned topology, start the lifecycle and execute the oracle control workload. | Package/config hashes match; effective sandbox and mount options are recorded; readiness and the per-start identity gate precede workload start; ACK contents and DB integrity match. |
 | FPC-02: dirty stop and busy unmount | Create dirty filesystem/DB state, stop the lifecycle with I/O admission open, then restart. Separately obstruct unmount with a controlled holder and request a planned stop. | Trace workload stop, unmount, daemon drain and restart. A failed cleanup is reported without claiming an inactive clean volume or automatically restarting a deliberately stopped workload. Record the live mount/device/daemon state and verify ACKs after the documented recovery. |
 | FPC-03: interrupted attach | Interrupt the helper after NBD connection, LVM activation and mount; repeat with timeout and SIGKILL. Include duplicate-start, foreign-backend, cleanup-failure and operator cancellation controls, plus the documented runtime-mask procedure while recovery is queued/running. | Workloads are quiesced before recovery cleanup; every mutation is identity-bound; successful cleanup permits reattach, while foreign identity or failed cleanup prevents restart. Maintenance leaves recovery disabled and the lifecycle stopped. Record attempts and verify start-rate limits, preserved records and ACKs. |
 | FPC-04: long and repeatedly interrupted recovery | Recover the declared maximum journal/fill profile. Separately stop progress, interrupt scan/repair/replay at multiple points, and inject repeated startup timeout or cgroup OOM before a final attempt with the declared normal budget. | A progressing recovery can finish within the agreed recovery bound; stalled work does not gain endless startup extensions. Retain every attempt's progress, timeout/OOM events, cumulative I/O, RSS/cgroup peak and duration. Final ACK and integrity checks pass. Progress notifications alone do not establish persisted replay progress across restarts. |

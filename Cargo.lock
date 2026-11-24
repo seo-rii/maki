@@ -887,6 +887,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
  "zeroize",
 ]
@@ -976,10 +977,13 @@ dependencies = [
  "maki-test-support",
  "parking_lot",
  "rand 0.9.5",
+ "rustls",
+ "rustls-native-certs",
  "thiserror",
  "tokio",
  "tracing",
  "uuid",
+ "webpki-roots",
  "zeroize",
 ]
 
@@ -1001,7 +1005,6 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
- "rustls-native-certs",
  "thiserror",
  "tokio",
  "tonic",
@@ -1076,7 +1079,6 @@ dependencies = [
  "parking_lot",
  "rcgen",
  "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror",
@@ -1085,7 +1087,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
- "webpki-roots",
 ]
 
 [[package]]
@@ -2178,7 +2179,6 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
- "rustls-native-certs",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",

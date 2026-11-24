@@ -15,6 +15,9 @@ mod native_plugin;
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::io;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
@@ -46,7 +49,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = short_dir::tempdir().unwrap();
         let root = dir.path().join("volume");
         let control = dir.path().join("control.sock");
         let config = dir.path().join("volume.toml");

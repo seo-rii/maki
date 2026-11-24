@@ -8,8 +8,8 @@
 # `maki volume inspect /etc/maki/volumes/postgres.toml` → uuid:
 volume_uuid = "<volume-uuid>"
 
-# Block size handed to nbd-client -b and blockdev --setbsz; equals
-# volume.device_block_size.
+# The NBD device's logical block size at connect, also set with
+# blockdev --setbsz; equals volume.device_block_size.
 device_block_size = 4096
 
 # Names used when the layout was created. Defaults would be
