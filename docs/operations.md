@@ -1411,7 +1411,7 @@ calls.
   This does not preallocate untouched slots or cover non-Linux backing behavior.
   It does not cover one metadata store either: an A/B copy that a power loss
   left undecodable is emptied before it is written again, so that store needs
-  free blocks and fails with ENOSPC on a filesystem that has none. The
+  free blocks and can fail with ENOSPC on a filesystem that has none. The
   checkpoint, barrier or attach that needed it then fails; the other copy and
   the journal are untouched, and it succeeds once space is available.
   A reserve-only refusal leaves existing data readable and does not

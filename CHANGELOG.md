@@ -698,9 +698,11 @@ documents.
   stages a binding, and `create` continues such a root: a staged binding is
   written again, and a published one is accepted only if it is the binding
   this creation would write, under an authority that is released and was
-  never activated. A binding for another authority or capacity, one that
-  cannot be read, and a staged entry that is not a regular file the command
-  can write again are refused with a message that names the way out
+  never activated. A binding for another authority or capacity and a staged
+  entry that is not a regular file the command can write again are refused
+  with a message that names the way out. A binding that cannot be read keeps
+  `remote enrollment requires an empty backing` from `create`, and
+  `resume-enrollment` under a released authority says what to do with it
   ([resume enrollment](docs/rollback-protection.md#resume-interrupted-initial-enrollment)).
 - **A connect keeps its negotiated connection across busy answers, waits for
   the daemon's export and can move to the next free NBD device** (AUD-162 to
@@ -723,8 +725,8 @@ documents.
   truncates such a copy to zero length and syncs that before it writes the
   record; a copy that decodes is never emptied. After a power loss a copy
   can be found empty where it held torn bytes, which every release reads as
-  an invalid copy. The store needs free blocks again and fails closed with
-  `ENOSPC` on a filesystem that has none
+  an invalid copy. The store needs free blocks again and can fail with
+  `ENOSPC` on a filesystem that has none, where it fails closed
   ([architecture](docs/architecture.md), SPEC §43).
 
 - **A connect retries while the kernel reports the NBD device busy** (AUD-150,
@@ -1378,8 +1380,9 @@ observable behaviour:
   generic-netlink mutex and the callback lock, so that other generic-netlink
   families and family lookups on the host wait too. The provisioning guide
   creates the volume group with `--setautoactivation n`, as a precaution
-  against LVM's event activation that was not exercised on a host. This
-  records change adds that an A/B store which empties a torn copy can fail
+  against LVM's event activation that was not exercised on a host. The
+  records change ([#389](https://github.com/seo-rii/maki/pull/389)) adds that an
+  A/B store which empties a torn copy can fail
   with `ENOSPC` (configuration, operations) and the backing filesystem
   assumption behind it (SPEC §43, support matrix).
 
