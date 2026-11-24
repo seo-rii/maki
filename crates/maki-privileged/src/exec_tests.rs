@@ -247,6 +247,93 @@ fn a_raw_disconnect_touches_only_its_own_connection() {
     }
 }
 
+/// The kernel acknowledges a disconnect before the device stops showing the
+/// connection: it keeps `pid` and `backend`, and refuses a new connect,
+/// until the last opener of the device has closed it (udev probes a device
+/// that was just written to). `nbd-disconnect` therefore waits, for a
+/// bounded time, until the device no longer shows the connection, and says
+/// what holds it when that does not happen.
+#[test]
+fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    let disconnects = |device: &'static str| {
+        move |step: &PlannedStep| {
+            assert!(
+                matches!(step, PlannedStep::NbdDisconnect { device: named } if named == device)
+            );
+            Ok(())
+        }
+    };
+
+    // The opener lets go a moment after the acknowledgement.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let attributes = sysfs.join("nbd5");
+    let mut closing = None;
+    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, Duration::from_secs(10), |step| {
+        closing = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            // The kernel removes them in this order.
+            std::fs::remove_file(attributes.join("pid")).unwrap();
+            std::fs::remove_file(attributes.join("backend")).unwrap();
+        }));
+        disconnects("/dev/nbd5")(step)
+    })
+    .unwrap();
+    assert_eq!(
+        nbd_backend_at(&sysfs, "/dev/nbd5").unwrap(),
+        None,
+        "returned while the device still showed the connection"
+    );
+    closing.unwrap().join().unwrap();
+
+    // Nothing lets go: a failure that says what the state is.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let patience = Duration::from_millis(250);
+    let started = Instant::now();
+    let error = disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd5",
+        OURS,
+        patience,
+        disconnects("/dev/nbd5"),
+    )
+    .expect_err("a device that still shows the connection")
+    .to_string();
+    assert!(started.elapsed() >= patience, "{:?}", started.elapsed());
+    for expected in [
+        "acknowledged the disconnect",
+        "/dev/nbd5 still shows the connection",
+        "something still has the device open",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
+
+    // A connection made since is not this one: the disconnect is done.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let backend = sysfs.join("nbd5/backend");
+    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
+        std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
+    .unwrap();
+
+    // Without the connection there is no request, and nothing to wait for.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd6", true, Some("maki-bootstrap-another")),
+        ],
+    );
+    let no_request = |_: &PlannedStep| -> Result<(), ExecError> { panic!("a disconnect was sent") };
+    disconnect_raw_with(&sysfs, "/dev/nbd4", OURS, patience, no_request).unwrap();
+    assert!(disconnect_raw_with(&sysfs, "/dev/nbd6", OURS, patience, no_request).is_err());
+}
+
 /// A step whose kernel answer could not be read stays an I/O error of its
 /// kind (a timeout is still a timeout), never a plain refusal: the callers
 /// decide from the device's backend identifier what is connected.

@@ -43,6 +43,9 @@ use crate::verify::{
 /// Serializes attach helpers system-wide (device allocation + connect).
 pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `nbd-disconnect` waits for a device to stop showing the
+/// connection it disconnected.
+const NBD_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -829,22 +832,49 @@ fn connect_raw_with(
 }
 
 /// Disconnect `device` if it is connected under `identifier`, a
-/// connection [`connect_raw`] made (`maki-attach nbd-disconnect`). A device
-/// without a connection needs nothing; any other connection is refused.
+/// connection [`connect_raw`] made (`maki-attach nbd-disconnect`), and wait
+/// until the device no longer shows it. A device without a connection needs
+/// nothing; any other connection is refused.
+///
+/// The kernel acknowledges a disconnect before the connection is gone from
+/// the device: it keeps the `pid` and `backend` attributes, and refuses a
+/// new connect, until the last opener of the device has closed it (udev
+/// probes a device that was just written to). A caller that goes on to use
+/// the device, or to check that it is free, must not see that state as
+/// success.
 pub fn disconnect_raw(device: &str, identifier: &str) -> Result<(), ExecError> {
+    disconnect_raw_with(
+        Path::new("/sys/block"),
+        device,
+        identifier,
+        NBD_RELEASE_TIMEOUT,
+        |step| run_step(step, None),
+    )
+}
+
+/// [`disconnect_raw`] on the device tree `sysfs`, with `patience` for the
+/// device to stop showing the connection after `disconnect`, which runs the
+/// disconnect step.
+fn disconnect_raw_with(
+    sysfs: &Path,
+    device: &str,
+    identifier: &str,
+    patience: Duration,
+    disconnect: impl FnOnce(&PlannedStep) -> Result<(), ExecError>,
+) -> Result<(), ExecError> {
     crate::config::check_raw_identifier(identifier)
         .map_err(|error| identity_error(error.to_string()))?;
     nbd_step_index(device)?;
-    if !raw_backend_is(Path::new("/sys/block"), device, identifier)? {
+    if !raw_backend_is(sysfs, device, identifier)? {
         tracing::info!("maki-attach: {device} shows no connection; nothing to disconnect");
         return Ok(());
     }
-    run_step(
-        &PlannedStep::NbdDisconnect {
-            device: device.into(),
-        },
-        None,
-    )
+    disconnect(&PlannedStep::NbdDisconnect {
+        device: device.into(),
+    })?;
+    // Not yet: the acknowledgement is taken for the end of the connection.
+    let _ = patience;
+    Ok(())
 }
 
 /// Refuse a device for a connection outside any attachment unless it shows
