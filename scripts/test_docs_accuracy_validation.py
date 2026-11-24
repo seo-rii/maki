@@ -372,5 +372,41 @@ class ReleaseCandidates(DocumentTest):
                 self.has(prose(document), f"`v{version}-rc.<n>`", document)
 
 
+
+class HelperAndWitnessStatements(DocumentTest):
+    """What the helper's man page and the witness guide say its code does."""
+
+    MAN = "packaging/debian/man/maki-attach.8"
+
+    def test_only_state_errors_tell_the_caller_to_run_as_root(self):
+        hint = "; run this command as root"
+        sources = sorted((ROOT / "crates/maki-privileged/src").rglob("*.rs"))
+        sources += sorted((ROOT / "bins/maki-attach/src").rglob("*.rs"))
+        hinted = [path.relative_to(ROOT).as_posix() for path in sources
+                  if hint in rust_strings(path.relative_to(ROOT))]
+        self.assertEqual(hinted, ["crates/maki-privileged/src/state.rs"])
+        man = prose(self.MAN)
+        self.lacks(man, "or its lock names that path, and says to run the command as root", self.MAN)
+        self.has(man, "one about the state directory or its lock also says to run the command "
+                      "as root", self.MAN)
+
+    def test_the_block_size_bound_is_the_kernel_page_size(self):
+        config = rust_strings("crates/maki-privileged/src/config.rs")
+        check = config[config.index("pub fn check_device_block_size"):]
+        self.has(check[:check.index("\n}\n")], "_SC_PAGESIZE", "check_device_block_size")
+        self.has(prose(self.MAN), "a power of two from 512 up to the kernel's page size", self.MAN)
+
+    def test_a_changed_witness_state_is_refused_first_as_invalid(self):
+        store = rust_strings("crates/maki-backing/src/remote_witness.rs")
+        self.has(store, 'invalid("remote witness changed while locked")', "remote_witness.rs")
+        wire = rust_strings("crates/maki-witness/src/lib.rs")
+        self.assertRegex(wire, r"io::ErrorKind::InvalidInput \| io::ErrorKind::InvalidData => \{\s*"
+                               r"WireError::InvalidRequest")
+        guide = prose("docs/remote-witness-service.md")
+        self.lacks(guide, "stops decoding while `serve` holds its lock also makes it answer "
+                          "unavailable until a restart", "remote-witness-service.md")
+        self.has(guide, "makes it refuse the next request as invalid", "remote-witness-service.md")
+
+
 if __name__ == "__main__":
     unittest.main()
