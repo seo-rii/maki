@@ -57,13 +57,11 @@ by the normal exit cleanup and supplies no successful lock verdict.
 
 ## Run
 
-The current helper requires nbd-client 3.27.0 or later built with netlink and
-backend-identifier support. Debian 12's stock nbd-client 3.24 is too old, and
-`--install-missing` does not replace an already installed old client. Build or
-install a qualified version before running the suite; a source build also needs
-`autoconf-archive`. The configured block-device path remains `/dev/nbd15`.
-Internally, current netlink nbd-client commands receive the kernel name
-`nbd15`, while block tools continue to receive `/dev/nbd15`.
+The runner needs no nbd-client: the `maki-attach` it builds connects both the
+raw export (`maki-attach nbd-connect`, outside any attachment) and the helper
+phase's attachment with its own NBD handshake and netlink requests. The
+configured block-device path remains `/dev/nbd15`; the helper addresses the
+kernel device by its index.
 
 Use a high-numbered, dedicated NBD device. The following command installs the
 missing Debian packages, caches sudo authorization interactively, and then
@@ -138,7 +136,8 @@ child directory, and delete only the `mktemp` work tree.
 It also removes the per-volume `/run/maki-control` directory and the temporary
 root-owned attach configuration created by the run.
 
-Every raw attachment phase supplies a fresh backend identifier to nbd-client.
+Every raw attachment phase supplies a fresh backend identifier to
+`maki-attach nbd-connect`.
 The runner records it before connecting, so even a command that fails after
 connecting can be cleaned up. Raw connect, disconnect, and LVM removal operations
 hold the helper's `/run/maki-attach/attach.lock`; each removal requires the live
@@ -172,6 +171,19 @@ report `Operation not permitted`, `Cannot open NBD: Permission denied` or the
 netlink client's `Failed to disconnect device` while the run's own backend
 stays connected. Any other output fails the run and is printed. No campaign
 has been rerun with these checks.
+
+## Helper-owned NBD connect — 2026-11-24
+
+The helper now negotiates with the daemon's socket and connects and
+disconnects NBD devices over netlink itself, so the runner neither requires nor
+installs nbd-client. Its raw phases use `maki-attach nbd-connect` and
+`nbd-disconnect` inside the attach lock, and the unprivileged disconnect check
+runs the helper's own `nbd-disconnect` as the invoking user: it passes only when
+the helper reports the kernel's `Operation not permitted` for
+`NBD_CMD_DISCONNECT` while the run's backend stays connected, and the evidence
+is kept as `unprivileged-nbd-disconnect.txt`. Every result below used
+nbd-client 3.27.1 (3.24 for the first one); no campaign has been run with the
+helper's own connect yet.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 

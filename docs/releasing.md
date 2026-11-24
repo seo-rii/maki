@@ -19,7 +19,7 @@ Python 3.11 or newer, Git, Rust/Cargo 1.94.0 (the CI baseline), a native C toolc
 [Debian installation guide](getting-started/installation-debian.md). Packages
 inherit the build host's native library requirements; an ELF architecture
 match alone does not make a package compatible with an older distribution.
-The target must also provide the versioned `nbd-client >= 3.27.0` dependency.
+The package needs no NBD client: the helper connects NBD devices itself.
 
 Prepare candidates after committing the intended changes. The command refuses
 staged or unstaged tracked changes and exports only `HEAD`; untracked files,
@@ -170,19 +170,10 @@ attestation policy.
 
 ## Retain the complete deployment inputs
 
-The Maki candidate builder does not build or include `nbd-client`. Keep the
-versioned `nbd-client >= 3.27.0` package alongside the candidate, with its source
-revision or source-package checksum, Debian packaging/patches, exact build
-commands and build log. Record the resulting package version, architecture,
-SHA-256 and netlink-enabled build configuration. The historical 3.27.1 package
-recipe has not been preserved; the installation guide's backport outline must
-be executed and validated on the selected build host before calling a new
-bundle reproducible or qualified.
-
 For the first deployment profile, retain one manifest of all installed package
 versions and the kernel, filesystem and Maki configuration. Qualify fresh-host
 installation, stopped-workload upgrade, and backup restore using those exact
-Maki and nbd-client artifacts on Debian 12 with local AES-GCM-SIV and a single
+Maki artifacts on Debian 12 with local AES-GCM-SIV and a single
 NBD/PV/VG/XFS LV. Attach results to the final integrated commit and package
 hashes. Changes to packages or configuration require the affected checks to be
 run again; creating a PR or passing unit tests does not supply those results.

@@ -37,12 +37,15 @@ On Debian-family systems the relevant packages are `nbdkit`,
 `nbdkit-plugin-dev`, `libnbd-bin`, and `fio`. Package and service installation
 remain distribution-specific.
 
-Privileged attachment additionally requires nbd-client 3.27.0 or later built
-with netlink and backend-identifier support. The helper validates `/dev/nbdN`
-as the configured block path and supplies `nbdN` to netlink nbd-client
-connect/disconnect commands. Debian 12's stock nbd-client 3.24 does not satisfy
-this requirement; the [Debian installation guide](getting-started/installation-debian.md)
-shows how to build and install the required version and the Maki package.
+Privileged attachment needs no NBD client package. The helper validates
+`/dev/nbdN` as the configured block path, negotiates with the volume daemon's
+socket itself (fixed-newstyle `NBD_OPT_GO` for the default export) and connects
+and disconnects the kernel device with generic-netlink requests to the `nbd`
+family, which needs a kernel whose `nbd` module has the netlink interface and
+the backend identifier (SPEC §6). It refuses an export that does not advertise
+FLUSH and FUA, before the kernel sees the socket. The
+[Debian installation guide](getting-started/installation-debian.md) shows how to
+build and install the Maki package.
 
 A new volume exports an empty device. Before its first `maki-attach attach`,
 create the PV, VG, XFS data LV and record their identities as described in
@@ -770,12 +773,14 @@ has no observed remaining use. This uses the helper's current mount namespace;
 cross-namespace operational qualification remains a target-host check. The
 trusted record format and the legacy migration requirements remain the same.
 
-This requires **nbd-client 3.27.0 or later built with netlink support**, and a
-kernel exposing the NBD backend identifier. The identifier option was added
-in [NBD 3.27.0](https://github.com/NetworkBlockDevice/nbd/releases/tag/nbd-3.27.0).
-An unsupported client or unverifiable connection fails closed. Qualify the
-updated helper on the intended Linux target before deployment; older privileged
-validation reports do not cover this connection-identity protocol.
+This requires a kernel whose `nbd` netlink family takes the backend identifier;
+the helper refuses to connect on one that does not, and an unverifiable
+connection fails closed. The helper sets the identifier itself; until the
+change that made it do so, it ran `nbd-client` 3.27 or later, which set the
+same kernel attribute, so attachments connected that way stay detachable.
+Qualify the updated helper on the intended Linux target before deployment;
+the privileged validation reports before that change used `nbd-client` 3.27.1
+and do not cover the helper's own connect.
 
 `maki-attach@<volume>.service` becomes active after the identity check passes.
 Its `RemainAfterExit=yes` retains that past result even if the mount later
@@ -1127,8 +1132,8 @@ path. Apply the package changes during a planned maintenance window:
    `/run/maki/attach/<volume>.nbd` files into the new helper directory.
 2. Disable old direct enablement of `maki@<volume>` and
    `maki-attach@<volume>`. Install the updated helper, daemon, attach, recover,
-   and workload-target units plus tmpfiles rules, and ensure the nbd-client,
-   systemd, and kernel requirements above are satisfied.
+   and workload-target units plus tmpfiles rules, and ensure the systemd and
+   kernel requirements above are satisfied.
 3. Update explicit `control.socket` values to
    `/run/maki-control/<volume>/control.sock`, or provision an equivalent custom
    path whose ancestors permit the configured control group to traverse it.

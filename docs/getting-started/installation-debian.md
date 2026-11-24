@@ -13,10 +13,9 @@ for a first installation.
 
 | Component | Requirement | Debian 12 status |
 |---|---|---|
-| `nbdkit` | Any recent release with API v2 (1.32.5 tested) | `apt install nbdkit` |
-| `nbd-client` | **3.27.0 or later**, built with netlink support | Stock package is 3.24: **too old**, see below |
+| `nbdkit` | Any recent release with API v2 and `NBD_OPT_GO` (1.32.5 tested) | `apt install nbdkit` |
 | kmod | `modprobe` to load the NBD module | `apt install kmod` |
-| Kernel NBD module | `nbd` with the sysfs backend identifier (Linux 6.1 tested) | Included |
+| Kernel NBD module | `nbd` with its netlink interface and the sysfs backend identifier (Linux 6.1 tested) | Included |
 | LVM2 | `fullreport`, `--devices` and UUID-scoped activation (2.03.16 tested) | `apt install lvm2` |
 | XFS tools | `mkfs.xfs`, `xfs_growfs` (6.1.0 tested) | `apt install xfsprogs` |
 | systemd | 249 or later for `OnSuccess=` in the recovery unit | 252 |
@@ -27,105 +26,20 @@ library packages that `dpkg-shlibdeps` finds in the binaries at build time
 (such as `libc6`):
 
 ```text
-Depends: nbd-client (>= 1:3.27.0), nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod
+Depends: nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod
 ```
 
-so `apt install ./maki_*.deb` refuses to install until a suitable
-`nbd-client` is present. Replacing the binary under `/usr/sbin` by hand does
-not satisfy the dependency and is not a supported configuration.
+No NBD client package is needed: `maki-attach` negotiates with the volume
+daemon's socket and connects and disconnects the kernel device over netlink
+itself, setting the attachment's identity as the device's backend
+identifier.
 
-## nbd-client 3.27 or later
-
-Trusted attachment identity relies on the kernel backend identifier that
-`nbd-client` passes over netlink starting with
-[NBD 3.27.0](https://github.com/NetworkBlockDevice/nbd/releases/tag/nbd-3.27.0).
-Check what your host offers:
-
-```bash
-apt-cache policy nbd-client | head -n 5
-nbd-client -h 2>&1 | grep -o 'version [0-9.]*'
-```
-
-If the candidate version is `1:3.27.0` or later, install it with `apt` and
-continue with [Build the Maki package](#build-the-maki-package).
-
-On Debian 12 the candidate is `1:3.24-*`. The qualification campaigns used
-`nbd-client` 3.27.1 built from upstream commit
-`f96f7fca3b37f4254c26c95f5c6c9dae70e030a1` and installed as the versioned
-Debian package `1:3.27.1-1`. The repository does not ship that package, and
-the exact recipe used during qualification is not preserved here; the
-standard Debian backport workflow below produces an equivalent versioned
-package. Review it before use and keep the resulting `.deb` with your
-deployment artifacts so every host installs the same build.
-
-The repository records no digest for the upstream `nbd-3.27.1.tar.xz`, and
-the download location alone does not prove what it serves. Before the first
-build, verify the tarball against the upstream maintainer's OpenPGP
-signature for the release (`gpg --verify <signature> nbd-3.27.1.tar.xz`),
-using a release key whose fingerprint you confirmed independently of the
-download. Do not build a tarball whose signature you could not verify.
-Record its SHA-256 (`sha256sum nbd-3.27.1.tar.xz`) with your deployment
-artifacts and set it for every build with
-`export NBD_TARBALL_SHA256=<verified digest>`.
-
-The recipe runs in a subshell that stops at the first failed command. It
-builds in a new directory, refuses a tarball with any other digest before
-building, and installs exactly the client package its build produced for the
-host architecture:
-
-```bash
-(
-set -euo pipefail
-# 1. Build dependencies of the existing Debian source package, plus the
-#    autoconf archive the upstream build needs. Enable `deb-src` first:
-#    uncomment the deb-src lines in /etc/apt/sources.list, or add
-#    "Types: deb deb-src" to the .sources file if the host uses deb822.
-apt update
-apt install -y build-essential devscripts autoconf-archive curl
-apt build-dep -y nbd-client
-
-# 2. Fetch the Debian packaging and the upstream release tarball into a new,
-#    empty directory, and check the tarball against the verified digest.
-nbd_build="$(mktemp -d /usr/local/src/nbd-3.27.1.XXXXXX)"
-printf 'building in %s\n' "$nbd_build"
-cd "$nbd_build"
-apt source nbd-client
-curl -fsSLO https://github.com/NetworkBlockDevice/nbd/releases/download/nbd-3.27.1/nbd-3.27.1.tar.xz
-printf '%s  nbd-3.27.1.tar.xz\n' "${NBD_TARBALL_SHA256:-}" | sha256sum --check --strict
-
-# 3. Rebase the Debian packaging onto the new upstream version.
-cd nbd-3.24*/
-uupdate --upstream-version 3.27.1 ../nbd-3.27.1.tar.xz
-cd ../nbd-3.27.1
-
-# 4. Build unsigned binary packages, then install the client package this
-#    build wrote to the parent directory (its name omits the epoch).
-dpkg-buildpackage -us -uc -b
-nbd_version="$(dpkg-parsechangelog --show-field Version)"
-nbd_deb="$(cd .. && pwd)/nbd-client_${nbd_version#*:}_$(dpkg --print-architecture).deb"
-apt install -y "$nbd_deb"
-sha256sum "$nbd_deb"
-)
-```
-
-Verify the result before continuing:
-
-```bash
-dpkg -s nbd-client | grep '^Version'         # 1:3.27.1-… or later
-nbd-client -h 2>&1 | grep -o 'version [0-9.]*'
-```
-
-`uupdate` may carry over packaging patches that no longer apply, and
-`dpkg-buildpackage` then stops. Drop the patches that upstream 3.27 already
-contains from `debian/patches/series` in the printed directory's
-`nbd-3.27.1` subdirectory, then repeat step 4 there inside
-`( set -euo pipefail; … )`. If the
-`libnl-genl-3` development package is missing, netlink support is compiled
-out and `maki-attach` will fail closed at attach time, so keep
-`apt build-dep` in step 1.
-
-With the default APT priorities, an older stock version leaves the installed
-backport in place. Leave the package eligible for newer updates.
+<a id="nbd-client-327-or-later"></a>
+A source-built `nbd-client` that a host installed for an earlier Maki release
+is no longer used and may be removed, and attachments it connected stay
+detachable, because the helper checks the same kernel backend identifier
+(`/sys/block/nbdN/backend`) that `nbd-client -identifier` set and disconnects
+through the same netlink interface.
 
 ## Build the Maki package
 

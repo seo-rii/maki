@@ -296,6 +296,13 @@ The helper MUST:
   step, by the backend identifier the kernel shows, never by assuming that
   nothing changed.
 
+Provisioning a new volume connects its export once outside any attachment
+(`maki-attach nbd-connect`, then `nbd-disconnect`), with the same handshake and
+request. Such a connection MUST NOT use an identifier of the form attach records
+use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
+a trusted record names, and its disconnect MUST touch only a device connected
+under its own identifier.
+
 The helper logs the process and user IDs of its socket peer when it connects,
 for diagnostics only: the documented flows may run nbdkit outside the
 volume's unit.
