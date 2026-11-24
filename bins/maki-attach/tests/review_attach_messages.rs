@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::path::Path;
 use std::process::{Command, Output};
 
 /// A volume no host has a configuration or an attachment for.
@@ -48,7 +49,9 @@ fn verify_names_the_file_it_cannot_open() {
 
 /// Without root every executing verb is refused at the attach state
 /// directory, which only root may open or create. The error names the
-/// directory and says whom to run as.
+/// directory and says whom to run as. The gate never creates the
+/// directory: on a host without one (no attach since boot, or Maki not
+/// installed) it names the directory as missing, which is not a refusal.
 #[test]
 fn an_executing_verb_without_root_names_the_state_directory_and_root() {
     if is_root() {
@@ -68,10 +71,14 @@ fn an_executing_verb_without_root_names_the_state_directory_and_root() {
         if stderr.contains("/etc/maki/attach/") {
             continue;
         }
-        let expected = format!(
-            "error: attach state directory {STATE}: Permission denied (os error 13); run this \
-             command as root"
-        );
+        let expected = if verb == "verify" && !Path::new(STATE).exists() {
+            format!("error: attach state directory {STATE}: No such file or directory (os error 2)")
+        } else {
+            format!(
+                "error: attach state directory {STATE}: Permission denied (os error 13); run \
+                 this command as root"
+            )
+        };
         assert!(
             stderr.lines().any(|line| line == expected),
             "{verb}: {stderr}"
