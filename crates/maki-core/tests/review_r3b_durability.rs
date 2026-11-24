@@ -1829,6 +1829,37 @@ async fn never_finished_shard_reads_as_holes(backing: &Arc<CrashableBacking>, pa
     );
 }
 
+/// A repair checkpoint that adopted several shards sizes their data files
+/// before the catalog names them, in shard order. The shards are kept in a
+/// hash map; in its order, which file a failed sync or a power loss in the
+/// middle had reached would differ from one process to the next.
+#[tokio::test]
+async fn adopted_orphans_are_sized_in_shard_order() {
+    let _serial = maki_test_support::failpoints::test_lock();
+    let backing = Arc::new(CrashableBacking::new());
+    drop(attach(&backing).await);
+    let orphans = [1u64, 2, 3, 4, 5];
+    for shard in orphans {
+        drop(backing.open(&layout::shard_data(shard), true).unwrap());
+    }
+    backing.sync_dir(layout::DATA_DIR).unwrap();
+
+    let engine = attach(&backing).await;
+    let sized = Arc::new(Mutex::new(Vec::new()));
+    let seen = sized.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op: &FaultOp<'_>| {
+        if let FaultOp::SetLen { path, len } = op {
+            if *len > 0 && path.ends_with(".dat") {
+                seen.lock().push(path.to_string());
+            }
+        }
+        None
+    })));
+    engine.checkpoint().await.unwrap();
+    backing.set_fault_hook(None);
+    assert_eq!(*sized.lock(), orphans.map(layout::shard_data));
+}
+
 /// Minimised from `random_workloads_with_sync_failures_never_show_foreign_data`
 /// (seed 29) once checkpoint destinations were reserved at write admission.
 /// A shard's creation stopped at its data file's size sync and power was
