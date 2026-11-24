@@ -172,6 +172,50 @@ impl PlannedStep {
             }
         }
     }
+
+    /// Replace the device `from` with `to` wherever the step names it.
+    fn rebind_device(&mut self, from: &str, to: &str) {
+        match self {
+            PlannedStep::NbdConnect { device, .. }
+            | PlannedStep::SetBlockSize { device, .. }
+            | PlannedStep::NbdDisconnect { device }
+            | PlannedStep::VerifyMountDevice {
+                nbd_device: device, ..
+            }
+            | PlannedStep::VerifyMountIdentity {
+                nbd_device: device, ..
+            } if device == from => *device = to.to_string(),
+            _ => {}
+        }
+    }
+
+    /// The step as its execution reports it. A plan cannot know the backend
+    /// identifier of a connect, which is made for each attach, and prints a
+    /// placeholder in its place; an executed connect names the `identifier`
+    /// it sends. Every other step reads as its plan line.
+    pub fn executed_with(&self, identifier: &str) -> String {
+        match self {
+            PlannedStep::NbdConnect {
+                socket,
+                device,
+                block_size,
+            } => connect_line(socket, device, *block_size, identifier),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// What a plan prints where a connect's backend identifier will be.
+const GENERATED_IDENTIFIER: &str = "<generated-connection-uuid>";
+
+/// The line of a connect step that sends `identifier`.
+fn connect_line(socket: &str, device: &str, block_size: u32, identifier: &str) -> String {
+    format!(
+        "connect {} to {} over netlink (block size {block_size}, backend identifier \
+         '{identifier}'; the export must advertise FLUSH and FUA)",
+        shell_word(device.strip_prefix("/dev/").unwrap_or(device)),
+        shell_word(socket)
+    )
 }
 
 /// Render one argument in command-shaped plan output, preserving simple paths.
@@ -195,13 +239,12 @@ impl fmt::Display for PlannedStep {
                 socket,
                 device,
                 block_size,
-            } => write!(
-                f,
-                "connect {} to {} over netlink (block size {block_size}, backend identifier \
-                 '<generated-connection-uuid>'; the export must advertise FLUSH and FUA)",
-                shell_word(device.strip_prefix("/dev/").unwrap_or(device)),
-                shell_word(socket)
-            ),
+            } => f.write_str(&connect_line(
+                socket,
+                device,
+                *block_size,
+                GENERATED_IDENTIFIER,
+            )),
             PlannedStep::SetBlockSize { device, block_size } => {
                 write!(f, "blockdev --setbsz {block_size} {}", shell_word(device))
             }
@@ -362,6 +405,14 @@ impl Plan {
     pub fn bind_device(&mut self, device: &str) {
         for step in &mut self.steps {
             step.bind_device(device);
+        }
+    }
+
+    /// Move a plan bound to the allocated device `from` to the device `to`:
+    /// an attach gives up a device the kernel keeps refusing as busy.
+    pub fn rebind_device(&mut self, from: &str, to: &str) {
+        for step in &mut self.steps {
+            step.rebind_device(from, to);
         }
     }
 }

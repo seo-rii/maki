@@ -74,8 +74,8 @@ install -m 0640 -o root -g maki volume.toml /etc/maki/volumes/<volume>.toml
 
 The daemon user reads that file through its group, and commands run as root or
 as the daemon user accept it. A file owned by the daemon user is accepted by
-the daemon and by commands run as that user (`sudo -u maki`), but refused by
-commands run as root. A configuration a user writes for
+the daemon and by commands run as that user (`runuser -u maki -- …`), but
+refused by commands run as root. A configuration a user writes for
 their own runs, such as a disposable one below `/tmp`, is accepted with the
 usual `0600` or `0644`. A configuration tool that installs the file as a
 symlink, or as a hard link into a store, must copy it instead. Keep the
@@ -998,6 +998,12 @@ already allocated journal or slot blocks before checkpoint completes. That
 holds only where the backing filesystem overwrites allocated blocks in place:
 not for extents shared with a reflink copy, and not on a copy-on-write
 filesystem ([backing store](deployment/support-matrix.md#backing-store-below-maki)).
+One metadata store is an exception there too: an A/B copy that a power loss
+left undecodable is emptied before it is written again, which releases its
+blocks, so on a filesystem with no free block that store can fail with ENOSPC,
+and with it the checkpoint, barrier or attach that needed it. The other copy
+is untouched, acknowledged writes stay in the journal, and the operation
+succeeds once space is available.
 A reservation failure returns ENOSPC without consuming a journal sequence and
 is retryable.
 

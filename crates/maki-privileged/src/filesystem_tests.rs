@@ -127,7 +127,7 @@ impl System for FilesystemSystem {
         }
     }
 
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.inner.wait_ready(step, device)
     }
 

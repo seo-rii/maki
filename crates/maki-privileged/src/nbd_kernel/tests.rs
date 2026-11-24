@@ -5,7 +5,7 @@
 use super::handshake::{
     Export, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_HAS_FLAGS, NBD_FLAG_SEND_FLUSH, NBD_FLAG_SEND_FUA,
     NBD_FLAG_SEND_TRIM, NBD_FLAG_SEND_WRITE_ZEROES, NBD_INFO_EXPORT, NBD_OPT_GO, NBD_REP_ACK,
-    NBD_REP_ERR_POLICY, NBD_REP_INFO, REPLY_MAGIC,
+    NBD_REP_ERR_POLICY, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, REPLY_MAGIC,
 };
 use super::*;
 
@@ -197,6 +197,157 @@ fn a_refused_handshake_closes_the_socket_and_names_the_reason() {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(server.join().unwrap(), "the helper kept its socket open");
+    }
+}
+
+/// A negotiated connection is handed to the kernel again only while it is
+/// what the handshake left: open, with nothing to read. Looking consumes
+/// nothing.
+#[test]
+fn a_negotiated_connection_is_reusable_only_while_open_and_silent() {
+    use std::os::unix::net::UnixStream;
+
+    let (client, server) = UnixStream::pair().unwrap();
+    assert!(idle(&client), "an open, silent connection");
+    assert!(idle(&client), "looking changed it");
+
+    // The daemon closed its end.
+    drop(server);
+    assert!(!idle(&client));
+
+    // The kernel's cleanup of a refused connect shut the socket down.
+    let (client, _server) = UnixStream::pair().unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(!idle(&client));
+
+    // The daemon closed without reading what the helper had sent: the
+    // connection was reset, and the look ends in an error.
+    let (client, server) = UnixStream::pair().unwrap();
+    (&client).write_all(&[0x25]).unwrap();
+    drop(server);
+    assert!(!idle(&client));
+
+    // A byte no server sends before a request; it stays unread.
+    let (client, mut server) = UnixStream::pair().unwrap();
+    server.write_all(&[0x67]).unwrap();
+    assert!(!idle(&client));
+    assert!(!idle(&client));
+    let mut byte = [0];
+    (&client).read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0x67]);
+    assert!(idle(&client));
+}
+
+/// The daemon serves one connection at a time, so a new negotiation closes
+/// the helper's earlier connection before it opens the next one, and what
+/// the daemon then answers is passed on: an export, or that the export is
+/// not available.
+#[test]
+fn a_new_negotiation_closes_the_earlier_connection_first() {
+    let directory = Directory::new();
+    let socket = directory.socket();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let serving = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        first.write_all(&export_script(1 << 20, FLAGS)).unwrap();
+        let (mut second, _) = listener.accept().unwrap();
+        // The second connection exists: the first must be closed already.
+        // What is left on it is the client's request, then the end.
+        first.set_nonblocking(true).unwrap();
+        let mut rest = Vec::new();
+        let closed_first = first.read_to_end(&mut rest).is_ok();
+        second
+            .write_all(&[greeting(), reply(NBD_REP_ERR_UNKNOWN, b"")].concat())
+            .unwrap();
+        second.set_read_timeout(Some(PATIENCE)).unwrap();
+        let _ = second.read_to_end(&mut rest);
+        closed_first
+    });
+    let netlink = netlink::Socket::open().unwrap();
+    let mut attempts = KernelAttempts {
+        netlink: &netlink,
+        family: 0x1e,
+        socket: &socket,
+        index: 3,
+        block_size: 4096,
+        identifier: IDENTIFIER,
+        deadline: Instant::now() + PATIENCE,
+        negotiated: None,
+    };
+    assert!(!attempts.reusable(), "nothing is negotiated yet");
+    assert!(matches!(attempts.negotiate(), Ok(Negotiation::Ready)));
+    assert!(attempts.reusable());
+    match attempts.negotiate() {
+        Ok(Negotiation::ExportUnavailable(refusal)) => {
+            assert!(refusal.contains(&socket), "{refusal}");
+            assert!(refusal.contains("NBD_REP_ERR_UNKNOWN"), "{refusal}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !attempts.reusable(),
+        "a refused negotiation left a connection"
+    );
+    drop(attempts);
+    assert!(
+        serving.join().unwrap(),
+        "the first connection was still open when the second arrived"
+    );
+}
+
+/// The step asks about the connection it negotiated, not only whether it
+/// has one: once the daemon has closed that connection, or has sent a byte
+/// on it, the next request is not sent on it.
+#[test]
+fn a_connection_the_daemon_closed_or_wrote_to_is_not_offered_again() {
+    for writes in [false, true] {
+        let directory = Directory::new();
+        let socket = directory.socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (proceed, negotiated) = std::sync::mpsc::channel::<()>();
+        let (changed, change) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let serving = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&export_script(1 << 20, FLAGS)).unwrap();
+            negotiated.recv().unwrap();
+            if writes {
+                stream.write_all(&[0x67]).unwrap();
+                changed.send(()).unwrap();
+                // Open until the client is done with it.
+                let _ = finished.recv();
+            } else {
+                // Read the client's request first, so that this is the end
+                // of the stream and not a reset.
+                stream.set_nonblocking(true).unwrap();
+                let mut request = Vec::new();
+                let _ = stream.read_to_end(&mut request);
+                drop(stream);
+                changed.send(()).unwrap();
+            }
+        });
+        let netlink = netlink::Socket::open().unwrap();
+        let mut attempts = KernelAttempts {
+            netlink: &netlink,
+            family: 0x1e,
+            socket: &socket,
+            index: 3,
+            block_size: 4096,
+            identifier: IDENTIFIER,
+            deadline: Instant::now() + PATIENCE,
+            negotiated: None,
+        };
+        assert!(matches!(attempts.negotiate(), Ok(Negotiation::Ready)));
+        assert!(attempts.reusable(), "writes: {writes}");
+        proceed.send(()).unwrap();
+        change.recv().unwrap();
+        assert!(
+            !attempts.reusable(),
+            "the step would send its next request on a connection the daemon {}",
+            if writes { "wrote to" } else { "closed" }
+        );
+        drop(finish);
+        serving.join().unwrap();
     }
 }
 

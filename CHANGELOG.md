@@ -3,13 +3,64 @@
 All notable changes to Maki, in particular anything that affects on-disk
 compatibility, the runtime layout, credentials or operator procedures. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-Maki has no tagged release yet, so everything is under *Unreleased* with the
-commit that introduced it. Procedures for each change live in the linked
+Maki has no final release yet (release candidates are tagged
+`v0.1.0-rc.<n>` as GitHub pre-releases), so everything is under *Unreleased*
+with the commit that introduced it. Procedures for each change live in the linked
 documents.
 
 ## Unreleased
 
 ### Breaking changes
+
+- **On RHEL 9 Maki is removed with `rpm -e maki`; `dnf remove maki` is always
+  refused** (AUD-161, AUD-173, 2026-11-24;
+  [#384](https://github.com/seo-rii/maki/pull/384)). rpm cannot stop a
+  transaction from a scriptlet: under an attached volume `dnf remove maki`
+  kept Maki, whose `%preun` refused, and erased `nbdkit-server`, `lvm2`,
+  `xfsprogs` and `kmod` as unused dependencies, and
+  `dnf install --allowerasing nbdkit` installed `nbdkit-selinux` beside it.
+  The RPM now installs `/etc/dnf/protected.d/maki.conf`, so dnf refuses,
+  before it changes anything, to remove Maki or a package it requires,
+  whether or not a volume is attached. Remove Maki with `rpm -e maki`, which
+  `%preun` still refuses under an attachment, then `dnf autoremove`;
+  reinstalling and upgrading are not refused. The RPM also declares
+  `Conflicts: nbdkit` (the metapackage) beside `Conflicts: nbdkit-selinux`,
+  so it cannot be installed on a host that has the metapackage, and it
+  provides `user(maki)`, `group(maki)` and `group(maki-admin)` wherever it is
+  built. The `v0.1.0-rc.1` RPM has neither the protection nor the provides:
+  remove it with `rpm -e` as well. When this entry was written no later
+  release candidate had been tagged
+  ([RHEL 9 removal](docs/getting-started/installation-rhel.md#upgrading-and-removal)).
+- **The export advertises fast zero and refuses every fast zero request**
+  (AUD-160, 2026-11-24; [#381](https://github.com/seo-rii/maki/pull/381)).
+  nbdkit asserts, rather than checks, that a WRITE_ZEROES request with
+  `NBD_CMD_FLAG_FAST_ZERO` was advertised, so one such request from any
+  client of the volume's NBD socket aborted an nbdkit built with assertions
+  (Ubuntu 24.04's 1.36.3), although the plugin would have refused it. The
+  plugin now advertises `NBD_FLAG_SEND_FAST_ZERO` and refuses every fast zero
+  request with `ENOTSUP`, without changing the export, as the NBD protocol
+  allows. The
+  transmission flags are 0x084d on a default volume and 0x086d on a discard
+  volume (0x004d and 0x006d before); `maki-attach` forwards them to the
+  kernel unchanged, and the Linux NBD driver neither reads that flag nor
+  sends such a request ([space reclamation](docs/space-reclamation.md), SPEC
+  §48).
+- **`maki-attach nbd-disconnect` waits until the connection is gone, and
+  `--plan` fails for a default configuration it cannot examine** (AUD-165,
+  AUD-167, 2026-11-24; [#383](https://github.com/seo-rii/maki/pull/383),
+  [#385](https://github.com/seo-rii/maki/pull/385)). The kernel acknowledges a
+  disconnect while the device still shows the connection, and refuses a new
+  connect, until the last opener has closed it. `nbd-disconnect` now waits up
+  to 15 s for the device to stop showing the connection it disconnected and
+  exits 1, saying that something still has the device open, where it returned
+  0 at once; run it again once the opener has let go. Detach and cleanup are
+  unchanged. `maki-attach <verb> --plan` without `--config` used to print the
+  plan of the built-in defaults, with status 0, whenever the default
+  configuration could not be examined (a caller who may not search
+  `/etc/maki/attach`); only a path that does not exist selects the defaults
+  now, and any other answer, a dangling symbolic link included, fails with
+  the path and status 1, for `--plan` and for the executing verbs
+  (`maki-attach(8)`, [helper](docs/operations.md#privileged-helper)).
 
 - **The privileged helper connects and disconnects NBD devices itself; no NBD
   client is used** (AUD-147, AUD-151, AUD-153, 2026-11-24;
@@ -62,7 +113,9 @@ documents.
   names, and `nbd-disconnect` touches only a device connected under its own
   identifier. Neither takes the attach lock, which the procedure holds for its
   whole run ([provisioning](docs/getting-started/first-volume.md),
-  `maki-attach(8)`).
+  `maki-attach(8)`). *Changed by AUD-165
+  ([#383](https://github.com/seo-rii/maki/pull/383)): `nbd-disconnect` waits
+  until the device no longer shows the connection.*
 
 - **The command-line binaries exit 2 for misuse, and `maki-attach` actions
   exit 3 off Linux** (AUD-137, AUD-144, 2026-11-23;
@@ -473,6 +526,10 @@ documents.
   unit to name nbdkit by its absolute path, never by a bare name that systemd
   would look up in `/usr/local` first. `SOURCE_DATE_EPOCH` must be given, 1990
   or later ([packaging/rpm/README.md](packaging/rpm/README.md)).
+  *Superseded in part by AUD-161
+  ([#384](https://github.com/seo-rii/maki/pull/384)): `%preun` cannot stop a dnf
+  transaction, so the package is dnf-protected and also conflicts with the
+  `nbdkit` metapackage.*
 
 - **A RHEL 9 installation guide** (AUD-158, 2026-11-24;
   [#374](https://github.com/seo-rii/maki/pull/374)): BaseOS and AppStream
@@ -611,6 +668,67 @@ documents.
 
 ### Changed
 
+- **`maki volume create` continues a local creation that stopped after its
+  witness anchor** (AUD-159, AUD-169, AUD-170, 2026-11-24;
+  [#382](https://github.com/seo-rii/maki/pull/382)). A local rollback creation
+  that stopped between its anchor and its superblock left a pair that
+  `create` refused and that held no volume, and both directories had to be
+  emptied by hand. Running `create` again now opens the pair against its
+  witness and continues it if, and only if, it holds nothing but an
+  unfinished creation, with the capacity that creation reserved; every other
+  pair is refused as before and left unchanged. Until then the daemon,
+  `maki check` and `maki volume inspect` fail when the backing is opened and
+  name `maki volume create` as what continues it, where they said "No such
+  file or directory" or a bare "no valid superblock"; `maki check` therefore
+  prints an error and exits 1 for such a pair, where it printed a failed
+  report. The first superblock copy of a new volume is written as
+  `superblock.next` and renamed, so a creation can leave that transient file
+  and no longer a `superblock.a` without a superblock; a root that holds such
+  a file from an earlier release is refused with its causes and never
+  initialized again
+  ([local creation](docs/rollback-protection.md#local-configuration-and-creation),
+  [operations](docs/operations.md)).
+- **A remote `maki volume create` continues a root in which a binding was
+  left without its format marker** (AUD-172, 2026-11-24;
+  [#387](https://github.com/seo-rii/maki/pull/387)). An interrupted
+  `volume resume-enrollment` could keep the binding, staged or published,
+  and lose the marker after a power loss; `create` then answered
+  `remote enrollment requires an empty backing` and `resume-enrollment`
+  `No such file or directory`. Recovery now makes the marker's name durable before it
+  stages a binding, and `create` continues such a root: a staged binding is
+  written again, and a published one is accepted only if it is the binding
+  this creation would write, under an authority that is released and was
+  never activated. A binding for another authority or capacity and a staged
+  entry that is not a regular file the command can write again are refused
+  with a message that names the way out. A binding that cannot be read keeps
+  `remote enrollment requires an empty backing` from `create`, and
+  `resume-enrollment` under a released authority says what to do with it
+  ([resume enrollment](docs/rollback-protection.md#resume-interrupted-initial-enrollment)).
+- **A connect keeps its negotiated connection across busy answers, waits for
+  the daemon's export and can move to the next free NBD device** (AUD-162 to
+  AUD-164, 2026-11-24; [#383](https://github.com/seo-rii/maki/pull/383)). The
+  helper retries two answers every 100 ms for up to 5 s, counted from the
+  first of them: the kernel's `EBUSY`, now on the connection it has already
+  negotiated while that is still usable, and the daemon's "export not
+  available" (`NBD_REP_ERR_UNKNOWN` to `NBD_OPT_GO`), which nbdkit also
+  answers for a moment after a previous connection closed. A server that
+  really has no default export is therefore refused after 5 s, not at once.
+  The daemon logs a warning for each second connection it refuses. An attach
+  that allocated its device itself and finds it busy to the end moves to the
+  next free device instead of failing, replacing its record first; it then
+  prints a second `# bound NBD device:` line. A pinned `nbd_device` is never
+  given up ([prerequisites](docs/operations.md#prerequisites), SPEC §6).
+- **An A/B metadata store empties an undecodable copy before it writes it**
+  (AUD-171, 2026-11-24; [#386](https://github.com/seo-rii/maki/pull/386)). A
+  copy that a power loss left torn could, after a second interrupted store,
+  hold a complete earlier record that no store had acknowledged. A store now
+  truncates such a copy to zero length and syncs that before it writes the
+  record; a copy that decodes is never emptied. After a power loss a copy
+  can be found empty where it held torn bytes, which every release reads as
+  an invalid copy. The store needs free blocks again and can fail with
+  `ENOSPC` on a filesystem that has none, where it fails closed
+  ([architecture](docs/architecture.md), SPEC §43).
+
 - **A connect retries while the kernel reports the NBD device busy** (AUD-150,
   2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375)). The kernel
   refuses `NBD_CMD_CONNECT` with `EBUSY` while anything has the unconnected
@@ -620,6 +738,10 @@ documents.
   a fresh connection to the daemon and only while the device still shows no
   connection; a device held open longer still fails as busy
   ([prerequisites](docs/operations.md#prerequisites)).
+  *Superseded in part by AUD-162 to AUD-164
+  ([#383](https://github.com/seo-rii/maki/pull/383)): the negotiated connection
+  is kept while it is usable, the 5 s count from the first busy answer, and
+  an attach that allocated the device itself moves to the next free one.*
 
 - **A displaced attach record is retired automatically once nothing of its
   attachment remains** (AUD-134, 2026-11-23;
@@ -681,7 +803,9 @@ documents.
   reservation ran out of space. It still never creates over an existing
   `anchor` or over a backing that committed data, short of both manifest
   slots lost or zeroed entirely, and a creation that stopped after
-  publishing the anchor is still refused. The local witness
+  publishing the anchor is still refused (*superseded by AUD-159,
+  [#382](https://github.com/seo-rii/maki/pull/382): `create` continues
+  it*). The local witness
   no longer installs an empty anchor first; an empty `anchor` that an
   earlier release left is refused with an explanation
   ([local creation](docs/rollback-protection.md#local-configuration-and-creation),
@@ -716,6 +840,28 @@ documents.
   every endpoint.
 
 ### Fixed
+
+- **2026-11-24 eighth round: `maki-attach` messages** (AUD-166, AUD-168;
+  [#385](https://github.com/seo-rii/maki/pull/385)). An executed connect step
+  logs and reports the backend identifier it sent, where it printed the
+  plan's placeholder `'<generated-connection-uuid>'`. An error about the
+  attach state directory, `attach.lock` or the configuration that `verify`
+  reads names the path, a permission refusal for a caller who is not root
+  ends with `; run this command as root`, and a program that cannot be
+  started is named (`cannot run modprobe: ...`), where each printed only the
+  operating system's error. A failed step prints `failed with status 1`, or
+  `failed without an exit status (a signal ended it)`, where it printed
+  `status Some(1)` and `status None`. Exit statuses are unchanged.
+- **2026-11-24 eighth round: release tooling** (AUD-174, AUD-175;
+  [#380](https://github.com/seo-rii/maki/pull/380)). The publish step of the
+  release workflow read a failed query of the releases or of the tag as "the
+  tag is free" and went on to create the draft; it now fails there, having
+  created nothing, and `scripts/release_assets.py state` refuses an answer
+  that is empty, not JSON, an error object or incomplete.
+  `scripts/prepare_release.py` refuses a source tree that is not the top
+  level of its own Git checkout, where a published source archive unpacked
+  below another checkout got that repository's version
+  ([rebuilding from a published source archive](docs/releasing.md#rebuilding-from-a-published-source-archive)).
 
 - **2026-11-23 fifth audit: command-line output** (AUD-122, AUD-123;
   [#353](https://github.com/seo-rii/maki/pull/353)). The five binaries no
@@ -1218,6 +1364,27 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-11-24 eighth round** (AUD-176 to AUD-178;
+  [#379](https://github.com/seo-rii/maki/pull/379)). Seven statements that the
+  code, the CI workflow or the tree contradicted are corrected: what the
+  `MAKI_LOG` fallback warning carries, two refusals the rollback guide
+  quoted, the claim of `SECURITY.md` and this file's header that nothing had
+  been tagged, where formatting runs in CI, the status page's date, and the
+  layouts of SPEC §11 and the README. The guides run commands as the daemon
+  user or the witness
+  account with `runuser -u <user> -- <command>` instead of `sudo -u`, which
+  neither package depends on, and the warning `maki volume create` prints
+  when run as root names the same form. SPEC §6 says what a stuck
+  `NBD_CMD_DISCONNECT` holds besides the attach lock: the global
+  generic-netlink mutex and the callback lock, so that other generic-netlink
+  families and family lookups on the host wait too. The provisioning guide
+  creates the volume group with `--setautoactivation n`, as a precaution
+  against LVM's event activation that was not exercised on a host. The
+  records change ([#389](https://github.com/seo-rii/maki/pull/389)) adds that an
+  A/B store which empties a torn copy can fail
+  with `ENOSPC` (configuration, operations) and the backing filesystem
+  assumption behind it (SPEC §43, support matrix).
 
 - **2026-11-24 seventh round** (AUD-147, AUD-148, AUD-151, AUD-157, AUD-158).
   SPEC §6 gains an "NBD connection" section: the handshake, the netlink

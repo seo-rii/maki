@@ -1,17 +1,207 @@
 //! Volume initialization (mkfs): create the durable on-disk layout (SPEC §21).
 
-use maki_backing::Backing;
+use maki_backing::{Backing, RollbackBacking};
 
 use crate::ab::AbStore;
 use crate::catalog::ShardCatalog;
 use crate::checkpoint::{CheckpointState, CHECKPOINT_STATE_A, CHECKPOINT_STATE_B};
-use crate::durable_proof::DurableProofStore;
+use crate::durable_proof::{DurableProofStore, DURABLE_PROOF_A, DURABLE_PROOF_B};
 use crate::error::FormatError;
 use crate::layout;
 use crate::superblock::{
     load_volume_superblock, Superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V2,
     SUPERBLOCK_VERSION_V3,
 };
+
+/// Why [`create_in_rollback_backing`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackCreateError {
+    /// The backing or its witness refused the creation, or failed.
+    #[error(transparent)]
+    Backing(std::io::Error),
+    /// The volume inside the backing could not be initialized.
+    #[error(transparent)]
+    Volume(#[from] FormatError),
+}
+
+/// Create a volume in a local rollback-protected backing: `create` enrolls
+/// the backing with its witness (and continues an enrollment that stopped
+/// before its witness anchor), and the volume is then initialized inside
+/// it. `open` must open the existing pair against its witness
+/// (`RollbackBacking::open`).
+///
+/// A command that stopped after the anchor and before the volume's
+/// superblock left a pair that `create` refuses, because it never writes
+/// over an anchor, and that holds no volume. Running the command again
+/// continues it: when `create` refuses an existing pair, the pair is
+/// opened, and if it holds nothing but an unfinished creation
+/// ([`unfinished_creation`]) what that creation left is removed and the
+/// volume is initialized anew.
+///
+/// That judgement is only made on a pair that opens. Opening authenticates
+/// the manifest and every committed page against the witness anchor, so
+/// what is judged is exactly what was committed: damage to a used volume
+/// (its superblock pages, its manifest slots, its anchor, a witness that is
+/// not mounted) fails the open and keeps the refusal, it never looks like
+/// an unfinished creation. And a volume that was ever attached cannot hold
+/// what is required: no superblock copy and nothing a creation does not
+/// write before its superblock. Every other pair is refused with `create`'s
+/// own error and left as it is.
+pub fn create_in_rollback_backing(
+    create: impl FnOnce() -> std::io::Result<RollbackBacking>,
+    open: impl FnOnce() -> std::io::Result<RollbackBacking>,
+    capacity: u64,
+    superblock: Superblock,
+    discard: bool,
+) -> Result<(RollbackBacking, Superblock), RollbackCreateError> {
+    let backing = match create() {
+        Ok(backing) => backing,
+        Err(refusal) if refusal.kind() == std::io::ErrorKind::AlreadyExists => {
+            continue_creation(open, capacity, refusal)?
+        }
+        Err(error) => return Err(RollbackCreateError::Backing(error)),
+    };
+    let superblock = if discard {
+        create_volume_with_discard(&backing, superblock)?
+    } else {
+        create_volume(&backing, superblock)?
+    };
+    Ok((backing, superblock))
+}
+
+/// The pair `create` refused with `refusal`, opened and emptied of an
+/// unfinished creation, or `refusal`.
+fn continue_creation(
+    open: impl FnOnce() -> std::io::Result<RollbackBacking>,
+    capacity: u64,
+    refusal: std::io::Error,
+) -> Result<RollbackBacking, RollbackCreateError> {
+    // A pair that does not open is not judged at all. The refusal alone
+    // reads as "empty both directories", so say why the pair does not open:
+    // the cause may be one to repair (a witness that is not mounted, a lock
+    // another command holds, an I/O error).
+    let backing = match open() {
+        Ok(backing) => backing,
+        Err(opened) => {
+            return Err(RollbackCreateError::Backing(std::io::Error::new(
+                refusal.kind(),
+                format!(
+                    "{refusal}; the existing pair does not open against its witness either: \
+                     {opened}"
+                ),
+            )))
+        }
+    };
+    // Serialize with a creation and an attach inside the backing, as
+    // `create_volume` does.
+    let volume_lock = backing
+        .try_lock(layout::VOLUME_LOCK)
+        .map_err(RollbackCreateError::Backing)?;
+    if !unfinished_creation(&backing)? {
+        return Err(RollbackCreateError::Backing(refusal));
+    }
+    // The witnessed manifest fixes the capacity the interrupted creation
+    // reserved; the daemon refuses a configuration that names another.
+    let reserved = backing.capacity().map_err(RollbackCreateError::Backing)?;
+    if reserved != capacity {
+        return Err(RollbackCreateError::Backing(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "an interrupted creation of this volume reserved capacity {reserved}, the \
+                 configuration names {capacity}: create the volume with capacity {reserved}, or \
+                 empty the backing and witness directories to start over"
+            ),
+        )));
+    }
+    // Start over inside the backing: the new volume has a new identity, and
+    // records of the interrupted one (its durable proof) would not match it.
+    for name in [layout::SHARD_CATALOG_A, layout::SUPERBLOCK_NEXT]
+        .into_iter()
+        .chain(CREATION_FILES)
+    {
+        match backing.remove(name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(FormatError::from(error).into()),
+        }
+    }
+    for dir in [
+        layout::DATA_DIR,
+        layout::JOURNAL_DIR,
+        layout::CHECKPOINT_DIR,
+    ] {
+        if backing.exists(dir).map_err(FormatError::from)? {
+            backing.sync_dir(dir).map_err(FormatError::from)?;
+        }
+    }
+    backing.sync_dir("").map_err(FormatError::from)?;
+    drop(volume_lock);
+    Ok(backing)
+}
+
+/// What a creation writes at the root of the backing before its superblock.
+const CREATION_ROOT: [&str; 6] = [
+    layout::VOLUME_LOCK,
+    layout::SHARD_CATALOG_A,
+    layout::SUPERBLOCK_NEXT,
+    layout::DATA_DIR,
+    layout::JOURNAL_DIR,
+    layout::CHECKPOINT_DIR,
+];
+
+/// What a creation writes in the layout directories before its superblock.
+const CREATION_FILES: [&str; 5] = [
+    DURABLE_PROOF_A,
+    DURABLE_PROOF_B,
+    layout::JOURNAL_DURABLE_MARK,
+    CHECKPOINT_STATE_A,
+    CHECKPOINT_STATE_B,
+];
+
+/// Whether `backing` holds nothing but what [`create_volume`] leaves when it
+/// stops before its superblock, its commit point: no superblock copy, and
+/// no entry other than the lock, the first shard-catalog copy, the staged
+/// first superblock copy, the three layout directories, the durable proof,
+/// the initial checkpoint state and the journal's durable mark, still
+/// empty. An empty backing qualifies.
+///
+/// A volume that was ever attached holds a superblock copy; one that
+/// acknowledged a write also holds a journal segment or a shard, and a
+/// durable mark that was written. So this is evidence of an unfinished
+/// creation only where the content of `backing` is authenticated, as a
+/// rollback-protected backing's is once it has opened against its witness.
+/// On a plain directory the same files are also what a used volume whose
+/// superblock copies were lost or damaged looks like: never judge one with
+/// this.
+pub fn unfinished_creation(backing: &dyn Backing) -> Result<bool, FormatError> {
+    for name in backing.list("")? {
+        if !CREATION_ROOT.contains(&name.as_str()) {
+            return Ok(false);
+        }
+    }
+    for dir in [
+        layout::DATA_DIR,
+        layout::JOURNAL_DIR,
+        layout::CHECKPOINT_DIR,
+    ] {
+        let entries = match backing.list(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if entries
+            .iter()
+            .any(|entry| !CREATION_FILES.contains(&format!("{dir}/{entry}").as_str()))
+        {
+            return Ok(false);
+        }
+    }
+    match backing.open(layout::JOURNAL_DURABLE_MARK, false) {
+        Ok(mark) => Ok(mark.len()? == 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Create a new volume in an empty backing root. Everything created here is
 /// durable when this returns (dirs synced), so a crash immediately after
@@ -46,8 +236,32 @@ fn create_volume_with_metadata_version(
     // different UUID over this volume's metadata (BUG-039).
     let _volume_lock = backing.try_lock(layout::VOLUME_LOCK)?;
     if backing.exists(layout::SUPERBLOCK_A)? || backing.exists(layout::SUPERBLOCK_B)? {
+        // A superblock file that holds no superblock is not a volume to
+        // report as present, and never one to initialize again: a release
+        // that created the first copy before writing it can have left it,
+        // and so can damage to both copies of a volume that holds data.
+        // Each refusal keeps its cause: a volume another release wrote and
+        // copies that could not be read are not "an earlier release stopped
+        // or the copies are damaged".
         return Err(FormatError::AlreadyExists(
-            "volume superblock already present".to_string(),
+            match load_volume_superblock(backing) {
+                Ok(_) => "volume superblock already present".to_string(),
+                Err(error @ FormatError::Unsupported(_)) => format!(
+                    "a volume superblock is present that this release cannot use ({error}); \
+                     the root is not initialized again"
+                ),
+                Err(FormatError::Io(error)) => format!(
+                    "a superblock file is present but could not be read ({error}); the root is \
+                     not initialized again"
+                ),
+                Err(error) => format!(
+                    "a superblock file is present but holds no valid superblock ({error}): \
+                     either a volume create of an earlier release stopped while it wrote the \
+                     first copy, or this volume's superblock copies are damaged. Only if the \
+                     volume was never attached, empty the backing root and create it again; \
+                     otherwise restore the root from a backup"
+                ),
+            },
         ));
     }
     // The rest of an earlier volume's root-level metadata is refused too: a
@@ -140,13 +354,32 @@ fn create_volume_with_metadata_version(
     // readable copy that is not durable (or only copy A): the root is then a
     // volume this function refuses, and writable recovery makes both copies
     // durable before anything else (`persist_volume_superblock`).
+    //
+    // The first copy has no other to fall back on, so it is never written
+    // under its own name: it is written and synced as `superblock.next` and
+    // renamed into place. `superblock.a` therefore never names an empty or
+    // torn copy, whatever kills this process, cuts the power or fails in
+    // between: the root holds a superblock or no superblock file. The
+    // second copy's store then rewrites and syncs the first and syncs the
+    // directory before it touches its own side (the preserve-first rule).
     superblock.generation = 0;
     let sb_ab = AbStore::new(layout::SUPERBLOCK_A, layout::SUPERBLOCK_B);
     let mut envelope = VolumeSuperblock {
         superblock,
         metadata_version,
     };
-    sb_ab.store(backing, &mut envelope)?; // side A, gen 1
+    {
+        use crate::ab::AbRecord;
+        envelope.set_generation(1);
+        let first = AbRecord::encode(&envelope);
+        let staged = backing.open(layout::SUPERBLOCK_NEXT, true)?;
+        staged.set_len(first.len() as u64)?;
+        staged.write_at(0, &first)?;
+        staged.sync_data()?;
+        // Closed before it is renamed, as the other staged records are.
+        drop(staged);
+        backing.rename(layout::SUPERBLOCK_NEXT, layout::SUPERBLOCK_A)?; // side A, gen 1
+    }
     sb_ab.store(backing, &mut envelope)?; // side B, gen 2
     backing.sync_dir("")?;
 

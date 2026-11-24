@@ -568,3 +568,21 @@ fn sentinel_opens_drop_only_o_noatime_and_only_when_it_is_refused() {
         }
     }
 }
+
+/// The gate reads one file by a path the operator chose, the volume's attach
+/// configuration. When it cannot, the error names that file: the operating
+/// system's error alone left the journal of a gated workload with "No such
+/// file or directory" and no hint of what to create.
+#[test]
+fn a_gate_names_the_configuration_it_cannot_read() {
+    let path = Path::new("/maki-review-no-such-directory/pg.toml");
+    let error = workload_verify::gate_config(path).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "attach config /maki-review-no-such-directory/pg.toml: {}",
+            io::Error::from_raw_os_error(libc::ENOENT)
+        )
+    );
+}

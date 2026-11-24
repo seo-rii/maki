@@ -6,9 +6,10 @@ seriously.
 
 ## Supported versions
 
-There is no tagged release yet. Security fixes land on `main`; deployments
-are expected to track a specific commit and record it in their qualification
-notes (see [status](docs/status.md)).
+There is no final release yet; release candidates (`v0.1.0-rc.<n>`) are
+unsigned GitHub pre-releases built from `main`. Security fixes land on
+`main`; deployments are expected to track a specific commit and record it in
+their qualification notes (see [status](docs/status.md)).
 
 ## Reporting a vulnerability
 

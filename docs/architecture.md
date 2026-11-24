@@ -124,9 +124,15 @@ writes.
 Metadata updates select an absent, invalid, or older A/B side for replacement.
 Before touching it, the store rewrites the preserved, typed-valid copy's exact
 bytes without truncation, synchronizes that file, and synchronizes its parent
-directory. Only then does it advance the generation, write the replacement,
-and synchronize the new contents. The caller must synchronize the replacement's
-directory entry when it creates a file. Each store advances the generation by
+directory. A replacement side that exists but does not decode (a torn or
+damaged copy) is then truncated to zero length and synchronized: an earlier
+interrupted store wrote it with the generation this store will use, and
+without this step the sectors of that store which reached the disk could
+combine with the sectors of this one into a valid copy of the earlier record.
+A side that decodes is never emptied. Only then does the store advance the
+generation, write the replacement, and synchronize the new contents. The
+caller must synchronize the replacement's directory entry when it creates a
+file. Each store advances the generation by
 one, and recovery and the deep check refuse a volume whose A/B metadata carries
 a CRC-valid generation in the top quarter of the generation space (above
 `u64::MAX - 2^62`) before any recovery write: no writer produces one, and

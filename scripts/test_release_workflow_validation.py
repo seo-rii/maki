@@ -234,6 +234,16 @@ class Workflow(unittest.TestCase):
         self.assertLess(script.index("release_assets.py uploaded"), script.index('gh release edit "$TAG" --draft=false'))
         self.assertIn("        if: failure()\n", self.step("publish", "what a failed publication left"))
 
+    def test_the_publish_step_stops_at_a_query_that_fails(self):
+        # The step reads the tag's state through "$(state)", where bash turns
+        # errexit off: each query has to report its own failure.
+        function = run_script(self.step("publish", "publish")).split("state() {\n", 1)[1].split("\n}\n", 1)[0]
+        queries = [line.strip() for line in function.splitlines() if line.strip().startswith("gh api ")]
+        self.assertEqual(len(queries), 2, function)
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertTrue(query.endswith(" || return 1"), query)
+
 
 @unittest.skipUnless(shutil.which("bash"), "the steps run in bash on the runners")
 class PublishSteps(unittest.TestCase):
@@ -257,17 +267,30 @@ if args[0] == "api":
     prefix = f"repos/{os.environ['GITHUB_REPOSITORY']}/"
     assert path.startswith(prefix), path
     path = path[len(prefix):]
-    if path == "releases?per_page=100":
+    query = ("releases" if path == "releases?per_page=100" else
+             "refs" if path.startswith("git/matching-refs/tags/") else None)
+    if query is None:
+        sys.exit(f"fake gh: unexpected api {path}")
+    failing = state.get("fail")
+    # As gh fails: without a connection it writes nothing; an HTTP error's
+    # body goes to stdout; a listing cut off between pages has written the
+    # pages before. The exit status is 1 each time.
+    if failing in ("api", f"api-{query}"):
+        sys.exit("error connecting to api.github.com")
+    if failing == f"api-{query}-body":
+        print(json.dumps({"message": "Server Error", "status": "500"}))
+        sys.exit("gh: Server Error (HTTP 500)")
+    if query == "releases":
         assert "--paginate" in args
         releases = [{key: release[key] for key in ("tag_name", "draft", "prerelease")}
                     for release in state["releases"]]
         print(json.dumps(releases[:1]))
+        if failing == "api-releases-partial":
+            sys.exit("gh: Bad Gateway (HTTP 502)")
         print(json.dumps(releases[1:]))
-    elif path.startswith("git/matching-refs/tags/"):
+    else:
         tag = path[len("git/matching-refs/tags/"):]
         print(json.dumps([ref for ref in state["refs"] if ref["ref"].startswith(f"refs/tags/{tag}")]))
-    else:
-        sys.exit(f"fake gh: unexpected api {path}")
 elif args[:2] == ["release", "create"]:
     tag = args[2]
     options = args[3:]
@@ -296,6 +319,8 @@ elif args[:2] == ["release", "edit"]:
     release["draft"] = False
     sha = OTHER if state.get("fail") == "wrong-tag" else release["target"]
     state["refs"].append({"ref": f"refs/tags/{release['tag_name']}", "object": {"sha": sha, "type": "commit"}})
+    if state.get("fail") == "api-after-publication":
+        state["fail"] = "api"
     save()
 elif args[:2] == ["release", "delete"]:
     assert args[3:] == ["--yes"], args
@@ -392,6 +417,49 @@ else:
         self.github()
         check = self.run_step(run_script(dict(steps(jobs()["check"]))["no release and no tag of that name"]))
         self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_a_query_that_fails_is_never_read_as_a_free_tag(self):
+        # GitHub holds a draft or a tag of that name, and the query that would
+        # show it fails. Inside "$(...)" bash does not stop at a failed
+        # command, and the file a failed query leaves is empty or incomplete.
+        draft = {"tag_name": "v0.1.0-rc.1", "draft": True, "prerelease": True}
+        other = {"tag_name": "v0.1.0-rc.10", "draft": False, "prerelease": True}
+        tag = {"ref": "refs/tags/v0.1.0-rc.1", "object": {"sha": OTHER}}
+        check_step = run_script(dict(steps(jobs()["check"]))["no release and no tag of that name"])
+        for failure, releases, refs in (
+            ("api", [draft], [tag]),
+            ("api-releases", [draft], []),
+            ("api-releases-partial", [other, draft], []),
+            ("api-releases-body", [draft], []),
+            ("api-refs", [], [tag]),
+            ("api-refs-body", [], [tag]),
+        ):
+            with self.subTest(failure=failure):
+                self.calls.unlink(missing_ok=True)
+                (self.root / "dist" / "draft-requested").unlink(missing_ok=True)
+                self.github(releases=releases, refs=refs, fail=failure)
+                result, cleanup = self.publish()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse([call for call in self.gh_calls() if call[0] == "release"],
+                                 "nothing may be created while the tag's state is unknown")
+                self.assertFalse((self.root / "dist" / "draft-requested").exists())
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                self.assertIn("Nothing was created", cleanup.stderr)
+                self.assertEqual(self.published()["releases"], releases, "what existed is left alone")
+                check = self.run_step(check_step)
+                self.assertNotEqual(check.returncode, 0)
+                self.assertFalse([call for call in self.gh_calls() if call[0] == "release"])
+
+    def test_a_query_that_fails_after_publication_deletes_nothing(self):
+        self.github(fail="api-after-publication")
+        result, cleanup = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(["release", "edit", "v0.1.0-rc.1", "--draft=false"], self.gh_calls())
+        self.assertFalse([call for call in self.gh_calls() if call[:2] == ["release", "delete"]])
+        self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+        self.assertIn("Could not read what is left for v0.1.0-rc.1", self.summary.read_text())
+        release = [entry for entry in self.published()["releases"] if entry["tag_name"] == "v0.1.0-rc.1"][0]
+        self.assertFalse(release["draft"], "the published release is left for the maintainer")
 
     def test_an_interrupted_upload_leaves_no_release_and_no_tag(self):
         for failure in ("upload", "rename"):
@@ -627,6 +695,37 @@ class ReleaseState(unittest.TestCase):
         tag = {"ref": "refs/tags/v0.1.0-rc.1", "object": {"sha": COMMIT}}
         self.assertEqual(self.state([page], [rc10, tag]), f"release=none\ntag={COMMIT}\n")
 
+    def test_a_query_without_a_complete_answer_is_refused_not_read_as_none(self):
+        # gh writes nothing when it cannot reach GitHub and an error object
+        # when GitHub refuses; an answer that says "none" is `[]`.
+        for name, releases, refs in (
+            ("no releases answer", "", "[]"),
+            ("blank releases answer", "\n \n", "[]"),
+            ("no refs answer", "[]", ""),
+            ("blank refs answer", "[]", "\n"),
+            ("truncated releases", '[{"tag_name": "v0.1.0-rc.1", "draft": tr', "[]"),
+            ("truncated refs", "[]", '[{"ref": "refs/tags/v0.1.0-rc.1", "obj'),
+            ("error object for releases", '{"message": "Server Error"}', "[]"),
+            ("error object after a page", '[]\n{"message": "Bad Gateway"}', "[]"),
+            ("error object for refs", "[]", '{"message": "Not Found"}'),
+            ("a release that is not an object", '["v0.1.0-rc.1"]', "[]"),
+            ("a ref that is not an object", "[]", '["refs/tags/v0.1.0-rc.1"]'),
+            ("two refs answers", "[]", "[]\n[]"),
+            ("the tag without its commit", "[]", '[{"ref": "refs/tags/v0.1.0-rc.1", "object": {}}]'),
+            ("the tag with a short commit", "[]",
+             '[{"ref": "refs/tags/v0.1.0-rc.1", "object": {"sha": "0123456789ab"}}]'),
+            ("releases that are not UTF-8", b"\xff\xfe[]", "[]"),
+        ):
+            with self.subTest(case=name):
+                for path, contents in ((self.work / "releases.json", releases), (self.work / "refs.json", refs)):
+                    path.write_bytes(contents if isinstance(contents, bytes) else contents.encode())
+                result = helper("state", "--tag", "v0.1.0-rc.1", "--releases", str(self.work / "releases.json"),
+                                "--refs", str(self.work / "refs.json"))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "", "no state may be printed for an unknown one")
+                self.assertTrue(result.stderr.startswith("release-assets: "), result.stderr)
+                self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+
     def test_uploaded_assets_must_match_by_name_and_size(self):
         assets = self.work / "assets"
         assets.mkdir()
@@ -690,7 +789,7 @@ class RpmManifest(unittest.TestCase):
         self.assertEqual(manifest["package"]["release"], "1")
         self.assertEqual(manifest["package"]["sha256"], sha256(self.package))
         self.assertIn("nbdkit-server", manifest["package"]["requires"])
-        self.assertEqual(manifest["package"]["conflicts"], ["nbdkit-selinux"])
+        self.assertEqual(sorted(manifest["package"]["conflicts"]), ["nbdkit", "nbdkit-selinux"])
         self.assertEqual(manifest["build_host"]["architecture"], "x86_64")
         self.assertIn("rustc 1.94.0", manifest["toolchain"]["rustc"])
         if shutil.which("sha256sum"):

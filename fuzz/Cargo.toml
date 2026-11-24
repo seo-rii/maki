@@ -2,8 +2,11 @@
 # (the empty [workspace] table below) so it never affects `cargo build
 # --workspace` and only builds under `cargo +nightly fuzz`.
 #
-# Run (Linux, nightly):
-#   cargo +nightly fuzz run format_decoders -- -max_total_time=60
+# Run (Linux, nightly). The two format targets need inputs longer than
+# libFuzzer's default limit of 4096 bytes: a superblock is a 4096-byte frame
+# after the byte that selects the decoder.
+#   cargo +nightly fuzz run format_decoders -- -max_len=8192 -max_total_time=60
+#   cargo +nightly fuzz run format_records  -- -max_len=8192 -max_total_time=60
 #   cargo +nightly fuzz run journal_scan    -- -max_total_time=60
 #   cargo +nightly fuzz run config_parse    -- -max_total_time=60
 #   cargo +nightly fuzz run endpoint_url    -- -max_total_time=60
@@ -19,6 +22,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+crc32fast = "1"
 libfuzzer-sys = "0.4"
 maki-format = { path = "../crates/maki-format" }
 maki-privileged = { path = "../crates/maki-privileged" }
@@ -26,6 +30,13 @@ maki-privileged = { path = "../crates/maki-privileged" }
 [[bin]]
 name = "format_decoders"
 path = "fuzz_targets/format_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_records"
+path = "fuzz_targets/format_records.rs"
 test = false
 doc = false
 bench = false

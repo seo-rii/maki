@@ -166,7 +166,7 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
             device,
             block_size,
             identifier,
-            |_, _| {
+            |_, _, _| {
                 connected = true;
                 Ok(())
             },
@@ -185,7 +185,7 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
         "/dev/nbd4",
         512,
         OURS,
-        |step, identifier| {
+        |step, identifier, _| {
             steps.push((step.clone(), identifier.to_string()));
             std::fs::write(sysfs.join("nbd4/pid"), "4242\n").unwrap();
             std::fs::write(sysfs.join("nbd4/backend"), format!("{identifier}\n")).unwrap();
@@ -212,10 +212,116 @@ fn a_raw_connect_checks_the_device_and_its_values_before_connecting() {
         "/dev/nbd5",
         4096,
         OURS,
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     )
     .unwrap_err();
     assert!(error.to_string().contains("shows no connection"), "{error}");
+}
+
+/// Run `action` and return what it logged.
+fn logged<T>(action: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, action);
+    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    (result, text)
+}
+
+/// A plan cannot know the backend identifier of a connect, which is made
+/// for each attach, and prints a placeholder. The executed step sends a real
+/// one, and its log line and its errors name that one: it is what
+/// `/sys/block/nbdN/backend` shows, and what `nbd-disconnect` must be given.
+#[test]
+fn an_executed_connect_names_the_identifier_it_sends() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const SOCKET: &str = "/run/maki/pg/nbd.sock";
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let step = PlannedStep::NbdConnect {
+        socket: SOCKET.into(),
+        device: "/dev/nbd4".into(),
+        block_size: 4096,
+    };
+    let planned = step.to_string();
+    assert!(
+        planned.contains("backend identifier '<generated-connection-uuid>'"),
+        "{planned}"
+    );
+    let executed = planned.replace("<generated-connection-uuid>", OURS);
+
+    // The step itself: netlink sockets are refused here, so it fails.
+    let (result, log) = logged(|| run_step(&step, Some(OURS)));
+    match result {
+        Err(ExecError::Step { step, .. }) => assert_eq!(step, executed),
+        other => panic!("{other:?}"),
+    }
+    assert!(log.contains(&format!("maki-attach: {executed}")), "{log}");
+    assert!(!log.contains("generated-connection-uuid"), "{log}");
+
+    // `nbd-connect` waits for the device as an attach does: that wait is
+    // given the same line for its error.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd4", false, None)]);
+    let error = connect_raw_with(
+        &sysfs,
+        &BTreeMap::new(),
+        SOCKET,
+        "/dev/nbd4",
+        4096,
+        OURS,
+        |_, _, executed| {
+            Err(ExecError::Step {
+                step: executed.to_string(),
+                message: "/dev/nbd4 did not become ready".into(),
+            })
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Step { step, .. } if *step == executed),
+        "{error}"
+    );
+}
+
+/// An attach makes its identifier itself, so the line of its failed connect
+/// is the only place that says which connection the attach was.
+#[test]
+fn an_attach_whose_device_never_becomes_ready_names_its_identifier() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let _lock = state.lock().unwrap();
+    let mut system = FakeSystem {
+        readiness_failure: true,
+        ..Default::default()
+    };
+    let error = execute_with(&plan_attach(&request()), Some(&state), &mut system)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("fixture readiness timeout"), "{error}");
+    let identifier = error
+        .split_once("backend identifier '")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(identifier, _)| identifier)
+        .unwrap_or_else(|| panic!("no identifier in {error}"));
+    let nonce = identifier
+        .strip_prefix("maki-")
+        .unwrap_or_else(|| panic!("{identifier} is not an attach's identifier: {error}"));
+    crate::config::check_uuid("connection_id", nonce)
+        .unwrap_or_else(|reason| panic!("{identifier}: {reason}"));
 }
 
 /// `nbd-disconnect` disconnects only the connection it names: a device that
@@ -247,6 +353,112 @@ fn a_raw_disconnect_touches_only_its_own_connection() {
     }
 }
 
+/// The kernel acknowledges a disconnect before the device stops showing the
+/// connection: it keeps `pid` and `backend`, and refuses a new connect,
+/// until the last opener of the device has closed it (udev probes a device
+/// that was just written to). `nbd-disconnect` therefore waits, for a
+/// bounded time, until the device no longer shows the connection, and says
+/// what holds it when that does not happen.
+#[test]
+fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
+    const OURS: &str = "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    let disconnects = |device: &'static str| {
+        move |step: &PlannedStep| {
+            assert!(
+                matches!(step, PlannedStep::NbdDisconnect { device: named } if named == device)
+            );
+            Ok(())
+        }
+    };
+
+    // The opener lets go a moment after the acknowledgement.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let attributes = sysfs.join("nbd5");
+    let mut closing = None;
+    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, Duration::from_secs(10), |step| {
+        closing = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            // The kernel removes them in this order.
+            std::fs::remove_file(attributes.join("pid")).unwrap();
+            std::fs::remove_file(attributes.join("backend")).unwrap();
+        }));
+        disconnects("/dev/nbd5")(step)
+    })
+    .unwrap();
+    assert_eq!(
+        nbd_backend_at(&sysfs, "/dev/nbd5").unwrap(),
+        None,
+        "returned while the device still showed the connection"
+    );
+    closing.unwrap().join().unwrap();
+
+    // Nothing lets go: a failure that says what the state is.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let patience = Duration::from_millis(250);
+    let started = Instant::now();
+    let error = disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd5",
+        OURS,
+        patience,
+        disconnects("/dev/nbd5"),
+    )
+    .expect_err("a device that still shows the connection")
+    .to_string();
+    assert!(started.elapsed() >= patience, "{:?}", started.elapsed());
+    for expected in [
+        "acknowledged the disconnect",
+        "/dev/nbd5 still shows the connection",
+        "something still has the device open",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
+
+    // A connection made since under another identifier is not this one:
+    // the disconnect is done.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let backend = sysfs.join("nbd5/backend");
+    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
+        std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
+    .unwrap();
+
+    // What cannot be read is not "gone". The kernel removes `pid` before
+    // `backend`, so a `pid` without an identifier is no state that this
+    // disconnect leaves behind. It is what a connection made since by an
+    // ioctl client shows, and the command fails on it.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
+    let backend = sysfs.join("nbd5/backend");
+    let error = disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
+        std::fs::remove_file(&backend).unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
+    .expect_err("an unreadable device was taken for a disconnected one")
+    .to_string();
+    assert!(
+        error.contains("backend identifier is unreadable"),
+        "{error}"
+    );
+
+    // Without the connection there is no request, and nothing to wait for.
+    let fixture = Fixture::new();
+    let sysfs = raw_sysfs(
+        &fixture,
+        &[
+            ("nbd4", false, None),
+            ("nbd6", true, Some("maki-bootstrap-another")),
+        ],
+    );
+    let no_request = |_: &PlannedStep| -> Result<(), ExecError> { panic!("a disconnect was sent") };
+    disconnect_raw_with(&sysfs, "/dev/nbd4", OURS, patience, no_request).unwrap();
+    assert!(disconnect_raw_with(&sysfs, "/dev/nbd6", OURS, patience, no_request).is_err());
+}
+
 /// A step whose kernel answer could not be read stays an I/O error of its
 /// kind (a timeout is still a timeout), never a plain refusal: the callers
 /// decide from the device's backend identifier what is connected.
@@ -272,6 +484,14 @@ fn an_unanswered_nbd_step_is_an_io_error_of_unknown_outcome() {
         nbd_step_error(&step, NbdError::Failed("refused".into())),
         ExecError::Step { message, .. } if message == "refused"
     ));
+    // A device that stayed busy is a refusal too, but one an attach can
+    // answer with another device: it keeps its own kind.
+    let busy = nbd_step_error(&step, NbdError::DeviceBusy("busy".into()));
+    assert_eq!(
+        busy.to_string(),
+        format!("step {:?} failed: busy", step.to_string())
+    );
+    assert!(matches!(busy, ExecError::DeviceBusy { message, .. } if message == "busy"));
 }
 
 /// The connect and disconnect steps start no program: the helper
@@ -464,7 +684,7 @@ impl System for InventorySystem {
         let result = self.inner.run_step(step, identifier);
         self.settle(result)
     }
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.inner.wait_ready(step, device)
     }
     fn allocate(&mut self) -> Result<String, ExecError> {
@@ -821,9 +1041,13 @@ impl System for FakeSystem {
         Ok(())
     }
 
-    fn wait_ready(&mut self, _step: &PlannedStep, _device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, _device: &str) -> Result<(), ExecError> {
         if self.readiness_failure {
-            Err(identity_error("fixture readiness timeout"))
+            // Like the real wait, the failure names the step it was given.
+            Err(ExecError::Step {
+                step: step.to_string(),
+                message: "fixture readiness timeout".into(),
+            })
         } else {
             Ok(())
         }
@@ -1875,7 +2099,7 @@ impl System for ReviewForeignMountSystem {
         }
     }
 
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         self.inner.wait_ready(step, device)
     }
 
@@ -2109,7 +2333,7 @@ impl System for ObservedSystem {
         }
         result
     }
-    fn wait_ready(&mut self, s: &PlannedStep, d: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, s: &str, d: &str) -> Result<(), ExecError> {
         self.fake.wait_ready(s, d)
     }
     fn allocate(&mut self) -> Result<String, ExecError> {
@@ -2407,6 +2631,53 @@ fn a_step_killed_by_a_signal_reports_no_exit_status() {
             other => panic!("{script}: expected a failed step, got {other:?}"),
         }
     }
+}
+
+/// A step whose program cannot be started names the program: on a host
+/// without `kmod` an attach ended with "No such file or directory (os error
+/// 2)" and nothing else. The error keeps its kind.
+#[test]
+fn a_step_whose_program_cannot_be_started_names_it() {
+    let error = match run(
+        &PlannedStep::ModprobeNbd,
+        "maki-review-no-such-program",
+        &[],
+    ) {
+        Err(ExecError::Io(error)) => error,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "cannot run maki-review-no-such-program: {}",
+            io::Error::from_raw_os_error(libc::ENOENT)
+        )
+    );
+}
+
+/// The error of a failed command prints the exit status as the number it
+/// is, and says so when a signal left none.
+#[test]
+fn a_failed_step_prints_its_exit_status_as_a_number() {
+    let failed = |status| {
+        ExecError::StepFailed {
+            step: "modprobe nbd".into(),
+            status,
+            stderr: "external command output omitted".into(),
+        }
+        .to_string()
+    };
+    assert_eq!(
+        failed(Some(1)),
+        "step \"modprobe nbd\" failed with status 1: external command output omitted"
+    );
+    let signalled = failed(None);
+    assert!(signalled.contains("a signal ended it"), "{signalled}");
+    assert!(
+        !signalled.contains("Some") && !signalled.contains("None"),
+        "{signalled}"
+    );
 }
 
 /// BUG-096: the mount source comes from mountinfo, and whoever mounts on

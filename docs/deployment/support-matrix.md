@@ -37,7 +37,7 @@ Current overall state is in [status](../status.md).
 | Debian 13 (trixie) on Google Compute Engine, Linux `6.12.*-cloud-amd64` | **Campaign passed** (scoped) | Remote HTTP/WebSocket/gRPC lifecycles under the shipped sandbox, netem latency and loss, NBD zeroing, with XFS directly on the NBD device ([record](../qualification/debian13-remote-transport-validation-2026-10-04.md)). Needs `fc8d697` or later (R5-037, R5-038). The campaigns ran with a source-built `nbd-client` 3.27, which the helper no longer uses. PostgreSQL 17 then passed its crash and lifecycle scenario under the packaged `maki-attach` LVM lifecycle ([record](../qualification/debian13-postgresql-http-validation-2026-10-05.md)) |
 | Later Debian releases | Not qualified | Check that systemd ≥ 249 is available |
 | Ubuntu 22.04 / 24.04 | Not qualified | Same requirements; the Debian packaging is not built for Ubuntu |
-| RHEL 9 (CentOS Stream 9, Rocky Linux 9, AlmaLinux 9) | Not qualified | RPM package and [installation guide](../getting-started/installation-rhel.md), BaseOS and AppStream only. On every change CI builds the packaged binaries in a CentOS Stream 9 container, checks the plugin ABI against EL9's nbdkit header, runs the helper, attach and plugin suites with EL9's nbdkit 1.38, and builds, installs and removes the RPM; that runs on Ubuntu's kernel. No kernel attachment, RHEL kernel, SELinux-enforcing run or campaign. LVM2 2.03.33 enables its devices file, which Maki's `--devices` scoping overrides; the RPM conflicts with `nbdkit-selinux`, which the `nbdkit` metapackage pulls in |
+| RHEL 9 (CentOS Stream 9, Rocky Linux 9, AlmaLinux 9) | Not qualified | RPM package and [installation guide](../getting-started/installation-rhel.md), BaseOS and AppStream only. On every change CI builds the packaged binaries in a CentOS Stream 9 container, checks the plugin ABI against EL9's nbdkit header, runs the helper, attach and plugin suites with EL9's nbdkit 1.38, and builds, installs and removes the RPM; that runs on Ubuntu's kernel. No kernel attachment, RHEL kernel, SELinux-enforcing run or campaign. LVM2 2.03.33 enables its devices file, which Maki's `--devices` scoping overrides; the RPM conflicts with the `nbdkit` metapackage and with `nbdkit-selinux`, which it pulls in, and dnf protects the installed package: it is removed with `rpm -e` |
 | Fedora | Not qualified | Not built or tested; the RHEL 9 RPM is built against EL9's glibc and package names |
 | RHEL 8 and its rebuilds | Unsupported | systemd 239 lacks the recovery unit's `OnSuccess=` |
 | Bare metal (any distribution) | Not qualified | Physical power-loss durability is an **open** gate; see [failure evidence](../status.md#failure-injection-evidence) |
@@ -64,7 +64,14 @@ xfsprogs, systemd ≥ 249 for the recovery unit's `OnSuccess=`. Details are in t
 The backing is an ordinary directory (`backing.root`). Maki relies on the
 filesystem honouring `fdatasync`, directory `fsync`, `posix_fallocate`, file
 locks and atomic rename, and on it overwriting allocated blocks in place
-([copy-on-write](#copy-on-write-filesystems)).
+([copy-on-write](#copy-on-write-filesystems)). It also relies on a file never
+showing old blocks after a crash: a truncation that was synced is durable,
+and a file grown after it reads as zeros where nothing was written. The
+journal's tail truncation, the shard data files and the A/B metadata stores
+(SPEC §43) depend on that. ext4 mounted with `data=writeback` does not give
+it: the kernel's ext4 documentation says that mode can leave stale data
+exposed in recently written files after an unclean shutdown. The rows below
+do not distinguish mount options.
 
 | Backing | Status | Notes |
 |---|---|---|

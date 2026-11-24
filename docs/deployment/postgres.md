@@ -55,7 +55,7 @@ Create the volume as the daemon user, then check it:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/postgres
-sudo -u maki maki volume create /etc/maki/volumes/postgres.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/postgres.toml
 maki volume inspect /etc/maki/volumes/postgres.toml
 ```
 

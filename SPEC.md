@@ -292,11 +292,38 @@ The helper MUST:
   handshake, the retries below and the wait for the kernel's answer) by the
   limit of an external step command and by the deadline its caller set for all
   of its commands (the failed-start hook's command budget);
-- retry a connect the kernel refuses with `EBUSY`, which it answers while
-  anything holds the unconnected device open (udev's probe after a
-  disconnect, any other opener), every 100 ms for up to 5 s within that time
-  bound, each time on a fresh connection to the daemon and only after checking
-  that the device still shows no connection; every other refusal is final;
+- retry the two answers that mean "busy", every 100 ms for up to 5 s counted
+  from the first of them, within that time bound, and each time only after
+  checking that the device still shows no connection. Every other answer is
+  final:
+  - the kernel's `EBUSY` for `NBD_CMD_CONNECT`, which it answers while
+    anything holds the unconnected device open (udev's probe after a
+    disconnect, any other opener). The kernel answers it before it takes the
+    socket, so the next request MUST go out on the connection that is already
+    negotiated, as long as that connection is still open and has nothing to
+    read on it, which the helper checks without consuming anything. Only a
+    connection that fails this check (the kernel shuts a socket down when it
+    refuses a connect after taking it) is replaced by a fresh one, and the
+    helper closes its earlier connection before it opens the next: the
+    volume daemon serves one connection at a time;
+  - the daemon's `NBD_REP_ERR_UNKNOWN` to `NBD_OPT_GO`, the export that is
+    not available. nbdkit answers it, without a message, whenever its plugin
+    cannot open the export, and it closes a connection a moment after the
+    peer did, so a handshake that follows a disconnect, or the helper's own
+    closed connection, can arrive while the plugin's one connection is still
+    taken. A server without a default export answers the same; the helper
+    cannot tell the two apart, so it bounds the wait and names both in its
+    refusal. The daemon logs each second connection it refuses;
+- when the kernel answered `EBUSY` until those retries ended, for a device
+  the attach allocated itself, give that device up for the next free one
+  instead of failing: what holds an unconnected device open shows nowhere in
+  sysfs, so allocation would choose the same device again, for this volume
+  and for every other. Under the attach lock the helper replaces its own
+  record with one that names the next device, with a connection identifier
+  of its own, before it connects that device, applies every check of a first
+  device to it, and never takes a device another volume's record names
+  (§8). All the devices tried share the time bound of one connect. It MUST
+  NOT give up a pinned `nbd_device`, nor a device that shows a connection;
 - create every descriptor close-on-exec, hand the kernel the socket without a
   send or receive timeout (the kernel's own I/O on it would fail once the
   device has been idle that long), and close its own descriptor of the socket
@@ -312,19 +339,33 @@ Provisioning a new volume connects its export once outside any attachment
 request. Such a connection MUST NOT use an identifier of the form attach records
 use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
 a trusted record names, and its disconnect MUST touch only a device connected
-under its own identifier.
+under its own identifier. The kernel acknowledges a disconnect before the
+connection is gone from the device: it keeps the `pid` and `backend`
+attributes, and refuses a new connect, until the last opener of the device has
+closed it. `nbd-disconnect` MUST NOT report success in that state: it waits up
+to 15 s for the device to stop showing the connection and fails, saying that
+something still has the device open, when it does not.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal
-ends them; the kernel runs the `nbd` family's requests one at a time.
+ends them. The `nbd` family does not set `parallel_ops`, so the kernel runs
+each of its requests under the global generic-netlink mutex: while one is
+stuck, no other `nbd` request runs, and neither does a request to any other
+generic-netlink family without `parallel_ops`, on the whole host. The control
+family is one of those, so every family lookup (`CTRL_CMD_GETFAMILY`) waits
+too, whichever family a client wants to resolve. The request also holds the
+generic-netlink callback lock (`cb_lock`) for reading: registering or
+unregistering a family, which loading or unloading a module that has one
+does, takes it for writing and waits, and from then on a new request to any
+family, with `parallel_ops` or not, queues behind that writer.
 `NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
 `NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
 that stopped reading with a full send buffer holds the helper, with the attach
-lock, until it reads again or its socket closes. In the helper's flows the
-unmount and the VG deactivation, bounded commands that need the daemon to serve
-I/O, run first when they are needed and fail first in that case; the outer
-bound is the unit's start or stop timeout, and a helper in an uninterruptible
-wait ends only when that wait does.
+lock and that mutex, until it reads again or its socket closes. In the helper's
+flows the unmount and the VG deactivation, bounded commands that need the
+daemon to serve I/O, run first when they are needed and fail first in that
+case; the outer bound is the unit's start or stop timeout, and a helper in an
+uninterruptible wait ends only when that wait does.
 
 The helper logs the process and user IDs of its socket peer when it connects,
 for diagnostics only: the documented flows may run nbdkit outside the
@@ -762,6 +803,7 @@ maki/
     ├── tmpfiles.d/
     ├── sysusers.d/
     ├── debian/
+    ├── rpm/
     └── examples/
 ```
 
@@ -1342,6 +1384,7 @@ the change was not applied; use the restart and self-test procedure above.
 ├── volume.lock
 ├── superblock.a
 ├── superblock.b
+├── superblock.next          (only while a creation writes its first copy)
 ├── shard-catalog.a
 ├── shard-catalog.b
 ├── canary.a
@@ -1456,6 +1499,21 @@ only, restricted to new volumes, and does not reinterpret ordinary v2/v3 roots.
 Its bounded capacity, commit protocol and explicit threat model are specified in
 [Rollback-protected backing](docs/rollback-protection.md). This storage option
 does not upgrade the crypto provider's declared replay capability.
+
+Creating a volume with a local witness enrolls the backing, publishes the
+witness anchor last, and then initializes the volume inside the backing,
+whose superblock is its commit point. `volume create` run again MUST complete
+a creation that stopped before the superblock was committed, and only such a
+one. Before the anchor it MAY accept only what an enrollment writes, with no
+committed manifest. After the anchor it MUST judge only a pair that opens
+against its witness, which authenticates the manifest and every committed
+page, and MUST continue only if that pair holds no superblock copy and
+nothing a creation does not write before its superblock; it then removes
+what the interrupted creation left and initializes the volume anew. Every
+other existing pair, one that does not open included, MUST be refused and
+left unchanged. Until a creation is complete, opening the pair MUST fail
+with an error that says the creation did not complete and names
+`volume create`.
 
 A remote witness configuration MUST select exactly one numeric `address` or
 `addresses` set (1–8 distinct nonzero socket ports). A set MUST include the
@@ -2603,7 +2661,16 @@ A/B metadata MUST fall back to the highest valid generation. Each store advances
 a generation by one; recovery and the deep check MUST refuse, before any
 recovery write, A/B metadata (superblock, shard catalog, allocation and discard
 maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
-is above `u64::MAX - 2^62`. Torn final journal tails may be truncated. Damage
+is above `u64::MAX - 2^62`. A store MUST NOT write into an existing side that
+does not decode until that side is durably empty: an interrupted store leaves
+its side carrying the generation the next store uses, and the sectors of two
+interrupted stores MUST NOT be able to form a valid record. A side that
+decodes MUST NOT be emptied. This rule, like the truncation of a torn journal
+tail, assumes a backing filesystem on which a synced truncation is durable
+and a file grown after it reads as zeros where nothing was written, after a
+crash too; a filesystem that can show old blocks in a file after a crash does
+not meet it ([backing store](docs/deployment/support-matrix.md#backing-store-below-maki)).
+Torn final journal tails may be truncated. Damage
 inside a non-final segment, or inside the part of the final segment that the
 durable proof or the durable mark covers, MUST refuse recovery. Beyond that
 part, a record that fails its checksum is a torn tail whether or not an intact
@@ -2662,9 +2729,20 @@ The adapter MUST verify device geometry, read and write callbacks, native FUA,
 FLUSH, parallel callbacks, panic containment, opt-in v3 TRIM (complete crypto
 units only), native WRITE_ZEROES of any length (chunked to the maximum I/O
 size; complete units discarded only when the client permits trimming on a v3
-volume; no fast zero), disabled multi-connection, disconnect, and clean
-detach. Default v2 volumes continue to advertise no TRIM; see
+volume), the refusal of fast zero, disabled multi-connection, disconnect, and
+clean detach. Default v2 volumes continue to advertise no TRIM; see
 `docs/space-reclamation.md` for the v3 persistence contract.
+
+The plugin MUST refuse every WRITE_ZEROES request that carries
+`NBD_CMD_FLAG_FAST_ZERO` with `ENOTSUP`, at once and without changing the
+export: partial units are written, so zeroing is never known to be faster
+than a write. It MUST nevertheless advertise fast zero
+(`NBD_FLAG_SEND_FAST_ZERO`), which the NBD protocol permits a server that
+always fails such requests. nbdkit does not check that the flag of a request
+was advertised; it asserts it, so an export that does not advertise fast zero
+lets one request from any client of the NBD socket abort a server built with
+assertions. The Linux NBD driver does not read that transmission flag and
+never sets the request flag.
 
 Linux qualification additionally covers the exported API-v2 prefix, libnbd
 round trips, fio verification, and the kernel NBD path. See

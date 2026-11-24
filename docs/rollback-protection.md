@@ -138,16 +138,47 @@ empty or partly written beside nothing but those lock files is completed by
 `volume create` the same way. Nothing has to be removed by hand, and
 `resume-enrollment` refuses such a root with a message that says to create
 the volume again. Once `rollback.format` holds the marker, `volume create`
-refuses the root (`remote enrollment requires an empty backing`) and the
-procedure below continues it. The binding, the next file, is written the
+no longer continues the root: it answers
+`remote enrollment requires an empty backing` while the authority is still
+unclaimed (the creation stopped before its claim, while it wrote the
+binding), and `remote witness already enrolled or occupied` once the
+creation had claimed the authority (it stopped while reserving the
+namespace, on a full disk for example, or before activation). The
+procedure below continues both. The binding, the next file, is written the
 same way, as `remote.enrollment.next` renamed to `remote.enrollment` once it
 is synced: a creation that stopped while it wrote the binding leaves at most
 the staged file, which nothing reads, and `resume-enrollment` continues it
-and writes the binding for the approved identity and capacity. An older
-binary wrote the binding in place; a `remote.enrollment` it left empty or
-incomplete is refused as invalid enrollment metadata, because it cannot be
-told apart from a damaged binding: move that file out of the backing root,
-keep it, and resume. An interrupted
+and writes the binding for the approved identity and capacity.
+`resume-enrollment` makes the marker's name durable before it stages the
+binding. An older binary did not: after a creation that failed in the
+directory sync that publishes the marker, or was killed between the marker's
+rename and that sync, a power loss during `resume-enrollment` could leave the
+binding, staged or published, in a root without `rollback.format`.
+`volume create` continues that root as well when it is run with the same
+authority and capacity: it never reads the staged file, and it accepts a
+published `remote.enrollment` only if it is the binding it would write
+itself. A `remote.enrollment` for another authority or capacity is refused by
+both commands and left as it is, with a message that says to create the
+volume with that creation's authority and capacity or to use an empty backing
+root. A staged file that the command cannot write again from the start (a
+link, a directory, a FIFO, a file with a second name, or a file that another
+user owns and this one cannot open, under `rollback.format.next` or
+`remote.enrollment.next`) is refused by both commands before they change
+anything, with a message that names it and gives the system's answer: remove
+it and run the command again. A command run as root leaves a file of the
+last kind when it is killed between creating the staged file under its name
+and giving it to the directory's owner, on a filesystem without unnamed
+temporary files; the daemon user's `volume create` used to fail on it once,
+remove it and continue on the next run, and now names it until it is
+removed. An older
+binary wrote the binding in place, and a `remote.enrollment` it left empty or
+incomplete cannot be told apart from a damaged binding. In a root whose
+`rollback.format` holds the marker, `resume-enrollment` refuses it as invalid
+enrollment metadata: move that file out of the backing root, keep it, and
+resume. In a root without `rollback.format`, `volume create` answers
+`remote enrollment requires an empty backing` and `resume-enrollment` says to
+move the file out and create the volume again: move it out, keep it, and run
+`volume create`. An interrupted
 `maki-witness init` is a separate case, described with
 [the authority's initialization](remote-witness-service.md#initialize-a-local-authority).
 
@@ -241,7 +272,7 @@ volume:
 
 ```sh
 install -d -o maki -g maki -m 0700 /var/lib/maki/protected /mnt/maki-witness/protected
-sudo -u maki maki volume create /etc/maki/volumes/protected.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/protected.toml
 ```
 
 Creation writes the backing files and the witness files (`anchor`,
@@ -259,10 +290,29 @@ nothing can open the volume, so nothing was acknowledged. A `maki volume
 create` that is killed, loses power or fails before it publishes the anchor
 (a full disk while it reserves the arena, for example) is completed by
 running it again, with nothing to remove by hand. Once the anchor is
-published, the command initializes the volume inside the backing; one that
-stops there is refused by a later `create`, which never writes over an
-anchor: if the volume was never attached, empty both directories and create
-it again. The format marker and the anchor are each written under
+published, the command initializes the volume inside the backing, in
+several commits that end with the volume's superblock. One that stops
+there is completed by running it again as well, with the capacity it was
+started with: `create` opens the pair against its witness, which
+authenticates the manifest and every committed page, and continues only
+if what it then finds is nothing but an unfinished creation, that is, no
+superblock copy and no entry other than what a creation writes before its
+superblock (the volume lock, the first shard-catalog copy, a staged
+`superblock.next`, the empty `data`, `journal` and `checkpoint`
+directories with the durable proof, the initial checkpoint state and a
+durable mark that is still empty). It
+removes those files and initializes the volume anew, with a new volume
+UUID. A volume that was ever attached holds a superblock copy, so it is
+never continued this way, and damage cannot make one look unfinished: a
+pair whose superblock pages, manifest slots or anchor are damaged or
+missing, or whose witness is not mounted, does not open, and `create`
+refuses it as before and leaves it as it is. Until the command is run
+again, the daemon, `maki check` and `maki volume inspect` refuse the pair
+and say why: before the anchor that the backing holds no format marker or
+the witness no anchor, after it `no valid superblock: this volume's
+creation did not complete`, each naming `maki volume create` as what
+continues it. Once a superblock copy is committed the volume exists and
+`create` refuses it. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
@@ -274,9 +324,12 @@ so `create` never creates over one, whatever the witness directory holds
 and short of both slots lost or zeroed entirely (an all-zero slot is an
 unwritten one): a witness mount that is missing (an empty directory in its
 place) cannot get a used volume recreated, and neither can slots that
-damage left holding anything else. It never writes over an `anchor` either. Earlier releases created
+damage left holding anything else. It never enrolls over an `anchor` either: a pair that
+has one is only ever opened against it. Earlier releases created
 the anchor empty before writing it: an empty `anchor` that such a release
-left is refused by `create` and by the daemon, which say that the creation
+left is refused by `create`
+(`rollback enrollment requires empty backing and witness directories`) and
+by the daemon and the offline commands, which say that the creation
 did not complete or the witness lost its state. If the volume was never
 attached, remove that empty file and run `maki volume create` again;
 otherwise restore the witness directory.
@@ -300,7 +353,7 @@ Use `maki check <config.toml> --deep` or `maki volume inspect <config.toml>` whi
 the volume is detached, as the daemon user or as root:
 
 ```sh
-sudo -u maki maki check /etc/maki/volumes/protected.toml --deep
+runuser -u maki -- maki check /etc/maki/volumes/protected.toml --deep
 ```
 
 These acquire the exclusive witness session and reestablish the selected
@@ -566,7 +619,7 @@ with the writer configuration as the daemon user (a process run as root
 refuses the daemon-owned writer key):
 
 ```sh
-sudo -u maki maki volume gc /etc/maki/protected-writer.toml
+runuser -u maki -- maki volume gc /etc/maki/protected-writer.toml
 ```
 
 The command prints `removed`, `skipped_live`, `skipped_unrecognized` and

@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,30 @@ impl BoundDeviceRecord {
 pub(crate) struct TrustedState {
     directory: File,
     owner: u32,
+    /// Where the directory is, for messages only: everything is opened
+    /// relative to `directory`.
+    path: PathBuf,
+}
+
+/// Name what could not be opened or locked. The operating system's error
+/// alone ("No such file or directory") says neither which of the helper's
+/// files it is about nor, to a caller that is not the files' `owner`, that
+/// the helper runs as that user. The error keeps its kind.
+pub(crate) fn named(what: &str, path: &Path, owner: u32, error: io::Error) -> io::Error {
+    // SAFETY: geteuid has no preconditions.
+    let caller = unsafe { libc::geteuid() };
+    let hint = if error.kind() == io::ErrorKind::PermissionDenied && caller != owner {
+        match owner {
+            0 => "; run this command as root".to_string(),
+            owner => format!("; run this command as uid {owner}"),
+        }
+    } else {
+        String::new()
+    };
+    io::Error::new(
+        error.kind(),
+        format!("{what} {}: {error}{hint}", path.display()),
+    )
 }
 
 fn trusted_directory(file: &File, owner: u32) -> io::Result<()> {
@@ -184,7 +208,7 @@ impl TrustedState {
     }
 
     pub(crate) fn open_beneath(directory: File, relative: &Path, owner: u32) -> io::Result<Self> {
-        Self::open_directory(directory, relative, owner, true)
+        Self::open_named(directory, relative, owner, true)
     }
 
     pub(crate) fn open_existing_beneath(
@@ -192,7 +216,20 @@ impl TrustedState {
         relative: &Path,
         owner: u32,
     ) -> io::Result<Self> {
-        Self::open_directory(directory, relative, owner, false)
+        Self::open_named(directory, relative, owner, false)
+    }
+
+    /// The attach state directory `relative` below `directory`, which is `/`
+    /// outside tests: an error names the directory as that path.
+    fn open_named(directory: File, relative: &Path, owner: u32, create: bool) -> io::Result<Self> {
+        Self::open_directory(directory, relative, owner, create).map_err(|error| {
+            named(
+                "attach state directory",
+                &Path::new("/").join(relative),
+                owner,
+                error,
+            )
+        })
     }
 
     fn open_directory(
@@ -232,19 +269,33 @@ impl TrustedState {
             trusted_directory(&child, owner)?;
             directory = child;
         }
-        Ok(Self { directory, owner })
+        Ok(Self {
+            directory,
+            owner,
+            path: Path::new("/").join(relative),
+        })
+    }
+
+    /// An error about `attach.lock`, named by its path.
+    fn lock_error(&self, error: io::Error) -> io::Error {
+        named(
+            "attach lock",
+            &self.path.join("attach.lock"),
+            self.owner,
+            error,
+        )
     }
 
     fn lock_file(&self) -> io::Result<File> {
         let name = CString::new("attach.lock").unwrap();
-        let file = openat(&self.directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
-        private_regular_file(&file, self.owner)?;
-        Ok(file)
+        openat(&self.directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)
+            .and_then(|file| private_regular_file(&file, self.owner).map(|()| file))
+            .map_err(|error| self.lock_error(error))
     }
 
     pub fn lock(&self) -> io::Result<StateLock> {
         let file = self.lock_file()?;
-        file.lock()?;
+        file.lock().map_err(|error| self.lock_error(error))?;
         Ok(StateLock(file))
     }
 
@@ -316,9 +367,10 @@ impl TrustedState {
     /// Verification joins the same exclusive lock without creating a file.
     pub fn lock_existing(&self) -> io::Result<StateLock> {
         let name = CString::new("attach.lock").unwrap();
-        let file = openat(&self.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)?;
-        private_regular_file(&file, self.owner)?;
-        file.lock()?;
+        let file = openat(&self.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)
+            .and_then(|file| private_regular_file(&file, self.owner).map(|()| file))
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|error| self.lock_error(error))?;
         Ok(StateLock(file))
     }
 
@@ -493,7 +545,7 @@ fn read_config_beneath(directory: File, relative: &Path, owner: u32) -> io::Resu
     let name = relative
         .file_name()
         .ok_or_else(|| invalid("config path has no filename"))?;
-    let state = TrustedState::open_existing_beneath(directory, parent, owner)?;
+    let state = TrustedState::open_directory(directory, parent, owner, false)?;
     let name = CString::new(name.as_bytes()).map_err(|_| invalid("invalid config filename"))?;
     let file = openat(&state.directory, &name, libc::O_RDONLY | libc::O_NOATIME, 0)?;
     let metadata = file.metadata()?;

@@ -56,6 +56,28 @@ def git(*args):
     return run(git_command(*args), env={**os.environ, "GIT_GRAFT_FILE": os.devnull})
 
 
+def require_own_checkout():
+    """Refuse a source tree that is not the top level of its own Git checkout.
+
+    Git looks for a repository in every parent directory. For a source
+    archive unpacked below another checkout it finds that one, whose HEAD,
+    history and Cargo.toml say nothing about this source."""
+    recorded = ("The version of a published source archive is `package.version` in the manifest published "
+                "beside it; see \"Rebuilding from a published source archive\" in docs/releasing.md.")
+    # The C locale: the one message that is recognised below is Git's own.
+    found = subprocess.run(git_command("rev-parse", "--show-toplevel"), capture_output=True, text=True,
+                           env={**os.environ, "LC_ALL": "C"})
+    if found.returncode:
+        if "not a git repository" not in found.stderr:
+            fail(f"git exited {found.returncode}:\n{found.stderr[-8000:]}")
+        fail(f"{ROOT} is not a Git checkout: a candidate version counts the commits below the source, "
+             f"and a source archive has no history. {recorded}")
+    top = found.stdout.rstrip("\n")
+    if not top or not os.path.samefile(top, ROOT):
+        fail(f"{ROOT} is not the top level of a Git checkout: it lies inside the repository at "
+             f"{top or '(no work tree)'}, whose history and version are not this source's. {recorded}")
+
+
 def digest(path):
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
@@ -169,6 +191,7 @@ def tracked_changes(*, repo=None):
 def candidate_source_version():
     import tomllib
 
+    require_own_checkout()
     # Capture only a committed source tree. Untracked files are excluded by
     # the selected Git tree, and staged/unstaged tracked changes must not be mistaken
     # for source included in this candidate.

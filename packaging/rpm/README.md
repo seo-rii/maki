@@ -46,16 +46,22 @@ The differences are deliberate:
   the manual pages, examples and `NEWS.gz` are documentation.
 - There is no `changelog.Debian.gz`; the package's own entry is in the RPM
   header (`rpm -q --changelog maki`).
+- The RPM adds `/etc/dnf/protected.d/maki.conf` (from
+  [`dnf-protected.conf`](dnf-protected.conf)), a `%config(noreplace)` file
+  that names `maki` as a package dnf must not remove
+  ([removal](#scriptlets-and-removal)). apt needs no counterpart: it stops at
+  a `prerm` that fails.
 
-The package owns only its own directories. It owns no file below
-`/etc/maki`, does not enable a volume, and does not start, stop or restart a
-service during install, upgrade or removal.
+The package owns only its own directories and, outside `/usr`, that one
+file. It owns no file below `/etc/maki`, does not enable a volume, and does
+not start, stop or restart a service during install, upgrade or removal.
 
 ## Dependencies
 
 ```text
 Requires: nbdkit-server, lvm2, xfsprogs, util-linux, systemd >= 249, kmod
-Conflicts: nbdkit-selinux
+Conflicts: nbdkit-selinux, nbdkit
+Provides: user(maki), group(maki), group(maki-admin)
 ```
 
 `nbdkit-server` provides `/usr/sbin/nbdkit`; the `nbdkit` metapackage would
@@ -63,11 +69,18 @@ add plugins and filters Maki does not use and, on a host with the targeted
 SELinux policy, the `nbdkit-selinux` module, under which the policy lets
 systemd neither execute nbdkit nor transition to its domain
 ([SELinux](../../docs/getting-started/installation-rhel.md#selinux)). The
-conflict makes dnf refuse that module, also when a later transaction would
-pull it in, instead of leaving `maki@` unable to start under enforcing
-SELinux; the price is that Maki cannot be installed beside it (libvirt and
-virt-v2v hosts, or hosts with SELinux off, where it would be harmless).
-nbd-client is not required.
+conflicts make dnf refuse that module and the metapackage, also when a later
+transaction would pull one in, instead of leaving `maki@` unable to start
+under enforcing SELinux; the price is that Maki cannot be installed beside
+either (libvirt and virt-v2v hosts, or hosts with SELinux off, where the
+module would be harmless). Only the metapackage requires the module, and
+only where `selinux-policy-targeted` is installed. It is named as well
+because Maki is a protected package
+([removal](#scriptlets-and-removal)): with the module alone refused,
+`dnf install --allowerasing nbdkit` satisfied the metapackage by proposing
+to replace `selinux-policy-targeted` with another policy. nbdkit's plugins
+and filters (`nbdkit-basic-plugins`, `nbdkit-basic-filters` and the others)
+install beside Maki under their own names. nbd-client is not required.
 
 rpm adds the binaries' shared-library requirements itself (`libc.so.6`,
 `libgcc_s.so.1`, `libm.so.6` with their symbol versions). Its generator reads
@@ -82,6 +95,14 @@ contract tests' header-only ELF stubs and must not be used for a package that
 will be installed. The plugin is excluded from rpm's provides: it is loaded by
 nbdkit, not linked by other packages.
 
+The package provides the user and the groups that its sysusers file creates,
+under the names other EL9 packages carry (`user(maki)`, `group(maki)`,
+`group(maki-admin)`), so that a package may require them. The spec declares
+them and turns rpm's sysusers dependency generator off: the generator comes
+with `systemd-rpm-macros`, which a RHEL 9 host with systemd has and the
+minimal container image has not, so it added them on one build host and not
+on the other.
+
 ## Artifact validation
 
 The builder applies the Debian builder's ELF checks (machine, class, byte
@@ -93,7 +114,7 @@ The release binaries are packaged byte for byte: the spec turns off
 stripping, the debuginfo split, build-id links and the other post-install
 processing that would change them.
 
-## Scriptlets
+## Scriptlets and removal
 
 `%post` runs `systemd-sysusers` and `systemd-tmpfiles --create` for Maki's
 files and `systemctl daemon-reload` when systemd is running, like the Debian
@@ -106,13 +127,35 @@ upgrade is never blocked: detach with the old helper first, as the
 [runtime-layout upgrade procedure](../../docs/operations.md#upgrading-the-runtime-layout)
 describes.
 
+`%preun` can keep only Maki itself. rpm 4.16 has no scriptlet that stops a
+transaction: when `%preun` fails, rpm skips that one erase and goes on. Under
+an attached volume `dnf remove maki` therefore kept Maki and erased
+`nbdkit-server`, `lvm2`, `xfsprogs` and `kmod`, which dnf had installed as
+Maki's dependencies and removes with it, and `dnf install --allowerasing` of
+a conflicting package installed it beside Maki. So the package names itself
+in `/etc/dnf/protected.d/maki.conf`: dnf (and microdnf) refuse, before they
+change anything, a transaction that would remove Maki or break its
+dependencies, attached or not. `rpm -e maki` removes the package, with
+`%preun`'s refusal in force, and `dnf autoremove` afterwards the
+dependencies nothing else needs; upgrades, downgrades and reinstallations
+are not affected. The
+[installation guide](../../docs/getting-started/installation-rhel.md#upgrading-and-removal)
+has the procedure.
+
 ## Builds and tests
 
 `SOURCE_DATE_EPOCH` is required, 1990-01-01 or later: the build time, every
 file time and the changelog entry come from it, and rpm cannot date a
 changelog entry before 1990 (it reports "bad date in %changelog" and still
 writes a package without the entry). The build is reproducible for a given
-`SOURCE_DATE_EPOCH` and rpm version; the build host name is fixed. Run the contract tests with:
+`SOURCE_DATE_EPOCH` on EL9, whichever of its dependency generators the build
+host has installed: the build host name is fixed, and the user and group
+provides come from the spec. Another rpm version or another distribution's
+rpm configuration (payload compression, `rpmlib()` requirements) writes a
+different file with the same contents. The `v0.1.0-rc.1` RPM predates this:
+built in a container without the sysusers generator, it has none of the
+three `user()` and `group()` provides, which the same build on a RHEL 9 host
+carried. Run the contract tests with:
 
 ```bash
 python3 -B -m unittest scripts.test_rpm_package -v

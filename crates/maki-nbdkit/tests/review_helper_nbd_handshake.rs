@@ -36,6 +36,10 @@ use handshake::{
     NBD_FLAG_SEND_FUA, NBD_FLAG_SEND_TRIM, NBD_FLAG_SEND_WRITE_ZEROES,
 };
 
+/// Bit 11 of the transmission flags: the kernel's NBD driver does not read
+/// it, and the plugin needs it advertised (see `review_fast_zero.rs`).
+const NBD_FLAG_SEND_FAST_ZERO: u16 = 1 << 11;
+
 const REQUIRE: &str = "MAKI_TEST_REQUIRE_NBDKIT";
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -172,6 +176,7 @@ fn the_plugin_passes_the_helpers_handshake_with_flush_and_fua() {
             (NBD_FLAG_SEND_FLUSH, "SEND_FLUSH"),
             (NBD_FLAG_SEND_FUA, "SEND_FUA"),
             (NBD_FLAG_SEND_WRITE_ZEROES, "SEND_WRITE_ZEROES"),
+            (NBD_FLAG_SEND_FAST_ZERO, "SEND_FAST_ZERO"),
         ] {
             assert_ne!(
                 flags & flag,
@@ -186,5 +191,77 @@ fn the_plugin_passes_the_helpers_handshake_with_flush_and_fua() {
             discard,
             "TRIM is advertised exactly where the volume keeps discards: {flags:#06x}"
         );
+    }
+}
+
+/// The plugin serves one connection. While one is open, as the kernel's is
+/// after a connect, nbdkit answers the next `NBD_OPT_GO` that the export is
+/// not available, and it closes a connection only a moment after its peer
+/// did. The helper waits for exactly this answer (SPEC §6), so it must be
+/// the one the handshake tells apart, and it must end once the first
+/// connection is closed.
+#[test]
+fn a_second_connection_is_answered_unavailable_until_the_first_is_closed() {
+    if !nbdkit_available("a_second_connection_is_answered_unavailable_until_the_first_is_closed") {
+        return;
+    }
+    let daemon = Daemon::start(false);
+    let open = || {
+        let stream = UnixStream::connect(&daemon.socket).unwrap();
+        handshake::negotiate(&stream, Instant::now() + DEADLINE).map(|export| (stream, export))
+    };
+    let first = open().unwrap_or_else(|error| panic!("{error}: {}", daemon.log()));
+    for _ in 0..3 {
+        let refusal = open().expect_err("a second connection was served");
+        assert!(
+            handshake::export_unavailable(&refusal),
+            "{refusal}: {}",
+            daemon.log()
+        );
+    }
+    drop(first);
+    // Not necessarily at once, but well within the five seconds the helper
+    // waits.
+    let closed = Instant::now();
+    loop {
+        match open() {
+            Ok(_) => break,
+            Err(error) => {
+                assert!(handshake::export_unavailable(&error), "{error}");
+                assert!(
+                    closed.elapsed() < Duration::from_secs(5),
+                    "the export stayed unavailable: {}",
+                    daemon.log()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// nbdkit gives a client no reason for that answer, so the daemon's own log
+/// has to say that the export exists and is taken.
+#[test]
+fn the_daemon_says_why_it_refuses_a_second_connection() {
+    if !nbdkit_available("the_daemon_says_why_it_refuses_a_second_connection") {
+        return;
+    }
+    let daemon = Daemon::start(false);
+    let first = UnixStream::connect(&daemon.socket).unwrap();
+    handshake::negotiate(&first, Instant::now() + DEADLINE)
+        .unwrap_or_else(|error| panic!("{error}: {}", daemon.log()));
+    let second = UnixStream::connect(&daemon.socket).unwrap();
+    assert!(handshake::negotiate(&second, Instant::now() + DEADLINE).is_err());
+    let started = Instant::now();
+    while !daemon
+        .log()
+        .contains("the volume serves one connection at a time")
+    {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "the daemon's log does not say why: {}",
+            daemon.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -43,10 +43,28 @@ socket itself (fixed-newstyle `NBD_OPT_GO` for the default export) and connects
 and disconnects the kernel device with generic-netlink requests to the `nbd`
 family, which needs a kernel whose `nbd` module has the netlink interface and
 the backend identifier (SPEC §6). It refuses an export that does not advertise
-FLUSH and FUA, before the kernel sees the socket. While something has the
-unconnected device open (udev probes a device right after a disconnect), the
-kernel refuses a connect as busy; the helper retries that for up to 5 s, as
-long as the device still shows no connection. The
+FLUSH and FUA, before the kernel sees the socket. Two answers to a connect
+mean "busy" and are retried every 100 ms, for up to 5 s from the first of them
+and only while the device still shows no connection:
+
+- the kernel's, while something has the unconnected device open (udev probes a
+  device right after a disconnect). The helper sends its next request on the
+  connection it has already negotiated, and negotiates a fresh one only when
+  that connection has been closed or shut down;
+- the daemon's, while its export is not available. The daemon serves one
+  connection at a time and closes one a moment after its peer did, so a
+  handshake right after a disconnect can be refused (`NBD_REP_ERR_UNKNOWN`).
+  A server without a default export answers the same: when the 5 s are over,
+  the refusal names both, and the daemon's own log says whether it refused a
+  second connection ("the volume serves one connection at a time, and one is
+  open").
+
+A device that stays busy to the end shows nothing in sysfs. When the attach
+allocated it (no pinned `nbd_device`), the helper gives it up, logs a warning
+and tries the next free device within the same step's time; a pinned device
+fails the attach. `maki-attach nbd-disconnect` waits up to 15 s until the
+device no longer shows its connection, which the kernel keeps showing while
+anything has the device open, and fails if it still does. The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -73,7 +91,8 @@ is disabled. See [space reclamation](space-reclamation.md) for format selection,
 partial-unit behavior and checkpoint ordering. WRITE_ZEROES is native and
 chunked to `nbd.maximum_io`, so a zero request of any length succeeds; on a
 `--discard` volume whole units may be discarded when the client allows it.
-Fast zero is not advertised.
+Fast zero is advertised, and every fast zero request is refused with `ENOTSUP`
+([why](space-reclamation.md)).
 
 ## Volume lifecycle
 
@@ -91,19 +110,33 @@ volume's shards would otherwise be adopted and served by the new one, and a
 root that still holds an earlier volume's `superblock.*`, `shard-catalog.*` or
 `canary.*` (a stale key canary would otherwise fail the first attach as a key
 mismatch). A leftover `volume.lock` is accepted.
-The superblock copies are written last, once everything else is durable: a
-creation interrupted before it writes a superblock copy leaves a root that is
-not a volume, and `volume create` refuses any files the interrupted run left in
-the layout directories until the root is emptied. Once a copy is readable, a
+The superblock copies are written last, once everything else is durable, and
+the first one is written and synced under a temporary name (`superblock.next`)
+and renamed into place, so a superblock file never holds anything but a
+superblock. A creation interrupted before a superblock copy exists leaves a
+root that is not a volume, and `volume create` refuses the files the
+interrupted run left (in the layout directories, `shard-catalog.a`,
+`superblock.next`) until the root is emptied. Once a copy exists, a
 retried `volume create` reports `volume superblock already present`: the root
 is a complete volume, except that a failed or killed creation may have left
 that copy only in the page cache. The first attach makes both superblock copies
 durable before it accepts writes; empty the root instead to start over.
+A superblock file that holds no valid superblock is a third state. This
+release does not produce it; an earlier one created the first copy before
+writing it, so a creation it stopped there left an empty or partly written
+`superblock.a`, and damage to both copies of a used volume looks the same.
+`volume create` refuses such a root with both causes and never initializes it
+again, and the daemon, `check` and `volume inspect` report `no valid
+superblock`. Only if the volume was never attached, empty the root and create
+it again; otherwise restore the root from a backup.
 A backing with a remote rollback witness is continued differently, without
 emptying its root: see
 [interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
-A backing with a local witness whose creation stopped before it published
-the witness anchor is completed by running `volume create` again
+A backing with a local witness is continued by running `volume create`
+again, without emptying anything, wherever its creation stopped before the
+volume's superblock was committed: before the witness anchor, or after it
+while the volume inside the backing was being initialized. Until then the
+daemon, `check` and `volume inspect` refuse it and name that command
 ([local rollback creation](rollback-protection.md#local-configuration-and-creation)).
 
 `volume inspect` and `check`, including `check --deep`, require an existing
@@ -129,7 +162,7 @@ the daemon and run the command as that user:
 
 ```bash
 install -d -o maki -g maki -m 0700 /var/lib/maki/example
-sudo -u maki maki volume create /etc/maki/volumes/example.toml
+runuser -u maki -- maki volume create /etc/maki/volumes/example.toml
 ```
 
 The backing filesystem must overwrite allocated blocks in place, or the
@@ -519,6 +552,11 @@ Every executing verb (attach, detach, cleanup, recover, grow, verify, and
 the `recover-failed-start` hook) reads this file only when it is a root-owned regular file with one link, not
 writable by group or others, below root-owned directories with the same
 restriction: the helper runs as root on what it says. `--plan` reads any file.
+Without `--config`, only a default path that does not exist selects the
+built-in defaults. A path the caller cannot examine, for example because
+`/etc/maki/attach` is closed to that user, is an error that names the path,
+for `--plan` too: a plan from the defaults would show another attachment than
+the configured one.
 For attach, detach, recover, cleanup and grow, command-line flags override the
 NBD device, NBD socket, VG, LV, mountpoint, volume UUID and XFS UUID, and
 `--init-sentinel` (attach only) turns the sentinel option on, never off.
@@ -602,7 +640,10 @@ Execution (Linux, root) then:
    connecting it;
 2. records the requested attachment and a random connection identifier before
    connecting NBD, then connects with the configured block size, waits until
-   the device reports a size, and verifies its kernel backend identifier;
+   the device reports a size, and verifies its kernel backend identifier. An
+   allocated device that the kernel keeps refusing as busy is given up for
+   the next free one: the record is replaced by one that names that device,
+   under a new identifier, before it is connected;
 3. activates the VG and records its mapping identity, then verifies XFS TYPE
    and the optional configured `fs_uuid` with a bounded block probe before
    mounting with `noatime,nosuid,nodev`: the filesystem's bytes come from the
@@ -1176,6 +1217,11 @@ trusted attachment record exists or a `maki@`, `maki-attach@`,
 lifecycle needs to detach. A failed `systemctl` query refuses the removal too. Drain and deactivate every volume first. Upgrades
 are not blocked and no maintainer script starts, stops or restarts a service
 ([package behaviour](../packaging/debian/README.md#removal-and-upgrade-behaviour)).
+On RHEL 9 the RPM is removed with `rpm -e maki`, which its `%preun` refuses
+in the same cases. `dnf remove maki` is always refused: rpm cannot stop a
+transaction from `%preun`, so the package is protected from dnf, which would
+otherwise keep Maki and erase its dependencies
+([RHEL 9 removal](getting-started/installation-rhel.md#upgrading-and-removal)).
 
 The [2026-09-19 package qualification](qualification/package-topology-migration-validation-2026-09-19.md)
 installed a generated pre-upgrade Debian package on a clean Debian 12 VM,
@@ -1363,6 +1409,11 @@ calls.
   or journal change; see the
   [physical reservation report](qualification/physical-reservation-validation-2026-09-18.md).
   This does not preallocate untouched slots or cover non-Linux backing behavior.
+  It does not cover one metadata store either: an A/B copy that a power loss
+  left undecodable is emptied before it is written again, so that store needs
+  free blocks and can fail with ENOSPC on a filesystem that has none. The
+  checkpoint, barrier or attach that needed it then fails; the other copy and
+  the journal are untouched, and it succeeds once space is available.
   A reserve-only refusal leaves existing data readable and does not
   by itself set a checkpoint error or change the engine state. It wakes the
   checkpoint worker for an immediate pass, which deletes covered journal
