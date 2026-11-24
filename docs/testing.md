@@ -58,6 +58,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | Baseline | Pull requests and pushes | Ubuntu and Windows, Rust 1.94.0 | Formatting, strict Clippy, and workspace tests block; on Ubuntu the root-only test targets also run as root |
 | Compatibility | Pull requests and pushes | Ubuntu and Windows, latest stable | Formatting, strict Clippy, and workspace tests block independently |
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
+| RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 | etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 
@@ -85,7 +86,10 @@ fault-oracle regressions. Actual Docker cgroup, KVM/Firecracker, and GCE reset
 campaigns remain opt-in host qualification steps. The job runs every
 `scripts/test_*.py` (`scripts/test_ci_gate_validation.py` fails for a module
 the workflow would not run) and fails when those suites leave
-`scripts/__pycache__` in the checkout.
+`scripts/__pycache__` in the checkout. There, `scripts/test_rpm_package.py`
+also builds the Debian package from the same stub artifacts and compares the
+two packages file by file; `MAKI_TEST_REQUIRE_DPKG_DEB=1` makes a missing
+`dpkg-deb` a failure instead of a skip.
 
 The workspace tests run as the unprivileged runner user. Tests that give a
 fixture to another user, run a binary as the daemon user, enter a private
@@ -131,6 +135,22 @@ and bounded diagnostics as a CI artifact. It does not attach devices or qualify
 the Debian 12 NBD/LVM/XFS stack. The
 [first production campaign](deployment/first-production-candidate.md) requires
 those installed-package and workload results separately.
+
+The `rhel9` job runs in the `quay.io/centos/centos:stream9` container; CentOS
+Stream 9 is the public upstream of RHEL 9. It installs its tools from BaseOS
+and AppStream, plus `nbdkit-devel` from CRB for the ABI header, without EPEL;
+builds the four packaged artifacts in release mode against glibc 2.34; runs
+`review_abi.rs` against EL9's `nbdkit-plugin.h`; runs the `maki-privileged`,
+`maki-attach` and `maki-nbdkit` suites through `run_cargo_tests.py`, so the
+native tests load Maki's plugin into EL9's nbdkit 1.38; and runs
+`scripts/test_rpm_package.py`. It then builds the real RPM, requires that it
+depends on glibc and on `GLIBC_2.34` symbols, installs it with dnf, checks
+its files and units (`rpm -V`, `systemd-analyze verify`), and requires
+`rpm -e` to refuse while an attachment record exists. The container runs as
+root, so the root-only targets of those crates run inline; those that need a
+private mount namespace or a writable cgroup hierarchy print why they skip
+there, and the Ubuntu job runs them as root. The kernel is the runner's: the
+job covers RHEL 9's userspace, not its kernel, SELinux or an attachment.
 
 The 2026-09-18 bounded-replay follow-up at revision `733833c` reran the Docker
 cgroup campaign. A 21.5 MiB distinct pressure tail recovered at 32 MiB with all
