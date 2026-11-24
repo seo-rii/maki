@@ -9,6 +9,8 @@
 //! - [`probe`]: pure parsers for mountinfo, sysfs and swap listings;
 //! - [`verify`]: the secure-mount verifier;
 //! - `exec` (Linux): command execution, observation, allocation, rollback;
+//! - `nbd_kernel` (Linux): the NBD handshake with the volume daemon and the
+//!   generic netlink requests that connect and disconnect the kernel device;
 //! - [`logging`]: the stderr `tracing` sink the executor reports through.
 
 // Diagnostics go through `tracing`, and the executor writes the device it
@@ -24,6 +26,9 @@ pub mod verify;
 
 #[cfg(target_os = "linux")]
 pub mod exec;
+
+#[cfg(target_os = "linux")]
+pub mod nbd_kernel;
 
 #[cfg(target_os = "linux")]
 mod state;

@@ -226,12 +226,18 @@ fn attach_plan_binds_the_allocated_device_everywhere() {
     assert!(!plan.needs_device_allocation());
     let rendered = plan.to_string();
     assert!(!rendered.contains("<auto>"), "{rendered}");
-    assert!(rendered.contains("nbd-client -unix /run/maki/pg/nbd.sock nbd3 -b 4096"));
+    assert!(
+        rendered.contains("connect nbd3 to /run/maki/pg/nbd.sock over netlink (block size 4096"),
+        "{rendered}"
+    );
     assert!(rendered.contains("blockdev --setbsz 4096 /dev/nbd3"));
     assert!(rendered.contains("nbd /dev/nbd3)"), "{rendered}");
     let mut detach = plan_detach(&request());
     detach.bind_device("/dev/nbd3");
-    assert!(detach.to_string().contains("nbd-client -d nbd3"));
+    assert!(detach.to_string().contains("disconnect nbd3 over netlink"));
+    for plan in [rendered, detach.to_string()] {
+        assert!(!plan.contains("nbd-client"), "{plan}");
+    }
 }
 
 #[test]
@@ -242,7 +248,7 @@ fn nbd_connect_uses_the_configured_block_size() {
         &cfg.into_request("pg", AttachOverrides::default(), true)
             .unwrap(),
     );
-    assert!(plan.to_string().contains("-b 512"), "{plan}");
+    assert!(plan.to_string().contains("(block size 512,"), "{plan}");
     assert!(plan.to_string().contains("--setbsz 512"), "{plan}");
 }
 
@@ -502,8 +508,8 @@ fn mountinfo_parsing_exposes_the_device_number() {
 
 /// With the packaged default (`nbd_device` unset) the detach plan carried
 /// the auto placeholder, and the executor "allocated" the lowest free
-/// device for it: `nbd-client -d` on an unrelated device, the real one
-/// left connected. A detach must use the device recorded at attach or
+/// device for it: a disconnect of an unrelated device, the real one left
+/// connected. A detach must use the device recorded at attach or
 /// refuse.
 #[test]
 fn detach_with_an_unrecorded_auto_device_is_unresolved_and_never_allocates() {
@@ -624,8 +630,8 @@ mod mount_root_hygiene {
     }
 }
 
-/// A pinned NBD device must be spelled canonically: `nbd-client` connects
-/// `/dev/nbd01` as nbd1, but identity checks compare the configured string
+/// A pinned NBD device must be spelled canonically: `/dev/nbd01` would be
+/// connected as nbd1 (index 1), but identity checks compare the configured string
 /// with kernel and mountinfo names, so a non-canonical spelling attached
 /// and then failed every verification.
 #[test]

@@ -76,6 +76,39 @@ fn nbd_client_netlink_target_is_the_validated_kernel_name() {
     assert!(nbd_client_target("/dev/sda").is_err());
 }
 
+/// The connect and disconnect steps start no program: the helper
+/// negotiates with the daemon and talks to the kernel itself, so no
+/// `nbd-client` is needed or run. Netlink sockets are refused here, so
+/// both steps fail before any request reaches the kernel.
+#[test]
+fn nbd_steps_start_no_external_program() {
+    let recording = command::record_commands();
+    let _netlink = crate::nbd_kernel::netlink::refuse_sockets();
+    let connect = PlannedStep::NbdConnect {
+        socket: "/run/maki/pg/nbd.sock".into(),
+        device: "/dev/nbd3".into(),
+        block_size: 4096,
+    };
+    let disconnect = PlannedStep::NbdDisconnect {
+        device: "/dev/nbd3".into(),
+    };
+    for (step, identifier) in [
+        (&connect, Some("maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c")),
+        (&disconnect, None),
+    ] {
+        match run_step(step, identifier) {
+            Err(ExecError::Step { message, .. }) => {
+                assert!(message.contains("netlink"), "{step}: {message}")
+            }
+            other => panic!("{step}: {other:?}"),
+        }
+    }
+    assert_eq!(recording.programs(), Vec::<String>::new());
+    // The other steps still run their commands, which the recording sees.
+    assert!(run_step(&PlannedStep::ModprobeNbd, None).is_err());
+    assert_eq!(recording.programs(), ["modprobe"]);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BackendFault {
     Foreign,

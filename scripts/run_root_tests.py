@@ -76,6 +76,9 @@ ROOT_TARGETS = (
     "crates/maki-nbdkit/tests/review_memory_budget_mountinfo.rs",
     "crates/maki-privileged/tests/review_mountinfo_bytes.rs",
     "crates/maki-privileged/tests/review_mountinfo_empty_source.rs",
+    # The helper's own NBD connect and disconnect through the kernel's nbd
+    # netlink family, which requires CAP_SYS_ADMIN (and the nbd module).
+    "crates/maki-privileged/tests/review_nbd_kernel.rs",
     # Unit tests: workload_verify_tests.rs gives the sentinel to uid 65534;
     # the witness tests in maki-backing check root's owner rules for the
     # temporary anchor record (owners are recorded, not applied).

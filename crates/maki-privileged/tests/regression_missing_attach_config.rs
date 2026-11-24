@@ -18,7 +18,7 @@ fn missing_attach_config_is_a_start_assertion() {
 
 /// Review R05 (2026-09-07): the packaged `Type=oneshot` unit set no start or
 /// stop timeout, and systemd disables the default start timeout for oneshot
-/// services. A hung helper (a stuck nbd-client, mount, or umount) would then
+/// services. A hung helper (a stuck NBD connect, mount, or umount) would then
 /// hold the global attach lock forever, blocking every other volume's
 /// attach/detach/grow. Both the attach (ExecStart) and detach (ExecStop) jobs
 /// must carry a finite bound so systemd terminates a stuck helper and releases

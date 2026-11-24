@@ -39,7 +39,7 @@ thread_local! {
 }
 
 /// Restores the previous limit when dropped; see [`finish_by`].
-pub(super) struct Deadline(Option<Instant>);
+pub(crate) struct Deadline(Option<Instant>);
 
 impl Drop for Deadline {
     fn drop(&mut self) {
@@ -52,7 +52,7 @@ impl Drop for Deadline {
 /// is started after it. A caller that itself runs inside a time limit (the
 /// failed-start hook, inside the unit's stop timeout) bounds all of its
 /// commands at once this way.
-pub(super) fn finish_by(deadline: Instant) -> Deadline {
+pub(crate) fn finish_by(deadline: Instant) -> Deadline {
     Deadline(FINISH_BY.replace(Some(deadline)))
 }
 
@@ -79,7 +79,49 @@ pub(crate) fn controlled(program: &str) -> Command {
     command
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECORDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Until the guard is dropped, the commands this thread would start are
+/// recorded by program name and fail without being started.
+#[cfg(test)]
+pub(crate) fn record_commands() -> Recording {
+    Recording(RECORDED.replace(Some(Vec::new())))
+}
+
+#[cfg(test)]
+pub(crate) struct Recording(Option<Vec<String>>);
+
+#[cfg(test)]
+impl Recording {
+    pub(crate) fn programs(&self) -> Vec<String> {
+        RECORDED.with_borrow(|recorded| recorded.clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for Recording {
+    fn drop(&mut self) {
+        RECORDED.set(self.0.take());
+    }
+}
+
 pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<Output> {
+    #[cfg(test)]
+    if RECORDED
+        .with_borrow_mut(|recorded| {
+            recorded
+                .as_mut()
+                .map(|programs| programs.push(command.get_program().to_string_lossy().into_owned()))
+        })
+        .is_some()
+    {
+        return Err(io::Error::other(
+            "this test records commands instead of starting them",
+        ));
+    }
     if let Some(deadline) = FINISH_BY.get() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
