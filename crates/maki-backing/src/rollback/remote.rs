@@ -259,55 +259,119 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
 /// marker and the binding are durable. For rollback protection it is an
 /// empty directory. A complete marker is a creation that got further, which
 /// enrollment recovery continues.
-fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
+///
+/// `creation` is the binding of the creation that asks, and a snapshot
+/// destination has none. A creation also continues a root in which the
+/// binding outlived the marker. A release whose enrollment recovery staged
+/// the binding before the marker's name was durable could leave that after
+/// a power loss: the binding under its staging name, which nothing reads
+/// and the creation writes again from the start, or published. A published
+/// binding is accepted only if it is exactly `creation`, the binding this
+/// creation would write. The caller has established that the authority of
+/// that identity is released and was never activated, so no volume was ever
+/// enrolled under it, here or anywhere, and the root holds nothing else. A
+/// binding for another authority or capacity belongs to another creation,
+/// and one that cannot be read cannot be told from a damaged one: both are
+/// refused and left as they are.
+fn require_empty_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> io::Result<()> {
+    let mut binding = false;
     for name in disk.list("")? {
         let unpublished = match name.as_str() {
             super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
             MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
+            enrollment::FILE_NEXT => creation.is_some(),
+            enrollment::FILE => {
+                binding = true;
+                creation.is_some()
+            }
             _ => false,
         };
         if !unpublished {
-            return Err(input("remote enrollment requires an empty backing"));
+            return Err(input(NOT_EMPTY));
         }
     }
-    Ok(())
+    match (binding, creation) {
+        (true, Some(creation)) => match Enrollment::load(disk) {
+            Ok(found) if found == *creation => Ok(()),
+            Ok(_) => Err(input(ANOTHER_CREATION)),
+            Err(_) => Err(input(NOT_EMPTY)),
+        },
+        _ => Ok(()),
+    }
 }
+
+const NOT_EMPTY: &str = "remote enrollment requires an empty backing";
+const ANOTHER_CREATION: &str = "this backing root holds the binding of an interrupted creation \
+    for another authority or capacity: create the volume with that creation's authority and \
+    capacity, or use an empty backing root";
 
 /// Publish the format marker. Called with both root operation and
 /// enrollment locks held. Until it is published the creation can simply be
 /// run again (`super::publish_marker`).
-fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
-    require_empty_remote_root(disk)?;
+///
+/// A binding that outlived its marker was accepted as it reads, and readable
+/// bytes are not proof of durability. Publishing the marker syncs the
+/// directory, which makes every name in it durable: the binding's bytes are
+/// written and synced again first, or a power loss could leave a published
+/// marker beside a binding that names nothing.
+fn initialize_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> io::Result<()> {
+    require_empty_remote_root(disk, creation)?;
+    if let Some(creation) = creation {
+        if disk.exists(enrollment::FILE)? {
+            Enrollment::load_or_create(disk, creation.identity, creation.capacity)?;
+        }
+    }
     super::publish_marker(disk, REMOTE_MAGIC)
 }
 
 /// Re-publish the marker enrollment recovery has validated, before the
 /// independent authority can accept enrollment. A readable legacy marker may
-/// be cache-only. Called with both root operation and enrollment locks held.
+/// be cache-only, and so may its name: the directory sync of the creation
+/// that published it may have failed. The caller writes the binding next.
+/// Where it will stage a new one, the marker's name is made durable first,
+/// so that no power loss leaves a binding without its marker. Where a
+/// binding is already there, the directory is not synced here: that would
+/// make the name of a binding durable whose bytes may not be, and the
+/// caller's rewrite of the binding syncs its bytes and then the directory.
+/// Called with both root operation and enrollment locks held.
 fn republish_marker(disk: &dyn Backing) -> io::Result<()> {
     let marker = disk.open(MARKER, false)?;
     marker.write_at(0, REMOTE_MAGIC)?;
     marker.set_len(REMOTE_MAGIC.len() as u64)?;
-    marker.sync_data()
+    marker.sync_data()?;
+    if disk.exists(enrollment::FILE)? {
+        return Ok(());
+    }
+    disk.sync_dir("")
 }
 
 /// Say what to do with a root that enrollment recovery cannot open because
 /// its creation stopped before the marker was published, while the approved
 /// authority is still one a creation accepts (released, never activated).
 /// Recovery continues a published root with the administrator's approval;
-/// this one needs none. Under a claimed authority a root without a marker
-/// is not an interrupted creation, and keeps its own refusal.
-fn unpublished(root: &Path, expected: &Record, error: io::Error) -> io::Error {
-    let nothing_published = expected.phase == Phase::Released
-        && FileBacking::read_only(root).is_ok_and(|disk| require_empty_remote_root(&disk).is_ok());
-    if !nothing_published {
+/// this one needs none. A root creation refuses because it holds another
+/// creation's binding gets that refusal, which says what continues it.
+/// Under a claimed authority a root without a marker is not an interrupted
+/// creation, and keeps its own refusal.
+fn unpublished(root: &Path, expected: &Record, capacity: u64, error: io::Error) -> io::Error {
+    if expected.phase != Phase::Released {
         return error;
     }
-    io::Error::new(
-        error.kind(),
-        "this backing root's creation stopped before it published the format marker: create \
-         the volume again instead of resuming",
-    )
+    let creation = Enrollment {
+        identity: expected.identity,
+        capacity,
+    };
+    let message = match FileBacking::read_only(root)
+        .and_then(|disk| require_empty_remote_root(&disk, Some(&creation)))
+    {
+        Ok(()) => {
+            "this backing root's creation stopped before it published the format marker: create \
+             the volume again instead of resuming"
+        }
+        Err(refusal) if refusal.to_string() == ANOTHER_CREATION => ANOTHER_CREATION,
+        Err(_) => return error,
+    };
+    io::Error::new(error.kind(), message)
 }
 
 fn collect_after_activation(
@@ -588,7 +652,8 @@ impl RollbackBacking {
                 "cannot recover enrollment after its first activation",
             ));
         }
-        let disk = remote_root(root, false).map_err(|error| unpublished(root, expected, error))?;
+        let disk = remote_root(root, false)
+            .map_err(|error| unpublished(root, expected, capacity, error))?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
@@ -628,7 +693,11 @@ impl RollbackBacking {
         let disk = remote_root(root, true)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
-        initialize_remote_root(disk.as_ref())?;
+        let creation = Enrollment {
+            identity: expected.identity,
+            capacity,
+        };
+        initialize_remote_root(disk.as_ref(), Some(&creation))?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
@@ -841,7 +910,7 @@ impl RollbackBacking {
     /// under the destination locks even if this preflight succeeded.
     pub fn check_snapshot_destination(target: &Path) -> io::Result<()> {
         match FileBacking::read_only(target) {
-            Ok(disk) => require_empty_remote_root(&disk),
+            Ok(disk) => require_empty_remote_root(&disk, None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -860,7 +929,7 @@ impl RollbackBacking {
         let disk = remote_root(target, true)?;
         let _target_guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
-        initialize_remote_root(disk.as_ref())?;
+        initialize_remote_root(disk.as_ref(), None)?;
         disk.create_dir_all(&descriptor.namespace)?;
         disk.sync_dir("")?;
         let scope = scope(disk.clone(), &descriptor.namespace)?;

@@ -30,7 +30,7 @@ fn attempt(machine: &CrashableBacking) -> io::Result<()> {
     let process = machine.process();
     let _operation = process.try_lock(OPERATION_LOCK)?;
     let _enrollment = process.try_lock(super::super::ENROLL_LOCK)?;
-    initialize_remote_root(process.as_ref())
+    initialize_remote_root(process.as_ref(), Some(&CREATION))
 }
 
 /// How many backing operations an undisturbed attempt performs.
@@ -65,7 +65,7 @@ fn published(machine: &CrashableBacking) -> bool {
 /// Exactly one documented command continues the root: enrollment recovery
 /// when the marker is published, `volume create` when it is not.
 fn one_command_continues(machine: &CrashableBacking, context: &str) {
-    let create = require_empty_remote_root(machine.process().as_ref());
+    let create = require_empty_remote_root(machine.process().as_ref(), Some(&CREATION));
     assert_eq!(
         create.is_ok(),
         !published(machine),
@@ -190,7 +190,7 @@ fn attempt_binding(machine: &CrashableBacking) -> io::Result<()> {
     let process = machine.process();
     let _operation = process.try_lock(OPERATION_LOCK)?;
     let _enrollment = process.try_lock(super::super::ENROLL_LOCK)?;
-    initialize_remote_root(process.as_ref())?;
+    initialize_remote_root(process.as_ref(), Some(&CREATION))?;
     Enrollment::load_or_create(process.as_ref(), IDENTITY, CAPACITY).map(drop)
 }
 
