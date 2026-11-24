@@ -214,12 +214,36 @@ The scheduled `nightly-gates` job runs:
 | `phase5_gate_breaker_cycles_full` | 10,000 circuit-breaker lifecycles |
 | `phase11_gate_dbsim_full` | 500 database-simulation runs |
 | `phase12_gate_full` | 500 barrier and 500 FUA power-loss simulations |
-| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures; a journal segment holds three records, so every workload rolls the journal |
-| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle, with the same small journal segment |
+| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures. The seeds take turns between a journal segment of three records, one of sixteen and the default one, and the gate asserts a minimum of automatic rolls and of workloads that end with more than three unsynced journal records. Measured without faults (9,000 workloads): 40,249 rolls, 1,443 power losses and 631 restarts with such a tail, the longest 50 records; with sync failures (3,600): 2,738 rolls, 885 and 349, the longest 70 |
+| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle, with the same turns and assertions. Measured (1,800 workloads): 29,147 rolls, 377 power losses and 134 restarts with more than three unsynced records, the longest 43; the tails vary from run to run |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
-| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures; a journal segment holds three write records |
-| `ab_torn_reuse_gate_full` | Chains of cut A/B stores over 2,000 to 4,000 seeds per record and torn-write unit: maps of five sectors, one page and 9000 bytes, checkpoint state, and the durable proof through `advance` |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures, with the same turns between journal segments and the same assertions. Measured (4,000 workloads): 7,253 rolls, 910 power losses and 379 restarts with more than three unsynced records, the longest 49 |
+| `ab_torn_reuse_gate_full` | Chains of A/B stores cut at the record's sync, 2,000 to 4,000 seeds per record and torn-write unit (maps of five sectors, one page and 9000 bytes, checkpoint state, the durable proof through `advance`), and 1,000 to 2,000 seeds of mixed disturbances on the proof and the page-sized maps |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on a second filesystem) |
+
+The durability sweeps behind these gates also run in the default suite over
+fewer seeds (`review_r3b_durability.rs`, `review_trim_power_loss.rs`). A
+journal roll seals and syncs the segment it leaves, so a workload that rolls
+constantly never has more than a segment's records unsynced, and a workload
+with the default segment never rolls: each seed runs with a segment of three
+records, of sixteen, or the default, and every sweep asserts a minimum of
+rolls and of workloads that end with more than three unsynced records at the
+power loss or at the restart. Measured on the committed seeds:
+
+| Sweep | Workloads | Rolls | Long tail at power loss | Long tail at restart | Longest tail |
+|---|---|---|---|---|---|
+| Sequential | 480 | 2,052 | 74 | 35 | 50 |
+| Sequential, sync failures | 320 | 247 | 88 | 29 | 38 |
+| Sequential, plaintext cache | 240 | 1,014 | 39 | 15 | 21 |
+| Sequential, plaintext cache, sync failures | 160 | 110 | 51 | 11 | 38 |
+| Concurrent writers | 72 | 1,173 | 12 to 15 | 2 to 10 | 19 to 28 |
+| Concurrent writers, plaintext cache | 36 | 571 | 8 to 10 | 0 or 1 | 16 to 22 |
+| Writes and trims | 144 | 472 | 27 | 16 | 21 |
+| Writes and trims, sync failures | 144 | 73 to 92 | 32 to 37 | 12 to 15 | 41 |
+
+With the default segment for every seed the sequential sweep had 119 power
+losses and 52 restarts with a long tail and no roll; with three-record
+segments for every seed it had 5,353 rolls and no long tail.
 
 The job runs `cargo test --workspace --release --locked --no-fail-fast -- --ignored`
 without a name filter, so every ignored test runs, including any new gate; the

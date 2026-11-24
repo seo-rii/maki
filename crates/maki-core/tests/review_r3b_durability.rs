@@ -3,8 +3,9 @@
 //! The SPEC §54 scenarios (phase 12) fix one sequence and vary the crash.
 //! This sweep varies the *sequence* too: seeded random single- and
 //! multi-unit writes, FUA, FLUSH, explicit checkpoints, automatic journal
-//! rolls (a journal segment holds three records), then a power loss with
-//! torn writes — or a plain
+//! rolls (two seeds in three run with a small journal segment) and long
+//! unsynced journal tails (the third keeps the default segment, see
+//! `segment_for`), then a power loss with torn writes — or a plain
 //! restart, which is *not* a power loss (K-01: recovery reads back page-cache
 //! bytes, and whatever it accepts must be durable before the writer resumes,
 //! because the next cycle may crash before any FLUSH). Every unit is checked
@@ -47,12 +48,89 @@ const DEVICE_UNITS: u64 = 48;
 /// Tiny shards: eight units each, so a workload spreads over six of them.
 const SHARD_BYTES: u64 = 8 * UNIT as u64;
 
-/// A tiny journal segment: it holds three records of a `unit`-sized write,
-/// so the fourth rolls it and a workload rolls constantly, not only when a
-/// checkpoint is asked for.
-fn segment_bytes(unit: u32) -> u64 {
+/// A journal segment that holds `records` records of a `unit`-sized write.
+fn segment_bytes(unit: u32, records: u64) -> u64 {
     let record = RECORD_HEADER_SIZE as u64 + unit as u64 + 8;
-    SEGMENT_HEADER_SIZE as u64 + 3 * record
+    SEGMENT_HEADER_SIZE as u64 + records * record
+}
+
+/// The journal segment a seed's workloads run with.
+///
+/// A small segment makes a workload roll the journal constantly, not only
+/// when a checkpoint is asked for. But a roll seals and syncs the segment it
+/// leaves, so with a segment of three records no more than three are ever
+/// appended and not yet synced. The default segment is never filled here:
+/// its workloads never roll, and their unsynced tail grows to tens of
+/// records, which is what a power loss has to cut and what a restart hands
+/// to recovery from the page cache alone. A sweep needs both, so the seeds
+/// take turns: no rolls and long tails, constant rolls and short tails, and
+/// a segment of sixteen records that gives some of each.
+fn segment_for(seed: u64, unit: u32) -> u64 {
+    match seed % 3 {
+        0 => VolumeOptions::default().journal_segment_size,
+        1 => segment_bytes(unit, 3),
+        _ => segment_bytes(unit, 16),
+    }
+}
+
+/// Whether `segment_for` gives the seed a segment its workloads fill.
+fn rolls_expected(seed: u64) -> bool {
+    !seed.is_multiple_of(3)
+}
+
+/// A tail of more records than this, appended and not yet synced when the
+/// workload ends, is a long one: more than the smallest segment can leave.
+const LONG_TAIL: u64 = 3;
+
+/// What a sweep's workloads did to the journal. A sweep that stops doing
+/// either still passes, and proves much less, so the tests that run the
+/// committed seeds hold their sweep to both.
+#[derive(Clone, Copy, Debug, Default)]
+struct Journal {
+    /// Automatic rolls.
+    rolls: u64,
+    /// Workloads that ended in a power loss with a long unsynced tail.
+    long_tail_power_losses: u64,
+    /// Workloads that ended in a restart with a long unsynced tail.
+    long_tail_restarts: u64,
+    /// The longest unsynced tail a workload ended with, in records.
+    longest_tail: u64,
+}
+
+impl Journal {
+    /// Record how a workload ended: `tail` records appended and not synced.
+    fn ended(&mut self, tail: u64, power_loss: bool) {
+        if tail > LONG_TAIL {
+            if power_loss {
+                self.long_tail_power_losses += 1;
+            } else {
+                self.long_tail_restarts += 1;
+            }
+        }
+        self.longest_tail = self.longest_tail.max(tail);
+    }
+
+    /// The sweep rolled the journal and ended workloads with long tails at
+    /// least this often.
+    fn assert_at_least(&self, rolls: u64, power_losses: u64, restarts: u64) {
+        assert!(
+            self.rolls >= rolls
+                && self.long_tail_power_losses >= power_losses
+                && self.long_tail_restarts >= restarts,
+            "the sweep no longer covers what it is meant to: {self:?}; expected at least {rolls} \
+             rolls, {power_losses} power losses and {restarts} restarts with more than \
+             {LONG_TAIL} unsynced records"
+        );
+    }
+}
+
+impl std::ops::AddAssign for Journal {
+    fn add_assign(&mut self, other: Self) {
+        self.rolls += other.rolls;
+        self.long_tail_power_losses += other.long_tail_power_losses;
+        self.long_tail_restarts += other.long_tail_restarts;
+        self.longest_tail = self.longest_tail.max(other.longest_tail);
+    }
 }
 
 /// The highest journal segment index on the backing: the active segment's,
@@ -345,24 +423,23 @@ struct Cycle {
 
 /// What a sweep did, for the tests that hold the sweep itself to something.
 struct Ran {
-    /// How often its workloads rolled the journal.
-    rolls: u64,
+    journal: Journal,
     /// Every operation with its result, and every injected fault.
     trace: String,
 }
 
 /// One seeded workload → crash/restart → recovery → oracle cycle set.
-/// Returns how often its workloads rolled the journal.
-async fn sweep(seed: u64, cycles: usize, sync_fault_permille: u32) -> u64 {
+/// Returns what its workloads did to the journal.
+async fn sweep(seed: u64, cycles: usize, sync_fault_permille: u32) -> Journal {
     sweep_verbose(seed, cycles, sync_fault_permille, None, false)
         .await
-        .rolls
+        .journal
 }
 
-async fn sweep_cached(seed: u64, cycles: usize, sync_fault_permille: u32) -> u64 {
+async fn sweep_cached(seed: u64, cycles: usize, sync_fault_permille: u32) -> Journal {
     sweep_verbose(seed, cycles, sync_fault_permille, None, true)
         .await
-        .rolls
+        .journal
 }
 
 async fn sweep_verbose(
@@ -378,9 +455,8 @@ async fn sweep_verbose(
     let mut maybe = Maybe::default();
     let mut stamp: u32 = 0;
     let mut trace = Trace::default();
-    let mut engine = try_attach_with(&backing, cache, segment_bytes(UNIT))
-        .await
-        .unwrap();
+    let segment = segment_for(seed, UNIT);
+    let mut engine = try_attach_with(&backing, cache, segment).await.unwrap();
 
     // With `verbose` the hook only records the operations it is asked about
     // (a permille of 0 never injects).
@@ -393,7 +469,7 @@ async fn sweep_verbose(
         )));
     }
 
-    let mut rolls = 0;
+    let mut journal = Journal::default();
     for cycle_index in 0..cycles {
         let cycle = Cycle {
             ops: rng.random_range(8..48),
@@ -502,8 +578,13 @@ async fn sweep_verbose(
         // a healthy device (its own fault tolerance is covered elsewhere).
         backing.set_fault_hook(None);
         if let (Some(first), Some(last)) = (first_segment, newest_segment(&backing)) {
-            rolls += last - first;
+            journal.rolls += last - first;
         }
+        let stats = engine.stats().await;
+        journal.ended(
+            stats.appended_sequence - stats.durable_sequence,
+            cycle.power_loss,
+        );
         drop(engine);
         let what = if cycle.power_loss {
             backing.crash(&mut rng);
@@ -513,7 +594,7 @@ async fn sweep_verbose(
             trace.op("restart".into());
             format!("seed {seed} cycle {cycle_index} (restart)")
         };
-        engine = match try_attach_with(&backing, cache, segment_bytes(UNIT)).await {
+        engine = match try_attach_with(&backing, cache, segment).await {
             Ok(engine) => engine,
             Err(e) => panic!(
                 "{what}: recovery refused the volume: {e}\n{}",
@@ -532,7 +613,7 @@ async fn sweep_verbose(
         }
     }
     Ran {
-        rolls,
+        journal,
         trace: trace.report(),
     }
 }
@@ -562,26 +643,32 @@ async fn a_sync_fault_sweep_runs_the_same_way_twice_from_one_seed() {
 #[tokio::test]
 async fn random_workloads_survive_power_loss_and_restart_cycles() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..120u64 {
-        // A sweep that stops rolling the journal still passes, and proves
-        // much less.
+        let ran = sweep(seed, 4, 0).await;
         assert!(
-            sweep(seed, 4, 0).await > 0,
+            ran.rolls > 0 || !rolls_expected(seed),
             "seed {seed}: the workload never rolled the journal"
         );
+        journal += ran;
     }
+    // Measured: 2052 rolls, 74 power losses and 35 restarts with a long
+    // tail, the longest 50 records.
+    journal.assert_at_least(1600, 55, 25);
 }
 
 #[tokio::test]
 async fn random_workloads_with_sync_failures_never_show_foreign_data() {
     let _serial = maki_test_support::failpoints::test_lock();
-    let mut rolls = 0;
+    let mut journal = Journal::default();
     for seed in 0..80u64 {
-        rolls += sweep(seed, 4, 150).await;
+        // A failed sync can stop a workload before its first roll, so only
+        // the sweep as a whole is held to it.
+        journal += sweep(seed, 4, 150).await;
     }
-    // A failed sync can stop a workload before its first roll, so only the
-    // sweep as a whole is held to it.
-    assert!(rolls > 0, "no workload rolled the journal");
+    // Measured: 247 rolls, 88 power losses and 29 restarts with a long
+    // tail, the longest 38 records.
+    journal.assert_at_least(150, 60, 18);
 }
 
 /// Restart-then-power-loss with no FLUSH in between is the K-01 shape: the
@@ -633,12 +720,20 @@ async fn restart_followed_by_power_loss_keeps_recovered_state() {
 #[ignore = "release gate: long randomized durability sweep"]
 async fn phase_r3b_durability_gate_full() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..1500u64 {
-        sweep(seed, 6, 0).await;
+        journal += sweep(seed, 6, 0).await;
     }
+    // Measured: 40249 rolls, 1443 power losses and 631 restarts with a long
+    // tail, the longest 50 records.
+    journal.assert_at_least(30000, 1000, 450);
+    let mut journal = Journal::default();
     for seed in 0..600u64 {
-        sweep(seed, 6, 150).await;
+        journal += sweep(seed, 6, 150).await;
     }
+    // Measured: 2738 rolls, 885 power losses and 349 restarts with a long
+    // tail, the longest 70 records.
+    journal.assert_at_least(1800, 600, 240);
 }
 
 /// A failed pre-journal reservation can leave an orphan shard file. Creating
@@ -864,7 +959,7 @@ fn big_superblock() -> Superblock {
     }
 }
 
-async fn attach_big(backing: &Arc<CrashableBacking>, cache: bool) -> Arc<Engine> {
+async fn attach_big(backing: &Arc<CrashableBacking>, cache: bool, segment: u64) -> Arc<Engine> {
     if !backing.exists("superblock.a").unwrap() {
         init::create_volume(backing.as_ref(), big_superblock()).unwrap();
     }
@@ -872,7 +967,7 @@ async fn attach_big(backing: &Arc<CrashableBacking>, cache: bool) -> Arc<Engine>
         Engine::attach(
             backing.process(),
             Arc::new(FakeCryptoProvider::new(BIG_UNIT)),
-            cache_options(BIG_UNIT, cache, segment_bytes(BIG_UNIT)),
+            cache_options(BIG_UNIT, cache, segment),
         )
         .await
         .unwrap(),
@@ -949,13 +1044,36 @@ async fn writer_task(
     }
 }
 
-async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
+/// Count the journal segments that are created while the returned hook is
+/// installed: one when a session first appends, one more for every roll.
+fn count_segments_created(backing: &CrashableBacking) -> Arc<std::sync::atomic::AtomicU64> {
+    let created = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = created.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op: &FaultOp<'_>| {
+        if let FaultOp::Open { path, create: true } = op {
+            let segment = path
+                .strip_prefix(layout::JOURNAL_DIR)
+                .and_then(|name| name.strip_prefix('/'))
+                .and_then(layout::parse_journal_segment);
+            if segment.is_some() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        None
+    })));
+    created
+}
+
+async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) -> Journal {
     let mut rng = StdRng::seed_from_u64(seed ^ 0xC0DE);
     let backing = Arc::new(CrashableBacking::new().with_tearing(256));
     let mut model = ReferenceBlockModel::new(BIG_UNIT as usize, DEVICE_UNITS);
-    let mut engine = attach_big(&backing, cache).await;
+    let segment = segment_for(seed, BIG_UNIT);
+    let mut engine = attach_big(&backing, cache, segment).await;
+    let mut journal = Journal::default();
 
     for cycle in 0..cycles {
+        let created = count_segments_created(&backing);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
         for w in 0..WRITERS {
@@ -1001,14 +1119,22 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
         }
         apply(&mut model, &mut rx);
 
+        backing.set_fault_hook(None);
+        journal.rolls += created
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        let stats = engine.stats().await;
+        let tail = stats.appended_sequence - stats.durable_sequence;
         drop(engine);
-        let what = if rng.random_bool(0.7) {
+        let power_loss = rng.random_bool(0.7);
+        journal.ended(tail, power_loss);
+        let what = if power_loss {
             backing.crash(&mut rng);
             format!("seed {seed} cycle {cycle} (power loss)")
         } else {
             format!("seed {seed} cycle {cycle} (restart)")
         };
-        engine = attach_big(&backing, cache).await;
+        engine = attach_big(&backing, cache, segment).await;
         let stats = engine.stats().await;
         assert!(
             stats.checkpoint_sequence <= stats.durable_sequence,
@@ -1024,26 +1150,36 @@ async fn concurrent_sweep(seed: u64, cycles: usize, cache: bool) {
             }
         }
     }
+    journal
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_survive_power_loss_and_restart() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..24u64 {
-        concurrent_sweep(seed, 3, false).await;
+        journal += concurrent_sweep(seed, 3, false).await;
     }
+    // Measured: 1173 rolls and, depending on how the writers and the
+    // barriers interleave, 12 to 15 power losses and 2 to 10 restarts with
+    // a long tail, the longest 19 to 28 records.
+    journal.assert_at_least(900, 6, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release gate: long concurrent partial-unit durability sweep"]
 async fn phase_r3b_concurrent_gate_full() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..300u64 {
-        concurrent_sweep(seed, 4, false).await;
+        journal += concurrent_sweep(seed, 4, false).await;
     }
     for seed in 0..150u64 {
-        concurrent_sweep(seed, 4, true).await;
+        journal += concurrent_sweep(seed, 4, true).await;
     }
+    // Measured: 29147 rolls, 377 power losses and 134 restarts with a long
+    // tail, the longest 43 records; the tails vary from run to run.
+    journal.assert_at_least(20000, 250, 80);
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,25 +1190,37 @@ async fn phase_r3b_concurrent_gate_full() {
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_survive_power_loss_and_restart() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..60u64 {
-        sweep_cached(seed, 4, 0).await;
+        journal += sweep_cached(seed, 4, 0).await;
     }
+    // Measured: 1014 rolls, 39 power losses and 15 restarts with a long
+    // tail, the longest 21 records.
+    journal.assert_at_least(800, 30, 10);
 }
 
 #[tokio::test]
 async fn random_workloads_with_a_plaintext_cache_and_sync_failures_never_show_foreign_data() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..40u64 {
-        sweep_cached(seed, 4, 150).await;
+        journal += sweep_cached(seed, 4, 150).await;
     }
+    // Measured: 110 rolls, 51 power losses and 11 restarts with a long
+    // tail, the longest 38 records.
+    journal.assert_at_least(70, 35, 6);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_partial_unit_workloads_with_a_plaintext_cache() {
     let _serial = maki_test_support::failpoints::test_lock();
+    let mut journal = Journal::default();
     for seed in 0..12u64 {
-        concurrent_sweep(seed, 3, true).await;
+        journal += concurrent_sweep(seed, 3, true).await;
     }
+    // Measured: 571 rolls, 8 to 10 power losses and at most one restart
+    // with a long tail, the longest 16 to 22 records.
+    journal.assert_at_least(400, 4, 0);
 }
 
 // ---------------------------------------------------------------------------
