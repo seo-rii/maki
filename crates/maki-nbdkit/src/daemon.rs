@@ -139,6 +139,17 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
                     rollback.capacity.0
                 )));
             }
+            // A local creation that stopped after its witness anchor left
+            // a pair that opens and holds no volume. Say so, and what
+            // continues it, in place of a bare "no valid superblock".
+            if rollback.remote.is_none() && init::unfinished_creation(&backing)? {
+                return Err(DaemonError::Format(FormatError::Invalid(
+                    "no valid superblock: this volume's creation did not complete (its \
+                     rollback-protected backing holds only an unfinished creation); run `maki \
+                     volume create` again, which continues it"
+                        .to_string(),
+                )));
+            }
             return Ok(Arc::new(backing));
         }
         #[cfg(not(target_os = "linux"))]

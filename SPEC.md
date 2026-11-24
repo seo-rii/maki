@@ -1457,6 +1457,21 @@ Its bounded capacity, commit protocol and explicit threat model are specified in
 [Rollback-protected backing](docs/rollback-protection.md). This storage option
 does not upgrade the crypto provider's declared replay capability.
 
+Creating a volume with a local witness enrolls the backing, publishes the
+witness anchor last, and then initializes the volume inside the backing,
+whose superblock is its commit point. `volume create` run again MUST complete
+a creation that stopped before the superblock was committed, and only such a
+one. Before the anchor it MAY accept only what an enrollment writes, with no
+committed manifest. After the anchor it MUST judge only a pair that opens
+against its witness, which authenticates the manifest and every committed
+page, and MUST continue only if that pair holds no superblock copy and
+nothing a creation does not write before its superblock; it then removes
+what the interrupted creation left and initializes the volume anew. Every
+other existing pair, one that does not open included, MUST be refused and
+left unchanged. Until a creation is complete, opening the pair MUST fail
+with an error that says the creation did not complete and names
+`volume create`.
+
 A remote witness configuration MUST select exactly one numeric `address` or
 `addresses` set (1–8 distinct nonzero socket ports). A set MUST include the
 independently approved nonzero `storage_identity`; every returned authority

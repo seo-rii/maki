@@ -133,7 +133,22 @@ impl FileWitness {
 
     pub(crate) fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
         let lock = backing.try_lock(LOCK_FILE)?;
-        let anchor = read_anchor(backing.as_ref())?;
+        // A witness without its anchor is what a creation leaves that
+        // stopped before it published one, and also what a witness mount
+        // that is not mounted, or one that lost its state, looks like. Name
+        // the causes and the way out of each, with the same error kind.
+        let anchor = read_anchor(backing.as_ref()).map_err(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return error;
+            }
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "the witness directory holds no anchor: either a volume create did not complete, \
+                 or the witness is not mounted or lost its state. Running volume create again \
+                 continues an interrupted creation and refuses a backing that holds committed \
+                 data; otherwise mount or restore the witness directory",
+            )
+        })?;
         // A prior process may have observed rename success and directory-sync
         // failure. Re-publish the exact validated record before returning so
         // callers never reclaim data based only on page-cache-visible state.

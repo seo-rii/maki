@@ -102,8 +102,11 @@ durable before it accepts writes; empty the root instead to start over.
 A backing with a remote rollback witness is continued differently, without
 emptying its root: see
 [interrupted initial enrollment](rollback-protection.md#resume-interrupted-initial-enrollment).
-A backing with a local witness whose creation stopped before it published
-the witness anchor is completed by running `volume create` again
+A backing with a local witness is continued by running `volume create`
+again, without emptying anything, wherever its creation stopped before the
+volume's superblock was committed: before the witness anchor, or after it
+while the volume inside the backing was being initialized. Until then the
+daemon, `check` and `volume inspect` refuse it and name that command
 ([local rollback creation](rollback-protection.md#local-configuration-and-creation)).
 
 `volume inspect` and `check`, including `check --deep`, require an existing

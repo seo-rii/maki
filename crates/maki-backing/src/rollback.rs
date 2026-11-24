@@ -405,7 +405,22 @@ impl RollbackBacking {
         witness: impl FnOnce() -> io::Result<FileWitness>,
     ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        let marker = disk.open(MARKER, false)?;
+        // A backing without its marker is what a creation leaves that
+        // stopped before it published one (or a wrong `backing.root`).
+        // Say so and name the way out, with the same error kind.
+        let marker = disk.open(MARKER, false).map_err(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return error;
+            }
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "this rollback backing holds no format marker ({MARKER}): either a volume \
+                     create did not complete here, which running volume create again continues, \
+                     or this is not the volume's backing root"
+                ),
+            )
+        })?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {
             return Err(invalid("invalid rollback format marker"));
