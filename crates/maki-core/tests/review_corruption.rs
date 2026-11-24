@@ -110,10 +110,14 @@ fn decode_stamp(unit: u64, buf: &[u8]) -> u16 {
 /// Deterministic workload; returns the acknowledged (and, after the final
 /// flush, durable) stamp of every written unit.
 async fn workload(backing: &Arc<CrashableBacking>) -> BTreeMap<u64, u16> {
+    workload_from(backing, 0x0C0DE).await
+}
+
+async fn workload_from(backing: &Arc<CrashableBacking>, seed: u64) -> BTreeMap<u64, u16> {
     let engine = Engine::attach(backing.clone() as Arc<dyn Backing>, provider(), options())
         .await
         .expect("attach fresh");
-    let mut rng = StdRng::seed_from_u64(0x0C0DE);
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut acked = BTreeMap::new();
     for round in 1..=260u16 {
         let unit = rng.random_range(0..UNITS);
@@ -279,52 +283,74 @@ async fn allocation_map_fallback_never_reads_checkpointed_data_as_zeros() {
 /// The deep checker names the stale copies before any checkpoint repairs
 /// them, and a checkpoint with nothing new to apply still persists the
 /// repair.
+///
+/// A shard's older map copy is stale only if a checkpoint has allocated a
+/// slot in that shard since the copy was written. Whether a workload's last
+/// checkpoint did depends on its seed, so the test makes one itself: a
+/// first checkpoint leaves both copies of every map equal, then one unit
+/// that was never written is written and checkpointed, which stores one
+/// copy of its shard's map. The workload seeds only vary what surrounds it.
 #[tokio::test]
 async fn deep_check_reports_allocation_repair_and_idle_checkpoint_persists_it() {
-    let backing = Arc::new(CrashableBacking::new());
-    init::create_volume(backing.as_ref(), superblock()).unwrap();
-    let expected = workload(&backing).await;
-    // Everything durable is checkpointed: the next checkpoint has no new
-    // records to apply.
-    let engine = Engine::attach(backing.clone() as Arc<dyn Backing>, provider(), options())
-        .await
-        .unwrap();
-    engine.checkpoint().await.unwrap();
-    drop(engine);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    for name in backing.list(layout::DATA_DIR).unwrap() {
-        if name.ends_with(".alloc.a") {
-            let stem = name.trim_end_matches(".alloc.a");
-            let a = format!("{}/{stem}.alloc.a", layout::DATA_DIR);
-            let b = format!("{}/{stem}.alloc.b", layout::DATA_DIR);
-            drop_newest_side::<AllocationMap>(backing.as_ref(), &a, &b);
+    for seed in [0x0C0DE, 1, 2, 3] {
+        let backing = Arc::new(CrashableBacking::new());
+        init::create_volume(backing.as_ref(), superblock()).unwrap();
+        let mut expected = workload_from(&backing, seed).await;
+        let engine = Engine::attach(backing.clone() as Arc<dyn Backing>, provider(), options())
+            .await
+            .unwrap();
+        engine.checkpoint().await.unwrap();
+        let fresh = (0..UNITS)
+            .find(|unit| !expected.contains_key(unit))
+            .expect("the workload leaves units unwritten");
+        engine
+            .write(fresh * UNIT as u64, &stamp_bytes(u16::MAX), true)
+            .await
+            .unwrap();
+        expected.insert(fresh, u16::MAX);
+        // Everything durable is checkpointed: the next checkpoint has no new
+        // records to apply.
+        engine.checkpoint().await.unwrap();
+        drop(engine);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for name in backing.list(layout::DATA_DIR).unwrap() {
+            if name.ends_with(".alloc.a") {
+                let stem = name.trim_end_matches(".alloc.a");
+                let a = format!("{}/{stem}.alloc.a", layout::DATA_DIR);
+                let b = format!("{}/{stem}.alloc.b", layout::DATA_DIR);
+                drop_newest_side::<AllocationMap>(backing.as_ref(), &a, &b);
+            }
         }
+        let report = deep_check(backing.clone() as Arc<dyn Backing>, SEGMENT).unwrap();
+        assert!(report.errors.is_empty(), "seed {seed}: {:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("repaired from slot headers")),
+            "seed {seed}: {:?}",
+            report.warnings
+        );
+        let engine = Engine::attach(backing.clone() as Arc<dyn Backing>, provider(), options())
+            .await
+            .unwrap();
+        for unit in 0..UNITS {
+            let want = expected.get(&unit).copied().unwrap_or(0);
+            assert_eq!(
+                read_stamp(&engine, unit).await,
+                want,
+                "seed {seed}: unit {unit}"
+            );
+        }
+        engine.checkpoint().await.unwrap(); // nothing new, repair only
+        drop(engine);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let store = SlotStore::open(backing.clone() as Arc<dyn Backing>, geometry()).unwrap();
+        assert!(
+            store.repaired_allocations().is_empty(),
+            "seed {seed}: idle checkpoint did not persist"
+        );
     }
-    let report = deep_check(backing.clone() as Arc<dyn Backing>, SEGMENT).unwrap();
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.contains("repaired from slot headers")),
-        "{:?}",
-        report.warnings
-    );
-    let engine = Engine::attach(backing.clone() as Arc<dyn Backing>, provider(), options())
-        .await
-        .unwrap();
-    for unit in 0..UNITS {
-        let want = expected.get(&unit).copied().unwrap_or(0);
-        assert_eq!(read_stamp(&engine, unit).await, want, "unit {unit}");
-    }
-    engine.checkpoint().await.unwrap(); // nothing new, repair only
-    drop(engine);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let store = SlotStore::open(backing.clone() as Arc<dyn Backing>, geometry()).unwrap();
-    assert!(
-        store.repaired_allocations().is_empty(),
-        "idle checkpoint did not persist"
-    );
 }
 
 /// Both copies of a cataloged shard's allocation map gone: SPEC §27 keeps
