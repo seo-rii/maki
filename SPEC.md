@@ -2661,7 +2661,11 @@ A/B metadata MUST fall back to the highest valid generation. Each store advances
 a generation by one; recovery and the deep check MUST refuse, before any
 recovery write, A/B metadata (superblock, shard catalog, allocation and discard
 maps, checkpoint state, durable proof, key canary) whose CRC-valid generation
-is above `u64::MAX - 2^62`. Torn final journal tails may be truncated. Damage
+is above `u64::MAX - 2^62`. A store MUST NOT write into an existing side that
+does not decode until that side is durably empty: an interrupted store leaves
+its side carrying the generation the next store uses, and the sectors of two
+interrupted stores MUST NOT be able to form a valid record. A side that
+decodes MUST NOT be emptied. Torn final journal tails may be truncated. Damage
 inside a non-final segment, or inside the part of the final segment that the
 durable proof or the durable mark covers, MUST refuse recovery. Beyond that
 part, a record that fails its checksum is a torn tail whether or not an intact

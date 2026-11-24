@@ -5,7 +5,9 @@
 //! the *stale* side, so a torn write can only destroy the copy being replaced;
 //! `load` selects the valid copy with the highest generation. Readable bytes
 //! are not proof of durability: a failed sync or a process restart can leave
-//! a newer valid copy in the page cache.
+//! a newer valid copy in the page cache. A torn copy stays invalid: a stale
+//! side that does not decode is durably emptied before it is written again,
+//! so sectors of two interrupted stores never add up to a valid record.
 //!
 //! Read classification: a side that is absent, empty, short, or fails its
 //! CRC/decode is an *invalid copy* (the other side is authoritative). Any
@@ -205,6 +207,10 @@ impl AbStore {
     /// parent directory: either may still be volatile after a failed store
     /// or caller dirsync. Rewriting is required because writeback errors can
     /// clear dirty page-cache bits without making those bytes durable.
+    /// A target that exists but does not decode is emptied, and the emptying
+    /// synced, before the record is written (one more fdatasync, paid only
+    /// then): what an earlier cut store left in it must not combine with
+    /// what a cut of this one leaves.
     /// Directory durability of the freshly created target remains the
     /// caller's responsibility — see `init::create_volume`.
     pub fn store<T: AbRecord>(
@@ -286,8 +292,36 @@ impl AbStore {
             backing.sync_dir(maki_backing::path::parent(preserved))?;
         }
 
+        // A target that exists but does not decode may hold part of an
+        // earlier store that a power loss cut: every sector of its record
+        // except some. That store used this same generation (one above the
+        // other side's), so its magic, version and generation, and whatever
+        // payload did not change since, are byte-identical to this record's.
+        // Written in place and cut as well, this store could put exactly the
+        // missing sectors on the disk and leave a complete, CRC-valid copy
+        // of the *earlier* attempt, which `load` would select although every
+        // recovery in between had fallen back from it. Empty such a side and
+        // make that durable before anything is written into it: from then on
+        // a cut can leave it empty, partly this record, or this record. The
+        // length is reasserted even when the file already reads as empty, as
+        // a truncation whose sync failed is not known to be on the disk. A
+        // side that decodes is never emptied (it is preserved or replaced by
+        // a newer generation), and a side that does not exist is created.
+        let target_decodes = if target == self.a { ta } else { tb }.is_some();
+        let file = if target_decodes {
+            backing.open(target, true)?
+        } else {
+            match backing.open(target, false) {
+                Ok(file) => {
+                    file.set_len(0)?;
+                    file.sync_data()?;
+                    file
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => backing.open(target, true)?,
+                Err(e) => return Err(FormatError::Io(e)),
+            }
+        };
         record.set_generation(next);
-        let file = backing.open(target, true)?;
         file.set_len(bytes.len() as u64)?;
         file.write_at(0, &bytes)?;
         // A failed sync here leaves the new record visible in the page cache
