@@ -310,13 +310,24 @@ fn raw_nbd(verb: &str, args: &[OsString]) -> ExitCode {
 /// it was named with `--config` or exists, built-in defaults otherwise. An
 /// executing verb runs as root on what the file says: only a root-controlled
 /// file is accepted (R5-030). A plan executes nothing and reads any file.
+///
+/// Only a default path that does not exist selects the defaults. One that
+/// cannot be examined (a caller who may not search the directory, a path
+/// through something that is no directory) or that names a link to nothing
+/// is read like any other, and that read fails with the path: a plan from
+/// the defaults would show another attachment than the one configured.
 fn attach_config(
     config_path: &Path,
     explicit: bool,
     plan_only: bool,
 ) -> Result<AttachConfig, String> {
-    if !explicit && !config_path.exists() {
-        return Ok(AttachConfig::default());
+    if !explicit {
+        match std::fs::symlink_metadata(config_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(AttachConfig::default())
+            }
+            _ => {}
+        }
     }
     #[cfg(target_os = "linux")]
     if !plan_only {
