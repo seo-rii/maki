@@ -707,4 +707,7 @@ mod netlink_tests;
 mod header_tests;
 
 #[cfg(test)]
+mod property_tests;
+
+#[cfg(test)]
 mod tests;
