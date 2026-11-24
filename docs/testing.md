@@ -138,16 +138,28 @@ those installed-package and workload results separately.
 
 The `rhel9` job runs in the `quay.io/centos/centos:stream9` container; CentOS
 Stream 9 is the public upstream of RHEL 9. It installs its tools from BaseOS
-and AppStream, plus `nbdkit-devel` from CRB for the ABI header, without EPEL;
-builds the four packaged artifacts in release mode against glibc 2.34; runs
-`review_abi.rs` against EL9's `nbdkit-plugin.h`; runs the `maki-privileged`,
-`maki-attach` and `maki-nbdkit` suites through `run_cargo_tests.py`, so the
-native tests load Maki's plugin into EL9's nbdkit 1.38; and runs
+and AppStream, plus `nbdkit-devel` from CRB for the ABI header, without EPEL:
+`nbdkit-server` and `nbdkit-basic-plugins` rather than the `nbdkit`
+metapackage the [RHEL guide](getting-started/installation-rhel.md#selinux)
+warns about, and the kernel UAPI headers. It builds the four packaged
+artifacts in release mode against glibc 2.34; runs `review_abi.rs` against
+EL9's `nbdkit-plugin.h`; runs the `maki-privileged`, `maki-attach` and
+`maki-nbdkit` suites through `run_cargo_tests.py` with `--no-fail-fast`, so
+the native tests load Maki's plugin into EL9's nbdkit 1.38; and runs
 `scripts/test_rpm_package.py`. It then builds the real RPM, requires that it
-depends on glibc and on `GLIBC_2.34` symbols, installs it with dnf, checks
-its files and units (`rpm -V`, `systemd-analyze verify`), and requires
-`rpm -e` to refuse while an attachment record exists. The container runs as
-root, so the root-only targets of those crates run inline; those that need a
+depends on glibc and on `GLIBC_2.34` symbols, installs it with dnf (its
+`Requires` bring lvm2, xfsprogs and kmod; the metapackage and
+`nbdkit-selinux` must stay absent), checks its files and units (`rpm -V`,
+`systemd-analyze verify`), and requires `rpm -e` to refuse while an
+attachment record exists.
+
+The container's steps run as root, but the workspace, `RUNNER_TEMP` and
+`HOME` belong to the runner's uid 1001. `actions/checkout` trusts the
+workspace only in a temporary git configuration, so the job adds it to root's
+`safe.directory`, and because fixtures that require root-owned ancestors
+closed to others (`regression_mount_target.rs`) refuse the workspace, `HOME`
+and `/tmp`, the tests get a root-owned `0755` `TMPDIR` below `/var/lib`. The
+root-only targets of those crates therefore run inline; those that need a
 private mount namespace or a writable cgroup hierarchy print why they skip
 there, and the Ubuntu job runs them as root. The kernel is the runner's: the
 job covers RHEL 9's userspace, not its kernel, SELinux or an attachment.
