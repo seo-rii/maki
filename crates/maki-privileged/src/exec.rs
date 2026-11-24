@@ -50,7 +50,7 @@ const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    #[error("step {step:?} failed with status {status:?}: {stderr}")]
+    #[error("step {step:?} failed {}: {stderr}", exit_status(*.status))]
     StepFailed {
         step: String,
         status: Option<i32>,
@@ -79,6 +79,15 @@ pub enum ExecError {
         rolled_back: usize,
         rollback_failed: usize,
     },
+}
+
+/// How a command that failed ended: its exit status, or none when a signal
+/// ended it.
+fn exit_status(status: Option<i32>) -> String {
+    match status {
+        Some(code) => format!("with status {code}"),
+        None => "without an exit status (a signal ended it)".into(),
+    }
 }
 
 /// Refuse a mountpoint whose path a non-trusted user could redirect.
