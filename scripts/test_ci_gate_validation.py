@@ -1,5 +1,6 @@
-"""The scheduled job must run every ignored release gate to completion, and
-the pull-request job every script test module."""
+"""The scheduled job must run every ignored release gate to completion, the
+pull-request job every script test module, and the RHEL 9 job the packaged
+build, the native suites and the RPM in a RHEL 9 userspace."""
 
 import fnmatch
 import json
@@ -252,6 +253,94 @@ class NightlyArtifactGates(unittest.TestCase):
         self.assertIn('"provider \\"fake\\" is not compiled into this build (feature '
                       '`fake-provider`); \\\n', DAEMON.read_text())
         self.assertIn("provider \"fake\" is not compiled into this build", FAKE_REFUSAL)
+
+
+def jobs():
+    """Each job's body, by name."""
+    return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", WORKFLOW.read_text()))
+
+
+def steps(job):
+    """(name or action, body) of each step of a job, comments removed."""
+    body = "".join(line for line in job.splitlines(keepends=True)
+                   if not line.lstrip().startswith("#"))
+    found = re.findall(r"(?ms)^      - (?:name: ([^\n]+)|uses: ([^\n]+))\n(.*?)(?=^      - |\Z)", body)
+    return [(name or uses, rest) for name, uses, rest in found]
+
+
+class RhelUserspaceJob(unittest.TestCase):
+    """A RHEL 9 userspace (glibc 2.34, nbdkit 1.38, lvm2, rpm 4.16) on every change."""
+
+    def setUp(self):
+        self.job = jobs()["rhel9"]
+        self.steps = steps(self.job)
+        self.names = [name for name, _ in self.steps]
+
+    def step(self, name):
+        return dict(self.steps)[name]
+
+    def test_runs_on_every_change_in_a_centos_stream_9_container(self):
+        self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + self.job)
+        self.assertIn("\n    container: quay.io/centos/centos:stream9\n", "\n" + self.job)
+        self.assertRegex(self.job, r"(?m)^    timeout-minutes: \d+$")
+        self.assertNotRegex(self.job, r"(?m)^    (?:if|needs|continue-on-error):")
+        self.assertNotIn("continue-on-error", self.job)
+
+    def test_uses_the_baseline_toolchain_and_its_own_cache(self):
+        pull_request = [name for name, _ in steps(jobs()["pr"])]
+        toolchain = [name for name in pull_request if name.startswith("dtolnay/rust-toolchain@")]
+        self.assertEqual([name for name in self.names if name.startswith("dtolnay/")], toolchain[:1])
+        self.assertIn("actions/checkout@v4", self.names)
+        self.assertIn("Swatinem/rust-cache@v2", self.names)
+        self.assertIn("key: rhel9", self.step("Swatinem/rust-cache@v2"))
+
+    def test_installs_from_baseos_appstream_and_crb_only(self):
+        install = self.step(self.names[0])
+        self.assertLess(self.names.index(self.names[0]), self.names.index("actions/checkout@v4"),
+                        "git must be installed before the checkout")
+        commands = re.findall(r"(?m)^\s*dnf (.*?)\\?$", install)
+        self.assertTrue(commands, "the first step installs the dependencies with dnf")
+        self.assertNotIn("epel", install.lower())
+        self.assertEqual(re.findall(r"--enablerepo=(\S+)", install), ["crb"],
+                         "CRB only, for nbdkit-devel")
+        packages = set(re.findall(r"[\w.+-]+", " ".join(
+            line for line in install.splitlines() if not line.strip().startswith(("nbdkit --", "test ")))))
+        for package in ("gcc", "git-core", "python3", "rpm-build", "cpio", "nbdkit", "nbdkit-devel",
+                        "libnbd", "lvm2", "xfsprogs", "util-linux", "kmod", "systemd", "kernel-headers"):
+            self.assertIn(package, packages)
+        for check in ("nbdkit --version", "nbdinfo --version", "nbdcopy --version",
+                      "test -f /usr/include/nbdkit-plugin.h",
+                      'test "$(command -v nbdkit)" = /usr/sbin/nbdkit'):
+            self.assertIn(check, install)
+
+    def test_builds_tests_and_packages_what_the_debian_package_ships(self):
+        order = [self.names.index(name) for name in (
+            "actions/checkout@v4", "packaged binaries", "nbdkit ABI against the EL9 header",
+            "helper, attach and plugin suites", "RPM package contract",
+            "build, install and remove the RPM")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("run: cargo build --release --locked -p maki -p maki-attach -p maki-check "
+                      "-p maki-nbdkit\n", self.step("packaged binaries"))
+        self.assertIn("run: cargo test --locked -p maki-nbdkit --test review_abi -- --nocapture\n",
+                      self.step("nbdkit ABI against the EL9 header"))
+        self.assertIn("run: python3 -B scripts/run_cargo_tests.py --locked -p maki-privileged "
+                      "-p maki-attach -p maki-nbdkit\n", self.step("helper, attach and plugin suites"))
+        self.assertIn("run: python3 -B -m unittest scripts.test_rpm_package -v\n",
+                      self.step("RPM package contract"))
+
+    def test_the_built_rpm_is_installed_checked_and_refuses_removal_under_a_record(self):
+        script = self.step("build, install and remove the RPM")
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("packaging/rpm/build-rpm.py", script)
+        self.assertIn("--release-dir target/release", script)
+        self.assertNotIn("--no-autoreq", script, "the real package keeps its native requirements")
+        for check in ("grep -qx glibc", "GLIBC_2\\.34", "dnf install -y", "rpm -V maki",
+                      "systemd-analyze verify", "/usr/lib/systemd/system/maki@.service",
+                      "/run/maki-attach/", "rpm -e maki"):
+            self.assertIn(check, script)
+        record = script.index("/run/maki-attach/")
+        self.assertLess(record, script.index("rpm -e maki"))
+        self.assertRegex(script, r"if rpm -e maki; then[^\n]*\n[^\n]*exit 1")
 
 
 if __name__ == "__main__":
