@@ -275,10 +275,15 @@ The helper MUST:
 - forward the export's 16-bit transmission flags to the kernel unchanged
   (`NBD_ATTR_SERVER_FLAGS`), and refuse, before the kernel sees the socket,
   an export that does not advertise `NBD_FLAG_HAS_FLAGS`,
-  `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`. Without them the kernel
-  completes FLUSH and FUA requests without sending them to the server, so a
-  filesystem barrier would never reach the journal (§12, §24, §25). Maki's
-  plugin always advertises both;
+  `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`. `SEND_FLUSH` is required
+  for durability: without it the kernel gives the device no write cache, so
+  FLUSH requests complete without reaching the server and FUA writes go out
+  as plain writes, and a filesystem barrier would never reach the journal
+  (§12, §24, §25). `SEND_FUA` is required by policy: without it the block
+  layer emulates every FUA write with a full flush, which reaches the server
+  but costs a flush per FUA write. `HAS_FLAGS` is required by the NBD
+  protocol, without which the other bits mean nothing; the kernel itself
+  ignores it. Maki's plugin always advertises FLUSH and FUA;
 - refuse an export whose size is 0 or larger than 2^63 − 1 bytes;
 - bound the handshake in bytes, checking every reply's length before reading
   it: no reply longer than 4098 bytes (a 4096-byte string and its type) and

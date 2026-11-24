@@ -39,13 +39,17 @@ documents.
 - **An NBD export without FLUSH and FUA is refused** (AUD-149, 2026-11-24;
   [#375](https://github.com/seo-rii/maki/pull/375)). Before the kernel sees
   the socket, the helper refuses an export that does not advertise
-  `NBD_FLAG_HAS_FLAGS`, `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA` (without
-  them the kernel completes FLUSH and FUA requests without sending them to the
-  server), an export of size 0 or above 2^63 − 1 bytes, and a server that
-  offers no fixed-newstyle negotiation or does not answer `NBD_OPT_GO`, with
-  no fallback to `NBD_OPT_EXPORT_NAME`. `nbd-client` accepted such exports.
-  Maki's own plugin always advertises FLUSH and FUA, and nbdkit answers
-  `NBD_OPT_GO` in every release the project documents (SPEC §6).
+  `NBD_FLAG_HAS_FLAGS`, `NBD_FLAG_SEND_FLUSH` and `NBD_FLAG_SEND_FUA`, an
+  export of size 0 or above 2^63 − 1 bytes, and a server that offers no
+  fixed-newstyle negotiation or does not answer `NBD_OPT_GO`, with no fallback
+  to `NBD_OPT_EXPORT_NAME`. `SEND_FLUSH` is required for durability: without
+  it the kernel gives the device no write cache, so FLUSH requests complete
+  without reaching the server and FUA writes go out as plain writes.
+  `SEND_FUA` is required by policy (without it the block layer emulates each
+  FUA write with a full flush) and `HAS_FLAGS` by the NBD protocol.
+  `nbd-client` accepted such exports. Maki's own plugin always advertises
+  FLUSH and FUA, and nbdkit answers `NBD_OPT_GO` in every release the project
+  documents (SPEC §6).
 - **Provisioning connects a new volume's export with `maki-attach nbd-connect`
   and `nbd-disconnect`** (AUD-152, 2026-11-24;
   [#375](https://github.com/seo-rii/maki/pull/375)). `maki-attach nbd-connect
@@ -1221,8 +1225,13 @@ observable behaviour:
   helper's own connect; the Debian guide's `nbd-client` section is one
   sentence, kept under its old anchor. The support matrix has RHEL 9, Fedora
   and RHEL 8 rows, and the testing guide describes the new tests, the CI
-  switches and the `rhel9` job. The remediation log records the seventh round
-  and marks the statements it supersedes.
+  switches and the `rhel9` job. SPEC §6, the helper's documentation and its
+  refusal message say why each export flag is required (`SEND_FLUSH` for
+  durability, `SEND_FUA` by policy, `HAS_FLAGS` by the protocol), where they
+  said that without any of them the kernel completes FLUSH and FUA without
+  sending them ([#376](https://github.com/seo-rii/maki/pull/376)). The
+  remediation log records the seventh round and marks the statements it
+  supersedes.
 
 - **2026-11-23 fifth audit and follow-ups** (AUD-124 to AUD-127, AUD-141).
   SPEC §43 classifies journal damage by the durable proof and mark instead of
