@@ -214,10 +214,10 @@ The scheduled `nightly-gates` job runs:
 | `phase5_gate_breaker_cycles_full` | 10,000 circuit-breaker lifecycles |
 | `phase11_gate_dbsim_full` | 500 database-simulation runs |
 | `phase12_gate_full` | 500 barrier and 500 FUA power-loss simulations |
-| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures |
-| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle |
+| `phase_r3b_durability_gate_full` | Randomized workload → power loss or restart → oracle, with random sync failures; a journal segment holds three records, so every workload rolls the journal |
+| `phase_r3b_concurrent_gate_full` | Concurrent partial-unit writers under the same crash/restart oracle, with the same small journal segment |
 | `phase_r3b_media_damage_gate_full` | Media damage to allocation-map copies and slot headers after a crash |
-| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures |
+| `trim_power_loss_gate_full` | 400 seeds of writes and unit-aligned trims on a discard (v3) volume → power loss or restart → oracle, half of them with sync failures; a journal segment holds three write records |
 | `ab_torn_reuse_gate_full` | Chains of cut A/B stores over 2,000 to 4,000 seeds per record and torn-write unit: maps of five sectors, one page and 9000 bytes, checkpoint state, and the durable proof through `advance` |
 | `phase_r5_rollback_write_cost_gate_full` | Rollback-protected backing: 64 KiB write cost with 128 MiB committed (Linux, witness on a second filesystem) |
 
@@ -568,7 +568,7 @@ Disk power-loss campaign.
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`) — a 60 s-per-target smoke run did ~62M iterations with no crash; a 24 CPU-hour-per-target corpus run remains outstanding |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`). Only short runs have been made, from an empty corpus; the last, on 2026-11-24 with libFuzzer and AddressSanitizer, ended without a crash: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M); `endpoint_url` and `probe_parsers` were not run then. The input counts say little: every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reaches almost no image that passes one (256 covered edges). `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). A seed corpus and a 24 CPU-hour-per-target run remain outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
