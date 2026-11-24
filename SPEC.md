@@ -292,11 +292,38 @@ The helper MUST:
   handshake, the retries below and the wait for the kernel's answer) by the
   limit of an external step command and by the deadline its caller set for all
   of its commands (the failed-start hook's command budget);
-- retry a connect the kernel refuses with `EBUSY`, which it answers while
-  anything holds the unconnected device open (udev's probe after a
-  disconnect, any other opener), every 100 ms for up to 5 s within that time
-  bound, each time on a fresh connection to the daemon and only after checking
-  that the device still shows no connection; every other refusal is final;
+- retry the two answers that mean "busy", every 100 ms for up to 5 s counted
+  from the first of them, within that time bound, and each time only after
+  checking that the device still shows no connection. Every other answer is
+  final:
+  - the kernel's `EBUSY` for `NBD_CMD_CONNECT`, which it answers while
+    anything holds the unconnected device open (udev's probe after a
+    disconnect, any other opener). The kernel answers it before it takes the
+    socket, so the next request MUST go out on the connection that is already
+    negotiated, as long as that connection is still open and has nothing to
+    read on it, which the helper checks without consuming anything. Only a
+    connection that fails this check (the kernel shuts a socket down when it
+    refuses a connect after taking it) is replaced by a fresh one, and the
+    helper closes its earlier connection before it opens the next: the
+    volume daemon serves one connection at a time;
+  - the daemon's `NBD_REP_ERR_UNKNOWN` to `NBD_OPT_GO`, the export that is
+    not available. nbdkit answers it, without a message, whenever its plugin
+    cannot open the export, and it closes a connection a moment after the
+    peer did, so a handshake that follows a disconnect, or the helper's own
+    closed connection, can arrive while the plugin's one connection is still
+    taken. A server without a default export answers the same; the helper
+    cannot tell the two apart, so it bounds the wait and names both in its
+    refusal. The daemon logs each second connection it refuses;
+- when the kernel answered `EBUSY` until those retries ended, for a device
+  the attach allocated itself, give that device up for the next free one
+  instead of failing: what holds an unconnected device open shows nowhere in
+  sysfs, so allocation would choose the same device again, for this volume
+  and for every other. Under the attach lock the helper replaces its own
+  record with one that names the next device, with a connection identifier
+  of its own, before it connects that device, applies every check of a first
+  device to it, and never takes a device another volume's record names
+  (§8). All the devices tried share the time bound of one connect. It MUST
+  NOT give up a pinned `nbd_device`, nor a device that shows a connection;
 - create every descriptor close-on-exec, hand the kernel the socket without a
   send or receive timeout (the kernel's own I/O on it would fail once the
   device has been idle that long), and close its own descriptor of the socket
@@ -312,7 +339,12 @@ Provisioning a new volume connects its export once outside any attachment
 request. Such a connection MUST NOT use an identifier of the form attach records
 use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
 a trusted record names, and its disconnect MUST touch only a device connected
-under its own identifier.
+under its own identifier. The kernel acknowledges a disconnect before the
+connection is gone from the device: it keeps the `pid` and `backend`
+attributes, and refuses a new connect, until the last opener of the device has
+closed it. `nbd-disconnect` MUST NOT report success in that state: it waits up
+to 15 s for the device to stop showing the connection and fails, saying that
+something still has the device open, when it does not.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal

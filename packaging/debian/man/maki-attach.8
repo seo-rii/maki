@@ -102,7 +102,10 @@ refuses a device that shows a connection or that an attachment record names,
 and an identifier of the form attachment records use
 .RI ( maki-uuid );
 .B nbd-disconnect
-disconnects only a device connected under the given identifier.
+disconnects only a device connected under the given identifier, and waits up
+to 15 seconds until the device no longer shows that connection. The kernel
+keeps showing it while anything has the device open; the command then fails
+and says so, and can be run again.
 .SH OPTIONS
 .TP
 .BI \-\-volume " name"
