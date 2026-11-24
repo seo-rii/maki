@@ -214,6 +214,17 @@ fn create_killed_at_the_volumes_first_page_can_be_run_again() {
             && refused.contains("maki volume create"),
         "{refused}"
     );
+    // Also under a configuration that names another capacity: the pair
+    // holds no volume to compare a capacity with.
+    let other = pair
+        .raw
+        .replace("capacity = \"8MiB\"", "capacity = \"16MiB\"");
+    assert_ne!(other, pair.raw);
+    let refused = build_backing(&parse_and_validate(&other).unwrap())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("did not complete"), "{refused}");
     pair.create_again("killed at the volume's first page");
 }
 

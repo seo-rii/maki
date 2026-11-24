@@ -520,6 +520,13 @@ fn open_names_an_interrupted_creation_and_what_continues_it() {
         text.contains("no anchor") && text.contains("volume create") && text.contains("mounted"),
         "{text}"
     );
+    // `create` enrolls a pair that committed nothing into whatever directory
+    // is configured, an empty mount point included: the operator is told to
+    // check the mount before running it.
+    assert!(
+        text.contains("make sure") && text.find("make sure") < text.find("volume create"),
+        "{text}"
+    );
     let unchanged = std::process::Command::new("true").output().unwrap();
     create_again(root.path(), witness.path(), &unchanged);
 }

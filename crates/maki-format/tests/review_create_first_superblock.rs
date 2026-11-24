@@ -149,3 +149,81 @@ fn a_superblock_file_that_holds_none_is_refused_as_that_and_left_alone() {
         "{error}"
     );
 }
+
+/// A backing whose superblock copies cannot be read.
+struct Unreadable(MemBacking);
+
+impl Backing for Unreadable {
+    fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn maki_backing::BackingFile>> {
+        if name.starts_with("superblock.") {
+            return Err(io::Error::other("injected read failure"));
+        }
+        self.0.open(name, create)
+    }
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.0.exists(name)
+    }
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.0.remove(name)
+    }
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn create_dir_all(&self, name: &str) -> io::Result<()> {
+        self.0.create_dir_all(name)
+    }
+    fn list(&self, name: &str) -> io::Result<Vec<String>> {
+        self.0.list(name)
+    }
+    fn sync_dir(&self, name: &str) -> io::Result<()> {
+        self.0.sync_dir(name)
+    }
+    fn try_lock(&self, name: &str) -> io::Result<Box<dyn maki_backing::VolumeLock>> {
+        self.0.try_lock(name)
+    }
+    fn free_bytes(&self) -> io::Result<Option<u64>> {
+        self.0.free_bytes()
+    }
+}
+
+/// The refusal is worded for its cause. "An earlier release stopped, or the
+/// copies are damaged" is said only of copies that hold no superblock: not
+/// of a volume a newer release wrote, nor of copies that could not be read.
+#[test]
+fn a_superblock_that_cannot_be_used_is_refused_with_its_own_cause() {
+    // Both copies carry a version this release does not know, with valid
+    // checksums.
+    let backing = MemBacking::new();
+    create(&backing, false).unwrap();
+    for name in [layout::SUPERBLOCK_A, layout::SUPERBLOCK_B] {
+        let file = backing.open(name, false).unwrap();
+        let mut bytes = vec![0; file.len().unwrap() as usize];
+        file.read_at(0, &mut bytes).unwrap();
+        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+        let length = bytes.len();
+        let crc = crc32fast::hash(&bytes[..length - 4]);
+        bytes[length - 4..].copy_from_slice(&crc.to_le_bytes());
+        file.write_at(0, &bytes).unwrap();
+    }
+    let cause = load_volume_superblock(&backing).unwrap_err();
+    assert!(matches!(cause, FormatError::Unsupported(_)), "{cause}");
+    let error = create(&backing, false).unwrap_err();
+    assert!(matches!(error, FormatError::AlreadyExists(_)), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains(&cause.to_string()) && !text.contains("earlier release"),
+        "{text}"
+    );
+
+    // The copies exist and cannot be read.
+    let backing = MemBacking::new();
+    create(&backing, false).unwrap();
+    let backing = Unreadable(backing);
+    let error = create(&backing, false).unwrap_err();
+    assert!(matches!(error, FormatError::AlreadyExists(_)), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("injected read failure") && !text.contains("earlier release"),
+        "{text}"
+    );
+}

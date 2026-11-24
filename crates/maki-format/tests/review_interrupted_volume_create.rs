@@ -627,6 +627,36 @@ fn a_used_volume_beside_an_unmounted_witness_is_never_created_over() {
     refused_unchanged(&unmounted, "unmounted witness");
 }
 
+/// A pair that `create` refuses and that does not open says why it does not
+/// open: the refusal alone reads as "empty both directories", also where
+/// the cause is one to repair (a witness that is not mounted).
+#[test]
+fn a_refused_pair_that_does_not_open_says_why() {
+    let unmounted = |machines: Machines| Machines {
+        root: machines.root,
+        witness: CrashableBacking::new(),
+    };
+    for (what, machines) in [
+        ("a used volume", unmounted(used().0)),
+        (
+            "an unfinished creation",
+            unmounted(interrupted(operations() * 2 / 3, None)),
+        ),
+    ] {
+        let error = machines.create().unwrap_err();
+        assert!(
+            matches!(&error, RollbackCreateError::Backing(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "{what}: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("requires empty backing and witness directories")
+                && text.contains("no anchor"),
+            "{what}: {text}"
+        );
+    }
+}
+
 /// What the witness authenticates must itself be nothing but an unfinished
 /// creation. A volume whose superblock copies are gone, but which holds
 /// anything a creation does not write before its superblock, is refused.
@@ -635,7 +665,7 @@ fn an_authenticated_volume_without_superblocks_that_holds_more_is_never_created_
     type Plant = fn(&RollbackBacking);
     let plants: [(&str, Plant); 6] = [
         ("a journal segment", |volume| {
-            volume.open("journal/segment-00000001.log", true).unwrap();
+            volume.open(&layout::journal_segment(1), true).unwrap();
         }),
         ("a shard", |volume| {
             volume.open(&layout::shard_data(0), true).unwrap();
