@@ -161,7 +161,18 @@ pub(super) fn capture(command: &mut Command, mut policy: Policy) -> io::Result<O
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|error| {
+            // The operating system's error alone does not say which program
+            // is missing or may not be run.
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot run {}: {error}",
+                    command.get_program().to_string_lossy()
+                ),
+            )
+        })?;
     let result = collect(&mut child, started, policy);
     match result {
         Ok(output) if output.status.success() => {

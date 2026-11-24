@@ -13,7 +13,7 @@ use super::{
 };
 use crate::config::{self, AttachOverrides};
 use crate::plan::{AttachRequest, AttachmentIdentity, AUTO_NBD_DEVICE, SENTINEL_FILE};
-use crate::state::{read_verify_config, BoundDeviceRecord, TrustedState};
+use crate::state::{named, read_verify_config, BoundDeviceRecord, TrustedState};
 
 pub(super) trait WorkloadSystem {
     fn backend(&self, device: &str) -> io::Result<Option<String>>;
@@ -225,9 +225,10 @@ pub(super) fn verify_request(
 }
 
 /// The gate's configuration, which must be the root-controlled file every
-/// executing verb accepts.
+/// executing verb accepts. An error names the file: the gate reads nothing
+/// else by a path the operator chose.
 pub(super) fn gate_config(path: &Path) -> io::Result<String> {
-    read_verify_config(path)
+    read_verify_config(path).map_err(|error| named("attach config", path, 0, error))
 }
 
 pub(super) fn execute(volume: &str, config_path: &Path) -> Result<(), ExecError> {
