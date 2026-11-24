@@ -44,8 +44,9 @@ use crate::verify::{
 pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long `nbd-disconnect` waits for a device to stop showing the
-/// connection it disconnected.
+/// connection it disconnected, and how often it looks.
 const NBD_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
+const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -872,9 +873,29 @@ fn disconnect_raw_with(
     disconnect(&PlannedStep::NbdDisconnect {
         device: device.into(),
     })?;
-    // Not yet: the acknowledgement is taken for the end of the connection.
-    let _ = patience;
-    Ok(())
+    let acknowledged = Instant::now();
+    loop {
+        match nbd_backend_at(sysfs, device) {
+            Ok(Some(backend)) if backend == identifier => {}
+            // No connection, or one made since: this one is gone.
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                return Err(identity_error(format!(
+                    "the kernel acknowledged the disconnect, but {device}'s backend identifier \
+                     is unreadable ({error}): it cannot be shown that the connection is gone"
+                )))
+            }
+        }
+        if acknowledged.elapsed() >= patience {
+            return Err(identity_error(format!(
+                "the kernel acknowledged the disconnect, but {device} still shows the \
+                 connection after {patience:?}: something still has the device open, and the \
+                 kernel keeps a connection's attributes, and refuses a new connect, until the \
+                 last opener has closed. Run the command again once it has let go"
+            )));
+        }
+        std::thread::sleep(NBD_RELEASE_INTERVAL.min(patience));
+    }
 }
 
 /// Refuse a device for a connection outside any attachment unless it shows
