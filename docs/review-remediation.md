@@ -142,9 +142,16 @@ Each item was checked against `main` with both pull requests merged.
   such a child at the step limit (AUD-151).
 - The RPM conflicts with `nbdkit-selinux`: Maki cannot be installed on a
   host that needs the module for libvirt or virt-v2v, nor on one where
-  SELinux is permissive or disabled and the module would be harmless.
+  SELinux is permissive or disabled and the module would be harmless
+  (AUD-154). *Corrected on 2026-11-24: this item said that
   `dnf --allowerasing` resolves a conflicting transaction by removing Maki,
-  which its `%preun` refuses while a volume is attached (AUD-154).
+  which `%preun` refuses while a volume is attached. `%preun` refused only
+  Maki's own erase and dnf ran the rest of the transaction: it installed the
+  module beside Maki, and a plain `dnf remove maki` under an attachment kept
+  Maki and erased `nbdkit-server`, `lvm2`, `xfsprogs` and `kmod`. The RPM
+  is now a dnf-protected package and also conflicts with the `nbdkit`
+  metapackage, so dnf refuses both transactions before it changes anything
+  ([RHEL 9 removal](getting-started/installation-rhel.md#upgrading-and-removal)).*
 - A device that something holds open for longer than the 5-second busy
   window still fails the connect as busy (AUD-150).
 - The CentOS Stream 9 source answers the sixth round's question: the
