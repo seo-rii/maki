@@ -188,3 +188,48 @@ fn the_plugin_passes_the_helpers_handshake_with_flush_and_fua() {
         );
     }
 }
+
+/// The plugin serves one connection. While one is open, as the kernel's is
+/// after a connect, nbdkit answers the next `NBD_OPT_GO` that the export is
+/// not available, and it closes a connection only a moment after its peer
+/// did. The helper waits for exactly this answer (SPEC §6), so it must be
+/// the one the handshake tells apart, and it must end once the first
+/// connection is closed.
+#[test]
+fn a_second_connection_is_answered_unavailable_until_the_first_is_closed() {
+    if !nbdkit_available("a_second_connection_is_answered_unavailable_until_the_first_is_closed") {
+        return;
+    }
+    let daemon = Daemon::start(false);
+    let open = || {
+        let stream = UnixStream::connect(&daemon.socket).unwrap();
+        handshake::negotiate(&stream, Instant::now() + DEADLINE).map(|export| (stream, export))
+    };
+    let first = open().unwrap_or_else(|error| panic!("{error}: {}", daemon.log()));
+    for _ in 0..3 {
+        let refusal = open().expect_err("a second connection was served");
+        assert!(
+            handshake::export_unavailable(&refusal),
+            "{refusal}: {}",
+            daemon.log()
+        );
+    }
+    drop(first);
+    // Not necessarily at once, but well within the five seconds the helper
+    // waits.
+    let closed = Instant::now();
+    loop {
+        match open() {
+            Ok(_) => break,
+            Err(error) => {
+                assert!(handshake::export_unavailable(&error), "{error}");
+                assert!(
+                    closed.elapsed() < Duration::from_secs(5),
+                    "the export stayed unavailable: {}",
+                    daemon.log()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}

@@ -644,7 +644,7 @@ fn nbd_step_index(device: &str) -> Result<u32, ExecError> {
 /// observe next, never by an assumption that nothing changed.
 fn nbd_step_error(step: &PlannedStep, error: NbdError) -> ExecError {
     match error {
-        NbdError::Failed(message) => ExecError::Step {
+        NbdError::Failed(message) | NbdError::DeviceBusy(message) => ExecError::Step {
             step: step.to_string(),
             message,
         },
