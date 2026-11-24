@@ -28,6 +28,9 @@ const SIZE: u64 = 64 << 20;
 const BLOCK_SIZE: u32 = 4096;
 const SETTLE: Duration = Duration::from_secs(15);
 
+/// The tests pick the lowest free device: one at a time.
+static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Report what is missing: a skip, or a failure when NBD is required.
 fn missing(what: &str) {
     assert!(
@@ -101,6 +104,9 @@ fn the_helper_connects_and_disconnects_a_kernel_nbd_device() {
     if !nbdkit::available("the_helper_connects_and_disconnects_a_kernel_nbd_device") {
         return missing("nbdkit is not installed");
     }
+    let _one_at_a_time = KERNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let server = nbdkit::Server::start(&["memory", "64M"]);
     let device = maki_privileged::exec::allocate_nbd_device()
         .unwrap_or_else(|error| panic!("no free NBD device: {error}"));
@@ -166,4 +172,60 @@ fn the_helper_connects_and_disconnects_a_kernel_nbd_device() {
         !Path::new(&format!("/sys/block/nbd{index}/pid")).exists()
             && sysfs(index, "backend").is_none_or(|backend| backend.is_empty())
     });
+}
+
+/// The provisioning verbs' path (`maki-attach nbd-connect` and
+/// `nbd-disconnect`): a raw connection under its own identifier, a refused
+/// disconnect under another one, and its own disconnect.
+#[test]
+fn a_provisioning_connection_is_disconnected_only_under_its_own_identifier() {
+    use maki_privileged::exec::{connect_raw, disconnect_raw};
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return missing("the nbd netlink family needs root (CAP_SYS_ADMIN)");
+    }
+    if let Err(what) = nbd_module_loaded() {
+        return missing(&what);
+    }
+    if !nbdkit::available("a_provisioning_connection_is_disconnected_only_under_its_own_identifier")
+    {
+        return missing("nbdkit is not installed");
+    }
+    let _one_at_a_time = KERNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let server = nbdkit::Server::start(&["memory", "64M"]);
+    let device = maki_privileged::exec::allocate_nbd_device()
+        .unwrap_or_else(|error| panic!("no free NBD device: {error}"));
+    let index: u32 = device.strip_prefix("/dev/nbd").unwrap().parse().unwrap();
+    let identifier = format!(
+        "maki-bootstrap-{}",
+        std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .unwrap()
+            .trim()
+    );
+    let mut connected = Connected(Some(index));
+    connect_raw(server.socket(), &device, BLOCK_SIZE, &identifier)
+        .unwrap_or_else(|error| panic!("connect {device}: {error}: {}", server.log()));
+    assert_eq!(
+        sysfs(index, "backend").as_deref(),
+        Some(identifier.as_str())
+    );
+    // A second raw connect of a connected device changes nothing.
+    assert!(connect_raw(server.socket(), &device, BLOCK_SIZE, "maki-bootstrap-other").is_err());
+    assert!(disconnect_raw(&device, "maki-bootstrap-other").is_err());
+    assert_eq!(
+        sysfs(index, "backend").as_deref(),
+        Some(identifier.as_str())
+    );
+    disconnect_raw(&device, &identifier)
+        .unwrap_or_else(|error| panic!("disconnect {device}: {error}"));
+    connected.0 = None;
+    wait_for("the disconnect", || {
+        !Path::new(&format!("/sys/block/nbd{index}/pid")).exists()
+            && sysfs(index, "backend").is_none_or(|backend| backend.is_empty())
+    });
+    // Nothing left to disconnect is not a failure.
+    disconnect_raw(&device, &identifier).unwrap();
 }

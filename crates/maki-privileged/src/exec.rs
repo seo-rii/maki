@@ -750,6 +750,70 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
     }
 }
 
+/// Connect `device` to the export behind `socket` outside any attachment,
+/// under the backend identifier `identifier` (`maki-attach nbd-connect`):
+/// provisioning a new volume connects its raw export once to create the
+/// PV, VG, LV and XFS, and the qualification runner does the same for its
+/// fixtures. It uses the attach steps' own connect and waits until the
+/// kernel shows the identifier.
+///
+/// The caller coordinates with maki-attach by holding the attach lock
+/// (`ATTACH_LOCK_PATH`) for its whole procedure, as the provisioning guide
+/// does; this takes no lock, so that such a caller does not wait for
+/// itself. It refuses an identifier of the attach-record form and a device
+/// that shows a connection or that a trusted attach record names.
+pub fn connect_raw(
+    socket: &str,
+    device: &str,
+    block_size: u32,
+    identifier: &str,
+) -> Result<(), ExecError> {
+    let refused = |error: crate::config::ConfigError| identity_error(error.to_string());
+    crate::config::check_raw_identifier(identifier).map_err(refused)?;
+    crate::config::check_abs_path("--socket", socket).map_err(refused)?;
+    crate::config::check_device_block_size("--block-size", block_size).map_err(refused)?;
+    nbd_step_index(device)?;
+    let reserved = match existing_state()? {
+        // No volume has the empty name: every record counts.
+        Some(state) => state.devices_of_other_volumes("")?,
+        None => BTreeMap::new(),
+    };
+    let sysfs = Path::new("/sys/block");
+    raw_device_is_free(sysfs, device, &reserved)?;
+    let step = PlannedStep::NbdConnect {
+        socket: socket.into(),
+        device: device.into(),
+        block_size,
+    };
+    run_step(&step, Some(identifier))?;
+    wait_nbd_ready(&step, device)?;
+    if !raw_backend_is(sysfs, device, identifier)? {
+        return Err(identity_error(format!(
+            "{device} shows no connection after the connect was acknowledged"
+        )));
+    }
+    Ok(())
+}
+
+/// Disconnect `device` if it is connected under `identifier`, a
+/// connection [`connect_raw`] made (`maki-attach nbd-disconnect`). A device
+/// without a connection needs nothing; any other connection is refused.
+pub fn disconnect_raw(device: &str, identifier: &str) -> Result<(), ExecError> {
+    crate::config::check_raw_identifier(identifier)
+        .map_err(|error| identity_error(error.to_string()))?;
+    nbd_step_index(device)?;
+    if !raw_backend_is(Path::new("/sys/block"), device, identifier)? {
+        tracing::info!("maki-attach: {device} shows no connection; nothing to disconnect");
+        return Ok(());
+    }
+    run_step(
+        &PlannedStep::NbdDisconnect {
+            device: device.into(),
+        },
+        None,
+    )
+}
+
 /// Refuse a device for a connection outside any attachment unless it shows
 /// no connection and no trusted record (`reserved`) names it.
 fn raw_device_is_free(
@@ -757,16 +821,38 @@ fn raw_device_is_free(
     device: &str,
     reserved: &BTreeMap<String, String>,
 ) -> Result<(), ExecError> {
-    let _ = (sysfs, device, reserved);
-    todo!("raw_device_is_free")
+    if let Some(owner) = reserved.get(device) {
+        return Err(identity_error(format!(
+            "{device} is named by the attach record of volume {owner}; refusing a connection \
+             outside that attachment"
+        )));
+    }
+    match nbd_backend_at(sysfs, device) {
+        Ok(None) => Ok(()),
+        Ok(Some(backend)) => Err(identity_error(format!(
+            "{device} is already connected (backend identifier {backend:?})"
+        ))),
+        Err(error) => Err(identity_error(format!(
+            "{device} cannot be shown to be free: its backend identifier is unreadable \
+             ({error})"
+        ))),
+    }
 }
 
 /// Whether `device` is connected under `identifier` (`true`) or shows no
 /// connection (`false`); any other backend, or none that can be read, is
 /// an error.
 fn raw_backend_is(sysfs: &Path, device: &str, identifier: &str) -> Result<bool, ExecError> {
-    let _ = (sysfs, device, identifier);
-    todo!("raw_backend_is")
+    match nbd_backend_at(sysfs, device) {
+        Ok(None) => Ok(false),
+        Ok(Some(backend)) if backend == identifier => Ok(true),
+        Ok(Some(backend)) => Err(identity_error(format!(
+            "{device} is connected under another identifier ({backend:?}); refusing to touch it"
+        ))),
+        Err(error) => Err(identity_error(format!(
+            "{device}'s backend identifier is unreadable ({error}); refusing to touch it"
+        ))),
+    }
 }
 
 /// The command ran to its own end and reported failure. A command that a
