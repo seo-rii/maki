@@ -295,6 +295,62 @@ fn a_new_negotiation_closes_the_earlier_connection_first() {
     );
 }
 
+/// The step asks about the connection it negotiated, not only whether it
+/// has one: once the daemon has closed that connection, or has sent a byte
+/// on it, the next request is not sent on it.
+#[test]
+fn a_connection_the_daemon_closed_or_wrote_to_is_not_offered_again() {
+    for writes in [false, true] {
+        let directory = Directory::new();
+        let socket = directory.socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (proceed, negotiated) = std::sync::mpsc::channel::<()>();
+        let (changed, change) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let serving = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&export_script(1 << 20, FLAGS)).unwrap();
+            negotiated.recv().unwrap();
+            if writes {
+                stream.write_all(&[0x67]).unwrap();
+                changed.send(()).unwrap();
+                // Open until the client is done with it.
+                let _ = finished.recv();
+            } else {
+                // Read the client's request first, so that this is the end
+                // of the stream and not a reset.
+                stream.set_nonblocking(true).unwrap();
+                let mut request = Vec::new();
+                let _ = stream.read_to_end(&mut request);
+                drop(stream);
+                changed.send(()).unwrap();
+            }
+        });
+        let netlink = netlink::Socket::open().unwrap();
+        let mut attempts = KernelAttempts {
+            netlink: &netlink,
+            family: 0x1e,
+            socket: &socket,
+            index: 3,
+            block_size: 4096,
+            identifier: IDENTIFIER,
+            deadline: Instant::now() + PATIENCE,
+            negotiated: None,
+        };
+        assert!(matches!(attempts.negotiate(), Ok(Negotiation::Ready)));
+        assert!(attempts.reusable(), "writes: {writes}");
+        proceed.send(()).unwrap();
+        change.recv().unwrap();
+        assert!(
+            !attempts.reusable(),
+            "the step would send its next request on a connection the daemon {}",
+            if writes { "wrote to" } else { "closed" }
+        );
+        drop(finish);
+        serving.join().unwrap();
+    }
+}
+
 #[test]
 fn a_daemon_that_never_answers_is_left_at_the_deadline() {
     let directory = Directory::new();

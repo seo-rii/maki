@@ -655,7 +655,10 @@ fn cleanup_does_not_fallback_when_lvm_was_killed_by_a_signal() {
 
     let error = cleanup_with(&plan_detach(&req), &state, &mut system).unwrap_err();
 
-    assert!(error.to_string().contains("status None"), "{error}");
+    assert!(
+        error.to_string().contains("failed without an exit status"),
+        "{error}"
+    );
     assert_eq!(system.fake.steps, ["umount", "lvm-deactivate"]);
     assert!(system.fake.vg_active, "the mapping was removed directly");
     assert_eq!(state.read("pg").unwrap(), Some(record));

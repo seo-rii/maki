@@ -214,6 +214,90 @@ fn verification_never_creates_a_missing_state_directory_or_lock() {
     assert!(state.lock_existing().is_ok());
 }
 
+/// The operating system's error alone does not say which of the helper's
+/// files is missing: a workload gate that ran before any attach since boot
+/// printed "No such file or directory (os error 2)" and nothing else. The
+/// state directory and the lock are named by their paths, as they are below
+/// the root they were opened from, and the error keeps its kind.
+#[test]
+fn a_missing_state_directory_or_lock_is_named() {
+    let fixture = Fixture::new();
+    let owner = fixture.0.metadata().unwrap().uid();
+    let missing = io::Error::from_raw_os_error(libc::ENOENT);
+    let open = || {
+        TrustedState::open_existing_beneath(
+            File::open(&fixture.0).unwrap(),
+            Path::new("run/maki-attach"),
+            owner,
+        )
+    };
+    let error = open().err().expect("opened a directory that is not there");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        error.to_string(),
+        format!("attach state directory /run/maki-attach: {missing}")
+    );
+
+    for directory in ["run", "run/maki-attach"] {
+        let directory = fixture.0.join(directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let state = open().unwrap();
+    let error = state
+        .lock_existing()
+        .err()
+        .expect("locked a file that is not there");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        error.to_string(),
+        format!("attach lock /run/maki-attach/attach.lock: {missing}")
+    );
+}
+
+/// A refusal is named too. A caller that is not the user the state belongs
+/// to is also told whom to run as: for the helper that user is root, and
+/// "Permission denied" alone left an operator without `sudo` guessing.
+#[test]
+fn a_refused_state_directory_or_lock_is_named() {
+    let fixture = Fixture::new();
+    let owner = fixture.0.metadata().unwrap().uid();
+    let other = owner.wrapping_add(1);
+    let error =
+        TrustedState::open_beneath(File::open(&fixture.0).unwrap(), Path::new("state"), other)
+            .err()
+            .expect("opened another user's state");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    let text = error.to_string();
+    assert!(
+        text.starts_with("attach state directory /state: "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!("; run this command as uid {other}")),
+        "{text}"
+    );
+
+    // The owner is refused for what is wrong, and told nothing more.
+    let state = fixture.state().unwrap();
+    std::fs::write(fixture.0.join("state/attach.lock"), b"").unwrap();
+    std::fs::set_permissions(
+        fixture.0.join("state/attach.lock"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    for error in [state.lock().err(), state.lock_existing().err()] {
+        let error = error.expect("locked a file that others can read");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let text = error.to_string();
+        assert!(
+            text.starts_with("attach lock /state/attach.lock: "),
+            "{text}"
+        );
+        assert!(!text.contains("run this command"), "{text}");
+    }
+}
+
 #[test]
 fn verify_config_loading_pins_trusted_descriptors_and_bounds_content() {
     let fixture = Fixture::new();

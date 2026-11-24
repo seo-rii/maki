@@ -50,7 +50,7 @@ const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    #[error("step {step:?} failed with status {status:?}: {stderr}")]
+    #[error("step {step:?} failed {}: {stderr}", exit_status(*.status))]
     StepFailed {
         step: String,
         status: Option<i32>,
@@ -79,6 +79,15 @@ pub enum ExecError {
         rolled_back: usize,
         rollback_failed: usize,
     },
+}
+
+/// How a command that failed ended: its exit status, or none when a signal
+/// ended it.
+fn exit_status(status: Option<i32>) -> String {
+    match status {
+        Some(code) => format!("with status {code}"),
+        None => "without an exit status (a signal ended it)".into(),
+    }
 }
 
 /// Refuse a mountpoint whose path a non-trusted user could redirect.
@@ -240,7 +249,9 @@ pub fn allocate_nbd_device() -> Result<String, ExecError> {
     allocation::allocate(Path::new("/sys/class/block"), Path::new(MOUNTINFO))
 }
 
-fn wait_nbd_ready(step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+/// Wait until `device` shows the connection that `step`, the executed
+/// connect step as [`PlannedStep::executed_with`] describes it, made.
+fn wait_nbd_ready(step: &str, device: &str) -> Result<(), ExecError> {
     let Some(n) = nbd_index(device) else {
         return Err(ExecError::Step {
             step: step.to_string(),
@@ -651,7 +662,7 @@ fn nbd_step_index(device: &str) -> Result<u32, ExecError> {
 /// be read is an I/O error of the step, like a command that ran out of
 /// time, so that what is connected is decided by the backend identifier the
 /// callers observe next, never by an assumption that nothing changed.
-fn nbd_step_error(step: &PlannedStep, error: NbdError) -> ExecError {
+fn nbd_step_error(step: &dyn std::fmt::Display, error: NbdError) -> ExecError {
     match error {
         NbdError::Failed(message) => ExecError::Step {
             step: step.to_string(),
@@ -680,9 +691,12 @@ fn run_step(step: &PlannedStep, connection_id: Option<&str>) -> Result<(), ExecE
             let index = nbd_step_index(device)?;
             let identifier =
                 connection_id.ok_or_else(|| identity_error("missing connect identifier"))?;
-            tracing::info!("maki-attach: {step}");
+            // The log and the error name the identifier that is sent, which
+            // the plan could only show as a placeholder.
+            let executed = step.executed_with(identifier);
+            tracing::info!("maki-attach: {executed}");
             crate::nbd_kernel::connect(socket, index, *block_size, identifier)
-                .map_err(|error| nbd_step_error(step, error))
+                .map_err(|error| nbd_step_error(&executed, error))
         }
         PlannedStep::SetBlockSize { device, block_size } => run(
             step,
@@ -793,16 +807,18 @@ pub fn connect_raw(
         device,
         block_size,
         identifier,
-        |step, identifier| {
+        |step, identifier, executed| {
             run_step(step, Some(identifier))?;
-            wait_nbd_ready(step, device)
+            wait_nbd_ready(executed, device)
         },
     )
 }
 
 /// [`connect_raw`] on the device tree `sysfs` with the devices trusted
 /// records name (`reserved`): everything is checked before `connect`, which
-/// runs the connect step and waits for the device, is called.
+/// runs the connect step and waits for the device, is called. It is given
+/// the step, the identifier and the step as executed, which names the
+/// identifier, for the wait's error.
 fn connect_raw_with(
     sysfs: &Path,
     reserved: &BTreeMap<String, String>,
@@ -810,7 +826,7 @@ fn connect_raw_with(
     device: &str,
     block_size: u32,
     identifier: &str,
-    connect: impl FnOnce(&PlannedStep, &str) -> Result<(), ExecError>,
+    connect: impl FnOnce(&PlannedStep, &str, &str) -> Result<(), ExecError>,
 ) -> Result<(), ExecError> {
     let refused = |error: crate::config::ConfigError| identity_error(error.to_string());
     crate::config::check_raw_identifier(identifier).map_err(refused)?;
@@ -823,7 +839,7 @@ fn connect_raw_with(
         device: device.into(),
         block_size,
     };
-    connect(&step, identifier)?;
+    connect(&step, identifier, &step.executed_with(identifier))?;
     if !raw_backend_is(sysfs, device, identifier)? {
         return Err(identity_error(format!(
             "{device} shows no connection after the connect was acknowledged"
@@ -877,7 +893,10 @@ fn disconnect_raw_with(
     loop {
         match nbd_backend_at(sysfs, device) {
             Ok(Some(backend)) if backend == identifier => {}
-            // No connection, or one made since: this one is gone.
+            // No connection, or one made since under another backend
+            // identifier: this one is gone. A connection made since without
+            // an identifier (an ioctl client's: `pid`, no `backend`) reads
+            // as neither; it is the unreadable case below and fails.
             Ok(_) => return Ok(()),
             Err(error) => {
                 return Err(identity_error(format!(
@@ -1058,7 +1077,9 @@ trait System {
     /// real system prints.
     fn announce_bound_device(&mut self, _device: &str) {}
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError>;
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError>;
+    /// Wait for `device` after its connect step ran; `step` is that step as
+    /// executed ([`PlannedStep::executed_with`]), for the error.
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError>;
     fn allocate(&mut self) -> Result<String, ExecError>;
     /// A free device that is none of `reserved`, the devices other volumes'
     /// trusted records name. An implementation that knows only `allocate`
@@ -1180,7 +1201,7 @@ impl System for LinuxSystem {
         run_step(step, identifier)
     }
 
-    fn wait_ready(&mut self, step: &PlannedStep, device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, step: &str, device: &str) -> Result<(), ExecError> {
         wait_nbd_ready(step, device)
     }
 
@@ -1645,7 +1666,7 @@ fn connect_recorded(
         let busy = match system.run_step(&step, Some(&record.connection_id)) {
             Ok(()) => {
                 return system
-                    .wait_ready(&step, device)
+                    .wait_ready(&step.executed_with(&record.connection_id), device)
                     .and_then(|()| verify_connection(record, system))
             }
             Err(busy @ ExecError::DeviceBusy { .. }) => busy,

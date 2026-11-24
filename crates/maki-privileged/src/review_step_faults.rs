@@ -740,7 +740,7 @@ impl System for World {
         })
     }
 
-    fn wait_ready(&mut self, _step: &PlannedStep, _device: &str) -> Result<(), ExecError> {
+    fn wait_ready(&mut self, _step: &str, _device: &str) -> Result<(), ExecError> {
         self.command("wait-ready", |world| {
             if world.served() {
                 Ok(())

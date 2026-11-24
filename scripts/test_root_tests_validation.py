@@ -49,8 +49,12 @@ PRIVILEGE_PROBE = re.compile(
 # Sources that probe their privilege although no case in them skips for lack
 # of root, and why. Everything else that matches must run in the root step.
 NOT_ROOT_ONLY = {
+    "bins/maki-attach/src/main.rs":
+        "one case skips as root, whom no directory's mode keeps out",
     "bins/maki-attach/tests/e2e.rs":
         "one case skips as root, where the verb would really run",
+    "bins/maki-attach/tests/review_attach_messages.rs":
+        "one case skips as root, where the verbs would really run",
     "bins/maki/tests/remote_admin.rs":
         "drops CAP_DAC_OVERRIDE when it happens to run as root and asserts the same either way",
     "bins/maki/src/main.rs":
