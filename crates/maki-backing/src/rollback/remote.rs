@@ -259,45 +259,243 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
 /// marker and the binding are durable. For rollback protection it is an
 /// empty directory. A complete marker is a creation that got further, which
 /// enrollment recovery continues.
-fn require_empty_remote_root(disk: &dyn Backing) -> io::Result<()> {
+///
+/// `creation` is the binding of the creation that asks, and a snapshot
+/// destination has none. A creation also continues a root in which the
+/// binding outlived the marker. A release whose enrollment recovery staged
+/// the binding before the marker's name was durable could leave that after
+/// a power loss: the binding under its staging name, which nothing reads
+/// and the creation writes again from the start, or published. A published
+/// binding is accepted only if it is exactly `creation`, the binding this
+/// creation would write. The caller has established that the authority of
+/// that identity is released and was never activated, so no volume was ever
+/// enrolled under it, here or anywhere, and the root holds nothing else. A
+/// binding for another authority or capacity belongs to another creation,
+/// and one that cannot be read cannot be told from a damaged one: both are
+/// refused and left as they are.
+fn require_empty_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> io::Result<()> {
+    examine_remote_root(disk, creation)?.map_err(|occupied| occupied.refusal())
+}
+
+/// What keeps a creation from continuing a root.
+enum Occupied {
+    /// An entry no creation leaves before its marker is published, or a
+    /// marker that is complete or foreign.
+    NotEmpty,
+    /// A staged name that holds something a creation cannot write again
+    /// from the start, with what opening it answered.
+    NotReplaceable(&'static str, io::Error),
+    /// A published binding for another authority or capacity.
+    AnotherCreation,
+    /// A published binding that cannot be read.
+    UnreadableBinding,
+}
+
+impl Occupied {
+    fn refusal(&self) -> io::Error {
+        match self {
+            Self::NotEmpty | Self::UnreadableBinding => input(NOT_EMPTY),
+            Self::NotReplaceable(name, cause) => {
+                not_replaceable(name, cause, "remove it, or use an empty backing root")
+            }
+            Self::AnotherCreation => input(ANOTHER_CREATION),
+        }
+    }
+}
+
+const NOT_EMPTY: &str = "remote enrollment requires an empty backing";
+const ANOTHER_CREATION: &str = "this backing root holds the binding of an interrupted creation \
+    for another authority or capacity: create the volume with that creation's authority and \
+    capacity, or use an empty backing root";
+
+/// `way_out` is what continues the root for the command that refuses it.
+fn not_replaceable(name: &str, cause: &io::Error, way_out: &str) -> io::Error {
+    input(format!(
+        "this backing root holds {name}, which is not a regular file that can be written again \
+         ({cause}): {way_out}"
+    ))
+}
+
+/// A staged name is accepted because the file under it is never read: the
+/// next attempt writes it again from the start. That holds only for what
+/// this process can open as a file to write, a regular file with one name.
+/// A link, a directory, a FIFO or a file with a second name would fail the
+/// attempt when it opens the entry, after it has published what comes
+/// before, and then fail every later one the same way.
+///
+/// Returns what opening the entry answered when the answer is about the
+/// entry: its kind, its links, or the right to open it. Any other failure
+/// (an I/O error, no descriptor left) says nothing about the entry and is
+/// the caller's error as it is; a good file must not be called unwritable
+/// for it.
+fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
+    match disk.open(name, false) {
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+            ) || error
+                .raw_os_error()
+                .is_some_and(|code| ENTRY_KIND_ERRORS.contains(&code)) =>
+        {
+            Ok(Some(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// What the system answers an open for an entry that is not a file to open:
+/// a symbolic link, a directory, a FIFO or socket nobody reads.
+#[cfg(unix)]
+const ENTRY_KIND_ERRORS: [i32; 4] = [libc::ELOOP, libc::EISDIR, libc::ENXIO, libc::ENOTDIR];
+#[cfg(not(unix))]
+const ENTRY_KIND_ERRORS: [i32; 0] = [];
+
+fn examine_remote_root(
+    disk: &dyn Backing,
+    creation: Option<&Enrollment>,
+) -> io::Result<Result<(), Occupied>> {
+    let mut binding = false;
+    let mut staged = Vec::new();
     for name in disk.list("")? {
         let unpublished = match name.as_str() {
-            super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
+            super::ENROLL_LOCK | OPERATION_LOCK => true,
+            super::MARKER_NEXT => {
+                staged.push(super::MARKER_NEXT);
+                true
+            }
             MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
+            enrollment::FILE_NEXT => {
+                staged.push(enrollment::FILE_NEXT);
+                creation.is_some()
+            }
+            enrollment::FILE => {
+                binding = true;
+                creation.is_some()
+            }
             _ => false,
         };
         if !unpublished {
-            return Err(input("remote enrollment requires an empty backing"));
+            return Ok(Err(Occupied::NotEmpty));
         }
     }
-    Ok(())
+    staged.sort_unstable();
+    for name in staged {
+        if let Some(cause) = unwritable(disk, name)? {
+            return Ok(Err(Occupied::NotReplaceable(name, cause)));
+        }
+    }
+    Ok(match (binding, creation) {
+        (true, Some(creation)) => match Enrollment::load(disk) {
+            Ok(found) if found == *creation => Ok(()),
+            Ok(_) => Err(Occupied::AnotherCreation),
+            Err(_) => Err(Occupied::UnreadableBinding),
+        },
+        _ => Ok(()),
+    })
 }
 
 /// Publish the format marker. Called with both root operation and
 /// enrollment locks held. Until it is published the creation can simply be
 /// run again (`super::publish_marker`).
-fn initialize_remote_root(disk: &dyn Backing) -> io::Result<()> {
-    require_empty_remote_root(disk)?;
+///
+/// A binding that outlived its marker was accepted as it reads, and readable
+/// bytes are not proof of durability. Publishing the marker syncs the
+/// directory, which makes every name in it durable: the binding's bytes are
+/// written and synced again first, or a power loss could leave a published
+/// marker beside a binding that names nothing.
+fn initialize_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> io::Result<()> {
+    require_empty_remote_root(disk, creation)?;
+    if let Some(creation) = creation {
+        if disk.exists(enrollment::FILE)? {
+            Enrollment::load_or_create(disk, creation.identity, creation.capacity)?;
+        }
+    }
     super::publish_marker(disk, REMOTE_MAGIC)
+}
+
+/// What enrollment recovery writes in the root it has validated, before the
+/// independent authority can accept enrollment: the marker again, then the
+/// binding. The crash model runs this function, so the order here is the
+/// order that is tested.
+///
+/// A readable legacy marker may be cache-only, and so may its name: the
+/// directory sync of the creation that published it may have failed, or the
+/// creation may have been killed before it. Where the binding is staged
+/// next, as a new file or over one an earlier attempt left, the marker's
+/// name is made durable first, so that no power loss leaves a binding
+/// without its marker. Where a binding is already published, the directory
+/// is not synced here: that would make the name of a binding durable whose
+/// bytes may not be, and the rewrite of the binding syncs its bytes and then
+/// the directory. A staged binding that cannot be written again is refused
+/// before anything is written. Called with both root operation and
+/// enrollment locks held.
+fn republish_root(disk: &dyn Backing, identity: [u8; 16], capacity: u64) -> io::Result<()> {
+    let bound = disk.exists(enrollment::FILE)?;
+    // Only this one name is looked for: an entry whose name is not UTF-8 is
+    // not it, and is no reason to refuse a root that recovery continues.
+    if !bound
+        && disk
+            .list_skipping_non_utf8("")?
+            .iter()
+            .any(|name| name == enrollment::FILE_NEXT)
+    {
+        if let Some(cause) = unwritable(disk, enrollment::FILE_NEXT)? {
+            return Err(not_replaceable(
+                enrollment::FILE_NEXT,
+                &cause,
+                "remove it and resume again",
+            ));
+        }
+    }
+    let marker = disk.open(MARKER, false)?;
+    marker.write_at(0, REMOTE_MAGIC)?;
+    marker.set_len(REMOTE_MAGIC.len() as u64)?;
+    marker.sync_data()?;
+    if !bound {
+        disk.sync_dir("")?;
+    }
+    Enrollment::load_or_create(disk, identity, capacity).map(drop)
 }
 
 /// Say what to do with a root that enrollment recovery cannot open because
 /// its creation stopped before the marker was published, while the approved
 /// authority is still one a creation accepts (released, never activated).
 /// Recovery continues a published root with the administrator's approval;
-/// this one needs none. Under a claimed authority a root without a marker
-/// is not an interrupted creation, and keeps its own refusal.
-fn unpublished(root: &Path, expected: &Record, error: io::Error) -> io::Error {
-    let nothing_published = expected.phase == Phase::Released
-        && FileBacking::read_only(root).is_ok_and(|disk| require_empty_remote_root(&disk).is_ok());
-    if !nothing_published {
+/// this one needs none. A root creation refuses for what it holds under the
+/// binding's names gets a message that says what continues it. Under a
+/// claimed authority a root without a marker is not an interrupted creation,
+/// and keeps its own refusal.
+fn unpublished(root: &Path, expected: &Record, capacity: u64, error: io::Error) -> io::Error {
+    if expected.phase != Phase::Released {
         return error;
     }
-    io::Error::new(
-        error.kind(),
-        "this backing root's creation stopped before it published the format marker: create \
-         the volume again instead of resuming",
-    )
+    let creation = Enrollment {
+        identity: expected.identity,
+        capacity,
+    };
+    let examined =
+        FileBacking::read_only(root).and_then(|disk| examine_remote_root(&disk, Some(&creation)));
+    let message = match examined {
+        Ok(Ok(())) => {
+            "this backing root's creation stopped before it published the format marker: create \
+             the volume again instead of resuming"
+                .to_string()
+        }
+        Ok(Err(Occupied::UnreadableBinding)) => {
+            "this backing root has no format marker and holds a remote.enrollment that cannot be \
+             read: move that file out of the backing root, keep it, and create the volume again"
+                .to_string()
+        }
+        Ok(Err(Occupied::NotEmpty)) | Err(_) => return error,
+        Ok(Err(Occupied::NotReplaceable(name, cause))) => {
+            not_replaceable(name, &cause, "remove it and create the volume again").to_string()
+        }
+        Ok(Err(occupied)) => occupied.refusal().to_string(),
+    };
+    io::Error::new(error.kind(), message)
 }
 
 fn collect_after_activation(
@@ -578,7 +776,8 @@ impl RollbackBacking {
                 "cannot recover enrollment after its first activation",
             ));
         }
-        let disk = remote_root(root, false).map_err(|error| unpublished(root, expected, error))?;
+        let disk = remote_root(root, false)
+            .map_err(|error| unpublished(root, expected, capacity, error))?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
         if inspect(rpc.as_ref())? != *expected {
@@ -589,13 +788,7 @@ impl RollbackBacking {
         // authority changes.
         Enrollment::verify_if_present(disk.as_ref(), expected.identity, capacity)?;
         let candidates = unactivated_candidates(&disk, expected, capacity)?;
-        // Re-publish the validated marker before the independent authority
-        // can accept enrollment. A readable legacy marker may be cache-only.
-        let marker = disk.open(MARKER, false)?;
-        marker.write_at(0, REMOTE_MAGIC)?;
-        marker.set_len(REMOTE_MAGIC.len() as u64)?;
-        marker.sync_data()?;
-        Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
+        republish_root(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(
             rpc.as_ref(),
@@ -623,7 +816,11 @@ impl RollbackBacking {
         let disk = remote_root(root, true)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
-        initialize_remote_root(disk.as_ref())?;
+        let creation = Enrollment {
+            identity: expected.identity,
+            capacity,
+        };
+        initialize_remote_root(disk.as_ref(), Some(&creation))?;
         Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
@@ -836,7 +1033,7 @@ impl RollbackBacking {
     /// under the destination locks even if this preflight succeeded.
     pub fn check_snapshot_destination(target: &Path) -> io::Result<()> {
         match FileBacking::read_only(target) {
-            Ok(disk) => require_empty_remote_root(&disk),
+            Ok(disk) => require_empty_remote_root(&disk, None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -855,7 +1052,7 @@ impl RollbackBacking {
         let disk = remote_root(target, true)?;
         let _target_guard = OperationGuard::acquire(disk.as_ref())?;
         let _enrollment = disk.try_lock(super::ENROLL_LOCK)?;
-        initialize_remote_root(disk.as_ref())?;
+        initialize_remote_root(disk.as_ref(), None)?;
         disk.create_dir_all(&descriptor.namespace)?;
         disk.sync_dir("")?;
         let scope = scope(disk.clone(), &descriptor.namespace)?;
