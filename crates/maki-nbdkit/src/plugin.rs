@@ -5,9 +5,9 @@
 //! - Field order follows nbdkit-plugin.h API version 2 for the fields we
 //!   populate; `_struct_size` includes the block_size callback so clients
 //!   can negotiate the configured limits. Other optional callbacks stay
-//!   NULL (multi-conn OFF). Zero is native and chunked (R5-036), fast zero
-//!   is not offered. TRIM is advertised per connection only for opt-in v3
-//!   volumes.
+//!   NULL (multi-conn OFF). Zero is native and chunked (R5-036); fast zero
+//!   is advertised and always refused (see `can_fast_zero`). TRIM is
+//!   advertised per connection only for opt-in v3 volumes.
 //! - `after_fork` initializes recovery, provider verification and the control
 //!   listener before announcing readiness. `open` only uses this adapter;
 //!   it never starts a runtime or retries a failed startup.
@@ -277,9 +277,13 @@ unsafe extern "C" fn can_zero(_h: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn can_fast_zero(_h: *mut c_void) -> c_int {
-    // Partial units are written, so a zero is never guaranteed faster
-    // than writing zeros.
-    0
+    // Advertised although `zero_v2` refuses every fast zero request. nbdkit
+    // does not check that a request's FAST_ZERO flag was advertised: it
+    // asserts it (`backend_zero`: `c->can_fast_zero == 1`), so with 0 here
+    // one such request from any client aborts the whole server. The NBD
+    // protocol lets a server advertise the flag and always fail with
+    // ENOTSUP, and nbdkit sends that failure on without emulating a zero.
+    1
 }
 
 unsafe extern "C" fn can_fua(_h: *mut c_void) -> c_int {
@@ -364,8 +368,9 @@ unsafe extern "C" fn trim_v2(handle: *mut c_void, count: u32, offset: u64, flags
 
 unsafe extern "C" fn zero_v2(handle: *mut c_void, count: u32, offset: u64, flags: u32) -> c_int {
     if flags & NBDKIT_FLAG_FAST_ZERO != 0 {
-        // Not advertised; a client that sends it anyway asked to fail
-        // rather than wait for a write.
+        // The client asked to fail rather than wait for a write. Partial
+        // units are written, so a zero is never known to be faster than
+        // writing zeros: refuse at once, before anything is changed.
         set_errno(libc::ENOTSUP);
         return -1;
     }

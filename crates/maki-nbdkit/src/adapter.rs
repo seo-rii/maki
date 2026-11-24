@@ -4,8 +4,8 @@
 //!   plugin's callbacks add one around everything else, so nothing ever
 //!   unwinds across the FFI boundary.
 //! - Capability surface per SPEC §48: FLUSH + FUA supported; TRIM enabled
-//!   only for opt-in v3 volumes; native, chunked write-zeroes (R5-036) without
-//!   fast zero; multi-connection disabled.
+//!   only for opt-in v3 volumes; native, chunked write-zeroes (R5-036), a
+//!   fast zero refused by the plugin; multi-connection disabled.
 //! - The NBD I/O limits are advertised through the plugin's `block_size`
 //!   callback. Zero-length, misaligned, and out-of-range requests are
 //!   refused with EINVAL before plaintext is copied or the engine entered

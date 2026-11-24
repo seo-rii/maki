@@ -2662,9 +2662,20 @@ The adapter MUST verify device geometry, read and write callbacks, native FUA,
 FLUSH, parallel callbacks, panic containment, opt-in v3 TRIM (complete crypto
 units only), native WRITE_ZEROES of any length (chunked to the maximum I/O
 size; complete units discarded only when the client permits trimming on a v3
-volume; no fast zero), disabled multi-connection, disconnect, and clean
-detach. Default v2 volumes continue to advertise no TRIM; see
+volume), the refusal of fast zero, disabled multi-connection, disconnect, and
+clean detach. Default v2 volumes continue to advertise no TRIM; see
 `docs/space-reclamation.md` for the v3 persistence contract.
+
+The plugin MUST refuse every WRITE_ZEROES request that carries
+`NBD_CMD_FLAG_FAST_ZERO` with `ENOTSUP`, at once and without changing the
+export: partial units are written, so zeroing is never known to be faster
+than a write. It MUST nevertheless advertise fast zero
+(`NBD_FLAG_SEND_FAST_ZERO`), which the NBD protocol permits a server that
+always fails such requests. nbdkit does not check that the flag of a request
+was advertised; it asserts it, so an export that does not advertise fast zero
+lets one request from any client of the NBD socket abort a server built with
+assertions. The Linux NBD driver does not read that transmission flag and
+never sets the request flag.
 
 Linux qualification additionally covers the exported API-v2 prefix, libnbd
 round trips, fio verification, and the kernel NBD path. See
