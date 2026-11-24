@@ -197,14 +197,14 @@ fn attempt_binding(machine: &CrashableBacking) -> io::Result<()> {
 /// One enrollment recovery in its own process, as far as the binding: what
 /// `recover_enrollment_remote` does in the root it has opened. It checks the
 /// binding, and refuses one that is there and is not this identity's, then
-/// publishes the marker again and writes the binding.
+/// calls the function that publishes the marker again and writes the
+/// binding, which this model calls too.
 fn resume_binding(machine: &CrashableBacking) -> io::Result<()> {
     let process = machine.process();
     let _operation = process.try_lock(OPERATION_LOCK)?;
     let _enrollment = process.try_lock(super::super::ENROLL_LOCK)?;
     Enrollment::verify_if_present(process.as_ref(), IDENTITY, CAPACITY)?;
-    republish_marker(process.as_ref())?;
-    Enrollment::load_or_create(process.as_ref(), IDENTITY, CAPACITY).map(drop)
+    republish_root(process.as_ref(), IDENTITY, CAPACITY)
 }
 
 /// Continue the root to a durable binding with the documented command:

@@ -150,20 +150,29 @@ is synced: a creation that stopped while it wrote the binding leaves at most
 the staged file, which nothing reads, and `resume-enrollment` continues it
 and writes the binding for the approved identity and capacity.
 `resume-enrollment` makes the marker's name durable before it stages the
-binding. An older binary did not: after a creation whose directory sync had
-failed, a power loss during `resume-enrollment` could leave the binding,
-staged or published, in a root without `rollback.format`. `volume create`
-continues that root as well when it is run with the same authority and
-capacity: it never reads the staged file, and it accepts a published
-`remote.enrollment` only if it is the binding it would write itself. A
-`remote.enrollment` for another authority or capacity is refused by both
-commands and left as it is, with a message that says to create the volume
-with that creation's authority and capacity or to use an empty backing
-root. An older
-binary wrote the binding in place; a `remote.enrollment` it left empty or
-incomplete is refused as invalid enrollment metadata, because it cannot be
-told apart from a damaged binding: move that file out of the backing root,
-keep it, and resume. An interrupted
+binding. An older binary did not: after a creation that failed in the
+directory sync that publishes the marker, or was killed between the marker's
+rename and that sync, a power loss during `resume-enrollment` could leave the
+binding, staged or published, in a root without `rollback.format`.
+`volume create` continues that root as well when it is run with the same
+authority and capacity: it never reads the staged file, and it accepts a
+published `remote.enrollment` only if it is the binding it would write
+itself. A `remote.enrollment` for another authority or capacity is refused by
+both commands and left as it is, with a message that says to create the
+volume with that creation's authority and capacity or to use an empty backing
+root. A staged file that the command cannot write again from the start (a
+link, a directory, a FIFO or a file with a second name under
+`rollback.format.next` or `remote.enrollment.next`) is refused by both
+commands before they change anything, with a message that names it: remove
+it and run the command again. An older
+binary wrote the binding in place, and a `remote.enrollment` it left empty or
+incomplete cannot be told apart from a damaged binding. In a root whose
+`rollback.format` holds the marker, `resume-enrollment` refuses it as invalid
+enrollment metadata: move that file out of the backing root, keep it, and
+resume. In a root without `rollback.format`, `volume create` answers
+`remote enrollment requires an empty backing` and `resume-enrollment` says to
+move the file out and create the volume again: move it out, keep it, and run
+`volume create`. An interrupted
 `maki-witness init` is a separate case, described with
 [the authority's initialization](remote-witness-service.md#initialize-a-local-authority).
 

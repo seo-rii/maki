@@ -274,29 +274,30 @@ fn open_root(root: &Path, create: bool, read_only: bool) -> io::Result<Arc<FileB
 /// and one that cannot be read cannot be told from a damaged one: both are
 /// refused and left as they are.
 fn require_empty_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> io::Result<()> {
-    let mut binding = false;
-    for name in disk.list("")? {
-        let unpublished = match name.as_str() {
-            super::ENROLL_LOCK | OPERATION_LOCK | super::MARKER_NEXT => true,
-            MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
-            enrollment::FILE_NEXT => creation.is_some(),
-            enrollment::FILE => {
-                binding = true;
-                creation.is_some()
-            }
-            _ => false,
-        };
-        if !unpublished {
-            return Err(input(NOT_EMPTY));
+    examine_remote_root(disk, creation)?.map_err(|occupied| occupied.refusal())
+}
+
+/// What keeps a creation from continuing a root.
+enum Occupied {
+    /// An entry no creation leaves before its marker is published, or a
+    /// marker that is complete or foreign.
+    NotEmpty,
+    /// A staged name that holds something a creation cannot write again
+    /// from the start.
+    NotReplaceable(&'static str),
+    /// A published binding for another authority or capacity.
+    AnotherCreation,
+    /// A published binding that cannot be read.
+    UnreadableBinding,
+}
+
+impl Occupied {
+    fn refusal(&self) -> io::Error {
+        match self {
+            Self::NotEmpty | Self::UnreadableBinding => input(NOT_EMPTY),
+            Self::NotReplaceable(name) => not_replaceable(name),
+            Self::AnotherCreation => input(ANOTHER_CREATION),
         }
-    }
-    match (binding, creation) {
-        (true, Some(creation)) => match Enrollment::load(disk) {
-            Ok(found) if found == *creation => Ok(()),
-            Ok(_) => Err(input(ANOTHER_CREATION)),
-            Err(_) => Err(input(NOT_EMPTY)),
-        },
-        _ => Ok(()),
     }
 }
 
@@ -304,6 +305,65 @@ const NOT_EMPTY: &str = "remote enrollment requires an empty backing";
 const ANOTHER_CREATION: &str = "this backing root holds the binding of an interrupted creation \
     for another authority or capacity: create the volume with that creation's authority and \
     capacity, or use an empty backing root";
+
+fn not_replaceable(name: &str) -> io::Error {
+    input(format!(
+        "this backing root holds {name}, which is not a regular file that can be written again: \
+         remove it, or use an empty backing root"
+    ))
+}
+
+/// A staged name is accepted because the file under it is never read: the
+/// next attempt writes it again from the start. That holds only for what
+/// this process can open as a file to write, a regular file with one name.
+/// A link, a directory, a FIFO or a file with a second name would fail the
+/// attempt when it opens the entry, after it has published what comes
+/// before, and then fail every later one the same way.
+fn replaceable(disk: &dyn Backing, name: &str) -> bool {
+    disk.open(name, false).is_ok()
+}
+
+fn examine_remote_root(
+    disk: &dyn Backing,
+    creation: Option<&Enrollment>,
+) -> io::Result<Result<(), Occupied>> {
+    let mut binding = false;
+    let mut staged = Vec::new();
+    for name in disk.list("")? {
+        let unpublished = match name.as_str() {
+            super::ENROLL_LOCK | OPERATION_LOCK => true,
+            super::MARKER_NEXT => {
+                staged.push(super::MARKER_NEXT);
+                true
+            }
+            MARKER => super::unwritten_marker(disk, REMOTE_MAGIC)?,
+            enrollment::FILE_NEXT => {
+                staged.push(enrollment::FILE_NEXT);
+                creation.is_some()
+            }
+            enrollment::FILE => {
+                binding = true;
+                creation.is_some()
+            }
+            _ => false,
+        };
+        if !unpublished {
+            return Ok(Err(Occupied::NotEmpty));
+        }
+    }
+    staged.sort_unstable();
+    if let Some(name) = staged.into_iter().find(|name| !replaceable(disk, name)) {
+        return Ok(Err(Occupied::NotReplaceable(name)));
+    }
+    Ok(match (binding, creation) {
+        (true, Some(creation)) => match Enrollment::load(disk) {
+            Ok(found) if found == *creation => Ok(()),
+            Ok(_) => Err(Occupied::AnotherCreation),
+            Err(_) => Err(Occupied::UnreadableBinding),
+        },
+        _ => Ok(()),
+    })
+}
 
 /// Publish the format marker. Called with both root operation and
 /// enrollment locks held. Until it is published the creation can simply be
@@ -324,35 +384,51 @@ fn initialize_remote_root(disk: &dyn Backing, creation: Option<&Enrollment>) -> 
     super::publish_marker(disk, REMOTE_MAGIC)
 }
 
-/// Re-publish the marker enrollment recovery has validated, before the
-/// independent authority can accept enrollment. A readable legacy marker may
-/// be cache-only, and so may its name: the directory sync of the creation
-/// that published it may have failed. The caller writes the binding next.
-/// Where it will stage a new one, the marker's name is made durable first,
-/// so that no power loss leaves a binding without its marker. Where a
-/// binding is already there, the directory is not synced here: that would
-/// make the name of a binding durable whose bytes may not be, and the
-/// caller's rewrite of the binding syncs its bytes and then the directory.
-/// Called with both root operation and enrollment locks held.
-fn republish_marker(disk: &dyn Backing) -> io::Result<()> {
+/// What enrollment recovery writes in the root it has validated, before the
+/// independent authority can accept enrollment: the marker again, then the
+/// binding. The crash model runs this function, so the order here is the
+/// order that is tested.
+///
+/// A readable legacy marker may be cache-only, and so may its name: the
+/// directory sync of the creation that published it may have failed, or the
+/// creation may have been killed before it. Where the binding is staged
+/// next, as a new file or over one an earlier attempt left, the marker's
+/// name is made durable first, so that no power loss leaves a binding
+/// without its marker. Where a binding is already published, the directory
+/// is not synced here: that would make the name of a binding durable whose
+/// bytes may not be, and the rewrite of the binding syncs its bytes and then
+/// the directory. A staged binding that cannot be written again is refused
+/// before anything is written. Called with both root operation and
+/// enrollment locks held.
+fn republish_root(disk: &dyn Backing, identity: [u8; 16], capacity: u64) -> io::Result<()> {
+    let bound = disk.exists(enrollment::FILE)?;
+    if !bound
+        && disk
+            .list("")?
+            .iter()
+            .any(|name| name == enrollment::FILE_NEXT)
+        && !replaceable(disk, enrollment::FILE_NEXT)
+    {
+        return Err(not_replaceable(enrollment::FILE_NEXT));
+    }
     let marker = disk.open(MARKER, false)?;
     marker.write_at(0, REMOTE_MAGIC)?;
     marker.set_len(REMOTE_MAGIC.len() as u64)?;
     marker.sync_data()?;
-    if disk.exists(enrollment::FILE)? {
-        return Ok(());
+    if !bound {
+        disk.sync_dir("")?;
     }
-    disk.sync_dir("")
+    Enrollment::load_or_create(disk, identity, capacity).map(drop)
 }
 
 /// Say what to do with a root that enrollment recovery cannot open because
 /// its creation stopped before the marker was published, while the approved
 /// authority is still one a creation accepts (released, never activated).
 /// Recovery continues a published root with the administrator's approval;
-/// this one needs none. A root creation refuses because it holds another
-/// creation's binding gets that refusal, which says what continues it.
-/// Under a claimed authority a root without a marker is not an interrupted
-/// creation, and keeps its own refusal.
+/// this one needs none. A root creation refuses for what it holds under the
+/// binding's names gets a message that says what continues it. Under a
+/// claimed authority a root without a marker is not an interrupted creation,
+/// and keeps its own refusal.
 fn unpublished(root: &Path, expected: &Record, capacity: u64, error: io::Error) -> io::Error {
     if expected.phase != Phase::Released {
         return error;
@@ -361,15 +437,21 @@ fn unpublished(root: &Path, expected: &Record, capacity: u64, error: io::Error) 
         identity: expected.identity,
         capacity,
     };
-    let message = match FileBacking::read_only(root)
-        .and_then(|disk| require_empty_remote_root(&disk, Some(&creation)))
-    {
-        Ok(()) => {
+    let examined =
+        FileBacking::read_only(root).and_then(|disk| examine_remote_root(&disk, Some(&creation)));
+    let message = match examined {
+        Ok(Ok(())) => {
             "this backing root's creation stopped before it published the format marker: create \
              the volume again instead of resuming"
+                .to_string()
         }
-        Err(refusal) if refusal.to_string() == ANOTHER_CREATION => ANOTHER_CREATION,
-        Err(_) => return error,
+        Ok(Err(Occupied::UnreadableBinding)) => {
+            "this backing root has no format marker and holds a remote.enrollment that cannot be \
+             read: move that file out of the backing root, keep it, and create the volume again"
+                .to_string()
+        }
+        Ok(Err(Occupied::NotEmpty)) | Err(_) => return error,
+        Ok(Err(occupied)) => occupied.refusal().to_string(),
     };
     io::Error::new(error.kind(), message)
 }
@@ -664,8 +746,7 @@ impl RollbackBacking {
         // authority changes.
         Enrollment::verify_if_present(disk.as_ref(), expected.identity, capacity)?;
         let candidates = unactivated_candidates(&disk, expected, capacity)?;
-        republish_marker(disk.as_ref())?;
-        Enrollment::load_or_create(disk.as_ref(), expected.identity, capacity)?;
+        republish_root(disk.as_ref(), expected.identity, capacity)?;
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(
             rpc.as_ref(),
