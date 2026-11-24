@@ -49,6 +49,9 @@ DEBIAN_NBDKIT = "ExecStart=/usr/bin/nbdkit \\"
 RPM_NBDKIT = "ExecStart=/usr/sbin/nbdkit \\"
 # The license text the Debian notice points to under /usr/share/common-licenses.
 LICENSE = "usr/share/licenses/maki/LICENSE"
+# rpm refuses a changelog year before 1990 ("bad date in %changelog") and still
+# writes the package, without the entry.
+OLDEST_CHANGELOG = 631152000  # 1990-01-01T00:00:00Z
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -165,12 +168,16 @@ def validate(args):
             "library dependencies",
             file=sys.stderr,
         )
+    if "SOURCE_DATE_EPOCH" not in os.environ:
+        fail("set SOURCE_DATE_EPOCH to the source's timestamp (for example the commit time): "
+             "the build time, the file times and the changelog entry come from it")
     try:
-        epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
+        epoch = int(os.environ["SOURCE_DATE_EPOCH"])
     except ValueError:
         fail("SOURCE_DATE_EPOCH must be an integer")
-    if epoch < 0:
-        fail("SOURCE_DATE_EPOCH must not be negative")
+    if epoch < OLDEST_CHANGELOG:
+        fail(f"SOURCE_DATE_EPOCH must not be before 1990-01-01 ({OLDEST_CHANGELOG}): rpm "
+             "cannot date a changelog entry earlier")
     owners = loader_dependencies(interpreters) if args.autoreq else set()
     return epoch, owners
 

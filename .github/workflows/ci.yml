@@ -274,7 +274,8 @@ jobs:
         run: |
           set -euo pipefail
           package="$RUNNER_TEMP/maki.rpm"
-          python3 -B packaging/rpm/build-rpm.py --release-dir target/release \
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 -B packaging/rpm/build-rpm.py --release-dir target/release \
             --version 0.0.0~ci --architecture "$(rpm --eval '%{_arch}')" --output "$package"
           rpm -qp --requires "$package" | tee "$RUNNER_TEMP/requires"
           # The owner of the binaries' loader, and libraries of EL9's glibc.

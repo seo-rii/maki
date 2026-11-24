@@ -103,9 +103,11 @@ describes.
 
 ## Builds and tests
 
-The build is reproducible for a given `SOURCE_DATE_EPOCH` and rpm version:
-the build time and every file time come from it and the build host name is
-fixed. Run the contract tests with:
+`SOURCE_DATE_EPOCH` is required, 1990-01-01 or later: the build time, every
+file time and the changelog entry come from it, and rpm cannot date a
+changelog entry before 1990 (it reports "bad date in %changelog" and still
+writes a package without the entry). The build is reproducible for a given
+`SOURCE_DATE_EPOCH` and rpm version; the build host name is fixed. Run the contract tests with:
 
 ```bash
 python3 -B -m unittest scripts.test_rpm_package -v
