@@ -316,15 +316,20 @@ under its own identifier.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal
-ends them; the kernel runs the `nbd` family's requests one at a time.
+ends them. The `nbd` family does not set `parallel_ops`, so the kernel runs
+each of its requests under the global generic-netlink mutex: while one is
+stuck, no other `nbd` request runs, and neither does a request to any other
+generic-netlink family without `parallel_ops`, on the whole host. The control
+family is one of those, so every family lookup (`CTRL_CMD_GETFAMILY`) waits
+too, whichever family a client wants to resolve.
 `NBD_CMD_DISCONNECT` takes each connection's transmit lock and writes
 `NBD_CMD_DISC` to the daemon's socket, which has no send timeout, so a daemon
 that stopped reading with a full send buffer holds the helper, with the attach
-lock, until it reads again or its socket closes. In the helper's flows the
-unmount and the VG deactivation, bounded commands that need the daemon to serve
-I/O, run first when they are needed and fail first in that case; the outer
-bound is the unit's start or stop timeout, and a helper in an uninterruptible
-wait ends only when that wait does.
+lock and that mutex, until it reads again or its socket closes. In the helper's
+flows the unmount and the VG deactivation, bounded commands that need the
+daemon to serve I/O, run first when they are needed and fail first in that
+case; the outer bound is the unit's start or stop timeout, and a helper in an
+uninterruptible wait ends only when that wait does.
 
 The helper logs the process and user IDs of its socket peer when it connects,
 for diagnostics only: the documented flows may run nbdkit outside the
