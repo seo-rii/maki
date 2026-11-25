@@ -458,35 +458,37 @@ impl RollbackBacking {
     /// hosts (see [`Self::create_on`]).
     #[doc(hidden)]
     pub fn open_on(disk: Arc<dyn Backing>, witness: Arc<dyn Backing>) -> io::Result<Self> {
-        Self::open_witnessed(disk, || FileWitness::open_backing(witness))
+        let listed = witness.clone();
+        Self::open_witnessed(
+            disk,
+            move || listed.list(""),
+            || FileWitness::open_backing(witness),
+        )
     }
 
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
-        Self::open_witnessed(disk, || FileWitness::open(witness))
+        Self::open_witnessed(
+            disk,
+            || FileBacking::read_only(witness)?.list(""),
+            || FileWitness::open(witness),
+        )
     }
 
+    /// `listing` lists the witness directory, only to word the refusal of
+    /// a backing without its marker; `witness` opens the witness.
     fn open_witnessed(
         disk: Arc<dyn Backing>,
+        listing: impl FnOnce() -> io::Result<Vec<String>>,
         witness: impl FnOnce() -> io::Result<FileWitness>,
     ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        // A backing without its marker is what a creation leaves that
-        // stopped before it published one (or a wrong `backing.root`).
-        // Say so and name the way out, with the same error kind.
         let marker = disk.open(MARKER, false).map_err(|error| {
             if error.kind() != io::ErrorKind::NotFound {
                 return error;
             }
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "this rollback backing holds no format marker ({MARKER}): either a volume \
-                     create did not complete here, which running volume create again continues, \
-                     or this is not the volume's backing root"
-                ),
-            )
+            no_marker(disk.as_ref(), listing())
         })?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {
@@ -765,22 +767,7 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
         )
     };
     for name in disk.list("")? {
-        let unpublished = match name.as_str() {
-            LOCK | MARKER_NEXT | ARENA => true,
-            MARKER => {
-                let marker = disk.open(MARKER, false)?;
-                let mut bytes = vec![0; MAGIC.len()];
-                let complete = marker.len()? == MAGIC.len() as u64 && {
-                    marker.read_at(0, &mut bytes)?;
-                    bytes == MAGIC
-                };
-                complete || unwritten_marker(disk, MAGIC)?
-            }
-            slot if slot == MANIFESTS[0] => unpublished_slot(disk, 0)?,
-            slot if slot == MANIFESTS[1] => unpublished_slot(disk, 1)?,
-            _ => false,
-        };
-        if !unpublished {
+        if !unpublished_entry(disk, &name)? {
             return Err(refused());
         }
     }
@@ -792,6 +779,96 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
         return Err(refused());
     }
     Ok(())
+}
+
+/// Whether the backing entry `name` is one that a creation which published
+/// nothing may have left, holding only what it writes there (see
+/// `require_unpublished_local`).
+fn unpublished_entry(disk: &dyn Backing, name: &str) -> io::Result<bool> {
+    Ok(match name {
+        LOCK | MARKER_NEXT | ARENA => true,
+        MARKER => {
+            let marker = disk.open(MARKER, false)?;
+            let mut bytes = vec![0; MAGIC.len()];
+            let complete = marker.len()? == MAGIC.len() as u64 && {
+                marker.read_at(0, &mut bytes)?;
+                bytes == MAGIC
+            };
+            complete || unwritten_marker(disk, MAGIC)?
+        }
+        slot if slot == MANIFESTS[0] => unpublished_slot(disk, 0)?,
+        slot if slot == MANIFESTS[1] => unpublished_slot(disk, 1)?,
+        _ => false,
+    })
+}
+
+/// The refusal of a backing without its format marker. That is what a
+/// creation leaves that stopped before it published the marker, and what
+/// a wrong `backing.root` looks like. Running `volume create` again
+/// continues only the first, and only when nothing in either directory
+/// stops it (`require_unpublished_local`): then the refusal says so.
+/// Otherwise it names the entries that stop a creation, which `volume
+/// create` refuses every time it runs, and offers nothing. `witness` is
+/// the listing of the witness directory; when either listing cannot be
+/// made, what a creation would do cannot be told and nothing is offered.
+fn no_marker(disk: &dyn Backing, witness: io::Result<Vec<String>>) -> io::Error {
+    let stopping = (|| -> io::Result<(Vec<String>, Vec<String>)> {
+        let mut backing = Vec::new();
+        for name in disk.list("")? {
+            if !unpublished_entry(disk, &name)? {
+                backing.push(name);
+            }
+        }
+        let witness = witness?
+            .into_iter()
+            .filter(|name| !FileWitness::left_by_an_unpublished_creation(name))
+            .collect();
+        Ok((backing, witness))
+    })();
+    let message = match stopping {
+        Ok((backing, witness)) if backing.is_empty() && witness.is_empty() => format!(
+            "this rollback backing holds no format marker ({MARKER}): either a volume create \
+             did not complete here, which running volume create again continues, or this is \
+             not the volume's backing root"
+        ),
+        Ok((backing, witness)) => {
+            let holds: Vec<String> = [("backing", backing), ("witness", witness)]
+                .into_iter()
+                .filter(|(_, names)| !names.is_empty())
+                .map(|(directory, names)| {
+                    format!("the {directory} directory holds {}", entry_names(names))
+                })
+                .collect();
+            format!(
+                "this rollback backing holds no format marker ({MARKER}), and volume create \
+                 does not continue a creation here: {}, which an interrupted creation does not \
+                 leave. Either this is not the volume's backing root, or volume create needs \
+                 directories that hold nothing else",
+                holds.join(" and ")
+            )
+        }
+        Err(_) => format!(
+            "this rollback backing holds no format marker ({MARKER}): either a volume create \
+             did not complete here, or this is not the volume's backing root"
+        ),
+    };
+    io::Error::new(io::ErrorKind::NotFound, message)
+}
+
+/// A bounded, quoted list of directory entries for a message.
+fn entry_names(mut names: Vec<String>) -> String {
+    const SHOWN: usize = 4;
+    names.sort();
+    let mut text = names
+        .iter()
+        .take(SHOWN)
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        text.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    text
 }
 
 /// Whether manifest slot `index` holds only what a creation writes there.

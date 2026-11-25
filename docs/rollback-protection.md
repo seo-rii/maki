@@ -311,8 +311,16 @@ again, the daemon, `maki check` and `maki volume inspect` refuse the pair
 and say why: before the anchor that the backing holds no format marker or
 the witness no anchor, after it `no valid superblock: this volume's
 creation did not complete`, each naming `maki volume create` as what
-continues it. Once a superblock copy is committed the volume exists and
-`create` refuses it. The format marker and the anchor are each written under
+continues it. A backing without its format marker that holds anything an
+interrupted creation does not leave (the `lost+found` of a filesystem
+mounted at the backing root, for example, or a manifest slot that holds
+data), or whose witness directory does, is no such creation: `create`
+refuses it every time
+(`rollback enrollment requires empty backing and witness directories`),
+and the refusal and the commands that open the pair name those entries
+instead of offering `create`. It is not the volume's backing root, or
+`create` needs directories that hold nothing else. Once a superblock copy
+is committed the volume exists and `create` refuses it. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
