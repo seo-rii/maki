@@ -65,7 +65,7 @@ parameters=(volume dev expected_bytes block_size vg lv mountpoint attach_config)
 identities=(volume_uuid connection_id boot_id pv_uuid vg_uuid lv_uuid fs_uuid)
 uuid='[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}'
 lvm_uuid='[[:alnum:]]{6}(-[[:alnum:]]{4}){5}-[[:alnum:]]{6}'
-continuing=
+continuing= published=
 
 die() { echo "$*" >&2; exit 1; }
 trap 'echo "Bootstrap stopped at line $LINENO." >&2' ERR
@@ -79,21 +79,23 @@ trap 'if (( $? )) && [[ -n $continuing && -f $record ]]; then
 fi' EXIT
 # Publish a copy of the record with the named values added: written and
 # synced under a staged name, then given the record's name, which is synced.
+# The first copy is linked, which refuses a record that appeared meanwhile.
 note() {
     local name
     rm -f "$record.next"
     (
         set -C
         {
-            if [[ -e $record ]]; then cat "$record"; fi
+            if [[ -n $published ]]; then cat "$record"; fi
             for name; do printf '%s=%s\n' "$name" "${!name}"; done
         } > "$record.next"
     )
     sync "$record.next"
-    if [[ -e $record ]]; then
+    if [[ -n $published ]]; then
         mv -T "$record.next" "$record"
     else
         ln -T "$record.next" "$record"
+        published=1 continuing=1
         rm "$record.next"
     fi
     sync "${record%/*}"
@@ -192,7 +194,6 @@ else
     connection_id="maki-bootstrap-$(cat /proc/sys/kernel/random/uuid)"
     boot_id=$(cat /proc/sys/kernel/random/boot_id)
     install -d -m 0700 -o root -g root /etc/maki/attach
-    continuing=1
     note "${parameters[@]}" volume_uuid connection_id boot_id
     systemctl start "maki@$volume.service"
     systemctl is-active "maki@$volume.service"
