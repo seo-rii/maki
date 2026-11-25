@@ -239,3 +239,79 @@ async fn a_remote_provider_is_not_contacted_for_a_configuration_the_volume_refus
     assert_eq!(engine.read(0, 512).await.unwrap(), [0x2d; 512]);
     assert!(requests.load(Ordering::SeqCst) > 0);
 }
+
+/// A remote configuration over a volume another provider created, and over a
+/// remote volume whose superblock records a key identity (which no remote
+/// configuration has, so only a superblock written by hand or by another
+/// tool carries one): attach and `build_provider_with_endpoints` compare the
+/// provider type and the key identity before any endpoint is asked. They
+/// refused a changed provider type as "remote configuration does not match
+/// the locked volume identity/geometry", and did not compare the key
+/// identity before probing the endpoint.
+#[tokio::test]
+async fn a_remote_configuration_is_compared_by_provider_type_and_key_identity() {
+    use maki_backing::FileBacking;
+    use maki_format::superblock::{Superblock, CRYPTO_FORMAT_VERSION};
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = TestServer::start(Arc::new(move |request| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        ResponseSpec::raw(request.body.iter().map(|byte| byte ^ 0x5a).collect())
+    }))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    for (index, (provider_type, key_identity, refusal)) in [
+        (
+            "remote-grpc",
+            "",
+            "volume was created with provider \"remote-grpc\", configuration says \"remote-http\"",
+        ),
+        (
+            "local-aes-gcm-siv",
+            "/etc/maki/vol.key",
+            "volume was created with provider \"local-aes-gcm-siv\", configuration says \
+             \"remote-http\"",
+        ),
+        (
+            "remote-http",
+            "stray-key",
+            "volume was created with key identity \"stray-key\", configuration says \"\"",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = directory
+            .path()
+            .join(index.to_string())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let config =
+            parse_and_validate(&remote_config(&root, &server.url(), "remote-v1", 0)).unwrap();
+        let stored = Superblock {
+            generation: 0,
+            volume_uuid: uuid::Uuid::new_v4(),
+            provider_type: provider_type.into(),
+            crypto_compatibility_id: config.crypto.effective_compatibility_id(),
+            key_identity: key_identity.into(),
+            geometry: config.geometry().unwrap(),
+            format_version: CRYPTO_FORMAT_VERSION,
+            created_unix: 0,
+        };
+        maki_format::init::create_volume(&FileBacking::new(&root).unwrap(), stored).unwrap();
+        let attached = attach_from_config(&config).await.err();
+        let built = build_provider_with_endpoints(&config).await.err();
+        for error in [attached, built] {
+            let error =
+                error.unwrap_or_else(|| panic!("{provider_type} {key_identity:?} accepted"));
+            let message = error.to_string();
+            assert!(
+                matches!(error, DaemonError::Attach(AttachError::IdentityMismatch(_))),
+                "{message}"
+            );
+            assert!(message.contains(refusal), "{message}");
+        }
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}

@@ -34,6 +34,26 @@ const SETTINGS: &[(&str, &str)] = &[
     ("slot_alignment", "512"),
     ("journal_segment_size", "\"64KiB\""),
     ("minimum_io", "4096"),
+    // The transport tables of a remote provider, as raw TOML.
+    ("http", ""),
+];
+
+/// The changes that make the fixture a remote configuration, which has no
+/// `[crypto].key`.
+const REMOTE: &[(&str, &str)] = &[
+    ("provider", "\"remote-http\""),
+    ("key", ""),
+    (
+        "http",
+        "[crypto.http]\n\
+         [[crypto.http.endpoint]]\n\
+         name = \"only\"\n\
+         url = \"http://127.0.0.1:9\"\n\
+         [crypto.http.encrypt]\n\
+         path = \"/encrypt\"\n\
+         [crypto.http.decrypt]\n\
+         path = \"/decrypt\"\n",
+    ),
 ];
 
 /// The fixture with `changes` applied, each a `(setting, value)` pair.
@@ -46,7 +66,11 @@ fn config(root: &Path, changes: &[(&str, &str)]) -> String {
             .map(|(_, value)| *value)
             .unwrap()
     };
-    let line = |name: &str| format!("{name} = {}\n", value(name));
+    // An empty value leaves the setting out.
+    let line = |name: &str| match value(name) {
+        "" => String::new(),
+        value => format!("{name} = {value}\n"),
+    };
     let mut text = String::from("config_schema_version = 1\n[volume]\n");
     for name in [
         "name",
@@ -69,6 +93,7 @@ fn config(root: &Path, changes: &[(&str, &str)]) -> String {
     text += "[crypto.capabilities]\n";
     text += &line("supported_plaintext_sizes");
     text += &line("max_ciphertext_size");
+    text += value("http");
     text += "[backing]\n";
     text += &format!(
         "root = {}\n",
@@ -376,4 +401,42 @@ fn a_legacy_key_path_suffix_matches_the_corrected_path() {
             text(&output)
         );
     }
+}
+
+/// A remote configuration has no `[crypto].key`, and a volume a remote
+/// configuration created stores no key identity: the side without one says
+/// so instead of showing an empty name.
+#[test]
+fn a_key_identity_one_side_does_not_have_is_named_as_missing() {
+    let local = Volume::create(&[]);
+    refused(
+        &local,
+        REMOTE,
+        &[
+            (
+                "crypto.provider",
+                "\"remote-http\"",
+                "\"local-aes-gcm-siv\"",
+            ),
+            ("crypto.key.name", "unset", "\"identity-key\""),
+        ],
+    );
+    let remote = Volume::create(REMOTE);
+    accepted(&remote, &[]);
+    refused(
+        &remote,
+        &[
+            ("provider", "\"local-aes-gcm-siv\""),
+            ("key", "{ source = \"env\", name = \"identity-key\" }"),
+            ("http", ""),
+        ],
+        &[
+            (
+                "crypto.provider",
+                "\"local-aes-gcm-siv\"",
+                "\"remote-http\"",
+            ),
+            ("crypto.key.name", "\"identity-key\"", "none"),
+        ],
+    );
 }
