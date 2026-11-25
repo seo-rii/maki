@@ -571,17 +571,22 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 `timeout`, so a slow handshake still serves the next request; a peer that never
 completes the handshake is abandoned then and the next request reconnects.
 
-A WebSocket request's `timeout` covers the connection it opens. The endpoint's
-host is resolved and its addresses are dialed as the gRPC transport's
-connector dials them: the family of the first address goes first, and the
-other family starts 300 ms later, or at once when the first family has failed.
-Within a family the addresses are tried one at a time, in the resolver's order,
-each but the last for at most an equal share of what is left of `timeout`, so
-an address that does not answer leaves the next one time. The first connection
-made wins and the other attempt is dropped. The TLS handshake and the upgrade
-then run on that connection, with the certificate verified for the URL's host,
-never for the address it resolved to; their failure is not retried at another
-address. No proxy is used.
+A WebSocket request's `timeout` covers the connection it opens, including the
+time the request waited for the connection. The endpoint's host is resolved;
+the family of the first address goes first, and the other family starts 300 ms
+later, or at once when the first family has failed, as in the gRPC transport's
+connector. Within a family the addresses are tried one at a time, in the
+resolver's order: each but the last may take an equal share of what is left of
+the request's `timeout`, and the last has the rest, so an address that does not
+answer leaves the next one time and one refused at once leaves its share to
+those after it. (The gRPC connector gives every address of a family, the last
+one too, a fixed share of its timeout, and keeps a family's first failure.)
+With a `timeout` of 300 ms or less, the other family is never tried when the
+first one does not answer. The first connection made wins and the other attempt
+is dropped; when none connects, the last failure is reported. The TLS handshake
+and the upgrade then run on that connection, with the certificate verified for
+the URL's host, never for the address it resolved to; their failure is not
+retried at another address. No proxy is used.
 
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request may have

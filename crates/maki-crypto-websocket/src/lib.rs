@@ -27,11 +27,12 @@
 //! upgrade) is marked as not sent, so the dispatcher may fail it over.
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
-//! A connect resolves the URL's host and dials its addresses as the gRPC
-//! transport's connector does: the other address family starts 300 ms after
-//! the first, and each family's addresses but the last have an equal share
-//! of what is left of the timeout, so one that never answers does not use
-//! it up. TLS verifies the URL's host.
+//! A connect resolves the URL's host and dials its addresses. The other
+//! address family starts 300 ms after the first, as in the gRPC transport's
+//! connector; each family's addresses but the last have an equal share of
+//! what is left of the request's timeout and the last has the rest (gRPC
+//! gives each a fixed share), so one that never answers does not use it up.
+//! TLS verifies the URL's host.
 
 // Diagnostics go through `tracing`: the `print!` family panics when the
 // write fails (a closed pipe, a full disk). Tests may print.
@@ -323,14 +324,19 @@ impl Dialer for SystemDialer {
 /// in the gRPC transport's connector (hyper-util's default).
 const OTHER_FAMILY_DELAY: Duration = Duration::from_millis(300);
 
-/// Dial the resolved `addresses` as hyper-util's connector does for the gRPC
-/// transport. The family of the first address goes first, the other family
-/// starts `OTHER_FAMILY_DELAY` later, or at once when the first family has
-/// failed outright, and each family's addresses are dialed in turn
-/// (`dial_in_turn`). The first stream that connects wins; the other
-/// family's attempt is dropped, which closes its socket. Only the TCP
-/// connect is raced: TLS and the upgrade run on the stream that won, and
-/// their failure is never retried at another address.
+/// Dial the resolved `addresses`, racing the two families as hyper-util's
+/// connector does for the gRPC transport. The family of the first address
+/// goes first, the other family starts `OTHER_FAMILY_DELAY` later, or at
+/// once when the first family has failed outright, and each family's
+/// addresses are dialed in turn (`dial_in_turn`). Unlike that connector,
+/// which gives every address a fixed `timeout / n` and keeps a family's
+/// first error, a family shares out what is left of `deadline`, its last
+/// address has the rest, and the last error is returned; so with
+/// `deadline` 300 ms away or less, a first family that never answers is
+/// never left. The first stream that connects wins; the other family's
+/// attempt is dropped, which closes its socket. Only the TCP connect is
+/// raced: TLS and the upgrade run on the stream that won, and their failure
+/// is never retried at another address.
 async fn dial_addresses(
     dialer: &dyn Dialer,
     addresses: Vec<SocketAddr>,
