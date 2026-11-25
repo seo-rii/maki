@@ -943,9 +943,12 @@ fn disconnect_raw_with(
 /// and is never taken for "gone".
 ///
 /// The kernel acknowledges a disconnect before the connection is gone from
-/// the device: it keeps the `pid` and `backend` attributes, and refuses a
-/// new connect, until the last opener of the device has closed it (udev
-/// probes a device on the change event of every disconnect).
+/// the device when anything holds the device open at the disconnect (a
+/// probe of an earlier event, a monitoring tool, multipathd, an operator's
+/// `blkid`): it keeps the `pid` and `backend` attributes, and refuses a new
+/// connect, until the last opener has closed it. The disconnect's own change
+/// event comes only when they go; the probe it starts opens the device
+/// afterwards, and is what makes the next connect busy, not what keeps them.
 fn await_release<C: Clock>(
     clock: &mut C,
     identifier: &str,
@@ -2150,10 +2153,11 @@ fn execute_with_options(
     // teardown; otherwise a retry must still know which device it owns.
     if disconnects && !connects {
         let current = record.as_ref().unwrap();
-        // The last opener is often udev's probe after the disconnect's change
-        // event: wait for it as `nbd-disconnect` does. Any connection the
-        // device shows then, this one or another made since, keeps the
-        // record, and one that cannot be read fails.
+        // Whatever held the device open at the disconnect keeps the
+        // connection's attributes until it closes: wait for that as
+        // `nbd-disconnect` does. Any connection the device shows then, this
+        // one or another made since, keeps the record, and one that cannot be
+        // read fails.
         let shown = await_release(
             system,
             &current.connection_id,

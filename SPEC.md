@@ -342,20 +342,25 @@ use (`maki-` and a UUID), MUST NOT take a device that shows a connection or that
 a trusted record names, and its disconnect MUST touch only a device connected
 under its own identifier.
 
-The kernel acknowledges a disconnect before the connection is gone from the
-device: it keeps the `pid` and `backend` attributes, and refuses a new connect,
-until the last opener of the device has closed it, and udev probes a device on
-the change event of every disconnect. `nbd-disconnect`, detach and cleanup (and
-the failed-start hook's rollback, which runs detach's steps) MUST NOT take a
-disconnect for complete in that state: each waits for the device to stop
-showing the connection it disconnected, looking every 100 ms for up to 15 s
-within the time bound above. A connection that the device shows meanwhile
-under another backend identifier means that the disconnected one is gone; one
-whose identifier cannot be read is not, and fails the command. `nbd-disconnect`
-fails, saying that something still has the device open, when the device still
-shows its connection at the end. Detach and cleanup retire the trusted record
-only when the device shows no connection after the wait (§8); otherwise they
-keep it and fail, and a later run continues from what the device shows then.
+When anything holds `/dev/nbdN` open at the disconnect (a probe of an earlier
+event, a monitoring tool, multipathd, an operator's `blkid`), the kernel
+acknowledges the disconnect before the connection is gone from the device: it
+keeps the `pid` and `backend` attributes, and refuses a new connect, until the
+last opener has closed it. The disconnect's own change event comes only when
+the attributes go; the probe it starts opens the device afterwards, and is what
+makes a connect right after the disconnect busy (above), not what keeps the
+attributes. `nbd-disconnect`, detach and cleanup (and the failed-start hook's
+rollback, which runs detach's steps) MUST NOT take a disconnect for complete in
+that state: each waits for the device to stop showing the connection it
+disconnected, looking every 100 ms for up to 15 s within the time bound above.
+A connection that the device shows meanwhile under another backend identifier
+means that the disconnected one is gone; one whose identifier cannot be read is
+not, and fails the command. `nbd-disconnect` fails, saying that something still
+has the device open, when the device still shows its connection at the end.
+Detach and cleanup retire the trusted record only when the device shows no
+connection after the wait (§8); otherwise they keep it and fail, and a later
+run continues from what the device shows then. They wait under the attach lock,
+so every other helper's attach, detach, cleanup, recover and grow waits too.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal

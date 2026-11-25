@@ -64,10 +64,13 @@ allocated it (no pinned `nbd_device`), the helper gives it up, logs a warning
 and tries the next free device within the same step's time; a pinned device
 fails the attach. After a disconnect, `maki-attach nbd-disconnect`, detach and
 cleanup wait up to 15 s, looking every 100 ms, until the device no longer shows
-the connection: the kernel keeps showing it while anything has the device open,
-and udev probes a device right after every disconnect. If it still does,
-`nbd-disconnect` fails, and detach and cleanup keep the attachment record and
-fail; a later run finishes. The
+the connection: the kernel keeps showing it until whatever held the device open
+at the disconnect (a probe of an earlier event, a monitoring tool, multipathd,
+an operator's `blkid`) has closed it. The disconnect's own change event comes
+only when the connection goes; the udev probe it starts is what can make a
+connect right after it busy. If the device still shows the connection at the
+end, `nbd-disconnect` fails, and detach and cleanup keep the attachment record
+and fail; run them again once nothing holds the device open. The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -736,7 +739,9 @@ detach and cleanup wait, still under the lock, until the device shows no
 connection (up to 15 s, as described under [prerequisites](#prerequisites)),
 and retire the record only then. A device that still shows the connection, or
 shows one under another identity, keeps the record and fails the command; one
-whose backend cannot be read fails it too.
+whose backend cannot be read fails it too. Once nothing holds the device open,
+a later run finishes the first case; in the second a later cleanup retires the
+record only by the rules above for a device connected under another identity.
 
 Detach, cleanup, recover and grow address the VG only where attach found it.
 Their `vgchange --activate n` and `lvextend` run with the record's candidate
@@ -1065,6 +1070,23 @@ volume can hold the attach lock for up to its 180-second start timeout, longer
 than any lock wait these timeouts leave room for: contention of that length is
 one way into
 [the state below](#interrupted-activation-after-the-daemon-stopped).
+
+The planned stop's `cleanup` (`ExecStop`) runs under the same
+`TimeoutStopSec=120`, and its wait for the device after the disconnect holds
+the attach lock for up to 15 seconds. When the devices of many volumes are all
+held open at their disconnects (a monitoring tool that keeps every
+`/dev/nbdN` open) and the volumes stop together, as at a host shutdown, their
+cleanups queue on the lock and each keeps it for the whole 15 seconds. From
+about the eighth in the queue on, cleanups reach their stop timeout, the later
+ones while they still wait for the lock. systemd ends such a cleanup before it
+has changed anything: the attachment and its record stay as they were, the
+daemon keeps serving, and the stop is retried as for any
+[failed planned stop](#retry-a-failed-planned-stop). Either way the record is
+kept and the planned stop fails, as it does for a cleanup whose own wait ran
+out; the failure only comes by timeout, and a cleanup ended during its own
+steps is resumed by the next one, which observes again before each step.
+Behind three such cleanups the failed-start hook's 40-second lock wait expires
+as well, and the coordinator proceeds without it, as above.
 
 Attach starts are limited to three in 300 seconds; inspect the failure before
 resetting a start-limit failure.

@@ -82,11 +82,14 @@ After its NBD disconnect, a
 waits, as
 .B nbd-disconnect
 does, up to 15 seconds until the device no longer shows the connection, and
-only then removes the attachment record. The kernel keeps showing a
-connection while anything has the device open, and udev probes the device
-right after every disconnect. If the device still shows a connection when
-the wait is over, the record is kept and the command fails; run it again
-once nothing holds the device open.
+only then removes the attachment record. The kernel keeps showing the
+connection until whatever held the device open at the disconnect has closed
+it. If the device still shows that connection when the wait is over, the
+record is kept and the command fails; run it again once nothing holds the
+device open. If the device shows another connection by then, the record is
+kept as well, and a later
+.B cleanup
+removes it only when nothing of the attachment remains on the host.
 .B recover-failed-start
 is the systemd failed-start cleanup hook. It asks systemd to queue the
 recovery coordinator and, when the start died between LVM activation and the
