@@ -139,9 +139,11 @@ NBD and device-mapper identities immediately before creating XFS. It writes
 `/etc/maki/attach/demo.toml` with the observed UUIDs and releases the bootstrap
 layout.
 
-If it fails, preserve and inspect the partial layout using that guide's
-[recovery notes](first-volume.md#recovering-from-a-failed-bootstrap). Do not
-continue at the formatting command or overwrite an existing filesystem.
+If it stops after printing its record (`/etc/maki/attach/demo.bootstrap`), it
+has changed the host: follow that guide's
+[recovery notes](first-volume.md#recovering-from-a-failed-bootstrap), which run
+the same block again to continue from the record. Do not continue at the
+formatting command or overwrite an existing filesystem.
 
 ## 5. Review the attach configuration
 
