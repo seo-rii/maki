@@ -24,12 +24,21 @@ maki \- administer Maki encrypted block volumes
 .B volume create
 initializes the backing described by the configuration.
 .B volume inspect
-reports the stored volume metadata.
+reports the stored volume metadata and does not compare the configuration's
+geometry or crypto identity with it.
 Pass
 .B \-\-discard
 at creation to select the discard-capable format.
 .B check
 performs an offline check. Detach the volume before a deep check.
+Both checks also compare the configuration with the volume, as attach does:
+a geometry, provider, key name, compatibility id or random prefix length that
+differs from what the volume stores fails the check with an
+.B "ERROR: configuration mismatch:"
+line that names the setting, the configured value and the volume's. The check
+loads no credential and contacts no provider, so a different key under the
+same name, an unavailable credential and a provider that fails its self-test
+are found only at attach.
 .PP
 An attached daemon exposes the
 .BR status ", " metrics ", " checkpoint ", " drain " and " reload

@@ -1351,6 +1351,12 @@ slot geometry
 volume maximum size
 ```
 
+Attaching an existing volume compares the configuration's value of each with
+the superblock before any credential is loaded or provider built, and refuses
+a configuration that differs; the key identity is the key's name, and the key
+canary (§27) proves the key material itself. `maki check` makes the same
+comparison and fails on a difference, naming the setting and both values.
+
 Requires daemon restart and self-test:
 
 ```text
@@ -1953,6 +1959,9 @@ whose dirty bits were cleared by failed writeback)
 scan the validated journal again and replay accepted records through a
 bounded ciphertext batch into checkpoint slots; sync shard data and
 allocation metadata, advance checkpoint state, then prune covered segments
+ ↓
+compare the configuration's immutable settings (§20) with the superblock,
+before any credential is loaded
  ↓
 run provider self-test
  ↓

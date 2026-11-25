@@ -83,7 +83,8 @@ Do not put this derived value in the configuration. The
 derived value must fit the superblock's compatibility field.
 
 Changing the prefix length or enabling/disabling the option on an existing
-volume is refused, even if slot sizes happen to remain the same. To change the
+volume is refused, even if slot sizes happen to remain the same (`maki check`
+reports it as a `crypto.random_prefix_bytes` mismatch). To change the
 setting, create a new volume with the desired configuration and copy data
 through the normal plaintext interface or restore a logical backup. There is
 no automatic in-place conversion. With the option omitted or zero, the original

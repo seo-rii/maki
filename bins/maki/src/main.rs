@@ -24,7 +24,7 @@ const USAGE: &str = "usage:
   maki volume snapshot <config.toml> <backup-dir>  capture an offline remote backing
   maki volume takeover <admin-config> <fence> <current-root-hex>
   maki volume restore <admin-config> <backup-dir> <fence> <current-root-hex> <snapshot-root-hex>
-  maki check <config.toml> [--deep]    offline format check (--deep: journal, checkpoint, slots)
+  maki check <config.toml> [--deep]    offline format and configuration check (--deep: journal, checkpoint, slots)
   maki status <config.toml>            daemon status (control socket)
   maki metrics <config.toml>           metrics snapshot (control socket)
   maki checkpoint <config.toml>        graceful checkpoint (control socket)
