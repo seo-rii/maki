@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -204,6 +204,10 @@ fn validate_name(name: &str, empty: bool) -> io::Result<()> {
 /// filesystem is enforced, but does not prove administrative independence.
 pub struct RollbackBacking {
     state: Arc<Mutex<State>>,
+    /// Why the session stopped, recorded once when [`State::stop`] runs.
+    /// Read without the state lock, which commits hold across storage and
+    /// witness I/O, so a status query never waits for them.
+    stopped: Arc<OnceLock<String>>,
 }
 
 struct State {
@@ -227,6 +231,8 @@ struct State {
     next_id: u64,
     locks: BTreeSet<u64>,
     poisoned: bool,
+    /// Shared with [`RollbackBacking::stopped`].
+    stopped: Arc<OnceLock<String>>,
     /// Arena slots the committed manifest references; recomputed only when
     /// a commit succeeds.
     committed_slots: BTreeSet<u64>,
@@ -566,7 +572,9 @@ impl RollbackBacking {
         manifest: Manifest,
         slot: usize,
     ) -> Self {
+        let stopped = Arc::new(OnceLock::new());
         Self {
+            stopped: stopped.clone(),
             state: Arc::new(Mutex::new(State {
                 committed_slots: slots_of(manifest.files.values()),
                 reserved_pages: manifest.reserved_pages(),
@@ -586,6 +594,7 @@ impl RollbackBacking {
                 unlinked_files: None,
                 locks: BTreeSet::new(),
                 poisoned: false,
+                stopped,
             })),
         }
     }
@@ -967,11 +976,28 @@ impl State {
         }
         if let Err(error) = self.witness.verify_current() {
             if self.witness.stops_session(&error) {
-                self.poisoned = true;
+                self.stop(&error);
             }
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Stop the session for good: every later operation of every handle
+    /// fails. The first cause is recorded for [`Backing::session_stopped`]
+    /// and logged once; the engine reports the volume degraded with it.
+    fn stop(&mut self, cause: &dyn std::fmt::Display) {
+        self.poisoned = true;
+        if self
+            .stopped
+            .set(format!("rollback session stopped: {cause}"))
+            .is_ok()
+        {
+            tracing::warn!(
+                "rollback session stopped: {cause}; every operation fails until the volume \
+                 is opened again against the witness"
+            );
+        }
     }
 
     fn directory(&self, name: &str) -> io::Result<()> {
@@ -1094,7 +1120,7 @@ impl State {
                 .advance(digest(b"maki.rollback.manifest.v1\0", &bytes))
         })();
         if let Err(error) = result {
-            self.poisoned = true;
+            self.stop(&format_args!("manifest commit failed: {error}"));
             return Err(error);
         }
         self.unlinked_files = Some(unlinked);
@@ -1189,13 +1215,14 @@ impl State {
                 error.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
             ) {
-                self.poisoned = true;
+                self.stop(&format_args!("arena page read failed: {error}"));
             }
             return Err(error);
         }
         if page_digest(&self.committed.identity, bytes) != page.hash {
-            self.poisoned = true;
-            return Err(invalid("rollback arena page authentication failed"));
+            let error = invalid("rollback arena page authentication failed");
+            self.stop(&error);
+            return Err(error);
         }
         Ok(())
     }
@@ -1228,7 +1255,7 @@ impl State {
             None => self.allocate_slot()?,
         };
         if let Err(error) = self.arena.write_at(slot * PAGE, bytes) {
-            self.poisoned = true;
+            self.stop(&format_args!("arena page write failed: {error}"));
             return Err(error);
         }
         self.possibly_dirty.insert(id);
@@ -1457,6 +1484,9 @@ impl Drop for CowLock {
 impl Backing for RollbackBacking {
     fn check_freshness(&self) -> io::Result<()> {
         self.state.lock().check()
+    }
+    fn session_stopped(&self) -> Option<String> {
+        self.stopped.get().cloned()
     }
     fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         validate_name(name, false)?;
@@ -2268,6 +2298,11 @@ mod tests {
             assert!(file.read_at(0, &mut [0; 3]).is_err(), "{boundary}");
             assert!(backing.check_freshness().is_err(), "{boundary}");
             assert!(file.write_at(0, b"bad").is_err(), "{boundary}");
+            let stopped = backing.session_stopped().expect(boundary);
+            assert!(
+                stopped.starts_with("rollback session stopped: manifest commit failed: "),
+                "{boundary}: {stopped}"
+            );
             drop((file, backing));
             if let Some(path) = blocker {
                 std::fs::remove_dir(path).unwrap();
@@ -2360,6 +2395,12 @@ mod tests {
                     backing.check_freshness().is_err(),
                     "{trigger} did not poison the session at {boundary}"
                 );
+                let stopped = backing.session_stopped();
+                assert!(
+                    stopped.as_deref().is_some_and(|reason| reason
+                        .starts_with("rollback session stopped: manifest commit failed: ")),
+                    "{trigger} {boundary}: {stopped:?}"
+                );
                 {
                     let state = backing.state.lock();
                     assert!(state.poisoned, "{trigger} {boundary}");
@@ -2389,6 +2430,7 @@ mod tests {
                     committed,
                     "{trigger} {boundary} reopened a different root"
                 );
+                assert_eq!(reopened.session_stopped(), None, "{trigger} {boundary}");
                 assert_eq!(reopened.free_bytes().unwrap(), Some(PAGE));
                 let replacement = reopened.open("replacement", true).unwrap();
                 replacement.write_at(0, &[0x55; PAGE as usize]).unwrap();

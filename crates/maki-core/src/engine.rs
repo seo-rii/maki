@@ -901,7 +901,7 @@ impl Engine {
     /// Current operational state. A journal whose last sync failed and has
     /// not been rewritten and synced since counts as degraded (SPEC §26:
     /// a persistence failure must be visible), whatever the checkpoint
-    /// state says.
+    /// state says, and so does a backing whose session stopped.
     pub fn state(&self) -> EngineState {
         let state = self.inner.state.lock().clone();
         self.inner.effective_state(state)
@@ -1939,13 +1939,24 @@ impl EngineInner {
         Ok(volume)
     }
 
-    /// The reported state: a stopped engine reports why; a checkpoint-degraded
-    /// volume stays degraded; a ready one is degraded while its journal cannot
-    /// be synced.
+    /// The reported state: a stopped engine reports why, and so does a
+    /// backing whose session stopped (a rollback-protected one after a
+    /// takeover, a witness change or an uncertain commit), since every
+    /// later request fails until the volume is attached again; a
+    /// checkpoint-degraded volume stays degraded; a ready one is degraded
+    /// while its journal cannot be synced.
     fn effective_state(&self, state: EngineState) -> EngineState {
         if let Some(reason) = self.failure.get() {
             return EngineState::Degraded {
                 reason: format!("engine stopped: {reason}; attach the volume again"),
+            };
+        }
+        if let Some(stopped) = self.backing.session_stopped() {
+            return EngineState::Degraded {
+                reason: format!(
+                    "{stopped}; every request fails until the volume is attached again; if \
+                     another writer took it over, leave this daemon stopped"
+                ),
             };
         }
         match state {

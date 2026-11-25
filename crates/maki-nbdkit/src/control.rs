@@ -301,7 +301,15 @@ impl ControlBackend for EngineControlBackend {
 
     async fn checkpoint(&self) -> Result<u64, String> {
         let _callback = self.admission.enter().map_err(str::to_owned)?;
-        self.engine.checkpoint().await.map_err(|e| e.to_string())
+        // The error goes to the client, and a failed checkpoint leaves the
+        // volume degraded: the daemon's log says so too, as the worker's
+        // does for its own passes. One line per failed request, without a
+        // rate limit: only those who may connect to the control socket can
+        // send requests, though back to back in one session.
+        self.engine.checkpoint().await.map_err(|error| {
+            tracing::warn!("requested checkpoint failed: {error}");
+            error.to_string()
+        })
     }
 
     async fn drain(&self) -> Result<u64, String> {

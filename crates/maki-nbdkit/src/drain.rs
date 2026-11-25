@@ -74,6 +74,11 @@ impl DrainGate {
         }
         .await
         .map_err(|e: maki_core::CoreError| e.to_string());
+        if let Err(error) = &result {
+            tracing::warn!(
+                "drain failed: {error}; I/O admission stays closed until a drain succeeds"
+            );
+        }
         self.state.lock().phase = match &result {
             Ok(sequence) => Phase::Drained(*sequence),
             Err(error) => Phase::Failed(error.clone()),
