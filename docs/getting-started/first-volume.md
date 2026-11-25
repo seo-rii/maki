@@ -65,7 +65,7 @@ parameters=(volume dev expected_bytes block_size vg lv mountpoint attach_config)
 identities=(volume_uuid connection_id boot_id pv_uuid vg_uuid lv_uuid fs_uuid)
 uuid='[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}'
 lvm_uuid='[[:alnum:]]{6}(-[[:alnum:]]{4}){5}-[[:alnum:]]{6}'
-continuing= published=
+continuing='' published=''
 
 die() { echo "$*" >&2; exit 1; }
 trap 'echo "Bootstrap stopped at line $LINENO." >&2' ERR
