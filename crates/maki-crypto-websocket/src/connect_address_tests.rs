@@ -578,6 +578,61 @@ async fn both_families_dead_fail_at_the_deadline_with_each_family_dialed_on_its_
     );
 }
 
+/// The endpoint failure, without its not-sent mark, of a request whose
+/// connection never got a stream through.
+async fn endpoint_failure(provider: &WsCryptoProvider) -> String {
+    let error = provider
+        .encrypt_batch(&context(), &[unit()])
+        .await
+        .expect_err("the endpoint refuses the connection");
+    assert_eq!(
+        error.class(),
+        maki_crypto::ErrorClass::EndpointFatal,
+        "{error:?}"
+    );
+    assert!(error.is_not_sent(), "{error:?}");
+    match error {
+        CryptoError::NotSent(inner) => inner.error().to_string(),
+        other => unreachable!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_refused_at_the_first_address_is_not_retried_at_the_other_family() {
+    // The first address completes TCP and answers the upgrade with 403.
+    let refusing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refusing_address = refusing.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut socket, _) = refusing.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") && socket.read(&mut byte).await.unwrap() == 1 {
+            head.push(byte[0]);
+        }
+        let _ = socket
+            .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+            .await;
+        let _ = socket.shutdown().await;
+    });
+    let (serving, _server) = websocket_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (doc_net(1), Answer::Serve(refusing_address)),
+        (test_net(2), Answer::Serve(serving)),
+    ]));
+    // Retry-safe, so only the class can stop a second attempt.
+    let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    assert_eq!(
+        endpoint_failure(&provider).await,
+        "endpoint fatal: websocket upgrade HTTP 403"
+    );
+    assert_eq!(
+        dialer.dialed(),
+        [doc_net(1)],
+        "an upgrade refusal must not be retried at another address"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_resolution_that_never_returns_ends_at_the_connect_deadline() {
     let dialer = TestDialer::new(Resolution::Never);
@@ -727,6 +782,34 @@ mod tls {
             .expect("a certificate for the URL's host is accepted at any address");
         assert_eq!(sni.await.unwrap().as_deref(), Some(HOST));
         drop(connection);
+    }
+
+    #[tokio::test]
+    async fn a_tls_failure_at_the_first_address_is_not_retried_at_the_next() {
+        // The first address completes TCP and presents a trusted certificate
+        // for another host; the second would serve the URL's host.
+        let other = identity("other.test");
+        let (refusing, _) = wss_server(&other).await;
+        let serving = identity(HOST);
+        let (serving_address, _) = wss_server(&serving).await;
+        let dialer = TestDialer::new(Resolution::Addresses(vec![
+            (test_net(1), Answer::Serve(refusing)),
+            (test_net(2), Answer::Serve(serving_address)),
+        ]));
+        let mut tls = trusting(&other).unwrap();
+        let mut both = other.cert_pem.clone();
+        both.extend_from_slice(&serving.cert_pem);
+        tls.ca_pem = Some(both);
+        let provider = provider(&format!("wss://{HOST}:{PORT}/"), Some(tls), &dialer);
+        assert_eq!(
+            endpoint_failure(&provider).await,
+            "endpoint fatal: websocket TLS authentication or protocol failure"
+        );
+        assert_eq!(
+            dialer.dialed(),
+            [test_net(1)],
+            "a TLS failure must not be retried at another address"
+        );
     }
 
     #[tokio::test]
