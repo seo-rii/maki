@@ -50,18 +50,24 @@ fn binaries() -> Vec<(String, String)> {
     binaries_in(&std::fs::read_to_string(fuzz_dir().join("Cargo.toml")).unwrap())
 }
 
-/// `(name, path)` of every `[[bin]]` in the manifest `manifest`.
+/// `(name, path)` of every `[[bin]]` in the manifest `manifest`, read line
+/// by line: a Windows checkout may end its lines with CRLF.
 fn binaries_in(manifest: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    for section in manifest.split("\n[").skip(1) {
-        let Some(body) = section.strip_prefix("[bin]]\n") else {
+    let mut lines = manifest.lines().map(str::trim).peekable();
+    while let Some(line) = lines.next() {
+        if line != "[[bin]]" {
             continue;
-        };
+        }
+        let mut body = Vec::new();
+        while let Some(line) = lines.next_if(|line| !line.starts_with('[')) {
+            body.push(line);
+        }
         let value = |key: &str| {
-            body.lines()
+            body.iter()
                 .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
                 .and_then(|rest| rest.strip_suffix('"'))
-                .unwrap_or_else(|| panic!("a [[bin]] without {key}: {body}"))
+                .unwrap_or_else(|| panic!("a [[bin]] without {key}: {body:?}"))
                 .to_string()
         };
         found.push((value("name"), value("path")));
@@ -169,6 +175,12 @@ fn every_committed_seed_replays_through_its_target() {
             skipped.push(target.name);
             continue;
         };
+        // The generator writes these only where they are in the host's byte
+        // order; a big-endian host reads the committed ones differently.
+        if cfg!(target_endian = "big") && seeds::LITTLE_ENDIAN.contains(&target.name) {
+            skipped.push(target.name);
+            continue;
+        }
         for (name, bytes) in files {
             assert!(
                 bytes.len() <= MAX_SEED_BYTES,
@@ -187,10 +199,12 @@ fn every_committed_seed_replays_through_its_target() {
     }
     assert_eq!(
         skipped,
-        if cfg!(target_os = "linux") {
-            Vec::new()
-        } else {
+        if !cfg!(target_os = "linux") {
             LINUX_ONLY.to_vec()
+        } else if cfg!(target_endian = "big") {
+            seeds::LITTLE_ENDIAN.to_vec()
+        } else {
+            Vec::new()
         }
     );
     assert!(replayed > 0, "no seed was replayed");

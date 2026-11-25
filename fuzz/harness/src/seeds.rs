@@ -56,6 +56,11 @@ impl Expect {
     }
 }
 
+/// Targets whose committed seeds are in a little-endian host's byte order:
+/// the kernel's netlink answers are in the host's. On a big-endian host the
+/// generator writes none of them and the replay skips them.
+pub const LITTLE_ENDIAN: [&str; 1] = ["nbd_netlink"];
+
 /// Every seed, in a fixed order.
 pub fn all() -> Vec<Seed> {
     let mut seeds = Vec::new();
@@ -72,8 +77,8 @@ pub fn all() -> Vec<Seed> {
     add("config_parse", config_parse());
     add("endpoint_url", endpoint_url());
     add("probe_parsers", probe_parsers());
-    // The helper's code is Linux's. The kernel's netlink answers are in its
-    // byte order; the committed ones are little-endian.
+    // The helper's code is Linux's, and the netlink seeds are
+    // little-endian (`LITTLE_ENDIAN`).
     #[cfg(target_os = "linux")]
     add("nbd_handshake", crate::nbd::handshake_seeds());
     #[cfg(all(target_os = "linux", target_endian = "little"))]
