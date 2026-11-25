@@ -320,8 +320,10 @@ fn not_replaceable(name: &str, cause: &io::Error, way_out: &str) -> io::Error {
 /// next attempt writes it again from the start. That holds only for what
 /// this process can open as a file to write, a regular file with one name.
 /// A link, a directory, a FIFO or a file with a second name would fail the
-/// attempt when it opens the entry, after it has published what comes
-/// before, and then fail every later one the same way.
+/// attempt when it opens the entry: under the binding's staged name after
+/// the marker was published, and every later attempt the same way; a link
+/// or a directory under the marker's staged name before anything is
+/// published, and every attempt, since `publish_marker` can remove neither.
 ///
 /// Returns what opening the entry answered when the answer is about the
 /// entry: its kind, its links, or the right to open it. Any other failure
