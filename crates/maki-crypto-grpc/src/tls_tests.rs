@@ -212,10 +212,23 @@ async fn mtls_rejects_missing_client_identity_and_accepts_configured_identity() 
         },
     )
     .unwrap();
-    assert!(missing
+    // A TLS 1.3 server refuses the missing certificate after the client's
+    // handshake, inside the first call, and the HTTP/2 library does not keep
+    // the TLS error: the documented exception, classified by its status
+    // (tests/review_tls_failure_in_call.rs pins it with TLS 1.2 as control).
+    let refused = missing
         .encrypt_batch(&context(), &[plaintext()])
         .await
-        .is_err());
+        .unwrap_err();
+    assert_eq!(
+        refused.class(),
+        maki_crypto::ErrorClass::Retryable,
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().starts_with("retryable: grpc status "),
+        "{refused}"
+    );
 
     let configured = GrpcCryptoProvider::new_with_tls(
         spec(url),
