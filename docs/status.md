@@ -124,13 +124,18 @@ See [cache reload](operations.md#growth-and-cache-reload).
   `Unavailable`), not as a TLS authentication failure: the refusal arrives
   after the handshake and the HTTP/2 library does not keep the TLS error
   ([provider error signals](configuration.md#provider-error-signals)).
-- The WebSocket transport runs its whole connect under one `timeout` and
-  tries the endpoint host's addresses in turn, so a host whose first address
-  does not answer loses that time on every connect: `localhost` that
-  resolves to `::1` first costs about 2 s on Windows for a listener on IPv4
-  only, and an IPv6 route that drops packets makes every connect time out.
-  The gRPC transport divides its connect timeout across the addresses, and
-  the HTTP transport tries the other address family after 300 ms.
+- An endpoint address that does not answer still costs time on every
+  connect. All three remote transports try the other address family 300 ms
+  after the first, so a dead IPv6 route before a live IPv4 address costs
+  about 300 ms. Within a family the WebSocket and gRPC transports give each
+  address a share of the timeout, so a dead address before a live one of
+  the same family (two IPv4 addresses, say) costs its share: half the
+  timeout for two. The HTTP transport sets no connect timeout (Maki gives
+  reqwest only the request `timeout`, and reqwest 0.12 then leaves
+  hyper-util's per-address connect timeout unset), so there such an address
+  can take the whole request `timeout`; this is read from the code, not
+  tested. With a WebSocket `timeout` of 300 ms or less, the other family is
+  never tried when the first one does not answer.
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs

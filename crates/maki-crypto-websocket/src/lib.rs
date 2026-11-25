@@ -27,28 +27,37 @@
 //! upgrade) is marked as not sent, so the dispatcher may fail it over.
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
+//! A connect resolves the URL's host and dials its addresses. The other
+//! address family starts 300 ms after the first, as in the gRPC transport's
+//! connector; each family's addresses but the last have an equal share of
+//! what is left of the request's timeout and the last has the rest (gRPC
+//! gives each a fixed share), so one that never answers does not use it up.
+//! TLS verifies the URL's host.
 
 // Diagnostics go through `tracing`: the `print!` family panics when the
 // write fails (a closed pipe, a full disk). Tests may print.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use response::Value;
 use rustls::pki_types::pem::PemObject as _;
 #[cfg(test)]
 use serde_json::json;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::Connector;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use maki_crypto::{
     CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider, PlaintextUnit,
@@ -274,8 +283,135 @@ impl Drop for MarkDeadOnDrop {
     }
 }
 
+/// Where a connection's TCP stream comes from: the addresses the endpoint's
+/// host resolves to, and a connection to one of them. The provider resolves
+/// and dials itself, and runs TLS and the upgrade over the stream it gets.
+/// Production uses the system resolver and a direct connection (no proxy is
+/// read); tests substitute both to give a name addresses that never answer.
+trait Dialer: Send + Sync {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>;
+    fn dial(&self, address: SocketAddr) -> BoxFuture<'static, std::io::Result<TcpStream>>;
+}
+
+struct SystemDialer;
+
+impl Dialer for SystemDialer {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+        let host = host.to_owned();
+        // An IP literal is parsed without a lookup; a name goes to the
+        // system resolver on a blocking thread.
+        Box::pin(async move {
+            Ok(tokio::net::lookup_host((host.as_str(), port))
+                .await?
+                .collect())
+        })
+    }
+
+    fn dial(&self, address: SocketAddr) -> BoxFuture<'static, std::io::Result<TcpStream>> {
+        Box::pin(TcpStream::connect(address))
+    }
+}
+
+/// How long the first address family has before the other one starts, as
+/// in the gRPC transport's connector (hyper-util's default).
+const OTHER_FAMILY_DELAY: Duration = Duration::from_millis(300);
+
+/// Dial the resolved `addresses`, racing the two families as hyper-util's
+/// connector does for the gRPC transport. The family of the first address
+/// goes first, the other family starts `OTHER_FAMILY_DELAY` later, or at
+/// once when the first family has failed outright, and each family's
+/// addresses are dialed in turn (`dial_in_turn`). Unlike that connector,
+/// which gives every address a fixed `timeout / n` and keeps a family's
+/// first error, a family shares out what is left of `deadline`, its last
+/// address has the rest, and the last error is returned; so with
+/// `deadline` 300 ms away or less, a first family that never answers is
+/// never left. The first stream that connects wins; the other family's
+/// attempt is dropped, which closes its socket. Only the TCP connect is
+/// raced: TLS and the upgrade run on the stream that won, and their failure
+/// is never retried at another address.
+async fn dial_addresses(
+    dialer: &dyn Dialer,
+    addresses: Vec<SocketAddr>,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<TcpStream> {
+    use futures_util::future::{select, Either};
+
+    let first_is_ipv6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let (first, other): (Vec<_>, Vec<_>) = addresses
+        .into_iter()
+        .partition(|address| address.is_ipv6() == first_is_ipv6);
+    if other.is_empty() {
+        return dial_in_turn(dialer, first, deadline).await;
+    }
+    let first = std::pin::pin!(dial_in_turn(dialer, first, deadline));
+    // Not polled, so not dialed, before the delay or the first family's end.
+    let other = std::pin::pin!(dial_in_turn(dialer, other, deadline));
+    let delay = std::pin::pin!(tokio::time::sleep(OTHER_FAMILY_DELAY));
+    let (result, rest) = match select(first, delay).await {
+        Either::Left((result, _delay)) => (result, Either::Right(other)),
+        Either::Right(((), first)) => match select(first, other).await {
+            Either::Left((result, other)) => (result, Either::Right(other)),
+            Either::Right((result, first)) => (result, Either::Left(first)),
+        },
+    };
+    match result {
+        // Returning drops the attempt still pending.
+        Ok(socket) => Ok(socket),
+        Err(_) => rest.await,
+    }
+}
+
+/// Dial `addresses` in the resolver's order, one at a time, and return the
+/// first stream that connects, or the last failure. Each address but the
+/// last may take an equal share of the time left to `deadline`, so one that
+/// never answers leaves the others their time; the last has what remains,
+/// bounded by the connect deadline itself. An address that fails sooner
+/// leaves its time to those after it, and one whose share runs out is
+/// dropped.
+async fn dial_in_turn(
+    dialer: &dyn Dialer,
+    addresses: Vec<SocketAddr>,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    let mut left = addresses.len();
+    for address in addresses {
+        let attempt = dialer.dial(address);
+        left -= 1;
+        let result = match deadline {
+            Some(deadline) if left > 0 => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let share = remaining / u32::try_from(left + 1).unwrap_or(u32::MAX);
+                tokio::time::timeout(share, attempt)
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+            }
+            _ => attempt.await,
+        };
+        match result {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "could not resolve to any address",
+        )
+    }))
+}
+
 pub struct WsCryptoProvider {
     spec: WsProviderSpec,
+    dialer: Arc<dyn Dialer>,
     tls_connector: Result<Option<Connector>, String>,
     connection: AsyncMutex<Option<Connection>>,
     next_id: AtomicU64,
@@ -364,6 +500,7 @@ impl WsCryptoProvider {
         };
         Self {
             spec,
+            dialer: Arc::new(SystemDialer),
             tls_connector,
             connection: AsyncMutex::new(None),
             next_id: AtomicU64::new(1),
@@ -451,8 +588,14 @@ impl WsCryptoProvider {
         }
     }
 
-    async fn connect(&self) -> Result<Connection, CryptoError> {
-        self.connect_with_tls(|| {
+    /// Connect within `timeout`, and no later than `until`: a request's
+    /// attempt passes its own deadline, which may have run while it waited
+    /// for the connection mutex.
+    async fn connect(
+        &self,
+        until: Option<tokio::time::Instant>,
+    ) -> Result<Connection, CryptoError> {
+        self.connect_with_tls(until, || {
             match self
                 .tls_connector
                 .as_ref()
@@ -467,13 +610,68 @@ impl WsCryptoProvider {
         .await
     }
 
+    /// `connect_async_tls_with_config` with the TCP connection made here: the
+    /// URL's host and port, its addresses from the dialer, dialed within
+    /// `deadline` by `dial_addresses`, then TLS and the upgrade over the
+    /// stream. TLS verifies the certificate against the URL's host, never an
+    /// address it resolved to.
+    async fn open_websocket(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        config: WebSocketConfig,
+        connector: Option<Connector>,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, CryptoError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        use tokio_tungstenite::tungstenite::error::{Error, UrlError};
+
+        let handshake = async {
+            let request = self.spec.url.as_str().into_client_request()?;
+            let uri = request.uri();
+            let host = uri.host().ok_or(Error::Url(UrlError::NoHostName))?;
+            // An IPv6 literal without its brackets, as the resolver takes it.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host)
+                .to_owned();
+            let port = uri
+                .port_u16()
+                .or(match uri.scheme_str() {
+                    Some("wss") => Some(443),
+                    Some("ws") => Some(80),
+                    _ => None,
+                })
+                .ok_or(Error::Url(UrlError::UnsupportedUrlScheme))?;
+            let addresses = self.dialer.resolve(&host, port).await?;
+            let socket = dial_addresses(&*self.dialer, addresses, deadline).await?;
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                socket,
+                Some(config),
+                connector,
+            )
+            .await
+        };
+        let (ws, _response) = handshake.await.map_err(classify_connect)?;
+        Ok(ws)
+    }
+
     // Keep TLS preparation inside the connection budget. The injectable loader
     // also lets the deadline tests model a slow synchronous native-root scan.
     async fn connect_with_tls(
         &self,
+        until: Option<tokio::time::Instant>,
         prepare_tls: impl FnOnce() -> Result<Option<Connector>, CryptoError>,
     ) -> Result<Connection, CryptoError> {
-        let deadline = tokio::time::Instant::now().checked_add(self.spec.timeout);
+        // The addresses share what is left of this deadline, so it must not
+        // reach past the request that asked for the connection.
+        let deadline = [
+            tokio::time::Instant::now().checked_add(self.spec.timeout),
+            until,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let connector = prepare_tls()?;
         // Native-root discovery is synchronous and cannot be preempted here.
         // Once it returns, an exhausted budget must not open a socket, and
@@ -484,24 +682,21 @@ impl WsCryptoProvider {
         let config = WebSocketConfig::default()
             .max_message_size(Some(self.spec.max_frame_bytes))
             .max_frame_size(Some(self.spec.max_frame_bytes));
-        // TCP connect and the HTTP upgrade have no timeout of their own: a
-        // peer that accepts and never answers would hold the connection
-        // mutex forever, and with it every request on this provider (C-05).
-        let connection = tokio_tungstenite::connect_async_tls_with_config(
-            &self.spec.url,
-            Some(config),
-            false,
-            connector,
-        );
-        let (ws, _response) = match deadline {
+        // Resolution, the TCP connect and the HTTP upgrade have no timeout of
+        // their own: a peer that accepts and never answers would hold the
+        // connection mutex forever, and with it every request on this
+        // provider (C-05). The deadline also divides the time among each
+        // family's resolved addresses, so one that never answers cannot
+        // spend it all.
+        let connection = self.open_websocket(deadline, config, connector);
+        let ws = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, connection)
                 .await
                 .map_err(|_| retryable("websocket connect timeout"))?,
             // Match Tokio's relative timeout behavior for durations too large
             // to represent as an Instant: keep polling without a deadline.
             None => connection.await,
-        }
-        .map_err(classify_connect)?;
+        }?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut sink, mut source) = ws.split();
@@ -666,6 +861,7 @@ impl WsCryptoProvider {
         items: usize,
         encoded: SecretBuffer,
         handed_over: &AtomicBool,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Value, CryptoError> {
         let queued = Arc::new(parking_lot::Mutex::new(Some(request::into_message(
             encoded,
@@ -678,7 +874,7 @@ impl WsCryptoProvider {
             loop {
                 let connecting = guard.is_none();
                 if connecting {
-                    *guard = Some(self.connect().await?);
+                    *guard = Some(self.connect(deadline).await?);
                 }
                 let conn = guard.as_ref().unwrap();
                 // Publish the owner and reply under the same lock used to
@@ -779,9 +975,12 @@ impl WsCryptoProvider {
             // attempt keeps PendingRequest's generation-scoped cleanup and
             // live-sibling ownership unchanged.
             let handed_over = AtomicBool::new(false);
+            // A connection this attempt opens ends with the attempt, also
+            // after the attempt waited for the connection mutex.
+            let deadline = tokio::time::Instant::now().checked_add(self.spec.timeout);
             let result = tokio::time::timeout(
                 self.spec.timeout,
-                self.request_once(id, items.len(), encoded, &handed_over),
+                self.request_once(id, items.len(), encoded, &handed_over, deadline),
             )
             .await
             .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
@@ -979,6 +1178,9 @@ mod response_secret_tests;
 #[cfg(test)]
 #[path = "connect_deadline_tests.rs"]
 mod connect_deadline_tests;
+
+#[cfg(test)]
+mod connect_address_tests;
 
 #[cfg(test)]
 mod cancellation_tests;
