@@ -923,6 +923,7 @@ dependencies = [
 name = "maki-check"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "maki-backing",
  "maki-core",
  "maki-format",

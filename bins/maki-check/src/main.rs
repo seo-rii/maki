@@ -3,7 +3,9 @@
 //! `maki-check <root>` runs the fast metadata checks; `--deep` additionally
 //! verifies checkpoint state, the key canary, the durable mark, the whole
 //! journal (with the recovery scanner) and every allocated slot (review
-//! M-018). The deep check takes the volume lock: run it after detach.
+//! M-018). The deep check takes the volume lock: run it after detach. A root
+//! this process may not write is checked read-only: nothing is written, the
+//! deep check takes the lock shared, and its verdict is at best `unproven`.
 
 // Output goes through `diagnostic!` and the stdout helpers below: the
 // `print!` family panics when a write fails (a closed pipe, a full disk),
@@ -121,7 +123,18 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let backing = match maki_backing::FileBacking::new(root) {
+    // A root this process may not write (a read-only mount, a tree it may
+    // not write; Linux only) is read through a view that creates, writes,
+    // syncs and removes nothing; the report says what that cannot prove. The
+    // view asked is the view read. Elsewhere the check opens the root as
+    // before.
+    let backing = match maki_backing::FileBacking::read_only(root).and_then(|view| {
+        if view.may_write()? {
+            maki_backing::FileBacking::new(root)
+        } else {
+            Ok(view)
+        }
+    }) {
         Ok(b) => b,
         Err(e) => {
             diagnostic!("error: {display}: {e}");

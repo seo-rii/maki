@@ -394,7 +394,14 @@ it creates one as `volume create` does, witness directory included.
 
 These acquire the exclusive witness session and reestablish the selected
 witness record's durability without advancing it, by writing the record to a
-new file renamed over the old one. They also recreate a lock file
+new file renamed over the old one, and rewrite and sync the backing's
+authenticated pages, manifest and format marker. So they need write access to
+both directories, which a plain backing does not need
+([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)):
+where the user running them may not write the backing root or the witness
+directory (a read-only mount, for example), `check` and `volume inspect`
+refuse with that directory, its setting and the reason before they open
+anything. They also recreate a lock file
 (`rollback.lock`, `witness.lock`) or inactive manifest slot that is missing
 (after a partial restore, for example). Run as root, they create every such
 file for the owner of its directory, so the daemon can still open both paths

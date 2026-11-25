@@ -11,6 +11,15 @@
 //!
 //! The volume lock is taken for the duration: a check must never race a
 //! live daemon.
+//!
+//! Through a backing that only reads ([`Backing::is_read_only`]: `maki
+//! check` and `maki-check` choose one for a root this process may not
+//! write) the check changes nothing. It takes the volume lock shared, never
+//! creating the lock file, and claims no more than reading proves: what it
+//! reads may exist only in the page cache, and the rewrites, syncs and
+//! repairs recovery makes before a writer resumes cannot be made, so the
+//! verdict is `unproven` rather than `clean` or `recoverable`, and what
+//! recovery would change (records to replay, journal repairs) is a warning.
 
 use std::sync::Arc;
 
@@ -49,13 +58,38 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
         return Ok(report);
     }
 
-    let _lock = match acquire_lock(&backing) {
+    // A writable check takes the lock exclusively, as attach does, and
+    // creates a lock file that is missing. A read-only one takes it shared
+    // through a read-only descriptor, which excludes a writer just as well,
+    // and cannot create the file: without it nothing excludes a writer, so
+    // the check does not run.
+    let read_only = backing.is_read_only();
+    let lock = if read_only {
+        backing
+            .try_lock_shared_existing(layout::VOLUME_LOCK)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::WouldBlock => RecoveryError::AlreadyAttached,
+                _ => RecoveryError::Io(error),
+            })
+    } else {
+        acquire_lock(&backing)
+    };
+    let _lock = match lock {
         Ok(lock) => lock,
         Err(RecoveryError::AlreadyAttached) => {
             report.errors.push(
                 "volume lock is held (daemon attached); detach before running a deep check"
                     .to_string(),
             );
+            return Ok(report);
+        }
+        Err(RecoveryError::Io(e)) if read_only && e.kind() == std::io::ErrorKind::NotFound => {
+            report.errors.push(format!(
+                "volume lock: {} is missing, and a read-only check cannot create it: without the \
+                 lock it cannot exclude a writer, so the deep check did not run (a writable \
+                 check or attach recreates the file)",
+                layout::VOLUME_LOCK
+            ));
             return Ok(report);
         }
         Err(RecoveryError::Io(e)) => return Err(CoreError::Io(e)),
@@ -180,14 +214,29 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                 scan.uncovered_records,
                 scan.durable_sequence
             ));
+            // Ordinary replay for the attach that follows a writable check;
+            // a change nobody can make through a read-only backing.
+            if read_only && scan.uncovered_records > 0 {
+                report.warnings.push(format!(
+                    "journal: {} record(s) newer than the checkpoint: recovery would replay them \
+                     into their slots and advance the checkpoint, which a read-only check cannot \
+                     do",
+                    scan.uncovered_records
+                ));
+            }
             for repair in &scan.repairs {
-                match repair {
-                    JournalRepair::Discard { path } => report.info.push(format!(
+                let repair = match repair {
+                    JournalRepair::Discard { path } => format!(
                         "journal: {path} never completed creation; recovery would discard it"
-                    )),
-                    JournalRepair::Truncate { path, len } => report.info.push(format!(
+                    ),
+                    JournalRepair::Truncate { path, len } => format!(
                         "journal: {path} has a torn tail; recovery would truncate it to {len} bytes"
-                    )),
+                    ),
+                };
+                if read_only {
+                    report.warnings.push(repair);
+                } else {
+                    report.info.push(repair);
                 }
             }
             replay_units = scan.replay_units;
@@ -342,8 +391,13 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // volume. `clean` needs no repair beyond ordinary replay; `recoverable`
     // has damage that a validated journal record repairs; `unrecoverable`
     // has damage (or metadata failure) nothing on this volume can repair.
+    // Through a read-only backing no attach follows and nothing read is
+    // shown to be on disk: `unproven` is all the check can say without an
+    // error, whatever its warnings list.
     let verdict = if !report.errors.is_empty() {
         "unrecoverable"
+    } else if read_only {
+        "unproven"
     } else if recoverable > 0 {
         "recoverable"
     } else {

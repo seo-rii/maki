@@ -250,6 +250,28 @@ pub trait Backing: Send + Sync + 'static {
     /// another process/daemon holds it (`VOLUME_ALREADY_ATTACHED`).
     fn try_lock(&self, path: &str) -> io::Result<Box<dyn VolumeLock>>;
 
+    /// Whether this backing only reads: it creates, writes, syncs and
+    /// removes nothing, and refuses every such change
+    /// ([`FileBacking::read_only`]). A check through it can neither make
+    /// what it reads durable nor repair anything, and says so.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Take the existing lock file `path` shared, through a read-only
+    /// descriptor, and never create it: a missing file fails with
+    /// `NotFound`. Shared holders admit each other; an exclusive
+    /// [`try_lock`](Backing::try_lock) holder excludes it (`WouldBlock`) and
+    /// is excluded while it is held. A backing without shared locks refuses
+    /// with `Unsupported`.
+    fn try_lock_shared_existing(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shared locks are not supported by this backing",
+        ))
+    }
+
     /// Free space available to this namespace, if the backing can tell
     /// (`None` = unknown). Feeds the journal emergency reserve and the
     /// `maki_backing_free_bytes` metric.

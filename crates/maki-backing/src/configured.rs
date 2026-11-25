@@ -45,6 +45,19 @@ impl ConfiguredDirectory {
         }
     }
 
+    /// Whether this process may create entries in the directory at `path`
+    /// ([`FileBacking::may_write_root`]), or the worded refusal of a
+    /// directory it cannot open or look at. It changes nothing.
+    pub fn may_write(&self, path: &Path) -> io::Result<bool> {
+        FileBacking::may_write_root(path).map_err(|error| self.refusal(path, error))
+    }
+
+    /// The directory at `path` as the refusals name it: "the backing root
+    /// <path> (`backing.root`)".
+    pub fn named(&self, path: &Path) -> String {
+        format!("the {} {} (`{}`)", self.what, path.display(), self.key)
+    }
+
     /// `error`, met while reaching or reading the directory at `path`,
     /// with the directory, its path, its setting and what to check. The
     /// kind is the one `error` has, but for what

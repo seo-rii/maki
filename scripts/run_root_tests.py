@@ -79,6 +79,8 @@ ROOT_TARGETS = (
     "crates/maki-backing/tests/review_root_staged_marker.rs",
     # A private mount namespace (and a cgroup for the memory budget), a
     # read-only bind mount, the immutable flag.
+    "bins/maki-check/tests/review_read_only_backing.rs",
+    "bins/maki/tests/review_read_only_backing.rs",
     "crates/maki-backing/tests/review_restore_read_only_source.rs",
     "crates/maki-nbdkit/tests/review_memory_budget_mount_table.rs",
     "crates/maki-nbdkit/tests/review_memory_budget_mountinfo.rs",
