@@ -1075,16 +1075,20 @@ The planned stop's `cleanup` (`ExecStop`) runs under the same
 `TimeoutStopSec=120`, and its wait for the device after the disconnect holds
 the attach lock for up to 15 seconds. When the devices of many volumes are all
 held open at their disconnects (a monitoring tool that keeps every
-`/dev/nbdN` open) and the volumes stop together, as at a host shutdown, their
-cleanups queue on the lock and each keeps it for the whole 15 seconds. From
-about the eighth in the queue on, cleanups reach their stop timeout, the later
-ones while they still wait for the lock. systemd ends such a cleanup before it
-has changed anything: the attachment and its record stay as they were, the
-daemon keeps serving, and the stop is retried as for any
-[failed planned stop](#retry-a-failed-planned-stop). Either way the record is
-kept and the planned stop fails, as it does for a cleanup whose own wait ran
-out; the failure only comes by timeout, and a cleanup ended during its own
-steps is resumed by the next one, which observes again before each step.
+`/dev/nbdN` open) and the volumes stop together, their cleanups queue on the
+lock and each keeps it for the whole 15 seconds. From about the eighth in the
+queue on, cleanups reach their stop timeout, the later ones while they still
+wait for the lock. systemd ends such a cleanup before it has changed anything:
+the attachment and its record stay as they were. In a planned stop of the
+attach units the daemon keeps serving, and the stop is retried as for any
+[failed planned stop](#retry-a-failed-planned-stop). At a host shutdown
+nothing retries it: `maki@` is stopped next all the same (`maki-attach@` is
+ordered after it), so a filesystem that such a cleanup did not unmount stays
+mounted, for the rest of the shutdown, on a device whose daemon is gone.
+Either way the record is kept and the stop fails, as it does for a cleanup
+whose own wait ran out; the failure only comes by timeout, and in a planned
+stop a cleanup ended during its own steps is resumed by the next one, which
+observes again before each step.
 Behind three such cleanups the failed-start hook's 40-second lock wait expires
 as well, and the coordinator proceeds without it, as above.
 
