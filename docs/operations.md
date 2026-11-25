@@ -62,9 +62,12 @@ and only while the device still shows no connection:
 A device that stays busy to the end shows nothing in sysfs. When the attach
 allocated it (no pinned `nbd_device`), the helper gives it up, logs a warning
 and tries the next free device within the same step's time; a pinned device
-fails the attach. `maki-attach nbd-disconnect` waits up to 15 s until the
-device no longer shows its connection, which the kernel keeps showing while
-anything has the device open, and fails if it still does. The
+fails the attach. After a disconnect, `maki-attach nbd-disconnect`, detach and
+cleanup wait up to 15 s, looking every 100 ms, until the device no longer shows
+the connection: the kernel keeps showing it while anything has the device open,
+and udev probes a device right after every disconnect. If it still does,
+`nbd-disconnect` fails, and detach and cleanup keep the attachment record and
+fail; a later run finishes. The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -728,7 +731,12 @@ by hand.
 with that record and the live `/sys/block/nbdN/backend` before unmounting or
 deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
-an explicit `--nbd-device` cannot bypass this check.
+an explicit `--nbd-device` cannot bypass this check. After the disconnect,
+detach and cleanup wait, still under the lock, until the device shows no
+connection (up to 15 s, as described under [prerequisites](#prerequisites)),
+and retire the record only then. A device that still shows the connection, or
+shows one under another identity, keeps the record and fails the command; one
+whose backend cannot be read fails it too.
 
 Detach, cleanup, recover and grow address the VG only where attach found it.
 Their `vgchange --activate n` and `lvextend` run with the record's candidate
@@ -1048,13 +1056,14 @@ attach unit's control group: a command of the failed start, such as a
 `vgchange` that defers signals until it has finished, can outlive the helper
 there. This check needs the unified cgroup hierarchy. It then waits up to 40
 seconds for the global attach lock, in turn behind the helpers already waiting
-for it (other volumes' attach, detach and cleanup), and its commands have 30
-seconds once it holds the lock. If the record or the control group cannot be
-read, the group does not settle, a bound expires, or the rollback is refused,
-the hook logs the reason and the coordinator proceeds as it would have without
-it. An attach of another volume can hold the attach lock for up to its
-180-second start timeout, longer than any lock wait these timeouts leave room
-for: contention of that length is one way into
+for it (other volumes' attach, detach and cleanup), and its commands, with the
+wait for the device after its disconnect, have 30 seconds once it holds the
+lock. If the record or the control group cannot be read, the group does not
+settle, a bound expires, or the rollback is refused, the hook logs the reason
+and the coordinator proceeds as it would have without it. An attach of another
+volume can hold the attach lock for up to its 180-second start timeout, longer
+than any lock wait these timeouts leave room for: contention of that length is
+one way into
 [the state below](#interrupted-activation-after-the-daemon-stopped).
 
 Attach starts are limited to three in 300 seconds; inspect the failure before

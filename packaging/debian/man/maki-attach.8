@@ -77,12 +77,23 @@ Use
 for a disconnected backend.
 .B cleanup
 uses the attachment record to select detach or recovery.
+After its NBD disconnect, a
+.BR detach " or " cleanup
+waits, as
+.B nbd-disconnect
+does, up to 15 seconds until the device no longer shows the connection, and
+only then removes the attachment record. The kernel keeps showing a
+connection while anything has the device open, and udev probes the device
+right after every disconnect. If the device still shows a connection when
+the wait is over, the record is kept and the command fails; run it again
+once nothing holds the device open.
 .B recover-failed-start
 is the systemd failed-start cleanup hook. It asks systemd to queue the
 recovery coordinator and, when the start died between LVM activation and the
 mapping proof, rolls back that activation itself while the daemon still
 serves the device, also when systemd refused the request: the scoped VG
-deactivation, the NBD disconnect, and the removal of the record. It never
+deactivation, the NBD disconnect, the same wait for the device, within the
+hook's time for its commands, and the removal of the record. It never
 unmounts.
 .PP
 The helper negotiates with the daemon's NBD socket and connects and
