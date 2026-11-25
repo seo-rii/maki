@@ -249,21 +249,23 @@ fn slots_of<'a>(nodes: impl Iterator<Item = &'a Node>) -> BTreeSet<u64> {
 struct Configured {
     what: &'static str,
     key: &'static str,
-    /// The kind of the error for a path that is not a directory.
-    not_a_directory: io::ErrorKind,
+    /// Whether a path that, followed, is something other than a directory
+    /// is refused as invalid input: the witness has always refused one so
+    /// (its own check follows the path). Every other path that is not a
+    /// directory keeps the system's NotADirectory.
+    other_than_a_directory_is_input: bool,
 }
 
 const BACKING_ROOT: Configured = Configured {
     what: "backing root",
     key: "backing.root",
-    not_a_directory: io::ErrorKind::NotADirectory,
+    other_than_a_directory_is_input: false,
 };
 
 const WITNESS_ROOT: Configured = Configured {
     what: "rollback witness directory",
     key: "backing.rollback_protection.witness_root",
-    // What the witness has always answered a path that is not a directory.
-    not_a_directory: io::ErrorKind::InvalidInput,
+    other_than_a_directory_is_input: true,
 };
 
 /// Refuse a configured directory that this process cannot open, before the
@@ -277,6 +279,7 @@ fn reachable(path: &Path, directory: &Configured) -> io::Result<()> {
         return Ok(());
     };
     let Configured { what, key, .. } = directory;
+    let followed = path;
     let path = path.display();
     let (kind, message) = match error.kind() {
         io::ErrorKind::NotFound => (
@@ -293,13 +296,32 @@ fn reachable(path: &Path, directory: &Configured) -> io::Result<()> {
                  owner and mode of the directory and of the directories above it"
             ),
         ),
-        io::ErrorKind::NotADirectory => (
-            directory.not_a_directory,
-            format!(
-                "the {what} {path} (`{key}`) is not a directory (a symbolic link is not \
-                 followed)"
-            ),
-        ),
+        io::ErrorKind::NotADirectory => {
+            // The path is opened without following a symbolic link in any
+            // component. Say which is wrong: the path itself, or the way
+            // to it.
+            let wrong = match std::fs::symlink_metadata(followed) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    "is a symbolic link, which is not followed: configure the directory itself"
+                }
+                Ok(metadata) if !metadata.is_dir() => "is not a directory",
+                Ok(_) => {
+                    "is reached through a symbolic link, which is not followed: configure \
+                     the path without it"
+                }
+                Err(_) => "cannot be reached: a component of its path is not a directory",
+            };
+            let input = directory.other_than_a_directory_is_input
+                && std::fs::metadata(followed).is_ok_and(|metadata| !metadata.is_dir());
+            (
+                if input {
+                    io::ErrorKind::InvalidInput
+                } else {
+                    error.kind()
+                },
+                format!("the {what} {path} (`{key}`) {wrong}"),
+            )
+        }
         _ => (
             error.kind(),
             format!("cannot open the {what} {path} (`{key}`): {error}"),
