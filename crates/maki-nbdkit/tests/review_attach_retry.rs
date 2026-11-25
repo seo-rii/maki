@@ -207,9 +207,11 @@ async fn non_retry_safe_initial_canary_probe_must_be_sent_only_once() {
 }
 
 /// A lone endpoint is probed like each endpoint of a set: a lost response
-/// is sent again only by a retry-safe provider. A lost response is a
-/// transient failure, so the lone endpoint is then kept for the dispatcher,
-/// which retries it under the availability policy.
+/// is sent again only by a retry-safe provider. A lost response may have
+/// reached the endpoint, so only a retry-safe provider keeps the lone
+/// endpoint for the dispatcher, which retries it under the availability
+/// policy; for one that is not retry-safe that failure is final, and the
+/// attach is refused with it.
 async fn lone_endpoint_probe_requests(retry_safe: bool) -> usize {
     let failed = TestServer::start(lost_response(false)).await;
     let directory = tempfile::tempdir().unwrap();
@@ -225,10 +227,30 @@ async fn lone_endpoint_probe_requests(retry_safe: bool) -> usize {
     assert!(raw.contains("availability_policy = \"stall\""));
     let cfg = parse_and_validate(&raw).unwrap();
     create_volume_from_config_str(&raw).unwrap();
-    let (_provider, endpoints) = build_provider_with_endpoints(&cfg).await.unwrap();
-    let states = endpoints.unwrap().endpoint_status();
-    assert_eq!(states.len(), 1);
-    assert!(states[0].validated, "{states:?}");
+    match build_provider_with_endpoints(&cfg).await {
+        Ok((_provider, endpoints)) => {
+            assert!(
+                retry_safe,
+                "an uncertain request was left for the dispatcher"
+            );
+            let states = endpoints.unwrap().endpoint_status();
+            assert_eq!(states.len(), 1);
+            assert!(states[0].validated, "{states:?}");
+        }
+        Err(error) => {
+            assert!(
+                !retry_safe,
+                "a retry-safe lone endpoint was refused: {error}"
+            );
+            let error = error.to_string();
+            assert!(
+                error.contains(
+                    "no remote endpoint is reachable; attach refused (\"ep0\": retryable:"
+                ),
+                "{error}"
+            );
+        }
+    }
     let requests = failed.requests.lock();
     assert!(requests.iter().all(|request| request.path == "/encrypt"));
     assert!(requests
@@ -243,7 +265,7 @@ async fn a_retry_safe_lone_endpoint_probe_is_retried_three_times() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_non_retry_safe_lone_endpoint_probe_is_sent_only_once() {
+async fn a_non_retry_safe_lone_endpoint_probe_is_sent_only_once_and_refused() {
     assert_eq!(
         lone_endpoint_probe_requests(false).await,
         1,

@@ -177,8 +177,10 @@ async fn tls_server() -> (std::net::SocketAddr, String) {
 /// The endpoint's certificate is replaced by one the client does not trust
 /// while the provider holds a cached channel (a server restarted with
 /// another certificate). A proxy sends the first connection to the trusted
-/// server and every later one to the other, and can cut the connections it
-/// carries.
+/// server and every later one to the other. It can cut a connection it
+/// carries: it drops the upstream side, closes its side towards the client
+/// and reports when the client has closed its end too, which the client
+/// does once its HTTP/2 connection has seen the close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_certificate_refused_when_a_cached_channel_reconnects_is_an_endpoint_failure() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -186,7 +188,11 @@ async fn a_certificate_refused_when_a_cached_channel_reconnects_is_an_endpoint_f
     let (replaced, _) = tls_server().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let carried: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+    type Cut = (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    let carried: Arc<Mutex<Vec<Cut>>> = Arc::default();
     let connections = Arc::new(AtomicUsize::new(0));
     tokio::spawn({
         let carried = carried.clone();
@@ -196,9 +202,22 @@ async fn a_certificate_refused_when_a_cached_channel_reconnects_is_an_endpoint_f
                 let first = connections.fetch_add(1, Ordering::SeqCst) == 0;
                 let target = if first { trusted } else { replaced };
                 let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
-                carried.lock().unwrap().push(tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-                }));
+                let (cut, cut_requested) = tokio::sync::oneshot::channel();
+                let (closed, client_closed) = tokio::sync::oneshot::channel();
+                carried.lock().unwrap().push((cut, client_closed));
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
+                        _ = cut_requested => {}
+                    }
+                    drop(upstream);
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut client).await;
+                    let mut sink = [0u8; 4096];
+                    while let Ok(1..) = tokio::io::AsyncReadExt::read(&mut client, &mut sink).await
+                    {
+                    }
+                    let _ = closed.send(());
+                });
             }
         }
     });
@@ -212,13 +231,17 @@ async fn a_certificate_refused_when_a_cached_channel_reconnects_is_an_endpoint_f
     .unwrap();
     encrypt(&provider).await.unwrap();
 
-    // Cut the connection under the cached channel and give the client's
-    // HTTP/2 connection a moment to see it closed, so the next call
-    // reconnects inside that channel rather than failing on the dying one.
-    for connection in carried.lock().unwrap().drain(..) {
-        connection.abort();
+    // Cut the connection under the cached channel and wait until the
+    // client has closed its end, so the next call reconnects inside that
+    // channel rather than failing on the dying connection.
+    let cuts: Vec<Cut> = carried.lock().unwrap().drain(..).collect();
+    for (cut, client_closed) in cuts {
+        let _ = cut.send(());
+        tokio::time::timeout(Duration::from_secs(10), client_closed)
+            .await
+            .expect("the client did not close the cut connection")
+            .unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let refused = encrypt(&provider).await.unwrap_err();
     assert_eq!(refused.class(), ErrorClass::EndpointFatal, "{refused}");
