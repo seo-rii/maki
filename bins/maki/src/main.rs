@@ -62,6 +62,38 @@ fn misuse(message: String) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// Refuse a word that starts with `-` where the command expects a
+/// configuration or directory path or a reload section: an option given in
+/// its place (`maki check --deep` with the configuration forgotten) would be
+/// opened as a file and fail with status 1. It is misuse, refused before
+/// anything is read. A file whose name starts with `-` is named `./-name`.
+fn misplaced_option(argv: &[&str], by_socket: bool) -> Option<ExitCode> {
+    const CONFIG: &str = "the volume configuration";
+    const ADMIN: &str = "the administrator configuration";
+    const BACKUP: &str = "the backup directory";
+    const SECTION: &str = "the reload section";
+    let operands: &[(usize, &str)] = match argv {
+        ["volume", "snapshot", ..] => &[(2, CONFIG), (3, BACKUP)],
+        ["volume", "restore", ..] => &[(2, ADMIN), (3, BACKUP)],
+        ["volume", "takeover" | "resume-enrollment", ..] => &[(2, ADMIN)],
+        ["volume", ..] => &[(2, CONFIG)],
+        ["reload", ..] if by_socket => &[(1, SECTION)],
+        ["reload", _, "cache", ..] => &[(1, CONFIG)],
+        ["reload", ..] => &[(1, CONFIG), (2, SECTION)],
+        ["check" | "status" | "metrics" | "checkpoint" | "drain", ..] if !by_socket => {
+            &[(1, CONFIG)]
+        }
+        _ => &[],
+    };
+    let (word, what) = operands.iter().find_map(|&(position, what)| {
+        argv.get(position)
+            .filter(|word| word.starts_with('-'))
+            .map(|word| (*word, what))
+    })?;
+    diagnostic!("error: expected {what}, found the option {word:?}\n{USAGE}");
+    Some(ExitCode::from(2))
+}
+
 /// Write `text` to stdout and flush it.
 ///
 /// `println!` panics when the write fails, and the panic replaces the
@@ -223,8 +255,9 @@ fn main() -> ExitCode {
     }
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [volume, verb, config] = raw_args.as_slice() {
-        if volume == "volume" && verb == "inspect" && config != "--socket" && config != "--timeout"
-        {
+        // A leading `-` is an option where the path belongs: misuse, which
+        // the parser below refuses.
+        if volume == "volume" && verb == "inspect" && !config.as_encoded_bytes().starts_with(b"-") {
             return match inspect(std::path::Path::new(config)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(error),
@@ -271,6 +304,9 @@ fn main() -> ExitCode {
         Err(e) => return misuse(e),
     };
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if let Some(refused) = misplaced_option(&argv, socket.is_some()) {
+        return refused;
+    }
     if let Some(socket) = socket {
         return control_by_socket(&argv, socket, timeout);
     }

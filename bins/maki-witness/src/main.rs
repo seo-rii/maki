@@ -159,6 +159,21 @@ fn volume_identity(text: &str) -> Result<Uuid, Failure> {
 }
 
 fn run(args: &[String]) -> Result<(), Failure> {
+    // A word that starts with `-` where a command expects its path is an
+    // option in the wrong place (`serve --help`): refused before a file is
+    // opened or a state directory created. A path that starts with `-` is
+    // named `./-name`.
+    if let [command, path, ..] = args {
+        let takes_path = matches!(
+            command.as_str(),
+            "init" | "init-etcd" | "serve" | "inspect" | "fingerprint"
+        );
+        if takes_path && path.starts_with('-') {
+            return Err(Failure::Usage(format!(
+                "{command}: expected a path, found the option {path:?}\n{HELP}"
+            )));
+        }
+    }
     match args {
         [help] if help == "--help" || help == "-h" => print_result(HELP)?,
         // BUG-112: every deployed binary reports its revision.

@@ -51,7 +51,10 @@ for the full command list and remote-volume operations.
 .SH EXIT STATUS
 Zero indicates success. A failing check, an error and a request the daemon
 refuses return 1. Invalid command usage, including a malformed option value
-or approval, returns 2 before anything is read.
+or approval and an option given where a configuration, a directory or a
+reload section belongs, returns 2 before anything is read. Name a file
+whose name starts with a dash as
+.IR ./\-name .
 .BR attach ", " detach " and " grow
 return 3: they print the
 .B maki-attach
