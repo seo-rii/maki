@@ -28,7 +28,7 @@ mod local_load_tests;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod review_restore;
-use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};
+use crate::{configured, path, Backing, BackingFile, FileBacking, VolumeLock};
 use remote::Witness;
 
 const PAGE: u64 = 4096;
@@ -369,6 +369,12 @@ impl RollbackBacking {
 
     /// Open only the exact manifest selected by the existing witness.
     pub fn open(root: &Path, witness: &Path) -> io::Result<Self> {
+        // Name a configured directory this process cannot open before the
+        // checks below report its bare error. Opening never creates either.
+        if cfg!(target_os = "linux") {
+            configured::BACKING_ROOT.reachable(root)?;
+            configured::WITNESS_ROOT.reachable(witness)?;
+        }
         independent_paths(root, witness)?;
         Self::open_backing(Arc::new(FileBacking::new(root)?), witness)
     }
@@ -391,35 +397,37 @@ impl RollbackBacking {
     /// hosts (see [`Self::create_on`]).
     #[doc(hidden)]
     pub fn open_on(disk: Arc<dyn Backing>, witness: Arc<dyn Backing>) -> io::Result<Self> {
-        Self::open_witnessed(disk, || FileWitness::open_backing(witness))
+        let listed = witness.clone();
+        Self::open_witnessed(
+            disk,
+            move || listed.list(""),
+            || FileWitness::open_backing(witness),
+        )
     }
 
     // Keep authentication and readiness barriers on one path for the real
     // backing and the executable crash model.
     fn open_backing(disk: Arc<dyn Backing>, witness: &Path) -> io::Result<Self> {
-        Self::open_witnessed(disk, || FileWitness::open(witness))
+        Self::open_witnessed(
+            disk,
+            || FileBacking::read_only(witness)?.list(""),
+            || FileWitness::open(witness),
+        )
     }
 
+    /// `listing` lists the witness directory, only to word the refusal of
+    /// a backing without its marker; `witness` opens the witness.
     fn open_witnessed(
         disk: Arc<dyn Backing>,
+        listing: impl FnOnce() -> io::Result<Vec<String>>,
         witness: impl FnOnce() -> io::Result<FileWitness>,
     ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        // A backing without its marker is what a creation leaves that
-        // stopped before it published one (or a wrong `backing.root`).
-        // Say so and name the way out, with the same error kind.
         let marker = disk.open(MARKER, false).map_err(|error| {
             if error.kind() != io::ErrorKind::NotFound {
                 return error;
             }
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "this rollback backing holds no format marker ({MARKER}): either a volume \
-                     create did not complete here, which running volume create again continues, \
-                     or this is not the volume's backing root"
-                ),
-            )
+            no_marker(disk.as_ref(), listing())
         })?;
         let mut magic = vec![0; MAGIC.len()];
         if marker.len()? != MAGIC.len() as u64 {
@@ -635,6 +643,17 @@ fn reserve_storage(disk: &dyn Backing, arena: &dyn BackingFile, capacity: u64) -
 /// left is never synced as it is: it is truncated and written again through
 /// a new descriptor first.
 fn publish_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<()> {
+    // Whatever an earlier run left under the staged name is never read.
+    // Remove it first, as a leftover `anchor.next` is, so the staged marker
+    // is a file this run creates (for the directory's owner when root runs
+    // it): a root-run creation killed between creating the name and giving
+    // it away leaves a file the daemon user may not open but may remove.
+    // What is not a regular file with one name was refused before this
+    // (`leftover`).
+    match disk.remove(MARKER_NEXT) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     let staged = (|| {
         let marker = disk.open(MARKER_NEXT, true)?;
         marker.set_len(0)?;
@@ -689,7 +708,11 @@ fn unwritten_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<bool> {
 /// holding anything else, bytes that do not decode included, is a
 /// volume's slot in whatever state damage left it: it is refused whatever
 /// the witness directory holds, an empty one included (a witness that is
-/// not mounted). The marker refuses anything but this format.
+/// not mounted). The marker refuses anything but this format. The staged
+/// marker, the arena and the slots must each be a regular file with one
+/// name, which the creation can write again (`leftover`): a staged marker
+/// this user may not open is removed before the marker is staged anew, and
+/// an arena or slot this user may not open is refused with the way out.
 fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::Result<()> {
     let refused = || {
         io::Error::new(
@@ -698,23 +721,19 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
         )
     };
     for name in disk.list("")? {
-        let unpublished = match name.as_str() {
-            LOCK | MARKER_NEXT | ARENA => true,
-            MARKER => {
-                let marker = disk.open(MARKER, false)?;
-                let mut bytes = vec![0; MAGIC.len()];
-                let complete = marker.len()? == MAGIC.len() as u64 && {
-                    marker.read_at(0, &mut bytes)?;
-                    bytes == MAGIC
-                };
-                complete || unwritten_marker(disk, MAGIC)?
+        match leftover(disk, &name)? {
+            Leftover::Unpublished => {}
+            Leftover::Other => return Err(refused()),
+            Leftover::Unopenable(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "the backing directory holds {name:?}, which this user may not open \
+                         ({error}): give it to the user this command runs as (chown), let that \
+                         user read and write it (chmod) and run the command again"
+                    ),
+                ))
             }
-            slot if slot == MANIFESTS[0] => unpublished_slot(disk, 0)?,
-            slot if slot == MANIFESTS[1] => unpublished_slot(disk, 1)?,
-            _ => false,
-        };
-        if !unpublished {
-            return Err(refused());
         }
     }
     if witness
@@ -725,6 +744,171 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
         return Err(refused());
     }
     Ok(())
+}
+
+/// What the backing entry `name` tells a creation (see
+/// `require_unpublished_local`).
+enum Leftover {
+    /// What a creation that published nothing may have left, holding only
+    /// what it writes there.
+    Unpublished,
+    /// Anything else: a creation never runs over it.
+    Other,
+    /// A file a creation reserves that this user may not open (the error):
+    /// what a creation run as root leaves when it is killed between
+    /// creating the file under its name and giving it to the directory's
+    /// owner.
+    Unopenable(io::Error),
+}
+
+fn leftover(disk: &dyn Backing, name: &str) -> io::Result<Leftover> {
+    // A creation writes what it stages and reserves under these names again
+    // from the start, which holds only for a regular file with one name: a
+    // link, a directory, a FIFO or a second name would fail it when it
+    // opens the entry, after it has published its marker, and every later
+    // run the same way. The lock is taken before this, by both commands.
+    // The staged marker is never read, and `publish_marker` removes the
+    // file under its name before it stages the marker, so one this user
+    // may not open (what a root-run creation leaves when it is killed
+    // before it gives the file away) does not stop a creation.
+    if name == MARKER_NEXT {
+        return Ok(match remote::unwritable(disk, name)? {
+            None => Leftover::Unpublished,
+            Some(error) if error.kind() == io::ErrorKind::PermissionDenied => Leftover::Unpublished,
+            Some(_) => Leftover::Other,
+        });
+    }
+    // The arena and the slots are opened and written as they are: one this
+    // user may not open stops a creation, with the way out.
+    if name == ARENA || MANIFESTS.contains(&name) {
+        match remote::unwritable(disk, name)? {
+            Some(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(Leftover::Unopenable(error))
+            }
+            Some(_) => return Ok(Leftover::Other),
+            None => {}
+        }
+    }
+    let unpublished = match name {
+        LOCK | ARENA => true,
+        MARKER => {
+            let marker = disk.open(MARKER, false)?;
+            let mut bytes = vec![0; MAGIC.len()];
+            let complete = marker.len()? == MAGIC.len() as u64 && {
+                marker.read_at(0, &mut bytes)?;
+                bytes == MAGIC
+            };
+            complete || unwritten_marker(disk, MAGIC)?
+        }
+        slot if slot == MANIFESTS[0] => unpublished_slot(disk, 0)?,
+        slot if slot == MANIFESTS[1] => unpublished_slot(disk, 1)?,
+        _ => false,
+    };
+    Ok(if unpublished {
+        Leftover::Unpublished
+    } else {
+        Leftover::Other
+    })
+}
+
+/// The refusal of a backing without its format marker. That is what a
+/// creation leaves that stopped before it published the marker, and what
+/// a wrong `backing.root` looks like. Running `volume create` again
+/// continues only the first, and only when nothing in either directory
+/// stops it (`require_unpublished_local`): then the refusal says so.
+/// Otherwise it names the entries that stop a creation, which `volume
+/// create` refuses every time it runs, and offers nothing. `witness` is
+/// the listing of the witness directory; when either listing cannot be
+/// made, what a creation would do cannot be told and nothing is offered.
+fn no_marker(disk: &dyn Backing, witness: io::Result<Vec<String>>) -> io::Error {
+    // The entries that stop a creation: in the backing directory those it
+    // never runs over and those this user may not open, in the witness
+    // directory those it never runs over.
+    type Stopping = (Vec<String>, Vec<String>, Vec<String>);
+    let stopping = (|| -> io::Result<Stopping> {
+        let (mut other, mut unopenable) = (Vec::new(), Vec::new());
+        for name in disk.list("")? {
+            match leftover(disk, &name)? {
+                Leftover::Unpublished => {}
+                Leftover::Other => other.push(name),
+                Leftover::Unopenable(_) => unopenable.push(name),
+            }
+        }
+        let witness = witness?
+            .into_iter()
+            .filter(|name| !FileWitness::left_by_an_unpublished_creation(name))
+            .collect();
+        Ok((other, unopenable, witness))
+    })();
+    let message = match stopping {
+        Ok((other, unopenable, witness))
+            if other.is_empty() && unopenable.is_empty() && witness.is_empty() =>
+        {
+            format!(
+                "this rollback backing holds no format marker ({MARKER}): either a volume \
+                 create did not complete here, which running volume create again continues, \
+                 or this is not the volume's backing root"
+            )
+        }
+        Ok((other, unopenable, witness)) => {
+            let mut reasons = Vec::new();
+            let holds: Vec<String> = [("backing", other), ("witness", witness)]
+                .into_iter()
+                .filter(|(_, names)| !names.is_empty())
+                .map(|(directory, names)| {
+                    format!("the {directory} directory holds {}", entry_names(names))
+                })
+                .collect();
+            let foreign = !holds.is_empty();
+            if foreign {
+                reasons.push(format!(
+                    "{}, which an interrupted creation does not leave",
+                    holds.join(" and ")
+                ));
+            }
+            if !unopenable.is_empty() {
+                reasons.push(format!(
+                    "the backing directory holds {}, which this user may not open: give it to \
+                     the user this command runs as (chown), let that user read and write it \
+                     (chmod) and run the command again",
+                    entry_names(unopenable)
+                ));
+            }
+            let mut message = format!(
+                "this rollback backing holds no format marker ({MARKER}), and volume create \
+                 does not continue a creation here: {}",
+                reasons.join("; ")
+            );
+            if foreign {
+                message.push_str(
+                    ". Either this is not the volume's backing root, or volume create needs \
+                     directories that hold nothing else",
+                );
+            }
+            message
+        }
+        Err(_) => format!(
+            "this rollback backing holds no format marker ({MARKER}): either a volume create \
+             did not complete here, or this is not the volume's backing root"
+        ),
+    };
+    io::Error::new(io::ErrorKind::NotFound, message)
+}
+
+/// A bounded, quoted list of directory entries for a message.
+fn entry_names(mut names: Vec<String>) -> String {
+    const SHOWN: usize = 4;
+    names.sort();
+    let mut text = names
+        .iter()
+        .take(SHOWN)
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        text.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    text
 }
 
 /// Whether manifest slot `index` holds only what a creation writes there.

@@ -328,7 +328,7 @@ fn not_replaceable(name: &str, cause: &io::Error, way_out: &str) -> io::Error {
 /// (an I/O error, no descriptor left) says nothing about the entry and is
 /// the caller's error as it is; a good file must not be called unwritable
 /// for it.
-fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
+pub(super) fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
     match disk.open(name, false) {
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -649,19 +649,30 @@ fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<Manifes
         .ok_or_else(|| invalid("uninitialized remote backing"))?;
     let source = scope(disk.clone(), &current.namespace)
         .map_err(|_| invalid("remote authority's current namespace is not valid in this root"))?;
-    let (manifest, _) = load_generation(source.as_ref(), current).map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidData {
-            invalid(format!(
-                "this backing root does not hold the remote authority's current generation \
-                 ({error}); check the witness address and backing root before retrying"
-            ))
-        } else {
-            // Unreadable storage does not establish a root/authority mismatch.
-            // Preserve both its classification and the underlying OS error.
-            error
-        }
-    })?;
+    let (manifest, _) = load_generation(source.as_ref(), current).map_err(not_current)?;
     Ok(manifest)
+}
+
+/// The refusal of a root in which the authority's current generation does
+/// not authenticate (`error` is the InvalidData proof of that), in the
+/// words attach, takeover, snapshot and GC all use. Any other error, such
+/// as unreadable storage, does not establish a root/authority mismatch: it
+/// is returned with its classification and the underlying OS error.
+pub(super) fn not_current(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::InvalidData {
+        invalid(format!(
+            "this backing root does not hold the remote authority's current generation \
+             ({error}); check the witness address and backing root before retrying"
+        ))
+    } else {
+        error
+    }
+}
+
+/// What [`load_generation`] finds in a namespace that holds no candidate
+/// for the descriptor, a missing namespace included.
+pub(super) fn no_witnessed_manifest() -> io::Error {
+    invalid("no exact remote witnessed manifest")
 }
 
 pub(super) fn load_generation(
@@ -729,7 +740,7 @@ pub(super) fn load_generation(
             }
         }
     }
-    Err(storage_error.unwrap_or_else(|| invalid("no exact remote witnessed manifest")))
+    Err(storage_error.unwrap_or_else(no_witnessed_manifest))
 }
 
 fn copy_generation(

@@ -327,3 +327,60 @@ fn refusal_checks_only_the_outer_marker_before_opening_any_writer() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("--destroy-data"));
     assert!(snapshot(fixture.witness.path()).is_empty());
 }
+
+/// Before it decides between creating a volume and reusing one, the
+/// benchmark looks at the backing root. A root it cannot look at is named
+/// with its path, the setting that names it and what to check, not with
+/// the bare system error.
+#[test]
+fn a_root_that_is_not_a_directory_is_named_with_its_setting() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    std::fs::write(fixture.root(), b"not a directory").unwrap();
+    for destroy in [false, true] {
+        let output = fixture.run(destroy);
+        assert_failed_without_report(&output, 1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let named = format!(
+            "the backing root {} (`backing.root`) is not a directory",
+            fixture.root().display()
+        );
+        assert!(stderr.contains(&named), "{stderr}");
+    }
+    assert_eq!(std::fs::read(fixture.root()).unwrap(), b"not a directory");
+}
+
+/// Restores a directory's mode before it is removed.
+struct Mode(PathBuf);
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[test]
+fn a_root_this_user_may_not_open_is_named_with_its_setting() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.create();
+    std::fs::set_permissions(fixture.root(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _mode = Mode(fixture.root());
+    // Root may open a mode-000 directory (CAP_DAC_OVERRIDE): only another
+    // user is refused one.
+    if std::fs::read_dir(fixture.root()).is_ok() {
+        eprintln!("needs a user that a mode-000 directory refuses (not root); skipping");
+        return;
+    }
+    let output = fixture.run(true);
+    assert_failed_without_report(&output, 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let named = format!(
+        "may not open the backing root {} (`backing.root`)",
+        fixture.root().display()
+    );
+    assert!(stderr.contains(&named), "{stderr}");
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+}

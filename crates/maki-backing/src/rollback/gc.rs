@@ -212,8 +212,18 @@ impl<'a> OperationGuard<'a> {
         // The format marker carries no identity. Authenticate the exact
         // physical current root before trusting this authority's fencing floor.
         // This also refuses accidentally configured authorities for other data.
-        let current_disk = self.disk.gc_scope(&current.namespace)?;
-        let capacity = super::remote::load_generation(&current_disk, current)?
+        // A root without the current namespace holds no candidate for it,
+        // as attach finds: refuse it in attach's words, not with the bare
+        // error of the missing directory.
+        let current_disk = self.disk.gc_scope(&current.namespace).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                super::remote::not_current(super::remote::no_witnessed_manifest())
+            } else {
+                error
+            }
+        })?;
+        let capacity = super::remote::load_generation(&current_disk, current)
+            .map_err(super::remote::not_current)?
             .0
             .capacity;
         // A foreign current namespace may already have been copied into this

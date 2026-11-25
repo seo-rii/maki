@@ -657,6 +657,39 @@ fn a_refused_pair_that_does_not_open_says_why() {
     }
 }
 
+/// A backing root without its format marker that holds what an interrupted
+/// creation does not leave (the `lost+found` of a filesystem mounted
+/// there) is refused by `create` every time it runs. Neither the refusal
+/// nor the commands that open the pair may say that running `create` again
+/// continues it; they name what stops it.
+#[test]
+fn a_root_without_a_marker_that_create_refuses_is_not_said_to_be_continued() {
+    let machines = machines();
+    machines
+        .root
+        .process()
+        .create_dir_all("lost+found")
+        .unwrap();
+    for attempt in ["first", "second"] {
+        let text = machines.create().unwrap_err().to_string();
+        assert!(
+            text.contains("requires empty backing and witness directories"),
+            "{attempt}: {text}"
+        );
+        assert!(text.contains("\"lost+found\""), "{attempt}: {text}");
+        assert!(
+            !text.contains("running volume create again continues"),
+            "{attempt}: {text}"
+        );
+    }
+    let text = machines.open().err().expect("no marker").to_string();
+    assert!(text.contains("\"lost+found\""), "{text}");
+    assert!(
+        !text.contains("running volume create again continues"),
+        "{text}"
+    );
+}
+
 /// What the witness authenticates must itself be nothing but an unfinished
 /// creation. A volume whose superblock copies are gone, but which holds
 /// anything a creation does not write before its superblock, is refused.

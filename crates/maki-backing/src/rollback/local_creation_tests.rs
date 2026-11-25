@@ -51,8 +51,7 @@ impl Machines {
 
     /// The daemon's start, in its own process.
     fn open(&self) -> io::Result<RollbackBacking> {
-        let witness = self.witness.process();
-        RollbackBacking::open_witnessed(self.root.process(), || FileWitness::open_backing(witness))
+        RollbackBacking::open_on(self.root.process(), self.witness.process())
     }
 
     fn power_loss(&self, seed: u64) {

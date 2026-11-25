@@ -311,16 +311,39 @@ again, the daemon, `maki check` and `maki volume inspect` refuse the pair
 and say why: before the anchor that the backing holds no format marker or
 the witness no anchor, after it `no valid superblock: this volume's
 creation did not complete`, each naming `maki volume create` as what
-continues it. Once a superblock copy is committed the volume exists and
-`create` refuses it. The format marker and the anchor are each written under
+continues it. A backing without its format marker that holds anything an
+interrupted creation does not leave (the `lost+found` of a filesystem
+mounted at the backing root, for example, or a manifest slot that holds
+data), or whose witness directory does, is no such creation: `create`
+refuses it every time
+(`rollback enrollment requires empty backing and witness directories`),
+and the refusal and the commands that open the pair name those entries
+instead of offering `create`. It is not the volume's backing root, or
+`create` needs directories that hold nothing else. Once a superblock copy
+is committed the volume exists and `create` refuses it. The format marker and the anchor are each written under
 a temporary name (`rollback.format.next`, `anchor.next`), synced and renamed
 into place, so neither name ever holds an empty or torn file. `create` then
 accepts a backing directory that holds only what a creation writes (the
 lock, the marker, the arena and the two manifest slots) as long as the
 second slot holds only zeros and the first only zeros or the initial empty
 manifest, and a witness directory that holds only `witness.lock` and
-`anchor.next`. Every volume that committed anything wrote its second slot,
-so `create` never creates over one, whatever the witness directory holds
+`anchor.next`. The staged marker, the arena and the slots must each be a
+regular file with one name, which the creation writes again: a directory,
+a symbolic link, a FIFO or a file with a second name under one of those
+names is refused before anything changes, and named. The one exception is
+an entry under the staged marker's name that the user running `volume
+create` may not open: anything there but a directory or a symbolic link
+is removed (only that name is unlinked; a second name keeps its file). A
+creation run as root that is killed between creating one of these files
+and giving it to the directory's owner leaves a file the daemon user may
+not open. Under the staged marker's name, which nothing reads, such a
+file is removed and the marker staged anew, so the daemon user's `volume
+create` continues in one run. An arena or a slot that the user running
+`volume create` may not open is refused before anything changes, with a
+message that says to give the file to that user (`chown`), let that user
+read and write it (`chmod`) and run the command again. Every volume that
+committed anything wrote its second slot, so `create` never creates over
+one, whatever the witness directory holds
 and short of both slots lost or zeroed entirely (an all-zero slot is an
 unwritten one): a witness mount that is missing (an empty directory in its
 place) cannot get a used volume recreated, and neither can slots that
@@ -355,6 +378,17 @@ the volume is detached, as the daemon user or as root:
 ```sh
 runuser -u maki -- maki check /etc/maki/volumes/protected.toml --deep
 ```
+
+These commands and the daemon never create the backing root or the witness
+directory, as `volume create` does. They refuse a backing root or witness
+directory that does not exist, is not a directory or that the user running
+them may not open, with its path and the setting that names it
+(`backing.root`, `backing.rollback_protection.witness_root`); a witness
+directory that is missing after a reboot usually means that its filesystem
+is not mounted. `maki-benchmark` refuses a backing root that is not a
+directory or that it may not open the same way, and a volume it reuses as
+the daemon does; where the backing root holds no volume, or does not exist,
+it creates one as `volume create` does, witness directory included.
 
 These acquire the exclusive witness session and reestablish the selected
 witness record's durability without advancing it, by writing the record to a

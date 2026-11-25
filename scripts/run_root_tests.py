@@ -73,6 +73,10 @@ ROOT_TARGETS = (
     # A root-run takeover killed at its fchown, then attaches and GC as the
     # daemon user (the test re-executes itself as uid 65534).
     "crates/maki-backing/tests/review_remote_gc_unreadable.rs",
+    # What a root-run local creation leaves when it is killed at its fchown,
+    # continued or refused by the daemon user's creation (re-executed as uid
+    # 65534).
+    "crates/maki-backing/tests/review_root_staged_marker.rs",
     # A private mount namespace (and a cgroup for the memory budget), a
     # read-only bind mount, the immutable flag.
     "crates/maki-backing/tests/review_restore_read_only_source.rs",
