@@ -372,41 +372,70 @@ class ReleaseCandidates(DocumentTest):
                 self.has(prose(document), f"`v{version}-rc.<n>`", document)
 
 
-
 class HelperAndWitnessStatements(DocumentTest):
     """What the helper's man page and the witness guide say its code does."""
 
     MAN = "packaging/debian/man/maki-attach.8"
 
-    def test_only_state_errors_tell_the_caller_to_run_as_root(self):
-        hint = "; run this command as root"
+    def test_the_run_as_root_hint_comes_with_the_state_files_and_the_gates_configuration(self):
+        # `state::named` adds the hint to a refusal for a caller that is not
+        # the files' owner; it is the one place the hint is written.
         sources = sorted((ROOT / "crates/maki-privileged/src").rglob("*.rs"))
         sources += sorted((ROOT / "bins/maki-attach/src").rglob("*.rs"))
+        sources = [path for path in sources if not path.name.endswith("_tests.rs")
+                   and not path.name.startswith("review_")]
         hinted = [path.relative_to(ROOT).as_posix() for path in sources
-                  if hint in rust_strings(path.relative_to(ROOT))]
+                  if "; run this command as root" in rust_strings(path.relative_to(ROOT))]
         self.assertEqual(hinted, ["crates/maki-privileged/src/state.rs"])
+        callers = {}
+        for path in sources:
+            text = rust_strings(path.relative_to(ROOT))
+            calls = re.findall(r"(?<![\w:.])named\(\s*(\"[^\"]*\"|\w+)", text)
+            if calls:
+                callers[path.relative_to(ROOT).as_posix()] = calls
+        # The state directory, its lock and its records, and the attachment
+        # file `verify` reads (`gate_config`); the other commands read theirs
+        # through `config::load` or `exec::load_trusted_config`, which do not.
+        self.assertEqual(sorted(callers), ["crates/maki-privileged/src/state.rs",
+                                           "crates/maki-privileged/src/workload_verify.rs"])
+        self.assertEqual(callers["crates/maki-privileged/src/workload_verify.rs"],
+                         ['"attach config"'])
         man = prose(self.MAN)
         self.lacks(man, "or its lock names that path, and says to run the command as root", self.MAN)
-        self.has(man, "one about the state directory or its lock also says to run the command "
-                      "as root", self.MAN)
+        self.lacks(man, "one about the state directory or its lock also says", self.MAN)
+        self.has(man, "one about the state directory, its lock or the attachment file that .B verify "
+                      "reads also says to run the command as root", self.MAN)
 
     def test_the_block_size_bound_is_the_kernel_page_size(self):
         config = rust_strings("crates/maki-privileged/src/config.rs")
         check = config[config.index("pub fn check_device_block_size"):]
-        self.has(check[:check.index("\n}\n")], "_SC_PAGESIZE", "check_device_block_size")
+        self.has(check[:check.index("\n}")], "_SC_PAGESIZE", "check_device_block_size")
+        self.has(rust_strings("bins/maki-attach/src/main.rs"),
+                 'check_device_block_size("--block-size"', "maki-attach main.rs")
         self.has(prose(self.MAN), "a power of two from 512 up to the kernel's page size", self.MAN)
 
     def test_a_changed_witness_state_is_refused_first_as_invalid(self):
-        store = rust_strings("crates/maki-backing/src/remote_witness.rs")
+        def flat(path):
+            return " ".join(rust_strings(path).split())
+        store = flat("crates/maki-backing/src/remote_witness.rs")
+        self.has(store, "fn invalid(message: &'static str) -> io::Error { "
+                        "io::Error::new(io::ErrorKind::InvalidData, message) }", "remote_witness.rs")
         self.has(store, 'invalid("remote witness changed while locked")', "remote_witness.rs")
-        wire = rust_strings("crates/maki-witness/src/lib.rs")
-        self.assertRegex(wire, r"io::ErrorKind::InvalidInput \| io::ErrorKind::InvalidData => \{\s*"
-                               r"WireError::InvalidRequest")
+        wire = flat("crates/maki-witness/src/lib.rs")
+        self.has(wire, "io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => { "
+                       "WireError::InvalidRequest", "maki-witness lib.rs")
+        self.has(wire, 'WireError::InvalidRequest => invalid("witness request rejected")',
+                 "maki-witness lib.rs")
+        self.has(wire, "fn invalid(message: &'static str) -> io::Error { "
+                       "io::Error::new(io::ErrorKind::InvalidInput, message) }", "maki-witness lib.rs")
+        session = flat("crates/maki-backing/src/rollback/remote.rs")
+        stops = session[session.index("fn stops_session("):]
+        self.has(stops[:stops.index("fn ", 3)], "Self::Remote(_) => matches!( error.kind(), "
+                 "io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput", "stops_session")
         guide = prose("docs/remote-witness-service.md")
         self.lacks(guide, "stops decoding while `serve` holds its lock also makes it answer "
                           "unavailable until a restart", "remote-witness-service.md")
         self.has(guide, "makes it refuse the next request as invalid", "remote-witness-service.md")
-
 
 if __name__ == "__main__":
     unittest.main()
