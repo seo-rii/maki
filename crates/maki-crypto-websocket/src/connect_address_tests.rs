@@ -179,6 +179,49 @@ async fn websocket_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (address, server)
 }
 
+/// A WebSocket server on loopback that answers every request frame on one
+/// connection with its items unchanged.
+async fn echo_server() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut peer = tokio_tungstenite::accept_async(socket).await.unwrap();
+        while let Some(Ok(message)) = peer.next().await {
+            let Ok(text) = message.into_text() else {
+                continue;
+            };
+            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let items: Vec<_> = request["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| json!({"unit": item["unit"], "data": item["data"]}))
+                .collect();
+            let answer = json!({"id": request["id"], "items": items}).to_string();
+            if peer.send(Message::text(answer)).await.is_err() {
+                return;
+            }
+        }
+    });
+    address
+}
+
+fn context() -> CryptoContext {
+    CryptoContext {
+        volume_uuid: uuid::Uuid::from_u128(1),
+        format_version: 1,
+        crypto_compatibility_id: "decoded-response-test".into(),
+    }
+}
+
+fn unit() -> PlaintextUnit {
+    PlaintextUnit {
+        unit_index: 0,
+        data: SecretBuffer::from_slice(&[0x5A; 16]),
+    }
+}
+
 /// Drive `future` with loopback IO pending while paused time stays where the
 /// test put it: a runtime that is never idle does not advance the clock.
 async fn without_advancing<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -313,6 +356,48 @@ async fn addresses_that_never_answer_fail_as_a_connect_timeout_at_the_deadline()
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_connect_after_a_wait_for_the_connection_shares_what_the_request_has_left() {
+    const WAIT: Duration = Duration::from_secs(6);
+    let listener = echo_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (test_net(1), Answer::Never),
+        (test_net(2), Answer::Serve(listener)),
+    ]));
+    let mut provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    // One attempt: the request has one timeout in all.
+    provider.spec.capabilities.retry_safe = false;
+    // Another caller holds the connection for 6 s of the request's 10 s.
+    let held = provider.connection.lock().await;
+    let started = tokio::time::Instant::now();
+    let (context, units) = (context(), [unit()]);
+    let request = provider.encrypt_batch(&context, &units);
+    tokio::pin!(request);
+    assert!(futures_util::poll!(&mut request).is_pending());
+    tokio::time::advance(WAIT).await;
+    drop(held);
+    assert!(futures_util::poll!(&mut request).is_pending());
+    assert_eq!(dialer.dialed(), [test_net(1)]);
+
+    // 4 s are left for two addresses: 2 s each, not half of a fresh 10 s.
+    let share = (TIMEOUT - WAIT) / 2;
+    tokio::time::advance(share - TICK).await;
+    assert!(futures_util::poll!(&mut request).is_pending());
+    assert_eq!(dialer.dialed(), [test_net(1)]);
+    tokio::time::advance(2 * TICK).await;
+    let _ = futures_util::poll!(&mut request);
+    assert_eq!(
+        dialer.dialed(),
+        [test_net(1), test_net(2)],
+        "the shares must come from what the request has left, not from a full timeout"
+    );
+    let ciphertext = without_advancing(request)
+        .await
+        .expect("the second address answers within the request's timeout");
+    assert_eq!(ciphertext.len(), 1);
+    assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_request_to_addresses_that_never_answer_fails_retryable_and_unsent_within_the_timeout() {
     let dialer = TestDialer::new(Resolution::Addresses(vec![
         (test_net(1), Answer::Never),
@@ -323,17 +408,7 @@ async fn a_request_to_addresses_that_never_answer_fails_retryable_and_unsent_wit
     provider.spec.capabilities.retry_safe = false;
     let started = tokio::time::Instant::now();
     let error = provider
-        .encrypt_batch(
-            &CryptoContext {
-                volume_uuid: uuid::Uuid::from_u128(1),
-                format_version: 1,
-                crypto_compatibility_id: "decoded-response-test".into(),
-            },
-            &[PlaintextUnit {
-                unit_index: 0,
-                data: SecretBuffer::from_slice(&[0x5A; 16]),
-            }],
-        )
+        .encrypt_batch(&context(), &[unit()])
         .await
         .expect_err("no address answers");
     assert!(error.is_retryable(), "{error:?}");
