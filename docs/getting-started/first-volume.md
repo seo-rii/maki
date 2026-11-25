@@ -28,11 +28,14 @@ Run this entire block as one Bash invocation. A failed command, unexpected
 size or identity stops it before the next mutation, and it does not clean up
 after an error. Before its first change to the host (starting the daemon) it
 creates a record of the run, `/etc/maki/attach/demo.bootstrap` (root, mode
-`0600`), with the variables a later run must share, the volume UUID and the
-connection identifier, and it adds the PV, VG and LV UUIDs and then the filesystem UUID as soon as it
-has read them. A run that stops prints the record. Then run the same block
-again: it continues from the record instead of creating anything, as
-[recovering from a failed bootstrap](#recovering-from-a-failed-bootstrap)
+`0600`). The record holds the variables a later run must share, the volume
+UUID, the connection identifier and the host's boot ID. The block adds the
+PV, VG and LV UUIDs, and then the filesystem UUID, as soon as it has read
+them. Each version of the record is written and synced under the staged name
+`demo.bootstrap.next` before it takes the record's name, so the record is
+never empty or cut short. A run that stops prints the record. Then run the
+same block again: it continues from the record instead of creating the
+layout, as [recovering from a failed bootstrap](#recovering-from-a-failed-bootstrap)
 describes. Do not continue at an arbitrary later line.
 
 The first daemon start binds the configured key through the key canary. Make
@@ -59,22 +62,41 @@ nbd=${dev#/dev/}
 lv_path=/dev/$vg/$lv
 # A run that continues from the record must have the values that made it.
 parameters=(volume dev expected_bytes block_size vg lv mountpoint attach_config)
+identities=(volume_uuid connection_id boot_id pv_uuid vg_uuid lv_uuid fs_uuid)
 uuid='[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}'
 lvm_uuid='[[:alnum:]]{6}(-[[:alnum:]]{4}){5}-[[:alnum:]]{6}'
+continuing=
 
 die() { echo "$*" >&2; exit 1; }
 trap 'echo "Bootstrap stopped at line $LINENO." >&2' ERR
-# Once the record exists, the host has been changed: say how to go on.
-trap 'if (( $? )) && [[ -e $record ]]; then
+# Once this run has made or accepted the record, a stop leaves the host
+# changed: say how to go on.
+trap 'if (( $? )) && [[ -n $continuing && -f $record ]]; then
     echo "The bootstrap has changed the host; $record records what it did:" >&2
     cat "$record" >&2
-    echo "Change nothing else, fix the cause and run this block again: it continues from the record." >&2
+    echo "Change nothing else, fix the cause and" \
+        "run this block again: it continues from the record." >&2
 fi' EXIT
+# Publish a copy of the record with the named values added: written and
+# synced under a staged name, then given the record's name, which is synced.
 note() {
     local name
-    for name; do
-        printf '%s=%s\n' "$name" "${!name}" >> "$record"
-    done
+    rm -f "$record.next"
+    (
+        set -C
+        {
+            if [[ -e $record ]]; then cat "$record"; fi
+            for name; do printf '%s=%s\n' "$name" "${!name}"; done
+        } > "$record.next"
+    )
+    sync "$record.next"
+    if [[ -e $record ]]; then
+        mv -T "$record.next" "$record"
+    else
+        ln -T "$record.next" "$record"
+        rm "$record.next"
+    fi
+    sync "${record%/*}"
 }
 verify_backend() {
     local backend bytes
@@ -93,33 +115,55 @@ done
 # Coordinate with maki-attach; the packaged runtime directory is root-only.
 [[ ! -L /run/maki-attach/attach.lock ]] || die "Unexpected lock symlink"
 exec 9>>/run/maki-attach/attach.lock
-flock -n 9
+flock -n 9 || die "Another bootstrap or a maki-attach command holds the attach lock;" \
+    "run this block again once it has finished."
 
 if [[ -e $record || -L $record ]]; then
     # An earlier run stopped after it changed the host. Its record, not what
     # the host shows now, says what it created: continue from there.
-    [[ -f $record && ! -L $record && -O $record ]] || die "$record is not a regular file of this user"
+    refuse() {
+        die "$record cannot be continued from: $*. Leave it and the host as they are," \
+            "and identify the layout by hand ('Recovering from a failed bootstrap')."
+    }
+    [[ -f $record && ! -L $record ]] || refuse "it is not a regular file"
+    [[ $(stat -c %u:%a "$record") == 0:600 ]] || refuse "it is not root's with mode 0600"
     declare -A recorded=()
     while IFS= read -r line; do
-        [[ $line =~ ^([a-z_]+)=(.*)$ && -z ${recorded[${BASH_REMATCH[1]}]+set} ]] ||
-            die "Unreadable line in $record: $line"
-        recorded[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+        [[ $line =~ ^([a-z_]+)=(.*)$ ]] || refuse "unreadable line: $line"
+        name=${BASH_REMATCH[1]}
+        [[ " ${parameters[*]} ${identities[*]} " == *" $name "* ]] || refuse "unknown name $name"
+        [[ -z ${recorded[$name]+set} ]] || refuse "$name appears twice"
+        recorded[$name]=${BASH_REMATCH[2]}
     done < "$record"
-    for name in "${parameters[@]}"; do
-        [[ ${recorded[$name]-} == "${!name}" ]] ||
-            die "$record was made with $name=${recorded[$name]-}; run the block that made it"
+    # read leaves an unterminated last line in $line: the record was cut short.
+    [[ -z $line ]] || refuse "its last line is unterminated"
+    for name in "${parameters[@]}" volume_uuid connection_id boot_id; do
+        [[ -n ${recorded[$name]+set} ]] || refuse "it has no $name (it is empty or cut short)"
     done
-    volume_uuid=${recorded[volume_uuid]-} connection_id=${recorded[connection_id]-}
+    for name in "${parameters[@]}"; do
+        [[ ${recorded[$name]} == "${!name}" ]] ||
+            die "$record was made with $name=${recorded[$name]};" \
+                "run the block that made it, with its values."
+    done
+    volume_uuid=${recorded[volume_uuid]} connection_id=${recorded[connection_id]}
     pv_uuid=${recorded[pv_uuid]-} vg_uuid=${recorded[vg_uuid]-} lv_uuid=${recorded[lv_uuid]-}
     fs_uuid=${recorded[fs_uuid]-}
-    [[ $volume_uuid =~ ^$uuid$ && $connection_id =~ ^maki-bootstrap-$uuid$ ]] || die "Invalid record"
+    [[ $volume_uuid =~ ^$uuid$ && $connection_id =~ ^maki-bootstrap-$uuid$ &&
+        ${recorded[boot_id]} =~ ^$uuid$ ]] ||
+        refuse "invalid volume UUID, connection identifier or boot ID"
     for identity in "$pv_uuid" "$vg_uuid" "$lv_uuid"; do
-        [[ -z $identity || $identity =~ ^$lvm_uuid$ ]] || die "Invalid LVM UUID in the record"
+        [[ -z $identity || $identity =~ ^$lvm_uuid$ ]] || refuse "invalid LVM UUID"
     done
     [[ -z $fs_uuid || ($fs_uuid =~ ^$uuid$ && -n $pv_uuid && -n $vg_uuid && -n $lv_uuid) ]] ||
-        die "Invalid filesystem UUID in the record"
+        refuse "an invalid filesystem UUID, or one without all three LVM UUIDs"
+    continuing=1
+    if [[ ${recorded[boot_id]} != "$(cat /proc/sys/kernel/random/boot_id)" ]]; then
+        echo "The host has restarted since $record was made, which ended its connection." \
+            "If $dev now shows another connection or attachment, this run refuses it." >&2
+    fi
 else
-    [[ ! -e "$attach_config" && ! -L "$attach_config" ]] || die "Attach configuration already exists"
+    [[ ! -e "$attach_config" && ! -L "$attach_config" ]] ||
+        die "Attach configuration already exists"
     [[ ! -e "$lv_path" && ! -L "$lv_path" ]] || die "LV path already exists"
     [[ ! -e "$mountpoint" ]] || die "Use a new mountpoint"
     existing_vgs=$(vgs --readonly --noheadings -o vg_name | awk '{$1=$1};1')
@@ -146,9 +190,10 @@ else
     [[ $volume_uuid =~ ^$uuid$ ]] || die "Invalid volume UUID"
     maki check "$config"
     connection_id="maki-bootstrap-$(cat /proc/sys/kernel/random/uuid)"
+    boot_id=$(cat /proc/sys/kernel/random/boot_id)
     install -d -m 0700 -o root -g root /etc/maki/attach
-    (set -C; : > "$record")
-    note "${parameters[@]}" volume_uuid connection_id
+    continuing=1
+    note "${parameters[@]}" volume_uuid connection_id boot_id
     systemctl start "maki@$volume.service"
     systemctl is-active "maki@$volume.service"
     # The helper's own NBD connect, outside any attachment; it takes no lock,
@@ -196,12 +241,14 @@ fi
 holders=$(ls -A "/sys/block/$nbd/holders")
 if [[ -n $holders ]]; then
     verify_backend
-    live_vg_uuid=$(vgs --readonly --devices "$dev" --noheadings -o vg_uuid "$vg" | tr -d '[:space:]')
+    live_vg_uuid=$(vgs --readonly --devices "$dev" --noheadings -o vg_uuid "$vg" |
+        tr -d '[:space:]')
     [[ $live_vg_uuid =~ ^$lvm_uuid$ && (-z $vg_uuid || $live_vg_uuid == "$vg_uuid") ]] ||
         die "VG identity changed"
     for holder in $holders; do
         holder_uuid=$(cat "/sys/block/$nbd/holders/$holder/dm/uuid")
-        [[ $holder_uuid == "LVM-${live_vg_uuid//-/}"* ]] || die "$holder holds $dev and is not a mapping of $vg"
+        [[ $holder_uuid == "LVM-${live_vg_uuid//-/}"* ]] ||
+            die "$holder holds $dev and is not a mapping of $vg"
     done
     vgchange --devices "$dev" -an "$vg"
 fi
@@ -210,11 +257,23 @@ maki-attach nbd-disconnect --nbd-device "$dev" --identifier "$connection_id" 9>&
 systemctl stop "maki@$volume.service"
 if [[ -z $fs_uuid ]]; then
     cat "$record" >&2
-    rm "$record"
-    die "Released the export, stopped maki@$volume.service and removed $record: the run stopped before it created the filesystem, so there is nothing to attach. See 'Recovering from a failed bootstrap' before running this block again."
+    rm -f "$record" "$record.next"
+    sync "${record%/*}"
+    die "Released the export, stopped maki@$volume.service and removed $record." \
+        "The run recorded no filesystem, so there is nothing to attach. If it reached" \
+        "pvcreate, the export holds what it wrote, perhaps a filesystem, and the next run" \
+        "refuses it: recreate a volume that never held data to start over" \
+        "(see 'Recovering from a failed bootstrap')."
 fi
 
-install -d -m 0700 -o root -g root /etc/maki/attach "$mountpoint"
+if [[ -e $mountpoint || -L $mountpoint ]]; then
+    # Only the empty directory that a run of this record made.
+    [[ -d $mountpoint && ! -L $mountpoint && $(stat -c %u:%a "$mountpoint") == 0:700 &&
+        -z $(ls -A "$mountpoint") ]] ||
+        die "Use a new mountpoint: $mountpoint is not the empty directory this bootstrap made"
+else
+    install -d -m 0700 -o root -g root "$mountpoint"
+fi
 attach=$(cat <<EOF
 volume_uuid = "$volume_uuid"
 device_block_size = $block_size
@@ -230,16 +289,25 @@ vg_uuid = "$vg_uuid"
 lv_uuid = "$lv_uuid"
 EOF
 )
-if [[ -e $attach_config || -L $attach_config ]]; then
-    # Only the configuration an earlier run wrote from this record is kept.
-    [[ -f $attach_config && ! -L $attach_config && $(< "$attach_config") == "$attach" ]] ||
-        die "Attach configuration already exists"
-else
-    # noclobber prevents replacing a configuration created during this procedure.
-    (set -C; printf '%s\n' "$attach" > "$attach_config")
+if [[ ! -e $attach_config && ! -L $attach_config ]]; then
+    # Written and synced under a staged name, then linked: the configuration's
+    # name only ever holds all of it, and the link refuses one made meanwhile.
+    rm -f "$attach_config.next"
+    (set -C; printf '%s\n' "$attach" > "$attach_config.next")
+    sync "$attach_config.next"
+    ln -T "$attach_config.next" "$attach_config"
 fi
+# Only the configuration this record gives is kept, also one an earlier run
+# of it wrote.
+[[ -f $attach_config && ! -L $attach_config && $(< "$attach_config") == "$attach" ]] ||
+    die "Attach configuration already exists"
+rm -f "$attach_config.next"
 chmod 0600 "$attach_config"
-rm "$record"
+sync "$attach_config"
+sync "${attach_config%/*}"
+# The record goes only once the configuration is durable.
+rm -f "$record" "$record.next"
+sync "${record%/*}"
 printf 'Created %s; review it before starting the lifecycle.\n' "$attach_config"
 BASH
 ```
@@ -349,30 +417,57 @@ of the block has finished or released it:
   `maki-workload@demo.target`, or run another bootstrap on the device or VG.
 
 Fix what the run printed and run the same block again, with the same
-variables: it refuses a record whose volume, device, sizes, VG, LV,
-mountpoint or attach configuration path differ. The block takes the attach
-lock and reads the record instead of checking for unused resources, creates
-nothing, and ends the way a run that does not stop ends:
+variables: it refuses a record whose volume, device, export or block size,
+VG, LV, mountpoint or attach configuration path differ. The block takes the
+attach lock (if another bootstrap or a `maki-attach` command holds it, the
+block says so and stops) and reads the record instead of checking for unused
+resources. It creates no PV, VG, LV or filesystem, and ends the way a run
+that does not stop ends:
 
-1. While the device has holders, it checks the connection, the size and the
+1. If the device has holders, it checks the connection, the size and the
    holders as above, then deactivates the VG.
 2. It runs `maki-attach nbd-disconnect` with the recorded identifier, which
    does nothing for a device that shows no connection and refuses another
    identifier's, then stops `maki@demo.service`.
 3. If the record names the filesystem, the layout is complete. The block
-   writes the attach configuration from the record, removes the record and
-   prints `Created /etc/maki/attach/demo.toml`; continue with
+   creates the mountpoint, or accepts one only if it is the empty root-owned
+   `0700` directory an earlier run of the record made, and never follows a
+   symlink there. It writes the attach configuration from the record, staged
+   and synced like the record, and removes the record only once the
+   configuration and its name are synced. Then it prints
+   `Created /etc/maki/attach/demo.toml`; continue with
    [step 2](#2-review-the-attach-configuration). It keeps an attach
-   configuration that already exists only if it is the one the record gives.
-4. If it does not, the run stopped before the filesystem was created and
-   there is nothing to attach. The block prints the record, removes it and
-   fails, saying that it released the export. The next run starts over.
+   configuration that already exists only if it is a regular file with
+   exactly the content the record gives.
+4. If it does not, the run recorded no filesystem: it stopped before
+   `mkfs.xfs`, or in it, or before it had read the new filesystem's UUID.
+   There is nothing to attach. The block prints the record, removes it and
+   fails, saying that it released the export. The next run starts over, and
+   it refuses an export that the stopped run wrote to: a run that reached
+   `pvcreate` leaves a PV, and perhaps a filesystem. Recreate such a volume,
+   as the signatures item below says.
 
 A run that stops again keeps the record; fix the new cause and run the block
 once more. When `nbd-disconnect` stops it because something still has the
 device open, find what does before running it again: `udevadm settle` waits
 for udev's probes, and `fuser -v /dev/nbd0` (psmisc) lists the processes that
 have the device open.
+
+If the host has restarted since the record was made, the block says so: the
+restart ended the recorded connection, and the device may since have been
+connected for something else, such as another volume's attachment. The block
+then refuses that connection, as it refuses any other identifier's. Check
+what is connected with `cat /sys/block/nbd0/backend`; the block can go on
+once the device shows no connection, for example after that volume has been
+detached.
+
+The block refuses a record it cannot continue from, and says so: one that is
+not a regular file, not root's with mode `0600`, has a line it cannot read,
+an unknown or repeated name or an unterminated last line, lacks a value the
+block writes first, or holds an invalid identity. It changes nothing then.
+Do not remove such a record to start over: whatever it still names is the
+only record of the run. Identify the layout by hand, as the last item below
+says.
 
 - Do not re-run just `mkfs.xfs`, add `-f`, or erase signatures to get past a
   failed check. Inspect the NBD backend, LVM identities and any partial layout
@@ -393,8 +488,8 @@ have the device open.
   compare its UUIDs with the intended layout. Never remove pins to bypass a
   mismatch.
 - A run of the block refuses to release the export (a holder that is not a
-  mapping of this VG, another backend identifier, a changed size), or the
-  record is gone: identify the layout first, then deactivate only the VG you
-  created and disconnect only an NBD backend that still has this run's
-  connection identity. The block never deactivates, disconnects or stops
-  anything for a device whose ownership it cannot show.
+  mapping of this VG, another backend identifier, a changed size), refuses
+  the record, or the record is gone: identify the layout first, then
+  deactivate only the VG you created and disconnect only an NBD backend that
+  still has this run's connection identity. The block never deactivates,
+  disconnects or stops anything for a device whose ownership it cannot show.
