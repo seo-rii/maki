@@ -329,9 +329,11 @@ The `fuzz` job runs where `nightly-gates` runs: it installs the pinned nightly
 and `cargo-fuzz`, copies the workspace's `Cargo.lock` to `fuzz/Cargo.lock`
 (which is not committed) so the fuzzed code is built with the versions the
 workspace pins, and runs every target `cargo fuzz list` names for 30 seconds
-from its seeds. `fuzz/Cargo.toml` patches the vendored `serde_json` and
-`bytes` as the workspace does, so the fuzzed JSON decoder is the one
-production uses. New inputs stay in `fuzz/corpus/<target>`, which is not
+from its seeds; a list that cannot be read or is empty fails the job. Its
+token may only read the repository. `fuzz/Cargo.toml` patches the vendored
+`serde_json` and `bytes` as the workspace does, so the fuzzed JSON decoder
+is the one production uses, and pins `libfuzzer-sys` and `arbitrary`
+exactly, which that lockfile does not list. New inputs stay in `fuzz/corpus/<target>`, which is not
 committed either; a crash fails the job and its input is uploaded as
 `fuzz-artifacts`. The same, locally:
 
