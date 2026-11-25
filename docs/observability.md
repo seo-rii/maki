@@ -97,10 +97,14 @@ The plugin and the `maki`, `maki-check`, `maki-attach` and `maki-benchmark`
 binaries install a stderr `tracing` subscriber at startup. The default
 threshold is `info` and `MAKI_LOG` overrides it. `maki-witness` uses its own
 stderr diagnostics. For the packaged daemon, checkpoint and journal-sync
-failures, provider quarantine, store repairs and control-server errors appear
+failures (the checkpoint worker's, and those of a checkpoint or drain that
+`maki checkpoint` or `maki drain` requested), a stopped rollback session,
+provider quarantine, store repairs and control-server errors appear
 in `journalctl -u maki@<volume>.service` with their level and target. A
 `state: degraded` in `maki status` therefore has a matching `WARN` line
-with the underlying error class. A failed NBD request
+with the underlying error class (an `ERROR` line for a stopped engine). A
+failed drain's line also says that I/O admission stays closed until a drain
+succeeds. A failed NBD request
 (read, write, flush, trim or zero) is logged as a `WARN` `request failed` line
 with the operation, offset, length, errno and error, at most once per second;
 the next line counts the ones suppressed in between. Payload bytes are never
