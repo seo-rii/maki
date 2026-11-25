@@ -259,7 +259,12 @@ alone do not reload the provider.
   No database run under space pressure has been qualified yet
   ([pressure run](../qualification/database-discard-pressure-validation-2026-10-03.md)).
 - Provider unavailable (remote provider): with `availability_policy = "stall"`
-  I/O stalls until an endpoint returns; nothing is acknowledged meanwhile.
+  I/O stalls until an endpoint returns; nothing is acknowledged meanwhile. A
+  daemon that starts while its only endpoint is away logs a warning naming
+  the endpoint and its failure and waits for it, within the unit's start
+  timeout. One whose only endpoint answers with an endpoint failure (a TLS
+  or authentication failure), or whose endpoints are all unreachable,
+  refuses the attach and names each endpoint's failure.
 
 ## 8. Backup and restore
 

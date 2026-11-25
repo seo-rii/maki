@@ -736,13 +736,16 @@ async fn cross_validate_reachable(
 /// Cross-endpoint interchangeability check (SPEC 34) plus the dispatcher
 /// (retry/budget/breaker/failover) shared by every remote transport.
 ///
-/// Each endpoint is first probed on its own (a single-endpoint self-test):
-/// endpoints that are unreachable right now are *quarantined* (review
-/// M-011) and enter the set unvalidated; they only start serving once the
-/// cross-endpoint check succeeds against a validated endpoint under the real
-/// volume context. Reachable endpoints are cross-checked against the first
-/// reachable one; proven non-interchangeability (or a misconfigured
-/// endpoint) refuses attach. At least one endpoint must be reachable.
+/// Each endpoint, a lone one included, is first probed on its own (a
+/// single-endpoint self-test): endpoints that are unreachable right now are
+/// *quarantined* (review M-011) and enter the set unvalidated; they only
+/// start serving once the cross-endpoint check succeeds against a validated
+/// endpoint under the real volume context. Reachable endpoints are
+/// cross-checked against the first reachable one; proven
+/// non-interchangeability (or a misconfigured endpoint) refuses attach. At
+/// least one endpoint must be reachable, and the refusal names each
+/// endpoint's last failure. The one exception is a lone endpoint that failed
+/// only transiently: it is retried under the availability policy.
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
@@ -790,19 +793,17 @@ async fn dispatch_endpoint_set(
         crypto_compatibility_id: superblock.crypto_compatibility_id.clone(),
     };
 
-    // 1. Reachability: every endpoint on its own, tolerating a few transient
-    //    failures only when it permits resending a request. A single endpoint
-    //    has nothing to cross-validate against: the engine self-test (through
-    //    the retry-safe-aware dispatcher) covers it.
+    // 1. Reachability: every endpoint on its own, a lone one included,
+    //    tolerating a few transient failures only when it permits resending
+    //    a request. Left to the engine self-test, which runs through the
+    //    dispatcher, a lone endpoint that cannot serve as configured made
+    //    `stall` wait at attach forever, with nothing logged and no control
+    //    socket to ask.
     let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
-    let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
-    let single = endpoints.len() == 1;
+    let mut failed: Vec<(String, Arc<dyn CryptoProvider>, maki_crypto::CryptoError)> = Vec::new();
+    let lone = endpoints.len() == 1;
     let probe_delay = config.crypto.retry.initial_delay.0;
     for (name, provider) in endpoints {
-        if single {
-            reachable.push((name, provider));
-            break;
-        }
         let validation_provider =
             apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
         // Self-tests and canary checks make real RPCs. A lost response does
@@ -852,16 +853,45 @@ async fn dispatch_endpoint_set(
         }
         match last {
             None => reachable.push((name, provider)),
-            Some(e) => {
-                tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
-                quarantined.push((name, provider));
-            }
+            Some(e) => failed.push((name, provider, e)),
         }
     }
+    // A lone endpoint has no peer to serve while it is away. One that failed
+    // only transiently (a lost connection, a timeout, a 5xx, throttling) is
+    // retried by the engine self-test through the dispatcher under the
+    // availability policy, as before: `stall` waits for it, `bounded-error`
+    // gives up at `max_operation_time`. An endpoint failure (TLS
+    // authentication, a refused or misrouted request) shows that it cannot
+    // serve as configured, and waiting would not change that.
+    if lone
+        && matches!(&failed[..], [(_, _, e)] if e.class() != maki_crypto::ErrorClass::EndpointFatal)
+    {
+        let (name, provider, e) = failed.pop().expect("one failed endpoint");
+        let policy = match config.crypto.availability_policy {
+            maki_format::config::AvailabilityPolicy::Stall => "stall",
+            maki_format::config::AvailabilityPolicy::BoundedError => "bounded-error",
+        };
+        tracing::warn!(
+            "endpoint {name:?} unreachable at attach ({e}); it is the only endpoint, so the \
+             attach keeps retrying it under the `{policy}` availability policy"
+        );
+        reachable.push((name, provider));
+    }
+    let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for (name, provider, e) in failed {
+        // A lone endpoint left here refuses the attach, whose error says why.
+        if !lone {
+            tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
+        }
+        unreachable.push(format!("{name:?}: {e}"));
+        quarantined.push((name, provider));
+    }
     if reachable.is_empty() {
-        return Err(DaemonError::Unsupported(
-            "no remote endpoint is reachable; attach refused".to_string(),
-        ));
+        return Err(DaemonError::Unsupported(format!(
+            "no remote endpoint is reachable; attach refused ({})",
+            unreachable.join("; ")
+        )));
     }
 
     // 2. Interchangeability among the reachable ones (SPEC 34).

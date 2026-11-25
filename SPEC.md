@@ -2249,12 +2249,19 @@ ciphertext encrypted by B must decrypt on A
 
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
-An endpoint that is unreachable when these self-tests run at attach is
-quarantined. A quarantined endpoint MUST NOT serve a volume request until
-the same validation, run against a validated endpoint under the real volume
-context, succeeds in full; the validation itself sends it requests. The set's
-common contract covers every configured endpoint, quarantined ones included,
-so admitting one never changes it.
+Every configured endpoint, a lone one included, is first probed on its own
+at attach. An endpoint that is unreachable when these self-tests run at
+attach is quarantined. When no endpoint is reachable the attach MUST be
+refused, and the refusal MUST name each endpoint's last failure. A lone
+endpoint whose failures were only transient (`Retryable` or `Throttled`)
+is the exception: it has no peer to serve meanwhile, so the attach logs a
+warning that names it and its failure and retries it under the
+availability policy (§35); an `EndpointFatal` failure refuses the attach
+under either policy. A quarantined endpoint MUST NOT serve a volume
+request until the same validation, run against a validated endpoint under
+the real volume context, succeeds in full; the validation itself sends it
+requests. The set's common contract covers every configured endpoint,
+quarantined ones included, so admitting one never changes it.
 
 Validation evidence is either conclusive or inconclusive:
 
@@ -2326,6 +2333,10 @@ Cancellation MUST release queued payload and its admission charge together,
 including requests queued behind a live blocked request. A shared RPC MUST
 remain available to its live callers and MUST be abandoned once its final
 caller cancels.
+
+At attach the policy applies only to a lone endpoint that failed
+transiently (§34): `stall` waits for it, after a warning that names the
+endpoint and its failure, since no control socket exists yet to ask.
 
 ## `bounded-error`
 
