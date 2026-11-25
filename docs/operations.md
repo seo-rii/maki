@@ -1459,17 +1459,24 @@ calls.
     anchor put back, a changed allow-list) before you restart it.
   - A commit or a page write whose outcome is uncertain (`manifest commit
     failed: <error>`, `arena page write failed: <error>`). The error says
-    what failed. A storage error (a failed sync or write, a full
-    filesystem) is corrected before you restart the daemon, which opens the
-    volume against the witness again and keeps every acknowledged write. A
-    commit the witness refused (a predecessor conflict, a denial) is
-    treated as in the item above.
+    what failed. Correct a storage error (a failed sync or write, a full
+    filesystem) before the volume is opened again; the reopened volume keeps
+    every acknowledged write. A commit the witness refused (a predecessor
+    conflict, a denial) is treated as in the item above.
   - A page the committed state references is missing, short or does not
     authenticate (`arena page read failed: <error>`, `rollback arena page
     authentication failed`): media damage looks like this, and so does an
     older copy of a page put back, which is the rollback this protection
     detects. Inspect the backing before you restart: attach refuses the
     volume until every committed page authenticates again.
+
+  With a local witness, restarting the daemon opens the volume again. With a
+  remote witness, a restart alone is refused: the stopped daemon's shutdown
+  drain fails, so it never releases its session, and the authority refuses
+  the next daemon's claim (a predecessor conflict) until an administrator
+  replaces the session with `maki volume takeover`, as for a
+  [stale or failed writer](remote-witness-service.md#snapshot-takeover-and-restore);
+  the takeover keeps every acknowledged write.
 - A volume configuration that is a symlink, has a second hard link, is owned
   by a user other than root and the loading process's user, or is writable by
   its group or others is refused before it is parsed, by the daemon (attach
