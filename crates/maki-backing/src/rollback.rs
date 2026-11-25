@@ -772,10 +772,17 @@ enum Leftover {
 
 fn leftover(disk: &dyn Backing, name: &str) -> io::Result<Leftover> {
     // A creation writes what it stages and reserves under these names again
-    // from the start, which holds only for a regular file with one name: a
-    // link, a directory, a FIFO or a second name would fail it when it
-    // opens the entry, after it has published its marker, and every later
-    // run the same way. The lock is taken before this, by both commands.
+    // from the start, which holds only for a regular file with one name, so
+    // anything else is refused here, named, before anything is published.
+    // Unrefused, a link, a directory, a FIFO or a second name under the
+    // arena fails the creation after its marker is published, and every
+    // later run the same way; a link or a directory under the staged
+    // marker's name fails every run before the marker, since
+    // `publish_marker` can remove neither; and any of them under a slot
+    // fails the check of the slot's contents (`unpublished_slot`) with the
+    // bare error of that open (the system's for a link or a directory,
+    // `FileBacking`'s own for a FIFO or a second name). The lock is taken
+    // before this, by both commands.
     // The staged marker is never read, and `publish_marker` removes the
     // file under its name before it stages the marker, so one this user
     // may not open (what a root-run creation leaves when it is killed

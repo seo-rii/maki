@@ -109,9 +109,12 @@ fn an_interrupted_creation_is_still_offered_to_create_which_continues_it() {
 /// files it reserves (`rollback.arena`, the manifest slots), are files it
 /// writes again from the start: a regular file with one name. Anything
 /// else under those names (a directory, a symbolic link, a FIFO, a file
-/// with a second name) fails the creation when it opens the entry, after
-/// it has published its marker, and then every later run the same way. It
-/// is refused before anything changes, named, and never offered.
+/// with a second name) stopped the creation when it opened the entry:
+/// under the arena after it had published its marker, and every later run
+/// the same way; under the staged marker before the marker (a link or a
+/// directory at every run, a FIFO or a second name once); under a slot
+/// with the bare error of the open that checks it. It is refused before anything changes, named,
+/// and never offered.
 #[test]
 fn a_reserved_name_that_is_not_a_regular_file_is_not_offered_to_create() {
     type Plant = fn(&Path, &Path);

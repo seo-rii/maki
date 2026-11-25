@@ -324,10 +324,15 @@ fn not_replaceable() -> [(&'static str, Plant); 4] {
 /// The staged names are accepted because a creation writes those files again
 /// from the start. An entry it cannot write again is not one of them: a
 /// link, a directory, a FIFO, a file with a second name. A creation that
-/// found out only when it opened the entry had already published its marker
-/// and left a root that failed the same way for good. Both commands refuse
-/// such a root before they change anything, name the entry, and write
-/// through no link; once the entry is removed, creation continues the root.
+/// found out only when it opened the entry under the binding's staged name
+/// had already published its marker; a link or a directory there then
+/// failed every later attempt the same way (a FIFO or a second name was
+/// removed by the failed attempt, and `resume-enrollment` continued the
+/// root). Under the marker's staged name it opened the entry before the
+/// marker, and a link or a directory there failed every attempt. Both
+/// commands refuse such a root before they change anything, name the entry,
+/// and write through no link; once the entry is removed, creation continues
+/// the root.
 #[test]
 fn control_a_staged_entry_that_cannot_be_written_again_is_refused_and_left() {
     for staged in [STAGED_BINDING, STAGED_MARKER] {
