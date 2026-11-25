@@ -262,8 +262,10 @@ alone do not reload the provider.
   I/O stalls until an endpoint returns; nothing is acknowledged meanwhile. A
   daemon that starts while its only endpoint is away logs a warning naming
   the endpoint and its failure and waits for it, within the unit's start
-  timeout. One whose only endpoint answers with an endpoint failure (a TLS
-  or authentication failure), or whose endpoints are all unreachable,
+  timeout, when the provider is `retry_safe` or the endpoint refused the
+  connection. Otherwise (an endpoint failure such as a TLS or authentication
+  failure, or a provider that is not `retry_safe` whose request may have
+  reached the endpoint), and when a set's endpoints are all unreachable, it
   refuses the attach and names each endpoint's failure.
 
 ## 8. Backup and restore

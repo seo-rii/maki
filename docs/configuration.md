@@ -599,15 +599,23 @@ cross-endpoint check succeeds against a validated endpoint. Each endpoint, a
 lone one included, is probed on its own at attach (three attempts, spaced by
 `retry.initial_delay`, for a `retry_safe` provider; one otherwise). When none
 is reachable the attach is refused with "no remote endpoint is reachable;
-attach refused" followed by each endpoint's name and last failure. A lone
-endpoint that failed only with retryable or throttled errors (a refused or
-lost connection, a timeout, a 5xx) is the exception: the attach logs a
+attach refused" followed by each endpoint's name and failure (the first
+endpoint failure among its attempts, otherwise the last failure). A lone
+endpoint is the exception when none of its attempts gave an endpoint
+failure and its probe request may be sent again: the provider is
+`retry_safe`, or every attempt failed before the request left Maki (a
+refused connection, a refused WebSocket upgrade). The attach then logs a
 warning, "endpoint "<name>" unreachable at attach (<error>); it is the only
 endpoint, so the attach keeps retrying it under the <policy> availability
 policy", and retries it like any request, so `stall` waits for it and
-`bounded-error` gives up at `max_operation_time`. An endpoint failure (a TLS
-authentication failure, a 401, 403 or 404) refuses the attach under either
-policy.
+`bounded-error` gives up at `max_operation_time`. Otherwise the probe's
+failure refuses the attach under either policy: an endpoint failure (a TLS
+authentication failure, a 401, 403 or 404) in any attempt, or, when the
+provider is not `retry_safe`, a failure after the request may have reached
+the endpoint (a 5xx, a timeout, a lost response), which is never sent
+again. The policy also governs the engine's own self-test that follows the
+probe, so under `stall` an endpoint that fails after passing its probe is
+waited for as well.
 Each background validation RPC shares the serving RPC count and resident-byte
 budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
 owns these validation tasks and cancels them when its final owner is dropped.
@@ -811,8 +819,8 @@ compatibility ID. Only these answers pass:
 A retryable, throttled or endpoint-failure answer to a probe is inconclusive:
 the endpoint is quarantined, or the attach fails when no other endpoint is
 reachable (a lone endpoint that answered only retryable or throttled errors
-is retried under the availability policy instead, as described
-[above](#websocket-and-grpc-contracts)). A contract error fails the
+and whose probe request may be sent again is retried under the availability
+policy instead, as described [above](#websocket-and-grpc-contracts)). A contract error fails the
 self-test and the attach. Any other answer, such as a 400, a 422 without a
 token, a gRPC `InvalidArgument` or a WebSocket `bad-request`, refuses the
 attach, because the declared capability was not proven. The cross-endpoint

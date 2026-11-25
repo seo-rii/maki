@@ -2252,12 +2252,17 @@ Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 Every configured endpoint, a lone one included, is first probed on its own
 at attach. An endpoint that is unreachable when these self-tests run at
 attach is quarantined. When no endpoint is reachable the attach MUST be
-refused, and the refusal MUST name each endpoint's last failure. A lone
-endpoint whose failures were only transient (`Retryable` or `Throttled`)
-is the exception: it has no peer to serve meanwhile, so the attach logs a
-warning that names it and its failure and retries it under the
-availability policy (§35); an `EndpointFatal` failure refuses the attach
-under either policy. A quarantined endpoint MUST NOT serve a volume
+refused, and the refusal MUST name each endpoint's failure (the first
+`EndpointFatal` failure among its probe attempts, otherwise the last). A
+lone endpoint is the exception when no probe attempt failed with
+`EndpointFatal` and the probe's request may be sent again: the provider is
+retry-safe, or no attempt may have sent it (§18). It has no peer to serve
+meanwhile, so the attach logs a warning that names it and its failure and
+retries it under the availability policy (§35). Otherwise its failure
+refuses the attach under either policy: an `EndpointFatal` failure shows it
+cannot serve as configured, and a request of a provider that is not
+retry-safe is never sent again after an attempt that may have sent it. A
+quarantined endpoint MUST NOT serve a volume
 request until the same validation, run against a validated endpoint under
 the real volume context, succeeds in full; the validation itself sends it
 requests. The set's common contract covers every configured endpoint,
@@ -2334,9 +2339,12 @@ including requests queued behind a live blocked request. A shared RPC MUST
 remain available to its live callers and MUST be abandoned once its final
 caller cancels.
 
-At attach the policy applies only to a lone endpoint that failed
-transiently (§34): `stall` waits for it, after a warning that names the
-endpoint and its failure, since no control socket exists yet to ask.
+At attach, the engine's self-test and key-canary check go through the
+dispatcher too, so the policy governs them as well: under `stall` the
+attach waits for an endpoint that fails after its probe passed, and for a
+lone endpoint whose probe failure was left to the dispatcher (§34), which
+the attach first names in a warning, since no control socket exists yet to
+ask.
 
 ## `bounded-error`
 

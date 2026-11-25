@@ -669,6 +669,21 @@ fn transport_failure(e: &maki_crypto::CryptoError) -> bool {
 }
 
 type NamedEndpoint = (String, Arc<dyn CryptoProvider>);
+
+/// Record one failed reachability probe attempt: keep the first endpoint
+/// failure among the attempts, and note whether the attempt may have reached
+/// the endpoint.
+fn note_probe_failure(
+    error: &maki_crypto::CryptoError,
+    endpoint_fatal: &mut Option<maki_crypto::CryptoError>,
+    maybe_sent: &mut bool,
+) {
+    if endpoint_fatal.is_none() && error.class() == maki_crypto::ErrorClass::EndpointFatal {
+        *endpoint_fatal = Some(error.duplicate());
+    }
+    *maybe_sent |= !error.is_not_sent();
+}
+
 type CheckedEndpoint = (String, Arc<dyn CryptoProvider>, bool);
 
 async fn cross_validate_reachable(
@@ -744,8 +759,9 @@ async fn cross_validate_reachable(
 /// cross-checked against the first reachable one; proven
 /// non-interchangeability (or a misconfigured endpoint) refuses attach. At
 /// least one endpoint must be reachable, and the refusal names each
-/// endpoint's last failure. The one exception is a lone endpoint that failed
-/// only transiently: it is retried under the availability policy.
+/// endpoint's failure. The one exception is a lone endpoint that failed
+/// only transiently and whose probe request may be sent again: it is
+/// retried under the availability policy.
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
@@ -800,7 +816,14 @@ async fn dispatch_endpoint_set(
     //    `stall` wait at attach forever, with nothing logged and no control
     //    socket to ask.
     let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
-    let mut failed: Vec<(String, Arc<dyn CryptoProvider>, maki_crypto::CryptoError)> = Vec::new();
+    // A failed endpoint with the failure to report and whether the
+    // dispatcher may send the probe's request to it again.
+    let mut failed: Vec<(
+        String,
+        Arc<dyn CryptoProvider>,
+        maki_crypto::CryptoError,
+        bool,
+    )> = Vec::new();
     let lone = endpoints.len() == 1;
     let probe_delay = config.crypto.retry.initial_delay.0;
     for (name, provider) in endpoints {
@@ -809,12 +832,13 @@ async fn dispatch_endpoint_set(
         // Self-tests and canary checks make real RPCs. A lost response does
         // not prove the operation was unapplied, so the whole probe must not
         // be restarted for a provider that does not promise retry safety.
-        let probe_attempts = if validation_provider.capabilities().await?.retry_safe {
-            3
-        } else {
-            1
-        };
+        let retry_safe = validation_provider.capabilities().await?.retry_safe;
+        let probe_attempts = if retry_safe { 3 } else { 1 };
         let mut last: Option<maki_crypto::CryptoError> = None;
+        // Across the attempts: the first endpoint failure, and whether any
+        // attempt may have reached the endpoint.
+        let mut endpoint_fatal: Option<maki_crypto::CryptoError> = None;
+        let mut maybe_sent = false;
         for attempt in 0..probe_attempts {
             match provider_self_test(validation_provider.as_ref(), &context, unit, &compat).await {
                 Ok(()) => {
@@ -833,12 +857,14 @@ async fn dispatch_endpoint_set(
                             break;
                         }
                         Err(AttachError::Crypto(e)) if transport_failure(&e) => {
+                            note_probe_failure(&e, &mut endpoint_fatal, &mut maybe_sent);
                             last = Some(e);
                         }
                         Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) if transport_failure(&e) => {
+                    note_probe_failure(&e, &mut endpoint_fatal, &mut maybe_sent);
                     last = Some(e);
                 }
                 Err(e) => {
@@ -853,20 +879,25 @@ async fn dispatch_endpoint_set(
         }
         match last {
             None => reachable.push((name, provider)),
-            Some(e) => failed.push((name, provider, e)),
+            Some(last) => {
+                let resendable = endpoint_fatal.is_none() && (retry_safe || !maybe_sent);
+                failed.push((name, provider, endpoint_fatal.unwrap_or(last), resendable));
+            }
         }
     }
-    // A lone endpoint has no peer to serve while it is away. One that failed
-    // only transiently (a lost connection, a timeout, a 5xx, throttling) is
-    // retried by the engine self-test through the dispatcher under the
-    // availability policy, as before: `stall` waits for it, `bounded-error`
-    // gives up at `max_operation_time`. An endpoint failure (TLS
-    // authentication, a refused or misrouted request) shows that it cannot
-    // serve as configured, and waiting would not change that.
-    if lone
-        && matches!(&failed[..], [(_, _, e)] if e.class() != maki_crypto::ErrorClass::EndpointFatal)
-    {
-        let (name, provider, e) = failed.pop().expect("one failed endpoint");
+    // A lone endpoint has no peer to serve while it is away. When no probe
+    // attempt gave an endpoint failure and the dispatcher may send the
+    // probe's request again (the provider is retry-safe, or no attempt may
+    // have reached the endpoint), the engine self-test retries it through
+    // the dispatcher under the availability policy: `stall` waits for it,
+    // `bounded-error` gives up at `max_operation_time`. Otherwise the
+    // probe's failure is final, as the dispatcher would make it: an endpoint
+    // failure (TLS authentication, a refused or misrouted request) in any
+    // attempt shows the endpoint cannot serve as configured, and a request of
+    // a provider that is not retry-safe that may have reached the endpoint
+    // is never sent again (SPEC §18).
+    if lone && matches!(&failed[..], [(_, _, _, true)]) {
+        let (name, provider, e, _) = failed.pop().expect("one failed endpoint");
         let policy = match config.crypto.availability_policy {
             maki_format::config::AvailabilityPolicy::Stall => "stall",
             maki_format::config::AvailabilityPolicy::BoundedError => "bounded-error",
@@ -879,7 +910,7 @@ async fn dispatch_endpoint_set(
     }
     let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     let mut unreachable: Vec<String> = Vec::new();
-    for (name, provider, e) in failed {
+    for (name, provider, e, _) in failed {
         // A lone endpoint left here refuses the attach, whose error says why.
         if !lone {
             tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
