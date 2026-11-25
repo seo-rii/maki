@@ -1053,8 +1053,10 @@ impl SlotStore {
         //    at open needs its map on disk first as well (K-03 residual: an
         //    interrupted checkpoint after this commit, then a power loss,
         //    otherwise leaves a cataloged shard with no allocation copy,
-        //    which every later attach refuses).
+        //    which every later attach refuses), and every shard's size must
+        //    be proven, an adopted shard whose maps are stored included.
         self.commit_adopted_maps()?;
+        self.prove_unproven_data_files(&|| {})?;
         self.persist_discards()?;
         fp("store.shard_dirsync")?;
         self.backing.sync_dir(layout::DATA_DIR)?;
@@ -1112,6 +1114,31 @@ impl SlotStore {
         shard.data.set_len(physical)?;
         shard.data.sync_data()?;
         shard.short = None;
+        Ok(())
+    }
+
+    /// Prove the size of every loaded shard's data file that is not proven
+    /// yet (`short` is set), in shard order. Both catalog commits run this
+    /// first: a commit publishes the whole in-memory catalog, and a
+    /// cataloged shard's short file is truncation damage, so a shard whose
+    /// size was never proven must not be named. The map state does not tell
+    /// which shards need it: an adopted shard's maps can be stored while
+    /// the size proof that followed failed.
+    fn prove_unproven_data_files(
+        &mut self,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<(), CoreError> {
+        let mut unproven: Vec<u64> = self
+            .shards
+            .iter()
+            .filter(|(_, s)| s.short.is_some())
+            .map(|(idx, _)| *idx)
+            .collect();
+        unproven.sort_unstable();
+        for idx in unproven {
+            self.prove_data_file(idx)?;
+            progress();
+        }
         Ok(())
     }
 
@@ -1272,21 +1299,11 @@ impl SlotStore {
         // with no allocation copy, which no later attach could open (K-03).
         // The commit also asserts every named shard's data-file size (a
         // cataloged shard's short file is truncation damage), so an adopted
-        // shard's size is proven first, as `commit_adopted_maps` does before
-        // `ensure_shard`'s commit: a zero-length orphan cataloged as is would
-        // read as damage (EIO) after the next power loss.
+        // shard's size is proven first, as `ensure_shard` does before its
+        // commit: a zero-length orphan cataloged as is would read as damage
+        // (EIO) after the next power loss.
         if self.catalog_dirty {
-            let mut unproven: Vec<u64> = self
-                .shards
-                .iter()
-                .filter(|(_, s)| s.short.is_some())
-                .map(|(idx, _)| *idx)
-                .collect();
-            unproven.sort_unstable();
-            for idx in unproven {
-                self.prove_data_file(idx)?;
-                progress();
-            }
+            self.prove_unproven_data_files(progress)?;
             fp("store.catalog_store")?;
             self.catalog_ab
                 .store(self.backing.as_ref(), &mut self.catalog)?;
