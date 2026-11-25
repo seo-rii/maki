@@ -162,12 +162,18 @@ async fn non_retry_safe_initial_probe_must_be_sent_only_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_dispatch_does_not_resend_non_retry_safe_request() {
-    let failed = TestServer::start(lost_response(false)).await;
+    // The lone endpoint serves its attach probe, then loses every response.
+    let failed = TestServer::start(Arc::new(|request| {
+        ResponseSpec::raw(request.body.iter().map(|byte| byte ^ 0x5a).collect())
+    }))
+    .await;
     let directory = tempfile::tempdir().unwrap();
     let raw = config(&directory.path().join("volume"), &[failed.url()], false);
     let cfg = parse_and_validate(&raw).unwrap();
     create_volume_from_config_str(&raw).unwrap();
     let (provider, _endpoints) = build_provider_with_endpoints(&cfg).await.unwrap();
+    failed.set_handler(lost_response(false));
+    failed.requests.lock().clear();
     let context = CryptoContext {
         volume_uuid: uuid::Uuid::from_u128(0x20261024),
         format_version: 1,
@@ -197,5 +203,50 @@ async fn non_retry_safe_initial_canary_probe_must_be_sent_only_once() {
         initial_probe_requests(false, true).await,
         1,
         "initial canary probing re-sent an uncertain non-retry-safe encrypt request"
+    );
+}
+
+/// A lone endpoint is probed like each endpoint of a set: a lost response
+/// is sent again only by a retry-safe provider. A lost response is a
+/// transient failure, so the lone endpoint is then kept for the dispatcher,
+/// which retries it under the availability policy.
+async fn lone_endpoint_probe_requests(retry_safe: bool) -> usize {
+    let failed = TestServer::start(lost_response(false)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let raw = config(
+        &directory.path().join("volume"),
+        &[failed.url()],
+        retry_safe,
+    )
+    .replace(
+        "availability_policy = \"bounded-error\"\nmax_operation_time = \"1s\"",
+        "availability_policy = \"stall\"",
+    );
+    assert!(raw.contains("availability_policy = \"stall\""));
+    let cfg = parse_and_validate(&raw).unwrap();
+    create_volume_from_config_str(&raw).unwrap();
+    let (_provider, endpoints) = build_provider_with_endpoints(&cfg).await.unwrap();
+    let states = endpoints.unwrap().endpoint_status();
+    assert_eq!(states.len(), 1);
+    assert!(states[0].validated, "{states:?}");
+    let requests = failed.requests.lock();
+    assert!(requests.iter().all(|request| request.path == "/encrypt"));
+    assert!(requests
+        .iter()
+        .all(|request| request.body == requests[0].body));
+    requests.len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_safe_lone_endpoint_probe_is_retried_three_times() {
+    assert_eq!(lone_endpoint_probe_requests(true).await, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_retry_safe_lone_endpoint_probe_is_sent_only_once() {
+    assert_eq!(
+        lone_endpoint_probe_requests(false).await,
+        1,
+        "the probe of a lone endpoint re-sent an uncertain non-retry-safe encrypt request"
     );
 }
