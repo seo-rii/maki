@@ -5,6 +5,12 @@
 //! `std::env::args`, which panics on an argument that is not UTF-8, so such
 //! an argument ended the command with status 101 and a Rust panic message
 //! instead of a usage error.
+//!
+//! An option given where a command expects its path (`maki-witness serve
+//! --help`, `maki-witness init --state <uuid>`) was taken for that path:
+//! `serve`, `inspect` and `fingerprint` tried to open a file of that name
+//! and exited 1, and `init` created a state directory named `--state` in the
+//! working directory.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -81,6 +87,50 @@ fn a_volume_identity_that_is_not_a_uuid_exits_2_before_anything_is_created() {
         !state.exists(),
         "a refused init created its state directory"
     );
+}
+
+/// The working directory holds a file of each such name whose contents
+/// are neither a configuration nor a certificate, so a command that opened
+/// one would fail with status 1.
+#[test]
+fn an_option_where_a_path_belongs_exits_2_before_anything_is_read_or_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = ["--help", "--bogus", "-", "--config"];
+    for name in files {
+        std::fs::write(dir.path().join(name), "neither\n").unwrap();
+    }
+    let mut failures = Vec::new();
+    for args in [
+        vec!["serve", "--help"],
+        vec!["inspect", "--bogus"],
+        vec!["fingerprint", "-"],
+        vec!["init-etcd", "--config", UUID],
+        vec!["init", "--state", UUID],
+        vec!["init", "-", UUID],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_maki-witness"))
+            .args(&args)
+            .current_dir(dir.path())
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        let stderr = stderr(&output);
+        if output.status.code() != Some(2) || !stderr.contains(USAGE) || !output.stdout.is_empty() {
+            failures.push(format!("{args:?}: {:?}: {stderr}", output.status.code()));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        !dir.path().join("--state").exists(),
+        "a refused init created its state directory"
+    );
+    for name in files {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(name)).unwrap(),
+            "neither\n",
+            "{name}"
+        );
+    }
 }
 
 /// A command whose arguments are well formed still exits 1 when it fails.
