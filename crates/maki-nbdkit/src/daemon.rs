@@ -182,19 +182,20 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
 pub fn volume_layout_present(config: &VolumeConfig) -> Result<bool, DaemonError> {
     config.validate()?;
     let root = Path::new(&config.backing.root);
+    // A missing root holds no volume, and creation makes it. Any other root
+    // that cannot be looked at is refused with its path and setting.
     match std::fs::metadata(root) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return Err(DaemonError::Unsupported(
-                "backing root is not a directory".into(),
-            ))
-        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
+        _ => maki_backing::configured::BACKING_ROOT.reachable(root)?,
     }
-    Ok(root.join("rollback.format").try_exists()?
-        || root.join(maki_format::layout::SUPERBLOCK_A).try_exists()?
-        || root.join(maki_format::layout::SUPERBLOCK_B).try_exists()?)
+    let present = |name: &str| {
+        root.join(name)
+            .try_exists()
+            .map_err(|error| maki_backing::configured::BACKING_ROOT.refusal(root, error))
+    };
+    Ok(present("rollback.format")?
+        || present(maki_format::layout::SUPERBLOCK_A)?
+        || present(maki_format::layout::SUPERBLOCK_B)?)
 }
 
 /// Open and validate an existing volume before a tool chooses creation or

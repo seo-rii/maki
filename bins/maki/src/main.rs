@@ -930,12 +930,10 @@ fn existing_backing(
     {
         return Err("read-only remote backing inspection is not supported; use `maki volume witness` to inspect the authority without claiming a writer".into());
     }
-    let root = std::path::Path::new(&cfg.backing.root);
-    match std::fs::metadata(root) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(format!("{}: not a directory", root.display())),
-        Err(error) => return Err(format!("{}: {error}", root.display())),
-    }
+    // An existing directory only: opening it read-only creates nothing.
+    maki_backing::configured::BACKING_ROOT
+        .reachable(std::path::Path::new(&cfg.backing.root))
+        .map_err(|error| error.to_string())?;
     maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
 }
 

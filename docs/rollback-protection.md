@@ -367,13 +367,16 @@ the volume is detached, as the daemon user or as root:
 runuser -u maki -- maki check /etc/maki/volumes/protected.toml --deep
 ```
 
-These commands, the daemon and `maki-benchmark` never create the backing
-root or the witness directory, as `volume create` does. A witness directory
-that does not exist, is not a directory or that the user running them may
-not open is refused with its path and `backing.rollback_protection.witness_root`;
-one that is missing after a reboot usually means that its filesystem is not
-mounted. The backing root is refused the same way with `backing.root`
-(`maki check` and `maki volume inspect` name only the path of a missing one).
+These commands and the daemon never create the backing root or the witness
+directory, as `volume create` does. They refuse a backing root or witness
+directory that does not exist, is not a directory or that the user running
+them may not open, with its path and the setting that names it
+(`backing.root`, `backing.rollback_protection.witness_root`); a witness
+directory that is missing after a reboot usually means that its filesystem
+is not mounted. `maki-benchmark` refuses a backing root that is not a
+directory or that it may not open the same way, and a volume it reuses as
+the daemon does; where the backing root holds no volume, or does not exist,
+it creates one as `volume create` does, witness directory included.
 
 These acquire the exclusive witness session and reestablish the selected
 witness record's durability without advancing it, by writing the record to a

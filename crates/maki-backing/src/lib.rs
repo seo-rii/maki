@@ -16,6 +16,7 @@
 // write fails (a closed pipe, a full disk). Tests may print.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
+pub mod configured;
 pub mod file;
 pub mod mem;
 pub mod path;

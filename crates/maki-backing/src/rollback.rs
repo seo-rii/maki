@@ -28,7 +28,7 @@ mod local_load_tests;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod review_restore;
-use crate::{path, Backing, BackingFile, FileBacking, VolumeLock};
+use crate::{configured, path, Backing, BackingFile, FileBacking, VolumeLock};
 use remote::Witness;
 
 const PAGE: u64 = 4096;
@@ -245,91 +245,6 @@ fn slots_of<'a>(nodes: impl Iterator<Item = &'a Node>) -> BTreeSet<u64> {
         .collect()
 }
 
-/// A directory a local rollback backing opens, as its configuration names it.
-struct Configured {
-    what: &'static str,
-    key: &'static str,
-    /// Whether a path that, followed, is something other than a directory
-    /// is refused as invalid input: the witness has always refused one so
-    /// (its own check follows the path). Every other path that is not a
-    /// directory keeps the system's NotADirectory.
-    other_than_a_directory_is_input: bool,
-}
-
-const BACKING_ROOT: Configured = Configured {
-    what: "backing root",
-    key: "backing.root",
-    other_than_a_directory_is_input: false,
-};
-
-const WITNESS_ROOT: Configured = Configured {
-    what: "rollback witness directory",
-    key: "backing.rollback_protection.witness_root",
-    other_than_a_directory_is_input: true,
-};
-
-/// Refuse a configured directory that this process cannot open, before the
-/// checks that follow report the bare system error: name the directory,
-/// its path and the configuration key, and what to check (a missing one is
-/// often a typo, or a filesystem that is not mounted), with the kind the
-/// system gave. It opens the directory read-only and changes nothing:
-/// opening a pair never creates either directory (`create` does).
-fn reachable(path: &Path, directory: &Configured) -> io::Result<()> {
-    let Err(error) = FileBacking::read_only(path) else {
-        return Ok(());
-    };
-    let Configured { what, key, .. } = directory;
-    let followed = path;
-    let path = path.display();
-    let (kind, message) = match error.kind() {
-        io::ErrorKind::NotFound => (
-            error.kind(),
-            format!(
-                "the {what} {path} (`{key}`) does not exist: check the configured path for a \
-                 typo and that the filesystem that holds it is mounted"
-            ),
-        ),
-        io::ErrorKind::PermissionDenied => (
-            error.kind(),
-            format!(
-                "this process may not open the {what} {path} (`{key}`): {error}; check the \
-                 owner and mode of the directory and of the directories above it"
-            ),
-        ),
-        io::ErrorKind::NotADirectory => {
-            // The path is opened without following a symbolic link in any
-            // component. Say which is wrong: the path itself, or the way
-            // to it.
-            let wrong = match std::fs::symlink_metadata(followed) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    "is a symbolic link, which is not followed: configure the directory itself"
-                }
-                Ok(metadata) if !metadata.is_dir() => "is not a directory",
-                Ok(_) => {
-                    "is reached through a symbolic link, which is not followed: configure \
-                     the path without it"
-                }
-                Err(_) => "cannot be reached: a component of its path is not a directory",
-            };
-            let input = directory.other_than_a_directory_is_input
-                && std::fs::metadata(followed).is_ok_and(|metadata| !metadata.is_dir());
-            (
-                if input {
-                    io::ErrorKind::InvalidInput
-                } else {
-                    error.kind()
-                },
-                format!("the {what} {path} (`{key}`) {wrong}"),
-            )
-        }
-        _ => (
-            error.kind(),
-            format!("cannot open the {what} {path} (`{key}`): {error}"),
-        ),
-    };
-    Err(io::Error::new(kind, message))
-}
-
 fn independent_paths(root: &Path, witness: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -454,9 +369,11 @@ impl RollbackBacking {
 
     /// Open only the exact manifest selected by the existing witness.
     pub fn open(root: &Path, witness: &Path) -> io::Result<Self> {
+        // Name a configured directory this process cannot open before the
+        // checks below report its bare error. Opening never creates either.
         if cfg!(target_os = "linux") {
-            reachable(root, &BACKING_ROOT)?;
-            reachable(witness, &WITNESS_ROOT)?;
+            configured::BACKING_ROOT.reachable(root)?;
+            configured::WITNESS_ROOT.reachable(witness)?;
         }
         independent_paths(root, witness)?;
         Self::open_backing(Arc::new(FileBacking::new(root)?), witness)
