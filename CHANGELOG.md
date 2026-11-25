@@ -962,7 +962,7 @@ documents.
   anything and names the entry. It used to publish its marker and then fail
   at every run for such an arena, fail every run before the marker for a
   link or a directory under the staged marker's name, and fail with the
-  bare system error for a slot; a FIFO or a second name under the staged
+  bare error of the open that checks it for a slot; a FIFO or a second name under the staged
   marker's name, which the failed first run removed, is now refused until
   it is removed. It removes a staged marker that its user may not open, as
   a creation run as root and killed before it gave the file away leaves

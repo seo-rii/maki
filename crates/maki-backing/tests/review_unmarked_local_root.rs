@@ -113,7 +113,7 @@ fn an_interrupted_creation_is_still_offered_to_create_which_continues_it() {
 /// under the arena after it had published its marker, and every later run
 /// the same way; under the staged marker before the marker (a link or a
 /// directory at every run, a FIFO or a second name once); under a slot
-/// with the system's error. It is refused before anything changes, named,
+/// with the bare error of the open that checks it. It is refused before anything changes, named,
 /// and never offered.
 #[test]
 fn a_reserved_name_that_is_not_a_regular_file_is_not_offered_to_create() {
