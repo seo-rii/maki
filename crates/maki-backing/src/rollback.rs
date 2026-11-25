@@ -780,7 +780,9 @@ fn unwritten_marker(disk: &dyn Backing, magic: &[u8]) -> io::Result<bool> {
 /// holding anything else, bytes that do not decode included, is a
 /// volume's slot in whatever state damage left it: it is refused whatever
 /// the witness directory holds, an empty one included (a witness that is
-/// not mounted). The marker refuses anything but this format.
+/// not mounted). The marker refuses anything but this format. The staged
+/// marker, the arena and the slots must each be a regular file with one
+/// name, which the creation can write again (`unpublished_entry`).
 fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::Result<()> {
     let refused = || {
         io::Error::new(
@@ -807,6 +809,16 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
 /// nothing may have left, holding only what it writes there (see
 /// `require_unpublished_local`).
 fn unpublished_entry(disk: &dyn Backing, name: &str) -> io::Result<bool> {
+    // A creation writes what it stages and reserves under these names again
+    // from the start, which holds only for a regular file with one name: a
+    // link, a directory, a FIFO or a second name would fail it when it
+    // opens the entry, after it has published its marker, and every later
+    // run the same way. The lock is taken before this, by both commands.
+    if (name == MARKER_NEXT || name == ARENA || MANIFESTS.contains(&name))
+        && remote::unwritable(disk, name)?.is_some()
+    {
+        return Ok(false);
+    }
     Ok(match name {
         LOCK | MARKER_NEXT | ARENA => true,
         MARKER => {

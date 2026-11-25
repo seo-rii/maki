@@ -327,7 +327,10 @@ accepts a backing directory that holds only what a creation writes (the
 lock, the marker, the arena and the two manifest slots) as long as the
 second slot holds only zeros and the first only zeros or the initial empty
 manifest, and a witness directory that holds only `witness.lock` and
-`anchor.next`. Every volume that committed anything wrote its second slot,
+`anchor.next`. The staged marker, the arena and the slots must each be a
+regular file with one name, which the creation writes again: a directory,
+a symbolic link, a FIFO or a file with a second name under one of those
+names is refused before anything changes, and named. Every volume that committed anything wrote its second slot,
 so `create` never creates over one, whatever the witness directory holds
 and short of both slots lost or zeroed entirely (an all-zero slot is an
 unwritten one): a witness mount that is missing (an empty directory in its

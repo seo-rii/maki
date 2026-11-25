@@ -328,7 +328,7 @@ fn not_replaceable(name: &str, cause: &io::Error, way_out: &str) -> io::Error {
 /// (an I/O error, no descriptor left) says nothing about the entry and is
 /// the caller's error as it is; a good file must not be called unwritable
 /// for it.
-fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
+pub(super) fn unwritable(disk: &dyn Backing, name: &str) -> io::Result<Option<io::Error>> {
     match disk.open(name, false) {
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
