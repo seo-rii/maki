@@ -732,7 +732,11 @@ response head or chunked body that does not parse, or a body that only the
 connection's close ends; a gRPC message whose length prefix, count or final
 status breaks the gRPC protocol, or a stream that ends inside a message; a
 WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
-with a numeric ID. Two protocol failures are classified otherwise:
+with a numeric ID. A TLS failure is recognised wherever the TLS error reaches
+the transport: in the connection attempt, and for gRPC also when the library
+reconnects inside an established channel (a server restarted with a
+certificate Maki does not trust); the next call then opens a new connection.
+Three failures are classified otherwise:
 
 - A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
   upgrade headers or with the wrong accept key, a status below 300 or above
@@ -751,6 +755,18 @@ with a numeric ID. Two protocol failures are classified otherwise:
   counts as sent, so a call that a GOAWAY refused is sent to another endpoint
   only when the provider is `retry_safe`. The next call opens a new
   connection.
+- A gRPC server that refuses the client certificate under TLS 1.3 does so
+  after the client has finished its side of the handshake, so the refusal
+  reaches the first call, not the connection attempt. The HTTP/2 library
+  keeps only the kind and text of that connection error, or cancels the call
+  with "connection closed", and Maki never classifies by text: the call is
+  classified by the status the library derives, usually `Unknown`,
+  `Cancelled` or `Unavailable`, which is retryable and counts as sent. The
+  server's log names the refusal. Under TLS 1.2 the refusal happens inside
+  the handshake and is an endpoint failure, and HTTP and WebSocket report it
+  as one when the server's alert is read before the connection is lost. On
+  any transport, a server that resets the connection before the client has
+  read its alert leaves only a lost connection, which is retryable.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:

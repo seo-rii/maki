@@ -64,6 +64,13 @@ impl ConnectionFailure {
     }
 }
 
+/// The endpoint failure for a TLS error anywhere in `error`'s chain, the
+/// connection attempt's classification applied to a failed call.
+pub(super) fn tls_failure(error: &(dyn std::error::Error + 'static)) -> Option<CryptoError> {
+    matches!(ConnectionFailure::classify(error), ConnectionFailure::Tls)
+        .then(|| ConnectionFailure::Tls.into_crypto_error())
+}
+
 struct CachedChannel {
     state: watch::Receiver<ConnectionState>,
     worker: JoinHandle<()>,
