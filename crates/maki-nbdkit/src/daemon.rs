@@ -183,7 +183,7 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
 ///
 /// Where this process may write the backing root (and, with local rollback
 /// protection, the witness directory) this is [`build_backing`], exactly as
-/// before. Where it may not ([`FileBacking::may_write_root`]: a read-only
+/// before. Where it may not ([`FileBacking::may_write`], Linux only: a read-only
 /// mount, a read-only bind mount, a directory it may not write, an immutable
 /// one), a plain root opens as a [`FileBacking::read_only`] view, which
 /// creates, writes, syncs and removes nothing; a check through it says so
@@ -220,10 +220,17 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
         }
         return build_backing(config);
     }
-    if BACKING_ROOT.may_write(root)? {
+    // Ask about the view that is then read, through its pinned descriptor:
+    // the directory found unwritable is the one checked. A root that becomes
+    // unwritable before `build_backing` opens it again fails there, as it
+    // did before; nothing is opened for writing on the read-only path.
+    let view = FileBacking::read_only(root).map_err(|error| BACKING_ROOT.refusal(root, error))?;
+    if view
+        .may_write()
+        .map_err(|error| BACKING_ROOT.refusal(root, error))?
+    {
         return build_backing(config);
     }
-    let view = FileBacking::read_only(root).map_err(|error| BACKING_ROOT.refusal(root, error))?;
     // As `build_backing` refuses it: a protected root is never read as a
     // plain one because its configuration stanza went missing.
     if view.exists("rollback.format")? {

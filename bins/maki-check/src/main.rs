@@ -124,14 +124,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     // A root this process may not write (a read-only mount, a tree it may
-    // not write) is read through a view that creates, writes, syncs and
-    // removes nothing; the report says what that cannot prove. Elsewhere the
-    // check opens the root as before.
-    let backing = match maki_backing::FileBacking::may_write_root(root).and_then(|writable| {
-        if writable {
+    // not write; Linux only) is read through a view that creates, writes,
+    // syncs and removes nothing; the report says what that cannot prove. The
+    // view asked is the view read. Elsewhere the check opens the root as
+    // before.
+    let backing = match maki_backing::FileBacking::read_only(root).and_then(|view| {
+        if view.may_write()? {
             maki_backing::FileBacking::new(root)
         } else {
-            maki_backing::FileBacking::read_only(root)
+            Ok(view)
         }
     }) {
         Ok(b) => b,

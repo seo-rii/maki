@@ -125,32 +125,34 @@ impl FileBacking {
         lock_shared(file)
     }
 
-    /// Whether this process may create entries in the existing directory
-    /// `root`, which is opened as [`FileBacking::read_only`] opens it:
-    /// nothing is created, written or synced. The answer is the kernel's
-    /// for this process's effective credentials, ACLs and capabilities
-    /// (`faccessat` with `AT_EACCESS` on the opened directory): `false` on a
-    /// read-only mount, a read-only bind mount included (EROFS), for a
-    /// directory without write permission for this process (EACCES), and
-    /// for an immutable directory (EPERM). It says nothing about the files
-    /// below the root. Only Linux asks; on other platforms, which serve
-    /// development only, the answer is `true`.
-    pub fn may_write_root(root: impl Into<PathBuf>) -> io::Result<bool> {
-        let root = root.into();
+    /// Whether this process may create entries in this backing's root. On
+    /// Linux it asks about the pinned root descriptor that every operation
+    /// of this backing resolves through, so the answer concerns the
+    /// directory this backing reads, even if the path has been renamed or
+    /// replaced since it was opened, and nothing is created, written or
+    /// synced. The answer is the kernel's for this process's effective
+    /// credentials, ACLs and capabilities (`faccessat` with `AT_EACCESS`):
+    /// `false` on a read-only mount, a read-only bind mount included
+    /// (EROFS), for a directory without write permission for this process
+    /// (EACCES), and for an immutable directory (EPERM). It says nothing
+    /// about the files below the root. Only Linux asks; on other platforms,
+    /// which serve development only, the answer is `true`.
+    pub fn may_write(&self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
-            linux::Directory::existing(&root)?.may_write()
+            self.directory.may_write()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if !fs::metadata(&root)?.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "backing root is not a directory",
-                ));
-            }
             Ok(true)
         }
+    }
+
+    /// [`Self::may_write`] of the existing directory `root`, opened as
+    /// [`FileBacking::read_only`] opens it and closed again. A caller that
+    /// reads the root after asking asks the view it reads through instead.
+    pub fn may_write_root(root: impl Into<PathBuf>) -> io::Result<bool> {
+        Self::read_only(root)?.may_write()
     }
 
     /// Refuse a change through a [`FileBacking::read_only`] view.
@@ -845,6 +847,10 @@ mod tests {
     fn a_writable_root_may_be_written_and_a_missing_one_is_not_created() {
         let dir = tempfile::tempdir().unwrap();
         assert!(FileBacking::may_write_root(dir.path()).unwrap());
+        assert!(FileBacking::read_only(dir.path())
+            .unwrap()
+            .may_write()
+            .unwrap());
         let missing = dir.path().join("missing");
         assert_eq!(
             FileBacking::may_write_root(&missing).unwrap_err().kind(),
@@ -853,6 +859,21 @@ mod tests {
         assert!(!missing.exists());
         fs::write(&missing, b"").unwrap();
         assert!(FileBacking::may_write_root(&missing).is_err());
+    }
+
+    /// `may_write` answers for the directory the backing holds, not for
+    /// whatever its path names by now, so a caller that reads through the
+    /// view it asked reads the directory the answer is about.
+    #[test]
+    fn may_write_answers_for_the_root_the_view_holds_not_for_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let view = FileBacking::read_only(&root).unwrap();
+        fs::rename(&root, dir.path().join("moved")).unwrap();
+        fs::write(&root, b"").unwrap();
+        assert!(view.may_write().unwrap());
+        assert!(FileBacking::may_write_root(&root).is_err());
     }
 
     #[test]
