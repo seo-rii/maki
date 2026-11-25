@@ -479,6 +479,8 @@ fn export_of(record: &BoundDeviceRecord) -> Export {
         .expect("fixture volume")
 }
 
+impl Clock for Host {}
+
 impl System for Host {
     fn lvm_preflight(
         &mut self,
@@ -904,6 +906,15 @@ fn every_verb_of_the_recorded_volume_converges_beside_the_other_volume() {
 
 /// A system that knows only the kernel's view of free devices.
 struct KernelView(Host);
+
+impl Clock for KernelView {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.0.sleep(duration);
+    }
+}
 
 impl System for KernelView {
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {

@@ -43,10 +43,29 @@ use crate::verify::{
 /// Serializes attach helpers system-wide (device allocation + connect).
 pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long `nbd-disconnect` waits for a device to stop showing the
-/// connection it disconnected, and how often it looks.
+/// How long `nbd-disconnect`, detach and cleanup wait for a device to stop
+/// showing the connection they disconnected, and how often they look
+/// ([`await_release`]).
 const NBD_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The clock of the waits the helper does itself, between its looks at the
+/// kernel. The provided methods are the real clock; a test system whose
+/// device can go on showing a connection after its disconnect gives the
+/// executor a manual one instead.
+trait Clock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// The real clock, for a wait outside the executor's [`System`].
+struct RealClock;
+
+impl Clock for RealClock {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
@@ -865,18 +884,20 @@ pub fn disconnect_raw(device: &str, identifier: &str) -> Result<(), ExecError> {
         device,
         identifier,
         NBD_RELEASE_TIMEOUT,
+        &mut RealClock,
         |step| run_step(step, None),
     )
 }
 
-/// [`disconnect_raw`] on the device tree `sysfs`, with `patience` for the
-/// device to stop showing the connection after `disconnect`, which runs the
-/// disconnect step.
+/// [`disconnect_raw`] on the device tree `sysfs`, with `patience` on
+/// `clock` for the device to stop showing the connection after
+/// `disconnect`, which runs the disconnect step.
 fn disconnect_raw_with(
     sysfs: &Path,
     device: &str,
     identifier: &str,
     patience: Duration,
+    clock: &mut impl Clock,
     disconnect: impl FnOnce(&PlannedStep) -> Result<(), ExecError>,
 ) -> Result<(), ExecError> {
     crate::config::check_raw_identifier(identifier)
@@ -889,31 +910,71 @@ fn disconnect_raw_with(
     disconnect(&PlannedStep::NbdDisconnect {
         device: device.into(),
     })?;
-    let acknowledged = Instant::now();
+    let patience = release_patience(patience);
+    match await_release(clock, identifier, patience, |_| {
+        nbd_backend_at(sysfs, device)
+    }) {
+        Ok(Some(backend)) if backend == identifier => Err(identity_error(format!(
+            "the kernel acknowledged the disconnect, but {device} still shows the connection \
+             after {patience:?}: something still has the device open, and the kernel keeps a \
+             connection's attributes, and refuses a new connect, until the last opener has \
+             closed. Run the command again once it has let go"
+        ))),
+        // No connection, or one made since under another backend
+        // identifier: this one is gone.
+        Ok(_) => Ok(()),
+        Err(error) => Err(identity_error(format!(
+            "the kernel acknowledged the disconnect, but {device}'s backend identifier is \
+             unreadable ({error}): it cannot be shown that the connection is gone"
+        ))),
+    }
+}
+
+/// Wait until the device that `backend` reads no longer shows the
+/// connection `identifier`, whose disconnect the kernel acknowledged: look,
+/// and while it still shows it, look again every [`NBD_RELEASE_INTERVAL`]
+/// on `clock` for up to `patience`, the last time when it is over.
+/// `nbd-disconnect`, detach and cleanup all wait so, for
+/// [`release_patience`]. Returns what the device showed at the last look:
+/// no connection or one made since under another backend identifier, when
+/// this one is gone, or still this one, when the time ran out. A look that
+/// cannot be read ends the wait with its error: a connection made since
+/// without an identifier (an ioctl client's: `pid`, no `backend`) reads so,
+/// and is never taken for "gone".
+///
+/// The kernel acknowledges a disconnect before the connection is gone from
+/// the device when anything holds the device open at the disconnect (a
+/// probe of an earlier event, a monitoring tool, multipathd, an operator's
+/// `blkid`): it keeps the `pid` and `backend` attributes, and refuses a new
+/// connect, until the last opener has closed it. The disconnect's own change
+/// event comes only when they go; the probe it starts opens the device
+/// afterwards, and is what makes the next connect busy, not what keeps them.
+fn await_release<C: Clock>(
+    clock: &mut C,
+    identifier: &str,
+    patience: Duration,
+    backend: impl Fn(&C) -> io::Result<Option<String>>,
+) -> io::Result<Option<String>> {
+    let acknowledged = clock.now();
     loop {
-        match nbd_backend_at(sysfs, device) {
-            Ok(Some(backend)) if backend == identifier => {}
-            // No connection, or one made since under another backend
-            // identifier: this one is gone. A connection made since without
-            // an identifier (an ioctl client's: `pid`, no `backend`) reads
-            // as neither; it is the unreadable case below and fails.
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                return Err(identity_error(format!(
-                    "the kernel acknowledged the disconnect, but {device}'s backend identifier \
-                     is unreadable ({error}): it cannot be shown that the connection is gone"
-                )))
-            }
+        let shown = backend(clock)?;
+        let waited = clock.now().saturating_duration_since(acknowledged);
+        if shown.as_deref() != Some(identifier) || waited >= patience {
+            return Ok(shown);
         }
-        if acknowledged.elapsed() >= patience {
-            return Err(identity_error(format!(
-                "the kernel acknowledged the disconnect, but {device} still shows the \
-                 connection after {patience:?}: something still has the device open, and the \
-                 kernel keeps a connection's attributes, and refuses a new connect, until the \
-                 last opener has closed. Run the command again once it has let go"
-            )));
-        }
-        std::thread::sleep(NBD_RELEASE_INTERVAL.min(patience));
+        clock.sleep(NBD_RELEASE_INTERVAL.min(patience - waited));
+    }
+}
+
+/// How long [`await_release`] may wait after a disconnect: `limit`, but not
+/// past the deadline that the thread's caller set for all of its commands
+/// ([`command::finish_by`], the failed-start hook's), which the disconnect
+/// step itself keeps too. Nothing, so one look, once that deadline has
+/// passed.
+fn release_patience(limit: Duration) -> Duration {
+    match command::step_deadline() {
+        Ok(deadline) => limit.min(deadline.saturating_duration_since(Instant::now())),
+        Err(_) => Duration::ZERO,
     }
 }
 
@@ -1002,8 +1063,9 @@ fn run_recorded_lvm(
 }
 
 /// System interactions are isolated so tests exercise the same ordering,
-/// record validation, and rollback decisions without touching devices.
-trait System {
+/// record validation, and rollback decisions without touching devices. The
+/// [`Clock`] is that of the executor's own waits.
+trait System: Clock {
     fn lvm_preflight(
         &mut self,
         _record: &BoundDeviceRecord,
@@ -1114,6 +1176,8 @@ trait System {
 }
 
 struct LinuxSystem;
+
+impl Clock for LinuxSystem {}
 
 impl System for LinuxSystem {
     fn announce_bound_device(&mut self, device: &str) {
@@ -2089,7 +2153,18 @@ fn execute_with_options(
     // teardown; otherwise a retry must still know which device it owns.
     if disconnects && !connects {
         let current = record.as_ref().unwrap();
-        if system.backend(&current.device)?.is_some() {
+        // Whatever held the device open at the disconnect keeps the
+        // connection's attributes until it closes: wait for that as
+        // `nbd-disconnect` does. Any connection the device shows then, this
+        // one or another made since, keeps the record, and one that cannot be
+        // read fails.
+        let shown = await_release(
+            system,
+            &current.connection_id,
+            release_patience(NBD_RELEASE_TIMEOUT),
+            |system| system.backend(&current.device),
+        )?;
+        if shown.is_some() {
             return Err(identity_error(
                 "disconnect has not completed; keeping the attach record for cleanup retry",
             ));

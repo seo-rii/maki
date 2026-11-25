@@ -33,8 +33,9 @@ RemainAfterExit=yes
 # lock indefinitely and block every other volume's attach/detach/grow. Bound
 # both jobs so systemd terminates a stuck helper and releases the lock. The
 # values sit above the internal 15s NBD readiness wait plus expected XFS mount
-# log recovery; timeout recovery still re-observes actual kernel state on the
-# next attempt (R05).
+# log recovery at start, and above an expected unmount plus the 15s wait for
+# the device to let go of its disconnected connection at stop; timeout
+# recovery still re-observes actual kernel state on the next attempt (R05).
 TimeoutStartSec=180
 TimeoutStopSec=120
 

@@ -100,6 +100,10 @@ struct Schedule {
     opener_opens_before: Option<usize>,
     opener_closes_before: Option<usize>,
     daemon_dies_before: Option<usize>,
+    /// The opener closes after the executor's sleep of this number, counted
+    /// from 1 in the verb: while it waits for a disconnected connection to
+    /// go.
+    opener_closes_after_sleep: Option<usize>,
 }
 
 /// What exists for the volume: (NBD connection, LV mapping, mount).
@@ -212,6 +216,11 @@ struct World {
     ours: RefCell<Option<String>>,
     connect_targets: RefCell<Vec<String>>,
     violations: RefCell<Vec<String>>,
+    /// The executor's manual clock: where it started, how long it has slept
+    /// in all, and each sleep of the running verb.
+    epoch: Instant,
+    slept: Duration,
+    sleeps: Vec<Duration>,
 }
 
 impl World {
@@ -253,6 +262,9 @@ impl World {
             ours: RefCell::new(None),
             connect_targets: RefCell::new(Vec::new()),
             violations: RefCell::new(Vec::new()),
+            epoch: Instant::now(),
+            slept: Duration::ZERO,
+            sleeps: Vec::new(),
         };
         world.publish();
         world
@@ -504,6 +516,19 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+impl Clock for World {
+    fn now(&self) -> Instant {
+        self.epoch + self.slept
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.slept += duration;
+        self.sleeps.push(duration);
+        if self.schedule.opener_closes_after_sleep == Some(self.sleeps.len()) {
+            self.set_opener(false);
+        }
     }
 }
 
@@ -835,6 +860,7 @@ impl Case {
         self.world.commands.set(0);
         self.world.observations.set(0);
         self.world.trace.borrow_mut().clear();
+        self.world.sleeps.clear();
         self.world.fault = fault;
         let (world, state) = (&mut self.world, &self.state);
         let attach = plan_attach(&self.request);
@@ -1425,6 +1451,7 @@ fn an_opener_during_an_attach_fails_it_cleanly_or_not_at_all() {
                     opener_opens_before: Some(opens),
                     opener_closes_before: closes,
                     daemon_dies_before: None,
+                    ..Schedule::default()
                 };
                 let first = case.run_scheduled(None, schedule, Verb::Attach);
                 let context = format!(
@@ -1590,6 +1617,7 @@ fn a_daemon_that_dies_during_an_attach_leaves_what_cleanup_ends() {
                     opener_opens_before: opens,
                     opener_closes_before: None,
                     daemon_dies_before: Some(dies),
+                    ..Schedule::default()
                 };
                 let first = case.run_scheduled(None, schedule, Verb::Attach);
                 let context = format!(
@@ -1660,11 +1688,13 @@ fn a_daemon_that_dies_during_a_teardown_leaves_what_cleanup_ends() {
 
 /// While a device still shows the recorded connection after an acknowledged
 /// disconnect, every verb says so or does nothing, keeps the record and
-/// changes nothing; a retry sends the disconnect again, which the kernel
-/// acknowledges again. Once the opener has let go, cleanup retires the
-/// record without a command.
+/// changes nothing; detach and cleanup say so after they waited 15 s for it
+/// to go, looking every 100 ms. A retry sends the disconnect again, which
+/// the kernel acknowledges again. Once the opener has let go, cleanup
+/// retires the record without a command.
 #[test]
 fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
+    let waited = vec![NBD_RELEASE_INTERVAL; 150];
     let mut case = Case::attached();
     case.world.set_opener(true);
     let detach = case.run(None, Verb::Detach);
@@ -1676,6 +1706,7 @@ fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
         case.commands_run(),
         ["c1:umount", "c2:lvm-deactivate", "c3:nbd-disconnect"]
     );
+    assert_eq!(case.world.sleeps, waited);
     assert!(case.lingering());
     let record = case.record().expect("the record is kept");
     case.checks().unwrap();
@@ -1703,6 +1734,12 @@ fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
             Outcome::HelperDied => panic!("{verb:?}"),
         }
         assert_eq!(case.commands_run(), commands, "{verb:?}");
+        let sleeps = if commands.is_empty() {
+            &[][..]
+        } else {
+            &waited
+        };
+        assert_eq!(case.world.sleeps, sleeps, "{verb:?}");
         assert_eq!(case.record(), Some(record.clone()), "{verb:?}");
         assert!(case.lingering(), "{verb:?}");
         case.checks().unwrap();
@@ -1712,6 +1749,134 @@ fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
     assert_eq!(case.run(None, Verb::Cleanup), Outcome::Done);
     assert!(case.commands_run().is_empty() && case.clean());
     case.restart().unwrap();
+}
+
+/// An opener that held the device at the disconnect (a probe of an earlier
+/// event, a monitoring tool) and lets go while detach or cleanup waits: the
+/// verb retires the record in the same run, without a second disconnect,
+/// also when the opener lets go at the last look, 15 s after the
+/// disconnect; with the daemon still serving and after it stopped.
+#[test]
+fn a_teardown_retires_its_record_once_the_opener_lets_go_during_its_wait() {
+    for (name, verb, daemon_stopped) in [
+        ("detach", Verb::Detach, false),
+        ("cleanup", Verb::Cleanup, false),
+        ("cleanup after the daemon stopped", Verb::Cleanup, true),
+    ] {
+        for sleeps in [1, 12, 150] {
+            let mut case = Case::attached();
+            if daemon_stopped {
+                case.world.stop_daemon();
+            }
+            case.world.set_opener(true);
+            let schedule = Schedule {
+                opener_closes_after_sleep: Some(sleeps),
+                ..Schedule::default()
+            };
+            let outcome = case.run_scheduled(None, schedule, verb);
+            let context = format!("{name}, opener lets go after sleep {sleeps}");
+            assert_eq!(outcome, Outcome::Done, "{context}");
+            let commands = if daemon_stopped {
+                // Nothing serves LVM's reads: cleanup removes the mapping
+                // its proof names.
+                [
+                    "c1:umount",
+                    "c2:lvm-deactivate",
+                    "c3:dmsetup-remove",
+                    "c4:nbd-disconnect",
+                ]
+                .as_slice()
+            } else {
+                ["c1:umount", "c2:lvm-deactivate", "c3:nbd-disconnect"].as_slice()
+            };
+            assert_eq!(case.commands_run(), commands, "{context}");
+            assert_eq!(
+                case.world.sleeps,
+                vec![NBD_RELEASE_INTERVAL; sleeps],
+                "{context}"
+            );
+            assert!(case.clean(), "{context}: {:?}", case.live());
+            case.checks().unwrap();
+            case.restart().unwrap();
+        }
+    }
+}
+/// The failed-start hook rolls an interrupted activation back with detach's
+/// steps and waits after its disconnect as detach does. An opener that held
+/// the device at the disconnect and lets go during the wait leaves nothing
+/// live and no record after the one run. One that stays keeps the record,
+/// after 150 looks, and the coordinator's cleanup ends it once the opener
+/// has let go. The hook's deadline for its commands ends the wait.
+#[test]
+fn the_failed_start_hook_waits_for_an_opener_after_its_disconnect() {
+    let rollback = ["c1:vgchange-deactivate-scoped", "c2:nbd-disconnect"];
+    for lvm_select_matches_nothing in [false, true] {
+        for sleeps in [1, 30, 150] {
+            let context = format!(
+                "select matches nothing {lvm_select_matches_nothing}, opener lets go after \
+                 sleep {sleeps}"
+            );
+            let mut case = interrupted_activation(lvm_select_matches_nothing);
+            case.world.set_opener(true);
+            let schedule = Schedule {
+                opener_closes_after_sleep: Some(sleeps),
+                ..Schedule::default()
+            };
+            let outcome = case.run_scheduled(None, schedule, Verb::FailedStartHook);
+            assert_eq!(outcome, Outcome::Done, "{context}");
+            assert_eq!(case.commands_run(), rollback, "{context}");
+            assert_eq!(
+                case.world.sleeps,
+                vec![NBD_RELEASE_INTERVAL; sleeps],
+                "{context}"
+            );
+            assert!(case.clean(), "{context}: {:?}", case.live());
+            case.checks().unwrap();
+            case.restart().unwrap();
+        }
+
+        let context = format!("select matches nothing {lvm_select_matches_nothing}");
+        let mut case = interrupted_activation(lvm_select_matches_nothing);
+        case.world.set_opener(true);
+        let outcome = case.run(None, Verb::FailedStartHook);
+        assert!(
+            matches!(&outcome, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+            "{context}: {outcome:?}"
+        );
+        assert_eq!(case.commands_run(), rollback, "{context}");
+        assert_eq!(
+            case.world.sleeps,
+            vec![NBD_RELEASE_INTERVAL; 150],
+            "{context}"
+        );
+        assert!(case.lingering() && case.record().is_some(), "{context}");
+        case.checks().unwrap();
+        // The coordinator stops the daemon before its cleanup.
+        case.world.set_opener(false);
+        case.world.stop_daemon();
+        assert_eq!(case.run(None, Verb::Cleanup), Outcome::Done, "{context}");
+        assert!(case.clean(), "{context}: {:?}", case.live());
+        case.restart().unwrap();
+
+        let budget = Duration::from_millis(1950);
+        let mut case = interrupted_activation(lvm_select_matches_nothing);
+        case.world.set_opener(true);
+        let outcome = {
+            let _bounded = command::finish_by(Instant::now() + budget);
+            case.run(None, Verb::FailedStartHook)
+        };
+        assert!(
+            matches!(&outcome, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+            "{context}, {budget:?}: {outcome:?}"
+        );
+        let waited = case.world.sleeps.iter().sum::<Duration>();
+        assert!(
+            !waited.is_zero() && waited <= budget,
+            "{context}: waited {waited:?}"
+        );
+        assert!(case.lingering() && case.record().is_some(), "{context}");
+        case.checks().unwrap();
+    }
 }
 
 /// With `/dev/nbd3` held open and `/dev/nbd4` free, an attach gives the
