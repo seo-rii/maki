@@ -21,6 +21,7 @@ members = [
     "bins/maki-check",
     "bins/maki-benchmark",
     "bins/maki-witness",
+    "fuzz/harness",
 ]
 
 [workspace.package]

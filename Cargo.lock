@@ -1109,6 +1109,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-fuzz-harness"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "maki-format",
+ "maki-privileged",
+ "uuid",
+]
+
+[[package]]
 name = "maki-nbdkit"
 version = "0.1.0"
 dependencies = [

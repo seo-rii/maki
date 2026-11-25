@@ -4,3 +4,5 @@
 vendor/** -text
 vendor/**/*.bin binary
 vendor/**/*.der binary
+# Fuzz seeds are inputs, compared byte for byte with what their generator writes.
+fuzz/seeds/** -text

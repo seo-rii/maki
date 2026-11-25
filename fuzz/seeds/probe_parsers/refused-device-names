@@ -1,0 +1,6 @@
+nbd0,nbd1
+nbd1,dm-0
+dm-0,nbd0
+/dev/nbd12
+/dev/nbd01
+nbd4294967296

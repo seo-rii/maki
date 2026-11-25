@@ -22,10 +22,9 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-crc32fast = "1"
 libfuzzer-sys = "0.4"
-maki-format = { path = "../crates/maki-format" }
-maki-privileged = { path = "../crates/maki-privileged" }
+# Every target's code: the stable suite runs it on the committed seeds.
+maki-fuzz-harness = { path = "harness" }
 
 [[bin]]
 name = "format_decoders"
@@ -72,5 +71,7 @@ bench = false
 [profile.release]
 debug = 1
 
-# Detach from the parent workspace.
+# Detach from the parent workspace. The harness below this directory is a
+# member of that one.
 [workspace]
+exclude = ["harness"]
