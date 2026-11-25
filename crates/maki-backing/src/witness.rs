@@ -474,6 +474,29 @@ fn checksum(body: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// The anchor's codec, for the fuzz harness ([`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzzing {
+    use super::Anchor;
+
+    pub(crate) const ENCODED_LEN: usize = super::ENCODED_LEN;
+    pub(crate) const BODY_LEN: usize = super::BODY_LEN;
+
+    pub(crate) fn decode(bytes: &[u8; ENCODED_LEN]) -> std::io::Result<Anchor> {
+        super::decode(bytes)
+    }
+
+    pub(crate) fn encode(anchor: &Anchor) -> [u8; ENCODED_LEN] {
+        super::encode(anchor)
+    }
+
+    /// The checksum an anchor whose first [`BODY_LEN`] bytes are `body`
+    /// ends with.
+    pub(crate) fn checksum(body: &[u8]) -> [u8; 32] {
+        super::checksum(body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

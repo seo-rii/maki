@@ -18,6 +18,9 @@
 
 pub mod configured;
 pub mod file;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod mem;
 pub mod path;
 pub mod remote_witness;

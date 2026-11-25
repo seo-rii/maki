@@ -1,0 +1,25 @@
+[package]
+name = "maki-fuzz-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+# A member of the root workspace, although it sits below fuzz/, whose own
+# manifest declares a workspace (that one excludes this directory).
+workspace = "../.."
+
+# The entry function of every coverage-guided fuzz target in fuzz/, and the
+# generator of their committed seeds (fuzz/seeds). The fuzz crate's targets
+# call these functions; tests/review_fuzz_corpus.rs feeds every committed
+# seed through them on the stable toolchain.
+
+[dependencies]
+crc32fast.workspace = true
+# `fuzzing` exposes the decoders of maki-backing's own records and the
+# root helper's reading of the kernel's netlink answer; nothing else
+# enables it.
+maki-backing = { workspace = true, features = ["fuzzing"] }
+maki-format.workspace = true
+maki-privileged = { workspace = true, features = ["fuzzing"] }
+uuid.workspace = true

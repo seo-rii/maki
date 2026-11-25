@@ -400,6 +400,38 @@ pub(crate) enum Unacknowledged {
     Unanswered(io::Error),
 }
 
+/// Read the answer to one request into `answer`, a datagram at a time, from
+/// `receive`: it fills the buffer it is given with one datagram and returns
+/// the datagram's length and its sender's netlink port, a length above the
+/// buffer's being a datagram that did not fit (`MSG_TRUNC`). Anything but an
+/// acknowledgement or a refusal leaves the outcome unknown.
+pub(crate) fn collect(
+    mut answer: Answer,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<(usize, u32)>,
+) -> Result<Vec<Vec<u8>>, Unacknowledged> {
+    let unanswered = |error: io::Error| Unacknowledged::Unanswered(error);
+    let malformed =
+        |message: String| unanswered(io::Error::new(io::ErrorKind::InvalidData, message));
+    let mut buffer = vec![0; MAX_DATAGRAM];
+    for _ in 0..MAX_DATAGRAMS {
+        let (length, sender) = receive(&mut buffer).map_err(unanswered)?;
+        if length > buffer.len() {
+            return Err(malformed(format!(
+                "the kernel's {length}-byte answer exceeds the {MAX_DATAGRAM}-byte limit"
+            )));
+        }
+        match answer.take(sender, &buffer[..length]) {
+            Ok(Received::Pending) => {}
+            Ok(Received::Acknowledged(replies)) => return Ok(replies),
+            Ok(Received::Refused(errno)) => return Err(Unacknowledged::Refused(errno)),
+            Err(message) => return Err(malformed(format!("the answer holds {message}"))),
+        }
+    }
+    Err(malformed(
+        "the kernel sent more datagrams than it answers a request with".into(),
+    ))
+}
+
 /// A generic netlink socket, close-on-exec, bound to a port the kernel
 /// chose.
 pub(crate) struct Socket {
@@ -509,25 +541,9 @@ impl Socket {
             }
             Err(_) => return Err(unanswered(io::Error::last_os_error())),
         }
-        let mut answer = Answer::new(seq, self.port, family);
-        let mut buffer = vec![0; MAX_DATAGRAM];
-        for _ in 0..MAX_DATAGRAMS {
-            let (length, sender) = self.receive(&mut buffer, deadline).map_err(unanswered)?;
-            if length > buffer.len() {
-                return Err(malformed(format!(
-                    "the kernel's {length}-byte answer exceeds the {MAX_DATAGRAM}-byte limit"
-                )));
-            }
-            match answer.take(sender, &buffer[..length]) {
-                Ok(Received::Pending) => {}
-                Ok(Received::Acknowledged(replies)) => return Ok(replies),
-                Ok(Received::Refused(errno)) => return Err(Unacknowledged::Refused(errno)),
-                Err(message) => return Err(malformed(format!("the answer holds {message}"))),
-            }
-        }
-        Err(malformed(
-            "the kernel sent more datagrams than it answers a request with".into(),
-        ))
+        collect(Answer::new(seq, self.port, family), |buffer| {
+            self.receive(buffer, deadline)
+        })
     }
 
     /// One datagram and its sender's port; a length above the buffer's is

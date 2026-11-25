@@ -1,0 +1,21 @@
+config_schema_version 1
+
+[volume]
+name "seed"
+max_virtual_size "1GiB"
+device_block_size 4096
+crypto_unit_size 4096
+shard_logical_size "64MiB"
+
+[crypto]
+provider "local-aes-gcm-siv"
+crypto_compatibility_id "local-aes-gcm-siv-v1"
+key { source "credential", name "crypto-token" }
+
+[crypto.capabilities]
+mode "declared"
+supported_plaintext_sizes [4096]
+max_ciphertext_size 4384
+
+[backing]
+root "/var/lib/maki/seed"

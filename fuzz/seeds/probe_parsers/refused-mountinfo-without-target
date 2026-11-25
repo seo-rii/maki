@@ -1,0 +1,2 @@
+22 1 252:1 / / rw,relatime shared:1 - xfs /dev/vda1 rw,attr2,inode64
+37 22 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=4096k,mode=755

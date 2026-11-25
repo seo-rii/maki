@@ -61,6 +61,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 | etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
+| Fuzzing | Scheduled run | Ubuntu, pinned nightly `nightly-2026-11-24`, `cargo-fuzz` 0.13.2 | Every [fuzz target](#fuzzing) runs for 30 seconds from its committed seeds under libFuzzer and AddressSanitizer; a crash blocks |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
 cancel the Windows evidence. The pinned baseline is reproducible; latest stable
@@ -70,10 +71,11 @@ push does not establish the final commit's remote CI result. Use
 compatibility checks.
 
 The baseline workspace suite includes unit tests, parser mutation smokes,
-golden format vectors, provider conformance, transport chaos, failpoints,
-manual-clock retry tests, privilege-plan tests, NBD adapter tests, database and
-power-loss simulations, and real-process tests for all five binaries (`maki`,
-`maki-attach`, `maki-check`, `maki-benchmark` and `maki-witness`).
+the replay of every committed [fuzz seed](#fuzzing), golden format vectors,
+provider conformance, transport chaos, failpoints, manual-clock retry tests,
+privilege-plan tests, NBD adapter tests, database and power-loss simulations,
+and real-process tests for all five binaries (`maki`, `maki-attach`,
+`maki-check`, `maki-benchmark` and `maki-witness`).
 The Linux baseline installs `nbdkit`, `nbdkit-plugin-dev`, `libnbd-bin` and
 `linux-libc-dev` before the workspace tests and checks their executables. This
 runs the native startup, negotiation, drain, process-crash, and ABI regressions
@@ -282,6 +284,71 @@ and requires `maki volume create` to refuse a configuration with
 compiled into this build` and leave no `superblock.a`. The workspace test run
 cannot show this, because feature unification compiles the fake provider into
 `maki-nbdkit` for that crate's own tests.
+
+### Fuzzing
+
+The coverage-guided targets in [`fuzz/`](../fuzz/Cargo.toml) are a crate of
+their own, built only by `cargo +nightly fuzz` (libFuzzer with
+AddressSanitizer). Each is one line that hands libFuzzer's input to the
+function of the same name in `fuzz/harness` (`maki-fuzz-harness`, a member of
+the workspace):
+
+| Target | What it reads |
+|---|---|
+| `format_decoders`, `format_records` | Every on-disk decoder of `maki-format`, on raw bytes and behind a repaired CRC-32 |
+| `journal_scan` | Journal segments, with a durable prefix or without |
+| `config_parse`, `endpoint_url` | The configuration file and endpoint URLs |
+| `probe_parsers` | The helper's mountinfo and sysfs-name parsers |
+| `nbd_handshake` (Linux) | The helper's NBD handshake client, which runs as root, against a server that sends the input |
+| `nbd_netlink` (Linux) | The helper's reading of the kernel's netlink answer to the family lookup, `NBD_CMD_CONNECT` and `NBD_CMD_DISCONNECT` |
+| `backing_records` | `maki-backing`'s own records: the witness anchor, the remote enrollment binding, the remote witness state, the rollback manifest, a manifest slot as the check of an interrupted creation reads it, and remote namespace names |
+
+`maki-privileged` and `maki-backing` expose what the last two need behind a
+`fuzzing` feature that only the harness enables; it adds no dependency. A
+target's function panics where the code broke a rule the target checks (an
+export the kernel may not use, a handshake client that reads beyond the
+handshake, a verdict the kernel does not send, an accepted record that is not its own encoding), and
+otherwise returns whether the code accepted the input.
+
+Each target's seeds are committed in `fuzz/seeds/<target>/`: the code's own
+encodings, or for the handshake and the netlink answer the bytes nbdkit and
+the kernel send, with copies cut short or changed. A seed's name says what
+the target must do with it: accept a `valid-` seed, refuse a `refused-` one,
+and only not crash on `noise-`. `fuzz/harness/tests/review_fuzz_corpus.rs`,
+in the default suite, feeds every committed seed through its target's
+function on the stable toolchain, requires an entry function, a `[[bin]]`
+and seeds for every target, and checks that the committed seeds are what
+the generator (`fuzz/harness/src/seeds.rs`) writes. After changing an
+encoding, write them again:
+
+```bash
+MAKI_FUZZ_WRITE_SEEDS=1 cargo test -p maki-fuzz-harness --test review_fuzz_corpus
+```
+
+The `fuzz` job runs where `nightly-gates` runs: it installs the pinned nightly
+and `cargo-fuzz`, copies the workspace's `Cargo.lock` to `fuzz/Cargo.lock`
+(which is not committed) so the fuzzed code is built with the versions the
+workspace pins, and runs every target `cargo fuzz list` names for 30 seconds
+from its seeds; a list that cannot be read or is empty fails the job. Its
+token may only read the repository. `fuzz/Cargo.toml` patches the vendored
+`serde_json` and `bytes` as the workspace does, so the fuzzed JSON decoder
+is the one production uses, and pins `libfuzzer-sys` and `arbitrary`
+exactly, which that lockfile does not list. New inputs stay in `fuzz/corpus/<target>`, which is not
+committed either; a crash fails the job and its input is uploaded as
+`fuzz-artifacts`. The same, locally:
+
+```bash
+cp Cargo.lock fuzz/Cargo.lock
+cargo +nightly fuzz run nbd_handshake fuzz/corpus/nbd_handshake fuzz/seeds/nbd_handshake -- \
+  -max_len=70000 -max_total_time=600
+```
+
+The two format targets need `-max_len=8192` (a superblock is a 4096-byte
+frame after the selector byte) and `nbd_handshake` `-max_len=70000`, beyond
+the client's 64 KiB limit. A crash's input reproduces it with
+`cargo +nightly fuzz run <target> <input>`; once the cause is fixed, commit
+it under `fuzz/seeds/<target>/` with a `valid-` or `refused-` name so the
+replay keeps it fixed.
 
 ## Test model
 
@@ -594,7 +661,7 @@ Disk power-loss campaign.
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); coverage-guided `cargo-fuzz` targets in `fuzz/` (`format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`). Only short runs have been made, from an empty corpus; the last, on 2026-11-24 with libFuzzer and AddressSanitizer, ended without a crash: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M); `endpoint_url` and `probe_parsers` were not run then. The input counts say little: every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reaches almost no image that passes one (256 covered edges). `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). A seed corpus and a 24 CPU-hour-per-target run remain outstanding |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); nine coverage-guided `cargo-fuzz` targets in `fuzz/`: `format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`, the root helper's `nbd_handshake` and `nbd_netlink`, and `maki-backing`'s `backing_records`. Their committed seeds are replayed by the default suite, and the scheduled `fuzz` job runs each target for 30 seconds from them ([Fuzzing](#fuzzing)). Only short runs have been made, all with libFuzzer and AddressSanitizer on one core and none with a crash. On 2026-11-24, from an empty corpus: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M). Every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reached almost no image that passes one (256 covered edges); `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). On 2026-11-25, from the committed seeds: `nbd_netlink`, `backing_records` and `nbd_handshake` 12 minutes each (37M, 29M and 1.3M inputs; 357, 4,318 and 333 edges), and 150 seconds each of `format_decoders` (34M, 378 edges), `format_records` (16M, 948), `journal_scan` (32M, 169), `config_parse` (3.0M, 4,291), `endpoint_url` (1.6M, 2,312) and `probe_parsers` (2.1M, 1,024). A 24 CPU-hour-per-target run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
@@ -887,8 +954,9 @@ Before production approval, complete its remaining coverage:
 - If using experimental rollback-protected backing, qualify its independent
   persistent witness as described [above](#experimental-rollback-backing).
 - Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
-  targets exist in `fuzz/`; only short smoke runs have been done) and
-  long-duration provider and 72-hour mixed-I/O soaks.
+  targets and their seeds are in `fuzz/`, and CI runs each for 30 seconds in
+  the scheduled tier; only short runs have been done) and long-duration
+  provider and 72-hour mixed-I/O soaks.
 
 These checks are privileged, destructive, externally credentialed, or
 long-running. Run them only in explicitly authorized environments.

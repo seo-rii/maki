@@ -905,6 +905,100 @@ fn commit(backing: &dyn Backing) -> io::Result<()> {
     backing.sync_dir("")
 }
 
+/// The state's envelope and the namespace reader, for the fuzz harness
+/// ([`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzzing {
+    use super::*;
+
+    /// Give `bytes`, the envelope of a state, the length and the checksum
+    /// of the body it holds.
+    pub(crate) fn seal(bytes: &mut [u8]) {
+        if bytes.len() < 44 {
+            return;
+        }
+        let body = u32::try_from(bytes.len() - 44).unwrap_or(u32::MAX);
+        bytes[8..12].copy_from_slice(&body.to_le_bytes());
+        let end = bytes.len() - 32;
+        let checksum = digest(STATE_DOMAIN, &bytes[..end]);
+        bytes[end..].copy_from_slice(&checksum);
+    }
+
+    pub(crate) fn namespace_fence(value: &str) -> io::Result<u64> {
+        super::namespace_fence(value)
+    }
+
+    /// States an authority stores: released before its first claim,
+    /// claimed, active, and claimed for a restore.
+    pub(crate) fn samples() -> Vec<(&'static str, Vec<u8>)> {
+        let identity = [1; 16];
+        let descriptor = |generation, epoch, fence, session| Descriptor {
+            anchor: Anchor {
+                identity,
+                generation,
+                root: [4; 32],
+            },
+            epoch,
+            namespace: namespace(fence, session),
+        };
+        let initial = Stored {
+            format: 2,
+            record: Record {
+                identity,
+                current: None,
+                fence: 0,
+                session: [0; 16],
+                phase: Phase::Released,
+                restore_source: None,
+                last_operation: [0; 16],
+            },
+            last_request_hash: None,
+            session_authorization_hash: None,
+        };
+        let claimed = Stored {
+            record: Record {
+                fence: 1,
+                session: [2; 16],
+                phase: Phase::Claimed,
+                last_operation: [3; 16],
+                ..initial.record.clone()
+            },
+            last_request_hash: Some([5; 32]),
+            session_authorization_hash: Some([6; 32]),
+            ..initial.clone()
+        };
+        let active = Stored {
+            record: Record {
+                current: Some(descriptor(4, 0, 1, [2; 16])),
+                phase: Phase::Active,
+                ..claimed.record.clone()
+            },
+            ..claimed.clone()
+        };
+        let restoring = Stored {
+            record: Record {
+                current: Some(descriptor(4, 0, 1, [2; 16])),
+                fence: 2,
+                session: [7; 16],
+                phase: Phase::RestoreClaimed,
+                restore_source: Some(descriptor(2, 0, 1, [2; 16])),
+                last_operation: [8; 16],
+                ..initial.record.clone()
+            },
+            ..claimed.clone()
+        };
+        [
+            ("released", initial),
+            ("claimed", claimed),
+            ("active", active),
+            ("restore-claimed", restoring),
+        ]
+        .into_iter()
+        .map(|(name, stored)| (name, encode(&stored).expect("a sample state")))
+        .collect()
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "remote_witness_init_tests.rs"]
 mod init_tests;

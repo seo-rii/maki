@@ -440,6 +440,64 @@ jobs:
             { echo "volume create failed without refusing provider = fake" >&2; exit 1; }
           test ! -e /tmp/fakevol/superblock.a
 
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))
+    # Coverage-guided fuzzing of every target in fuzz/ (cargo-fuzz, libFuzzer
+    # and AddressSanitizer). It needs a nightly compiler, so it runs where the
+    # release gates run, never on the pull-request path; every change still
+    # replays the committed seeds through each target's entry function on the
+    # baseline toolchain (fuzz/harness/tests/review_fuzz_corpus.rs). Each
+    # target starts from fuzz/seeds/<target> and runs for 30 seconds; what a
+    # run finds stays in fuzz/corpus, which is not committed, and a crash's
+    # input is uploaded.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-24
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - name: install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # fuzz/Cargo.lock is not committed: starting it from the workspace's
+      # builds the fuzzed code with the versions the workspace pins.
+      - name: build every fuzz target
+        run: |
+          cp Cargo.lock fuzz/Cargo.lock
+          cargo fuzz build
+      # The two format targets read a 4096-byte frame after their selector
+      # byte, and nbd_handshake must reach the client's 64 KiB byte limit.
+      - name: run every fuzz target from its seeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A list that cannot be read or is empty would run nothing.
+          targets="$(cargo fuzz list)"
+          test -n "$targets"
+          for target in $targets; do
+            case "$target" in
+              format_decoders|format_records) max_len=8192 ;;
+              nbd_handshake) max_len=70000 ;;
+              *) max_len=4096 ;;
+            esac
+            mkdir -p "fuzz/corpus/$target"
+            cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+              -max_total_time=30 -max_len="$max_len" -timeout=25 -rss_limit_mb=2048
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
   etcd-qualification:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))
     runs-on: ubuntu-latest

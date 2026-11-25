@@ -198,6 +198,27 @@ fn validate_name(name: &str, empty: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// The step at which a manifest slot's bytes failed to be a manifest.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestRefusal {
+    /// They are not a manifest's JSON.
+    Encoding,
+    /// The manifest is not valid.
+    Content,
+    /// The manifest encodes beyond its capacity's bound.
+    Size,
+}
+
+/// The manifest `bytes` decode to, which is valid, and its canonical
+/// encoding. A reader accepts the bytes only if they are that encoding.
+fn parse_manifest(bytes: &[u8]) -> Result<(Manifest, Vec<u8>), ManifestRefusal> {
+    let manifest: Manifest =
+        serde_json::from_slice(bytes).map_err(|_| ManifestRefusal::Encoding)?;
+    manifest.validate().map_err(|_| ManifestRefusal::Content)?;
+    let canonical = manifest.encode().map_err(|_| ManifestRefusal::Size)?;
+    Ok((manifest, canonical))
+}
+
 /// A bounded Linux storage format. `capacity_bytes` is usable reserved
 /// logical page capacity; physical footprint is twice that plus two manifests.
 /// The witness MUST have an independent, durable restore policy. A different
@@ -467,15 +488,14 @@ impl RollbackBacking {
                 if digest(b"maki.rollback.manifest.v1\0", &bytes) != anchor.root {
                     return Err(invalid("manifest does not match independent witness"));
                 }
-                let manifest: Manifest = serde_json::from_slice(&bytes)
-                    .map_err(|_| invalid("invalid rollback manifest encoding"))?;
-                manifest
-                    .validate()
-                    .map_err(|_| invalid("invalid rollback manifest content"))?;
-                if manifest
-                    .encode()
-                    .map_err(|_| invalid("invalid rollback manifest size"))?
-                    != bytes
+                let (manifest, canonical) = parse_manifest(&bytes).map_err(|refusal| {
+                    invalid(match refusal {
+                        ManifestRefusal::Encoding => "invalid rollback manifest encoding",
+                        ManifestRefusal::Content => "invalid rollback manifest content",
+                        ManifestRefusal::Size => "invalid rollback manifest size",
+                    })
+                })?;
+                if canonical != bytes
                     || manifest.identity != anchor.identity
                     || manifest.generation != anchor.generation
                     || file.len()? != manifest_bound(manifest.capacity)
@@ -1637,6 +1657,82 @@ impl Backing for RollbackBacking {
         state.check()?;
         state.reclaim_closed_files()?;
         Ok(Some(state.committed.capacity - state.reserved_pages * PAGE))
+    }
+}
+
+/// The manifest's codec and the check of a manifest slot a creation left,
+/// for the fuzz harness ([`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzzing {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io;
+
+    use super::{Backing, Entry, Manifest, Node, PageRef};
+
+    pub(crate) use super::enrollment::fuzzing as enrollment;
+
+    pub(crate) const MANIFESTS: [&str; 2] = super::MANIFESTS;
+
+    /// The canonical encoding of the manifest `bytes` decode to, as both
+    /// readers of a witnessed manifest find it (`parse_manifest`), or
+    /// `None` where they refuse the bytes before comparing them with it.
+    pub(crate) fn manifest(bytes: &[u8]) -> Option<Vec<u8>> {
+        super::parse_manifest(bytes)
+            .ok()
+            .map(|(_, canonical)| canonical)
+    }
+
+    pub(crate) fn unpublished_slot(disk: &dyn Backing, index: usize) -> io::Result<bool> {
+        super::unpublished_slot(disk, index)
+    }
+
+    /// The fence of a remote namespace's name, as GC reads a root's
+    /// entries.
+    pub(crate) fn namespace_fence(name: &str) -> Option<u64> {
+        super::gc::namespace_fence(name)
+    }
+
+    /// The manifest a creation writes (generation 0, nothing in it), and
+    /// one holding a directory, files and pages.
+    pub(crate) fn samples() -> Vec<(&'static str, Vec<u8>)> {
+        let initial = Manifest {
+            format: 1,
+            identity: [17; 16],
+            generation: 0,
+            capacity: 16384,
+            next_id: 1,
+            entries: BTreeMap::new(),
+            files: BTreeMap::new(),
+        };
+        let page = |slot, byte| PageRef {
+            slot,
+            hash: [byte; 32],
+        };
+        let used = Manifest {
+            generation: 7,
+            next_id: 4,
+            entries: BTreeMap::from([
+                ("data".to_string(), Entry::Directory),
+                ("data/shard-00000000.dat".to_string(), Entry::File(1)),
+                ("volume.lock".to_string(), Entry::File(3)),
+            ]),
+            files: BTreeMap::from([
+                (
+                    1,
+                    Node {
+                        len: 8197,
+                        pages: BTreeMap::from([(0, page(5, 0xa0)), (2, page(1, 0xc0))]),
+                        reserved: BTreeSet::from([0, 1, 2]),
+                    },
+                ),
+                (3, Node::default()),
+            ]),
+            ..initial.clone()
+        };
+        [("initial", initial), ("used", used)]
+            .into_iter()
+            .map(|(name, manifest)| (name, manifest.encode().expect("a sample manifest")))
+            .collect()
     }
 }
 

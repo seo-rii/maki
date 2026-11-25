@@ -1,6 +1,7 @@
 """The scheduled job must run every ignored release gate to completion, the
-pull-request job every script test module, and the RHEL 9 job the packaged
-build, the native suites and the RPM in a RHEL 9 userspace."""
+pull-request job every script test module, the RHEL 9 job the packaged
+build, the native suites and the RPM in a RHEL 9 userspace, and the fuzz job
+every fuzz target from its committed seeds."""
 
 import fnmatch
 import json
@@ -14,6 +15,8 @@ import unittest
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+FUZZ_MANIFEST = ROOT / "fuzz" / "Cargo.toml"
+FUZZ_STEP = "run every fuzz target from its seeds"
 WITNESS_MANIFEST = ROOT / "crates" / "maki-witness" / "Cargo.toml"
 ETCD_GATE = ROOT / "crates" / "maki-witness" / "tests" / "etcd_ha.rs"
 ETCD_CFG = '#[cfg(all(unix, feature = "etcd-qualification"))]'
@@ -102,7 +105,7 @@ class ReleaseGateContract(unittest.TestCase):
 
     def test_integration_gate_opt_in_requires_a_same_repository_pull_request(self):
         workflow = WORKFLOW.read_text()
-        for job in ("nightly-gates", "etcd-qualification"):
+        for job in ("nightly-gates", "etcd-qualification", "fuzz"):
             match = re.search(rf"^  {job}:\n    if: ([^\n]+)", workflow, re.MULTILINE)
             self.assertIsNotNone(match)
             for event, repository, branch, enabled in (
@@ -429,6 +432,157 @@ class RhelUserspaceJob(unittest.TestCase):
         self.assertLess(script.index("rm /run/maki-attach/ci.nbd\n"), idle)
         removal = script.index("rpm -e maki\n", idle)
         self.assertLess(removal, script.index("test ! -e /etc/dnf/protected.d/maki.conf\n"))
+
+
+FAKE_CARGO_FUZZ = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+arguments = sys.argv[1:]
+if arguments == ["fuzz", "list"]:
+    listing = os.environ.get("FUZZ_LIST", "")
+    if listing == "fail":
+        sys.exit(2)
+    if listing != "empty":
+        print("\n".join(json.loads(os.environ["FUZZ_TARGETS"])))
+    sys.exit(0)
+if arguments[:2] != ["fuzz", "run"]:
+    sys.exit("fixture: unexpected cargo arguments: " + " ".join(arguments))
+with open(os.environ["FUZZ_CALLS"], "a") as calls:
+    calls.write(json.dumps(arguments[2:]) + "\n")
+sys.exit(1 if arguments[2] == os.environ.get("FUZZ_FAIL", "") else 0)
+'''
+
+
+def fuzz_targets():
+    """The [[bin]] names of fuzz/Cargo.toml, in order."""
+    return re.findall(r'(?m)^\[\[bin\]\]\nname = "([^"]+)"$', FUZZ_MANIFEST.read_text())
+
+
+class FuzzJob(unittest.TestCase):
+    """Every fuzz target runs from its committed seeds on a pinned nightly,
+    where the release gates run and never on the pull-request path."""
+
+    def setUp(self):
+        self.job = jobs().get("fuzz")
+        self.assertIsNotNone(self.job, "ci.yml has no fuzz job")
+        self.steps = steps(self.job)
+        self.names = [name for name, _ in self.steps]
+
+    def step(self, name):
+        return dict(self.steps)[name]
+
+    def test_a_pinned_nightly_and_cargo_fuzz_off_the_pull_request_path(self):
+        self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + self.job)
+        self.assertRegex(self.job, r"(?m)^    timeout-minutes: \d+$")
+        self.assertNotIn("continue-on-error", self.job)
+        self.assertRegex(self.step("dtolnay/rust-toolchain@master"),
+                         r"(?m)^          toolchain: nightly-\d{4}-\d{2}-\d{2}$")
+        self.assertIn("run: cargo install cargo-fuzz --version 0.13.2 --locked\n",
+                      self.step("install pinned cargo-fuzz"))
+        self.assertIn("key: fuzz", self.step("Swatinem/rust-cache@v2"))
+        for job in ("pr", "latest-stable", "rhel9"):
+            self.assertNotIn("cargo fuzz", jobs()[job])
+            self.assertNotIn("nightly", jobs()[job])
+
+    def test_the_fuzz_build_starts_from_the_workspace_lockfile(self):
+        build = self.step("build every fuzz target")
+        self.assertIn("cp Cargo.lock fuzz/Cargo.lock\n", build)
+        self.assertLess(build.index("cp Cargo.lock fuzz/Cargo.lock\n"), build.index("cargo fuzz build"))
+        self.assertLess(self.names.index("build every fuzz target"), self.names.index(FUZZ_STEP))
+
+    def test_crates_the_workspace_lockfile_cannot_pin_are_pinned_exactly(self):
+        # After `cp Cargo.lock fuzz/Cargo.lock` Cargo adds libFuzzer's crate
+        # and its `arbitrary` at whatever version is newest unless the
+        # manifest names one.
+        lockfile = (ROOT / "Cargo.lock").read_text()
+        for name in ("libfuzzer-sys", "arbitrary"):
+            with self.subTest(name=name):
+                self.assertNotIn(f'name = "{name}"', lockfile)
+                self.assertRegex(FUZZ_MANIFEST.read_text(), rf'(?m)^{name} = "=\d+\.\d+\.\d+"$')
+
+    def test_the_job_reads_the_repository_and_writes_nothing(self):
+        self.assertRegex(self.job, r"(?m)^    permissions:\n      contents: read\n    [a-z]")
+
+    def test_the_fuzzed_code_uses_the_workspace_patches(self):
+        # Without them the fuzzed serde_json and bytes would be the
+        # crates.io releases, not the vendored copies production uses.
+        root = re.search(r"(?ms)^\[patch\.crates-io\]\n(.*?)(?=^\[|\Z)", (ROOT / "Cargo.toml").read_text())
+        fuzz = re.search(r"(?ms)^\[patch\.crates-io\]\n(.*?)(?=^\[|\Z)", FUZZ_MANIFEST.read_text())
+        self.assertIsNotNone(fuzz, "fuzz/Cargo.toml patches nothing")
+        patches = dict(re.findall(r'(?m)^(\w+) = \{ path = "([^"]+)" \}$', root.group(1)))
+        for name, path in re.findall(r'(?m)^(\w+) = \{ path = "([^"]+)" \}$', fuzz.group(1)):
+            self.assertEqual("../" + patches[name], path, name)
+        for name in ("serde_json", "bytes"):
+            self.assertRegex(fuzz.group(1), rf"(?m)^{name} = ")
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_every_target_runs_briefly_from_its_seeds_and_a_crash_fails_the_job(self):
+        self.assertIn("shell: bash", self.step(FUZZ_STEP))
+        targets = fuzz_targets()
+        self.assertGreaterEqual(len(targets), 9)
+        for failing in ("", targets[len(targets) // 2]):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory(prefix="maki-ci-fuzz-") as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                cargo = binary / "cargo"
+                cargo.write_text(FAKE_CARGO_FUZZ)
+                cargo.chmod(0o700)
+                calls = root / "calls.jsonl"
+                environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                                   FUZZ_TARGETS=json.dumps(targets), FUZZ_CALLS=str(calls),
+                                   FUZZ_FAIL=failing)
+                result = subprocess.run(["bash", "-e", "-c", step_script(FUZZ_STEP)], cwd=root,
+                                        env=environment, capture_output=True, text=True, timeout=10)
+                ran = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+                if failing:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(ran[-1][0], failing)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call[0] for call in ran], targets)
+                for call in ran:
+                    target = call[0]
+                    # New inputs go to the uncommitted corpus; the seeds are only read.
+                    self.assertEqual(call[1:3], [f"fuzz/corpus/{target}", f"fuzz/seeds/{target}"])
+                    self.assertTrue((root / "fuzz" / "corpus" / target).is_dir())
+                    options = call[call.index("--") + 1:]
+                    self.assertTrue(any(re.fullmatch(r"-max_total_time=\d+", option) for option in options),
+                                    options)
+                    self.assertTrue(any(re.fullmatch(r"-timeout=\d+", option) for option in options), options)
+                    length = [option for option in options if option.startswith("-max_len=")]
+                    self.assertEqual(len(length), 1, options)
+                    if target in ("format_decoders", "format_records"):
+                        # A superblock frame is 4096 bytes after the selector.
+                        self.assertGreater(int(length[0].split("=")[1]), 4097)
+                    if target == "nbd_handshake":
+                        # Beyond the client's 64 KiB byte limit.
+                        self.assertGreater(int(length[0].split("=")[1]), 64 * 1024)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_a_target_list_that_fails_or_is_empty_fails_the_step(self):
+        for listing in ("fail", "empty"):
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory(prefix="maki-ci-fuzz-") as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                cargo = binary / "cargo"
+                cargo.write_text(FAKE_CARGO_FUZZ)
+                cargo.chmod(0o700)
+                calls = root / "calls.jsonl"
+                environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                                   FUZZ_TARGETS=json.dumps(fuzz_targets()), FUZZ_CALLS=str(calls),
+                                   FUZZ_LIST=listing)
+                result = subprocess.run(["bash", "-e", "-c", step_script(FUZZ_STEP)], cwd=root,
+                                        env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(calls.exists(), "a target ran without a list")
+
+    def test_a_crash_input_is_kept(self):
+        upload = self.step("actions/upload-artifact@v4")
+        self.assertIn("if: failure()", upload)
+        self.assertIn("path: fuzz/artifacts", upload)
 
 
 if __name__ == "__main__":

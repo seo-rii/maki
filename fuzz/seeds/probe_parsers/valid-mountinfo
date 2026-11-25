@@ -1,0 +1,3 @@
+22 1 252:1 / / rw,relatime shared:1 - xfs /dev/vda1 rw,attr2,inode64
+36 22 253:3 / /mnt/target rw,nosuid,nodev,noatime shared:40 - xfs /dev/mapper/maki--vg-data rw,attr2,inode64,logbufs=8
+37 22 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=4096k,mode=755

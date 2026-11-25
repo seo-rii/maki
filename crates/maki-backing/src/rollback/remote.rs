@@ -703,15 +703,14 @@ pub(super) fn load_generation(
             if digest(b"maki.rollback.manifest.v1\0", &bytes) != descriptor.anchor.root {
                 return Err(invalid("remote root mismatch"));
             }
-            let manifest: Manifest = serde_json::from_slice(&bytes)
-                .map_err(|_| invalid("invalid remote manifest encoding"))?;
-            manifest
-                .validate()
-                .map_err(|_| invalid("invalid remote manifest content"))?;
-            if manifest
-                .encode()
-                .map_err(|_| invalid("invalid remote manifest size"))?
-                != bytes
+            let (manifest, canonical) = parse_manifest(&bytes).map_err(|refusal| {
+                invalid(match refusal {
+                    ManifestRefusal::Encoding => "invalid remote manifest encoding",
+                    ManifestRefusal::Content => "invalid remote manifest content",
+                    ManifestRefusal::Size => "invalid remote manifest size",
+                })
+            })?;
+            if canonical != bytes
                 || manifest.identity != descriptor.anchor.identity
                 || manifest.generation != descriptor.anchor.generation
                 || file.len()? != manifest_bound(manifest.capacity)
