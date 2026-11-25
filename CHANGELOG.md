@@ -12,6 +12,50 @@ documents.
 
 ### Breaking changes
 
+- **Attach refuses a shard whose allocation map lists slots but whose data
+  file is missing, and every attach stores the loaded shard catalog again**
+  (AUD-181, AUD-182, 2026-11-25;
+  [#394](https://github.com/seo-rii/maki/pull/394)). A shard-catalog copy
+  whose `fdatasync` failed when it first named a shard was read back from
+  the page cache after a restart and never stored again, so writes were
+  acknowledged for that shard while no durable catalog copy named it, and
+  the next power loss removed it from the catalog. A crash alone lost no
+  data, but one lost data file then made the shard read as zeros with a
+  clean `maki check --deep`. Every attach of a volume whose catalog names a
+  shard now stores the catalog once more (one more A/B store with its
+  syncs) at the first write into a loaded shard, the first idle checkpoint
+  or recovery's replay into one, whichever comes first; if that store
+  fails, the write or checkpoint fails and the next one retries it. A
+  volume with a shard that the loaded catalog copy does not name, that has
+  no data file and whose allocation map lists a slot no longer attaches
+  ("shard N: data file missing: ..."), and `maki check` and `maki check
+  --deep` report it as an error; it used to attach and read those units as
+  zeros. A short data file of an uncataloged shard that holds a written
+  slot header is truncation, so units beyond its end read as EIO where they
+  read zeros. Open now reads the allocation copies of a shard that the
+  catalog copy does not name and that has no data file and, for each shard
+  it adopts with an empty map, up to one 64-byte slot header per slot until
+  it finds a written one, at every open until the shard is cataloged; an
+  I/O error on either read fails the attach. A cataloged
+  shard's truncated data file gets its damage marks stored and its file
+  grown back at the same first write or idle checkpoint, so the deep check
+  then reports those units as allocated slots with an invalid header. A new
+  shard's creation also proves the size of every shard whose size no sync
+  has proven, where an adopted shard whose size proof had failed could be
+  cataloged as it was and read as EIO after a power loss (AUD-182)
+  ([architecture](docs/architecture.md), SPEC §14, §22).
+- **An option given where `maki` or `maki-witness` expects a path exits 2**
+  (AUD-190, 2026-11-25; [#393](https://github.com/seo-rii/maki/pull/393)).
+  With the configuration forgotten, `maki check --deep`, `maki status
+  --help`, `maki volume inspect --help` and the like opened a file named
+  after the option and exited 1, and `maki-witness init --state <uuid>`
+  created a state directory named `--state` and exited 0. A word that
+  starts with `-` where `maki` expects a volume or administrator
+  configuration, a backup directory or a reload section, or where
+  `maki-witness init`, `init-etcd`, `serve`, `inspect` or `fingerprint`
+  expects its path, is now refused with the usage and status 2 before
+  anything is opened or created; `--help` after a command is refused the
+  same way. A file whose name starts with `-` is named `./-name` (maki(8)).
 - **On RHEL 9 Maki is removed with `rpm -e maki`; `dnf remove maki` is always
   refused** (AUD-161, AUD-173, 2026-11-24;
   [#384](https://github.com/seo-rii/maki/pull/384)). rpm cannot stop a
@@ -160,6 +204,12 @@ documents.
   identity that rustls rejects is reported as `bad client identity: …`. The
   remote witness still trusts only its own CA
   ([providers](docs/configuration.md#providers)).
+  *Corrected on 2026-11-25 (AUD-188,
+  [#392](https://github.com/seo-rii/maki/pull/392)): with a single endpoint
+  that held only under `bounded-error`; under the default `stall` the
+  attach waited without end and logged nothing. A lone endpoint is now
+  probed at attach, and a failed TLS handshake refuses it under either
+  policy.*
 - **Attach reserves the NBD devices that other volumes' attach records name**
   (AUD-120, [#354](https://github.com/seo-rii/maki/pull/354)). Under the
   attach lock, attach reads every `/run/maki-attach/<volume>.nbd` record
@@ -668,6 +718,49 @@ documents.
 
 ### Changed
 
+- **Attach probes a lone remote endpoint and refuses one that cannot serve
+  as configured** (AUD-188, AUD-189, 2026-11-25;
+  [#392](https://github.com/seo-rii/maki/pull/392)). Under the default
+  `stall` policy an attach whose only endpoint failed TLS authentication
+  (another host's certificate, an untrusted CA) waited without end: it
+  logged nothing, bound no control socket and never became ready. A lone
+  endpoint is now probed like the endpoints of a set, which adds one
+  self-test and canary round at attach. An endpoint failure in any attempt
+  (TLS authentication, a 401, 403 or 404, an invalid WebSocket upgrade)
+  refuses the attach under either policy, and so does a failure after
+  which a request of a provider that is not `retry_safe` may have reached
+  the endpoint. A lone endpoint that failed only transiently, when the
+  request may be sent again, is still retried under the policy, after a
+  `WARN` that names it, its failure and the policy. "no remote endpoint is
+  reachable; attach refused" now names each endpoint's failure, and a lone
+  endpoint that fails its self-test otherwise is refused with "endpoint
+  "<name>" failed its self-test: ...". The gRPC transport classifies a TLS
+  failure that reaches a call (tonic reconnecting a cached channel to a
+  server whose certificate is not trusted) as an endpoint failure, which
+  opens the endpoint's circuit at once. A TLS 1.3 server's refusal of the
+  client certificate over gRPC is still reported as retryable
+  ([provider error signals](docs/configuration.md#provider-error-signals),
+  SPEC §34, §35).
+- **`maki status` reports a stopped rollback session as degraded, and the
+  daemon logs a failed requested checkpoint or drain** (AUD-187, AUD-191,
+  2026-11-25; [#395](https://github.com/seo-rii/maki/pull/395)). A
+  rollback-protected session that stopped for good (after `maki volume
+  takeover` or a restore beside a live daemon, an older anchor put back, an
+  uncertain commit or a damaged page) failed every request with EIO while
+  `maki status` reported `state: ready` and `maki_volume_state` 1, until a
+  checkpoint worker pass failed, or for good. From the first request that
+  finds the stop, status now reports `state: degraded` with a reason that
+  starts `rollback session stopped:` and names the cause, and
+  `maki_volume_state` is 2; nothing clears it, and the daemon logs one
+  `WARN` with the cause. With a remote witness a restart alone does not
+  reopen such a volume: the next daemon's claim is refused until `maki
+  volume takeover` ([failure handling](docs/operations.md#failure-handling)).
+  A checkpoint that `maki checkpoint` requested, and a drain (the `drain`
+  verb or the one shutdown runs), that fails now logs one `WARN` per
+  request, `requested checkpoint failed: <error>` and `drain failed:
+  <error>; I/O admission stays closed until a drain succeeds`, without a
+  rate limit; only the checkpoint worker's failures were logged before
+  ([logs](docs/observability.md#logs)).
 - **`maki volume create` continues a local creation that stopped after its
   witness anchor** (AUD-159, AUD-169, AUD-170, 2026-11-24;
   [#382](https://github.com/seo-rii/maki/pull/382)). A local rollback creation
@@ -841,6 +934,31 @@ documents.
 
 ### Fixed
 
+- **2026-11-25 ninth round: refusals of the rollback-protected backing**
+  (AUD-183 to AUD-186; [#391](https://github.com/seo-rii/maki/pull/391)).
+  `maki volume gc` refuses a remote backing root that does not hold the
+  authority's current generation in attach's words ("this backing root
+  does not hold the remote authority's current generation (...); check the
+  witness address and backing root before retrying"), where it printed "No
+  such file or directory (os error 2)" or "no exact remote witnessed
+  manifest". The daemon, `maki check`, `maki volume inspect` and
+  `maki-benchmark` refuse a backing root or witness directory that does not
+  exist, is not a directory or that the user may not open with its path,
+  the setting that names it (`backing.root`,
+  `backing.rollback_protection.witness_root`) and what to check, where they
+  printed the bare system error; `check` and `inspect` word a backing root
+  this way for plain volumes too, and `maki-benchmark` on a symbolically
+  linked backing root that holds a volume exits 1 where it exited 2. A local
+  backing without its format marker is offered `volume create` only where
+  `create` continues it; otherwise the refusal names the entries that stop
+  a creation, such as a `lost+found`. `volume create` refuses a root whose
+  arena, manifest slot or staged marker is not a regular file with one name
+  before it publishes anything, where it published its marker and then
+  failed at every run; it removes a staged marker that its user may not
+  open, as a creation run as root and killed before it gave the file away
+  leaves one, and continues in one run; and it refuses an arena or slot its
+  user may not open with the way out (`chown`, `chmod`)
+  ([local creation](docs/rollback-protection.md#local-configuration-and-creation)).
 - **2026-11-24 eighth round: `maki-attach` messages** (AUD-166, AUD-168;
   [#385](https://github.com/seo-rii/maki/pull/385)). An executed connect step
   logs and reports the backend identifier it sent, where it printed the
@@ -1365,6 +1483,20 @@ observable behaviour:
 
 ### Documentation
 
+- **2026-11-25 ninth round** (AUD-192;
+  [#390](https://github.com/seo-rii/maki/pull/390)). maki-attach(8) says
+  which errors tell a caller without the permission to run the command as
+  root (those about the state directory, its lock and the gate
+  configuration `verify` reads, not the attachment file of the other
+  commands) and that `--block-size` goes up to the kernel's page size (4096
+  on x86_64). The witness service guide says that a `remote.state` that
+  changes or stops decoding under a running `serve` makes it refuse the next
+  request as invalid, which stops the session that sent it, before it
+  answers unavailable until a restart, and that `serve` logs nothing about
+  it. The records change adds to the status page's known limitations that
+  the WebSocket transport does not divide its connect deadline across the
+  endpoint host's addresses. No release candidate has been tagged since
+  `v0.1.0-rc.1`, which predates this round and the eighth.
 - **2026-11-24 eighth round** (AUD-176 to AUD-178;
   [#379](https://github.com/seo-rii/maki/pull/379)). Seven statements that the
   code, the CI workflow or the tree contradicted are corrected: what the

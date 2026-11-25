@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-11-24. External campaign evidence below runs through
+Last updated: 2026-11-25. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -124,6 +124,13 @@ See [cache reload](operations.md#growth-and-cache-reload).
   `Unavailable`), not as a TLS authentication failure: the refusal arrives
   after the handshake and the HTTP/2 library does not keep the TLS error
   ([provider error signals](configuration.md#provider-error-signals)).
+- The WebSocket transport runs its whole connect under one `timeout` and
+  tries the endpoint host's addresses in turn, so a host whose first address
+  does not answer loses that time on every connect: `localhost` that
+  resolves to `::1` first costs about 2 s on Windows for a listener on IPv4
+  only, and an IPv6 route that drops packets makes every connect time out.
+  The gRPC transport divides its connect timeout across the addresses, and
+  the HTTP transport tries the other address family after 300 ms.
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs
