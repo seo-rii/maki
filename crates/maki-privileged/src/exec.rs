@@ -43,8 +43,9 @@ use crate::verify::{
 /// Serializes attach helpers system-wide (device allocation + connect).
 pub const ATTACH_LOCK_PATH: &str = "/run/maki-attach/attach.lock";
 const NBD_READY_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long `nbd-disconnect` waits for a device to stop showing the
-/// connection it disconnected, and how often it looks ([`await_release`]).
+/// How long `nbd-disconnect`, detach and cleanup wait for a device to stop
+/// showing the connection they disconnected, and how often they look
+/// ([`await_release`]).
 const NBD_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const NBD_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -909,6 +910,7 @@ fn disconnect_raw_with(
     disconnect(&PlannedStep::NbdDisconnect {
         device: device.into(),
     })?;
+    let patience = release_patience(patience);
     match await_release(clock, identifier, patience, |_| {
         nbd_backend_at(sysfs, device)
     }) {
@@ -931,12 +933,14 @@ fn disconnect_raw_with(
 /// Wait until the device that `backend` reads no longer shows the
 /// connection `identifier`, whose disconnect the kernel acknowledged: look,
 /// and while it still shows it, look again every [`NBD_RELEASE_INTERVAL`]
-/// on `clock` for up to `patience`. Returns what the device showed at the
-/// last look: no connection or one made since under another backend
-/// identifier, when this one is gone, or still this one, when the time ran
-/// out. A look that cannot be read ends the wait with its error: a
-/// connection made since without an identifier (an ioctl client's: `pid`,
-/// no `backend`) reads so, and is never taken for "gone".
+/// on `clock` for up to `patience`, the last time when it is over.
+/// `nbd-disconnect`, detach and cleanup all wait so, for
+/// [`release_patience`]. Returns what the device showed at the last look:
+/// no connection or one made since under another backend identifier, when
+/// this one is gone, or still this one, when the time ran out. A look that
+/// cannot be read ends the wait with its error: a connection made since
+/// without an identifier (an ioctl client's: `pid`, no `backend`) reads so,
+/// and is never taken for "gone".
 ///
 /// The kernel acknowledges a disconnect before the connection is gone from
 /// the device: it keeps the `pid` and `backend` attributes, and refuses a
@@ -951,12 +955,23 @@ fn await_release<C: Clock>(
     let acknowledged = clock.now();
     loop {
         let shown = backend(clock)?;
-        if shown.as_deref() != Some(identifier)
-            || clock.now().saturating_duration_since(acknowledged) >= patience
-        {
+        let waited = clock.now().saturating_duration_since(acknowledged);
+        if shown.as_deref() != Some(identifier) || waited >= patience {
             return Ok(shown);
         }
-        clock.sleep(NBD_RELEASE_INTERVAL.min(patience));
+        clock.sleep(NBD_RELEASE_INTERVAL.min(patience - waited));
+    }
+}
+
+/// How long [`await_release`] may wait after a disconnect: `limit`, but not
+/// past the deadline that the thread's caller set for all of its commands
+/// ([`command::finish_by`], the failed-start hook's), which the disconnect
+/// step itself keeps too. Nothing, so one look, once that deadline has
+/// passed.
+fn release_patience(limit: Duration) -> Duration {
+    match command::step_deadline() {
+        Ok(deadline) => limit.min(deadline.saturating_duration_since(Instant::now())),
+        Err(_) => Duration::ZERO,
     }
 }
 
@@ -2135,7 +2150,17 @@ fn execute_with_options(
     // teardown; otherwise a retry must still know which device it owns.
     if disconnects && !connects {
         let current = record.as_ref().unwrap();
-        if system.backend(&current.device)?.is_some() {
+        // The last opener is often udev's probe after the disconnect's change
+        // event: wait for it as `nbd-disconnect` does. Any connection the
+        // device shows then, this one or another made since, keeps the
+        // record, and one that cannot be read fails.
+        let shown = await_release(
+            system,
+            &current.connection_id,
+            release_patience(NBD_RELEASE_TIMEOUT),
+            |system| system.backend(&current.device),
+        )?;
+        if shown.is_some() {
             return Err(identity_error(
                 "disconnect has not completed; keeping the attach record for cleanup retry",
             ));
