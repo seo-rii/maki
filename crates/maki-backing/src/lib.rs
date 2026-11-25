@@ -196,9 +196,11 @@ pub trait Backing: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Why this backing's session stopped for good, if it has: a backing
-    /// with a freshness authority that observed a change it did not make,
-    /// or could not tell the outcome of its own commit, refuses every later
+    /// Why this backing's session stopped for good, if it has. A backing
+    /// with a freshness authority stops when the authority no longer names
+    /// its state, when the outcome of a commit or of a page write is
+    /// uncertain, or when a page its committed state references is missing,
+    /// short or does not authenticate; it then refuses every later
     /// operation until the volume is opened again. Answers at once, without
     /// storage or witness I/O, so a status query never waits for either.
     fn session_stopped(&self) -> Option<String> {

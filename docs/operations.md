@@ -1443,15 +1443,33 @@ calls.
   daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
-- When the session of a rollback-protected volume stops (another writer took
-  the volume over or restored it, the witness changed, or the outcome of a
-  commit is uncertain; see [rollback protection](rollback-protection.md)),
-  every later request fails with EIO and `maki status` reports `state:
-  degraded` with a reason starting `rollback session stopped:`, and
-  `maki_volume_state` is 2, from the first request that finds it, and the log
-  has one `WARN` line with the cause. Nothing clears it. After a takeover or a
-  restore leave the daemon stopped; otherwise find out what changed the
-  witness before you restart it.
+- When the session of a rollback-protected volume stops
+  ([rollback protection](rollback-protection.md)), every later request fails
+  with EIO. From the first request that finds the stop, `maki status`
+  reports `state: degraded` with a reason starting `rollback session
+  stopped:` and the cause, `maki_volume_state` is 2, and the log has one
+  `WARN` line with the cause. Nothing clears it. What to do depends on the
+  cause:
+  - The witness no longer names this writer's state (`remote writer revoked
+    or witness changed`, `witness anchor changed while locked`, a missing or
+    invalid anchor, or a remote witness's denial or invalid answer). After a
+    `maki volume takeover` or `restore`, another writer owns the volume:
+    leave this daemon stopped. Otherwise find out what changed the witness
+    (a witness directory that is not mounted or was replaced, an older
+    anchor put back, a changed allow-list) before you restart it.
+  - A commit or a page write whose outcome is uncertain (`manifest commit
+    failed: <error>`, `arena page write failed: <error>`). The error says
+    what failed. A storage error (a failed sync or write, a full
+    filesystem) is corrected before you restart the daemon, which opens the
+    volume against the witness again and keeps every acknowledged write. A
+    commit the witness refused (a predecessor conflict, a denial) is
+    treated as in the item above.
+  - A page the committed state references is missing, short or does not
+    authenticate (`arena page read failed: <error>`, `rollback arena page
+    authentication failed`): media damage looks like this, and so does an
+    older copy of a page put back, which is the rollback this protection
+    detects. Inspect the backing before you restart: attach refuses the
+    volume until every committed page authenticates again.
 - A volume configuration that is a symlink, has a second hard link, is owned
   by a user other than root and the loading process's user, or is writable by
   its group or others is refused before it is parsed, by the daemon (attach
