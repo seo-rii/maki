@@ -119,6 +119,11 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,
   and stack temporaries of the local cipher implementations are outside the
   `secure-buffers` page lock ([transport memory](transport-memory.md)).
+- A gRPC endpoint whose TLS 1.3 server refuses the client certificate is
+  reported with a retryable status (`grpc status Unknown`, `Cancelled` or
+  `Unavailable`), not as a TLS authentication failure: the refusal arrives
+  after the handshake and the HTTP/2 library does not keep the TLS error
+  ([provider error signals](configuration.md#provider-error-signals)).
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs

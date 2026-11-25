@@ -12,7 +12,12 @@
 //! `maki-crypto-error` metadata value on `FailedPrecondition`:
 //! `auth-tag-mismatch` or `context-mismatch`, or
 //! `unsupported-format-version` or `unsupported-compatibility-id`. Remote
-//! status text and details are never read.
+//! status text and details are never read. A status tonic made locally from
+//! a TLS failure (its source holds a rustls error, as after a failed
+//! reconnect inside a cached channel) is an endpoint failure whatever its
+//! code. Nothing a peer sends can put one there: a status decoded from its
+//! trailers has no source, and the chain of one made from an HTTP/2 reset
+//! or GOAWAY ends in an `h2::Error`, which has no source of its own.
 //!
 //! The provider's private wire items erase their owned data on drop and field
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
@@ -96,6 +101,20 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
     {
         return CryptoError::Contract(local.0.into());
     }
+    // tonic also dials inside an established channel: after the connection
+    // under it closes, the next call reconnects, and a handshake that fails
+    // there (a server restarted with a certificate this client does not
+    // trust) reaches the call as a status with the transport error as its
+    // source. Like a failed connection attempt it is an endpoint failure.
+    // Nothing a peer sends can claim one: a status decoded from trailers has
+    // no source, and the source chain of one made from an HTTP/2 reset or
+    // GOAWAY ends in an `h2::Error`, which has no source of its own (h2
+    // keeps an I/O error only as its kind and text). The same is why a TLS 1.3 server's
+    // refusal of the client certificate, which also arrives inside the
+    // call, is decided by its status's code.
+    if let Some(error) = local_tls_failure(status) {
+        return error;
+    }
     // FailedPrecondition alone is a request error. Integrity additionally
     // requires exactly one allowlisted ASCII metadata value, never free text.
     if status.code() == Code::FailedPrecondition {
@@ -141,6 +160,12 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
         Code::Unimplemented => CryptoError::EndpointFatal(message),
         _ => CryptoError::Retryable(message),
     }
+}
+
+/// The endpoint failure for a status whose source chain holds a rustls
+/// error: one tonic made locally from a TLS failure of the connection.
+fn local_tls_failure(status: &tonic::Status) -> Option<CryptoError> {
+    std::error::Error::source(status).and_then(connection::tls_failure)
 }
 
 /// Convenience for tests/docs: class of a mapped code.
@@ -931,6 +956,12 @@ impl GrpcCryptoProvider {
         // proves that no byte of the request was sent; it is marked so the
         // dispatcher may send the request to a peer (SPEC §18).
         let handed_over = AtomicBool::new(false);
+        // A TLS failure inside the call is an endpoint failure, but unlike a
+        // completed error response it leaves no working connection: retire
+        // the channel, so the next call reconnects through the payload-free
+        // attempt above instead of tonic's own reconnect with its request
+        // queued (see `preserve` below).
+        let tls_failed = AtomicBool::new(false);
         let exchange = async {
             let channel = connection.channel().await?;
             let mut grpc = tonic::client::Grpc::new(BoundedResponseChannel {
@@ -943,9 +974,12 @@ impl GrpcCryptoProvider {
                 .await
                 .map_err(|e| CryptoError::Retryable(format!("grpc endpoint not ready: {e}")))?;
             handed_over.store(true, Ordering::SeqCst);
-            grpc.unary(request, path, codec)
-                .await
-                .map_err(|status| map_status(&status))
+            grpc.unary(request, path, codec).await.map_err(|status| {
+                if local_tls_failure(&status).is_some() {
+                    tls_failed.store(true, Ordering::SeqCst);
+                }
+                map_status(&status)
+            })
         };
         let result = tokio::time::timeout(self.spec.timeout, exchange).await;
         let unsent = |error: CryptoError| {
@@ -961,7 +995,9 @@ impl GrpcCryptoProvider {
                 response.into_inner()
             }
             Ok(Err(error)) => {
-                if error.class() != ErrorClass::Retryable {
+                // A completed error response keeps the connection; a local
+                // TLS failure does not (see `tls_failed`).
+                if error.class() != ErrorClass::Retryable && !tls_failed.load(Ordering::SeqCst) {
                     connection.preserve();
                 }
                 return Err(unsent(error));

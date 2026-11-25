@@ -669,6 +669,21 @@ fn transport_failure(e: &maki_crypto::CryptoError) -> bool {
 }
 
 type NamedEndpoint = (String, Arc<dyn CryptoProvider>);
+
+/// Record one failed reachability probe attempt: keep the first endpoint
+/// failure among the attempts, and note whether the attempt may have reached
+/// the endpoint.
+fn note_probe_failure(
+    error: &maki_crypto::CryptoError,
+    endpoint_fatal: &mut Option<maki_crypto::CryptoError>,
+    maybe_sent: &mut bool,
+) {
+    if endpoint_fatal.is_none() && error.class() == maki_crypto::ErrorClass::EndpointFatal {
+        *endpoint_fatal = Some(error.duplicate());
+    }
+    *maybe_sent |= !error.is_not_sent();
+}
+
 type CheckedEndpoint = (String, Arc<dyn CryptoProvider>, bool);
 
 async fn cross_validate_reachable(
@@ -736,13 +751,17 @@ async fn cross_validate_reachable(
 /// Cross-endpoint interchangeability check (SPEC 34) plus the dispatcher
 /// (retry/budget/breaker/failover) shared by every remote transport.
 ///
-/// Each endpoint is first probed on its own (a single-endpoint self-test):
-/// endpoints that are unreachable right now are *quarantined* (review
-/// M-011) and enter the set unvalidated; they only start serving once the
-/// cross-endpoint check succeeds against a validated endpoint under the real
-/// volume context. Reachable endpoints are cross-checked against the first
-/// reachable one; proven non-interchangeability (or a misconfigured
-/// endpoint) refuses attach. At least one endpoint must be reachable.
+/// Each endpoint, a lone one included, is first probed on its own (a
+/// single-endpoint self-test): endpoints that are unreachable right now are
+/// *quarantined* (review M-011) and enter the set unvalidated; they only
+/// start serving once the cross-endpoint check succeeds against a validated
+/// endpoint under the real volume context. Reachable endpoints are
+/// cross-checked against the first reachable one; proven
+/// non-interchangeability (or a misconfigured endpoint) refuses attach. At
+/// least one endpoint must be reachable, and the refusal names each
+/// endpoint's failure. The one exception is a lone endpoint that failed
+/// only transiently and whose probe request may be sent again: it is
+/// retried under the availability policy.
 async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
@@ -790,30 +809,36 @@ async fn dispatch_endpoint_set(
         crypto_compatibility_id: superblock.crypto_compatibility_id.clone(),
     };
 
-    // 1. Reachability: every endpoint on its own, tolerating a few transient
-    //    failures only when it permits resending a request. A single endpoint
-    //    has nothing to cross-validate against: the engine self-test (through
-    //    the retry-safe-aware dispatcher) covers it.
+    // 1. Reachability: every endpoint on its own, a lone one included,
+    //    tolerating a few transient failures only when it permits resending
+    //    a request. Left to the engine self-test, which runs through the
+    //    dispatcher, a lone endpoint that cannot serve as configured made
+    //    `stall` wait at attach forever, with nothing logged and no control
+    //    socket to ask.
     let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
-    let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
-    let single = endpoints.len() == 1;
+    // A failed endpoint with the failure to report and whether the
+    // dispatcher may send the probe's request to it again.
+    let mut failed: Vec<(
+        String,
+        Arc<dyn CryptoProvider>,
+        maki_crypto::CryptoError,
+        bool,
+    )> = Vec::new();
+    let lone = endpoints.len() == 1;
     let probe_delay = config.crypto.retry.initial_delay.0;
     for (name, provider) in endpoints {
-        if single {
-            reachable.push((name, provider));
-            break;
-        }
         let validation_provider =
             apply_random_prefix(provider.clone(), unit as u32, prefix_bytes, &compat).await?;
         // Self-tests and canary checks make real RPCs. A lost response does
         // not prove the operation was unapplied, so the whole probe must not
         // be restarted for a provider that does not promise retry safety.
-        let probe_attempts = if validation_provider.capabilities().await?.retry_safe {
-            3
-        } else {
-            1
-        };
+        let retry_safe = validation_provider.capabilities().await?.retry_safe;
+        let probe_attempts = if retry_safe { 3 } else { 1 };
         let mut last: Option<maki_crypto::CryptoError> = None;
+        // Across the attempts: the first endpoint failure, and whether any
+        // attempt may have reached the endpoint.
+        let mut endpoint_fatal: Option<maki_crypto::CryptoError> = None;
+        let mut maybe_sent = false;
         for attempt in 0..probe_attempts {
             match provider_self_test(validation_provider.as_ref(), &context, unit, &compat).await {
                 Ok(()) => {
@@ -832,12 +857,14 @@ async fn dispatch_endpoint_set(
                             break;
                         }
                         Err(AttachError::Crypto(e)) if transport_failure(&e) => {
+                            note_probe_failure(&e, &mut endpoint_fatal, &mut maybe_sent);
                             last = Some(e);
                         }
                         Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) if transport_failure(&e) => {
+                    note_probe_failure(&e, &mut endpoint_fatal, &mut maybe_sent);
                     last = Some(e);
                 }
                 Err(e) => {
@@ -852,16 +879,50 @@ async fn dispatch_endpoint_set(
         }
         match last {
             None => reachable.push((name, provider)),
-            Some(e) => {
-                tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
-                quarantined.push((name, provider));
+            Some(last) => {
+                let resendable = endpoint_fatal.is_none() && (retry_safe || !maybe_sent);
+                failed.push((name, provider, endpoint_fatal.unwrap_or(last), resendable));
             }
         }
     }
+    // A lone endpoint has no peer to serve while it is away. When no probe
+    // attempt gave an endpoint failure and the dispatcher may send the
+    // probe's request again (the provider is retry-safe, or no attempt may
+    // have reached the endpoint), the engine self-test retries it through
+    // the dispatcher under the availability policy: `stall` waits for it,
+    // `bounded-error` gives up at `max_operation_time`. Otherwise the
+    // probe's failure is final, as the dispatcher would make it: an endpoint
+    // failure (TLS authentication, a refused or misrouted request) in any
+    // attempt shows the endpoint cannot serve as configured, and a request of
+    // a provider that is not retry-safe that may have reached the endpoint
+    // is never sent again (SPEC §18).
+    if lone && matches!(&failed[..], [(_, _, _, true)]) {
+        let (name, provider, e, _) = failed.pop().expect("one failed endpoint");
+        let policy = match config.crypto.availability_policy {
+            maki_format::config::AvailabilityPolicy::Stall => "stall",
+            maki_format::config::AvailabilityPolicy::BoundedError => "bounded-error",
+        };
+        tracing::warn!(
+            "endpoint {name:?} unreachable at attach ({e}); it is the only endpoint, so the \
+             attach keeps retrying it under the `{policy}` availability policy"
+        );
+        reachable.push((name, provider));
+    }
+    let mut quarantined: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for (name, provider, e, _) in failed {
+        // A lone endpoint left here refuses the attach, whose error says why.
+        if !lone {
+            tracing::warn!("endpoint {name:?} quarantined: unreachable at attach ({e})");
+        }
+        unreachable.push(format!("{name:?}: {e}"));
+        quarantined.push((name, provider));
+    }
     if reachable.is_empty() {
-        return Err(DaemonError::Unsupported(
-            "no remote endpoint is reachable; attach refused".to_string(),
-        ));
+        return Err(DaemonError::Unsupported(format!(
+            "no remote endpoint is reachable; attach refused ({})",
+            unreachable.join("; ")
+        )));
     }
 
     // 2. Interchangeability among the reachable ones (SPEC 34).

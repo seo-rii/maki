@@ -595,7 +595,27 @@ it counts once in `maki_crypto_deadline_exceeded_total`. A shared RPC
 remains active while it still has a live caller.
 Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
-cross-endpoint check succeeds against a validated endpoint.
+cross-endpoint check succeeds against a validated endpoint. Each endpoint, a
+lone one included, is probed on its own at attach (three attempts, spaced by
+`retry.initial_delay`, for a `retry_safe` provider; one otherwise). When none
+is reachable the attach is refused with "no remote endpoint is reachable;
+attach refused" followed by each endpoint's name and failure (the first
+endpoint failure among its attempts, otherwise the last failure). A lone
+endpoint is the exception when none of its attempts gave an endpoint
+failure and its probe request may be sent again: the provider is
+`retry_safe`, or every attempt failed before the request left Maki (a
+refused connection, a refused WebSocket upgrade). The attach then logs a
+warning, "endpoint "<name>" unreachable at attach (<error>); it is the only
+endpoint, so the attach keeps retrying it under the <policy> availability
+policy", and retries it like any request, so `stall` waits for it and
+`bounded-error` gives up at `max_operation_time`. Otherwise the probe's
+failure refuses the attach under either policy: an endpoint failure (a TLS
+authentication failure, a 401, 403 or 404) in any attempt, or, when the
+provider is not `retry_safe`, a failure after the request may have reached
+the endpoint (a 5xx, a timeout, a lost response), which is never sent
+again. The policy also governs the engine's own self-test that follows the
+probe, so under `stall` an endpoint that fails after passing its probe is
+waited for as well.
 Each background validation RPC shares the serving RPC count and resident-byte
 budgets, and its probe batches are narrowed to fit those budgets. The dispatcher
 owns these validation tasks and cancels them when its final owner is dropped.
@@ -732,7 +752,11 @@ response head or chunked body that does not parse, or a body that only the
 connection's close ends; a gRPC message whose length prefix, count or final
 status breaks the gRPC protocol, or a stream that ends inside a message; a
 WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
-with a numeric ID. Two protocol failures are classified otherwise:
+with a numeric ID. A TLS failure is recognised wherever the TLS error reaches
+the transport: in the connection attempt, and for gRPC also when the library
+reconnects inside an established channel (a server restarted with a
+certificate Maki does not trust); the next call then opens a new connection.
+Three failures are classified otherwise:
 
 - A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
   upgrade headers or with the wrong accept key, a status below 300 or above
@@ -751,6 +775,18 @@ with a numeric ID. Two protocol failures are classified otherwise:
   counts as sent, so a call that a GOAWAY refused is sent to another endpoint
   only when the provider is `retry_safe`. The next call opens a new
   connection.
+- A gRPC server that refuses the client certificate under TLS 1.3 does so
+  after the client has finished its side of the handshake, so the refusal
+  reaches the first call, not the connection attempt. The HTTP/2 library
+  keeps only the kind and text of that connection error, or cancels the call
+  with "connection closed", and Maki never classifies by text: the call is
+  classified by the status the library derives, usually `Unknown`,
+  `Cancelled` or `Unavailable`, which is retryable and counts as sent. The
+  server's log names the refusal. Under TLS 1.2 the refusal happens inside
+  the handshake and is an endpoint failure, and HTTP and WebSocket report it
+  as one when the server's alert is read before the connection is lost. On
+  any transport, a server that resets the connection before the client has
+  read its alert leaves only a lost connection, which is retryable.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:
@@ -782,12 +818,15 @@ compatibility ID. Only these answers pass:
 
 A retryable, throttled or endpoint-failure answer to a probe is inconclusive:
 the endpoint is quarantined, or the attach fails when no other endpoint is
-reachable. A contract error fails the self-test and the attach. Any other
-answer, such as a 400, a 422 without a token, a gRPC `InvalidArgument` or a
-WebSocket `bad-request`, refuses the attach, because the declared capability
-was not proven. The cross-endpoint check reads a refusal the other way: an
-endpoint that answers another endpoint's ciphertext with an integrity failure
-or a request error is not interchangeable with it, and the attach is refused.
+reachable (a lone endpoint that answered only retryable or throttled errors
+and whose probe request may be sent again is retried under the availability
+policy instead, as described [above](#websocket-and-grpc-contracts)). A contract error fails the
+self-test and the attach. Any other answer, such as a 400, a 422 without a
+token, a gRPC `InvalidArgument` or a WebSocket `bad-request`, refuses the
+attach, because the declared capability was not proven. The cross-endpoint
+check reads a refusal the other way: an endpoint that answers another
+endpoint's ciphertext with an integrity failure or a request error is not
+interchangeable with it, and the attach is refused.
 
 ## Backing directory identity
 
