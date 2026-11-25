@@ -1,16 +1,23 @@
 # Coverage-guided (libFuzzer) fuzz targets. Detached from the main workspace
-# (the empty [workspace] table below) so it never affects `cargo build
-# --workspace` and only builds under `cargo +nightly fuzz`.
+# (the [workspace] table below) so it never affects `cargo build
+# --workspace` and only builds under `cargo +nightly fuzz`. Each target is
+# one line that calls its entry function in harness/ (maki-fuzz-harness, a
+# member of the main workspace), whose suite replays every committed seed in
+# seeds/<target>/ on the stable toolchain
+# (harness/tests/review_fuzz_corpus.rs).
 #
-# Run (Linux, nightly). The two format targets need inputs longer than
-# libFuzzer's default limit of 4096 bytes: a superblock is a 4096-byte frame
-# after the byte that selects the decoder.
-#   cargo +nightly fuzz run format_decoders -- -max_len=8192 -max_total_time=60
-#   cargo +nightly fuzz run format_records  -- -max_len=8192 -max_total_time=60
-#   cargo +nightly fuzz run journal_scan    -- -max_total_time=60
-#   cargo +nightly fuzz run config_parse    -- -max_total_time=60
-#   cargo +nightly fuzz run endpoint_url    -- -max_total_time=60
-#   cargo +nightly fuzz run probe_parsers   -- -max_total_time=60
+# Run (Linux, nightly) from the repository root. Cargo.lock is not
+# committed here: start it from the workspace's, so the fuzzed code is
+# built with the versions the workspace pins. A run reads the committed
+# seeds and keeps what it finds in fuzz/corpus/<target>, which is not
+# committed either; a crash's input goes to fuzz/artifacts/<target>.
+#   cp Cargo.lock fuzz/Cargo.lock
+#   cargo +nightly fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- -max_total_time=60
+# Add -max_len=8192 for format_decoders and format_records (a superblock is
+# a 4096-byte frame after the byte that selects the decoder, longer than
+# libFuzzer's default limit of 4096 bytes) and -max_len=70000 for
+# nbd_handshake (beyond the client's 64 KiB byte limit). The fuzz job of
+# .github/workflows/ci.yml runs every target so for 30 seconds.
 
 [package]
 name = "maki-fuzz"
@@ -22,7 +29,9 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+# Exact: fuzz/Cargo.lock is not committed, and the workspace's lockfile that
+# the build starts from does not list it.
+libfuzzer-sys = "=0.4.13"
 # Every target's code: the stable suite runs it on the committed seeds.
 maki-fuzz-harness = { path = "harness" }
 
@@ -91,6 +100,14 @@ bench = false
 
 [profile.release]
 debug = 1
+
+# The workspace's patches of the crates the fuzzed code uses, so that it is
+# built as the workspace builds it: the vendored serde_json (which decodes
+# the rollback manifest and the remote witness state) and bytes, not their
+# crates.io releases.
+[patch.crates-io]
+bytes = { path = "../vendor/bytes" }
+serde_json = { path = "../vendor/serde_json" }
 
 # Detach from the parent workspace. The harness below this directory is a
 # member of that one.

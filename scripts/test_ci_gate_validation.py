@@ -487,6 +487,10 @@ class FuzzJob(unittest.TestCase):
         self.assertLess(build.index("cp Cargo.lock fuzz/Cargo.lock\n"), build.index("cargo fuzz build"))
         self.assertLess(self.names.index("build every fuzz target"), self.names.index(FUZZ_STEP))
 
+    def test_libfuzzer_is_pinned_where_the_workspace_lockfile_cannot_pin_it(self):
+        self.assertNotIn("libfuzzer-sys", (ROOT / "Cargo.lock").read_text())
+        self.assertRegex(FUZZ_MANIFEST.read_text(), r'(?m)^libfuzzer-sys = "=\d+\.\d+\.\d+"$')
+
     def test_the_fuzzed_code_uses_the_workspace_patches(self):
         # Without them the fuzzed serde_json and bytes would be the
         # crates.io releases, not the vendored copies production uses.
