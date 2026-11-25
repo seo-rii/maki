@@ -10,6 +10,11 @@
 //!
 //! The configuration and socket named here do not exist: a command that got
 //! as far as reading or connecting would fail with status 1.
+//!
+//! An option given where the command expects a path or a reload section
+//! (`maki check --deep`, the configuration forgotten) was taken for that
+//! path: `maki` tried to open a file named `--deep` and exited 1 with "No
+//! such file or directory". It is misuse too.
 
 #[path = "support/short_dir.rs"]
 mod short_dir;
@@ -22,6 +27,16 @@ const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 fn maki<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_maki"))
         .args(args)
+        .env_remove("MAKI_LOG")
+        .output()
+        .unwrap()
+}
+
+/// `maki` run in `directory`, where a relative path is looked up.
+fn maki_in(directory: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_maki"))
+        .args(args)
+        .current_dir(directory)
         .env_remove("MAKI_LOG")
         .output()
         .unwrap()
@@ -100,6 +115,81 @@ fn malformed_options_and_approvals_exit_2_before_anything_is_read() {
             "{args:?} read its configuration or socket: {stderr}"
         );
         assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+/// Every word that stands where a configuration, an administrator
+/// configuration, a backup directory or a reload section belongs. The
+/// working directory holds a file of each such name whose contents are not
+/// a configuration, so a command that opened one would fail with status 1
+/// and a parse error.
+#[test]
+fn an_option_where_a_path_belongs_exits_2_before_anything_is_read() {
+    let dir = short_dir::tempdir().unwrap();
+    let config = dir.path().join("missing.toml");
+    let config = config.to_str().unwrap();
+    let socket = dir.path().join("missing.sock");
+    let socket = socket.to_str().unwrap();
+    let words = [
+        "--deep",
+        "--help",
+        "--discard",
+        "--bogus",
+        "--dir",
+        "--section",
+        "-v",
+        "-",
+    ];
+    for word in words {
+        std::fs::write(dir.path().join(word), "not a configuration\n").unwrap();
+    }
+    let mut failures = Vec::new();
+    for args in [
+        vec!["check", "--deep"],
+        vec!["check", "--help"],
+        vec!["check", "-", "--deep"],
+        vec!["volume", "create", "--discard"],
+        vec!["volume", "inspect", "--help"],
+        vec!["volume", "witness", "-v"],
+        vec!["volume", "gc", "--bogus"],
+        vec!["volume", "snapshot", config, "--dir"],
+        vec!["volume", "snapshot", "--bogus", "--dir"],
+        vec!["volume", "takeover", "--bogus", "1", ROOT],
+        vec!["volume", "restore", config, "--dir", "1", ROOT, ROOT],
+        vec!["volume", "resume-enrollment", "--discard", "1", UUID],
+        vec!["status", "--help"],
+        vec!["metrics", "-v"],
+        vec!["checkpoint", "--bogus"],
+        vec!["drain", "--bogus"],
+        vec!["reload", "--deep", "cache", "--max-bytes", "4096"],
+        vec!["reload", "--help", "limits"],
+        vec!["reload", config, "--section"],
+        vec!["reload", "--socket", socket, "--section"],
+        vec!["status", "--timeout", "5", "--help"],
+    ] {
+        let output = maki_in(dir.path(), &args);
+        let stderr = stderr(&output);
+        if output.status.code() != Some(2)
+            || !stderr.starts_with("error: ")
+            || !stderr.contains("usage:")
+            || stderr.contains("No such file")
+            || stderr.contains("TOML")
+            || !output.stdout.is_empty()
+        {
+            failures.push(format!("{args:?}: {:?}: {stderr}", output.status.code()));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // A file whose name starts with `-` is still named as a path.
+    let output = maki_in(dir.path(), &["check", "./--deep"]);
+    let stderr = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("invalid TOML"), "{stderr}");
+    for word in words {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(word)).unwrap(),
+            "not a configuration\n"
+        );
     }
 }
 
