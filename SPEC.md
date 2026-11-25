@@ -2021,6 +2021,24 @@ MUST NOT re-encode a valid copy and MUST make the selected copy durable before
 touching the other, so an interruption at any point never destroys a copy that
 was already durable. Read-only checks and inspection MUST NOT write it.
 
+`maki check`, `maki-check` and `maki volume inspect` open a backing root that
+the running process may not write (a read-only mount, a directory without
+write permission for it, an immutable directory) read-only, and any other
+root as before. Through that view they MUST NOT create, write, sync or remove
+anything. The deep check MUST take the volume lock shared through a read-only
+descriptor, which excludes a writer for the whole check, and MUST NOT run
+when the lock file is missing. A read-only check proves less than the same
+read followed by recovery: what it reads may exist only in the page cache,
+and none of the rewrites, syncs and repairs above can be made. It MUST say
+so, MUST NOT report the volume `clean` or `recoverable` (its verdict is
+`unproven`, or `unrecoverable` when it finds damage), and MUST report the
+records recovery would replay and the journal repairs it would make as
+warnings. A rollback-protected backing has no read-only open, because opening
+it re-publishes its authenticated state and witness record
+([local configuration and creation](docs/rollback-protection.md#local-configuration-and-creation));
+these commands MUST refuse it, before opening it, when its backing root or
+witness directory cannot be written.
+
 Damage beyond the required final-tail boundary MAY be treated as torn unsynced
 data. An intact later record MUST NOT be used to infer earlier durability:
 unsynced sectors may persist out of order. Recovery MUST rewrite, verify and

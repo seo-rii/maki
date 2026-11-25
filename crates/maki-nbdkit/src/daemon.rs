@@ -178,6 +178,62 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
+/// The backing of an existing volume for a command that only reads it
+/// (`maki check`, `maki check --deep`, `maki volume inspect`).
+///
+/// Where this process may write the backing root (and, with local rollback
+/// protection, the witness directory) this is [`build_backing`], exactly as
+/// before. Where it may not ([`FileBacking::may_write_root`]: a read-only
+/// mount, a read-only bind mount, a directory it may not write, an immutable
+/// one), a plain root opens as a [`FileBacking::read_only`] view, which
+/// creates, writes, syncs and removes nothing; a check through it says so
+/// and claims less (`maki_format::checker::READ_ONLY_CHECK`). The commands
+/// cannot work through a writable backing there: every file would be opened
+/// read-write, which such a root refuses.
+///
+/// A rollback-protected backing has no read-only open: opening it
+/// authenticates its state against the witness and then re-publishes that
+/// state and the witness anchor before anything is read (the failed
+/// writeback rule, K-01). A local one whose root or witness directory this
+/// process may not write is refused with the reason, before anything is
+/// opened. A remote one is opened as [`build_backing`] opens it; `maki`
+/// refuses it before calling this.
+pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    use maki_backing::configured::{BACKING_ROOT, WITNESS_ROOT};
+    let root = Path::new(&config.backing.root);
+    if let Some(rollback) = &config.backing.rollback_protection {
+        if rollback.remote.is_none() {
+            let witness = Path::new(&rollback.witness_root);
+            WITNESS_ROOT.reachable(witness)?;
+            for (directory, path) in [(&BACKING_ROOT, root), (&WITNESS_ROOT, witness)] {
+                if !directory.may_write(path)? {
+                    return Err(DaemonError::Unsupported(format!(
+                        "{} cannot be written by this process, and a rollback-protected \
+                         backing cannot be checked or inspected read-only: opening it \
+                         re-publishes its authenticated state and the witness anchor before \
+                         anything is read. Run the command where the backing root and the \
+                         witness directory can both be written",
+                        directory.named(path)
+                    )));
+                }
+            }
+        }
+        return build_backing(config);
+    }
+    if BACKING_ROOT.may_write(root)? {
+        return build_backing(config);
+    }
+    let view = FileBacking::read_only(root).map_err(|error| BACKING_ROOT.refusal(root, error))?;
+    // As `build_backing` refuses it: a protected root is never read as a
+    // plain one because its configuration stanza went missing.
+    if view.exists("rollback.format")? {
+        return Err(DaemonError::Unsupported(
+            "protected backing requires [backing.rollback_protection]".to_string(),
+        ));
+    }
+    Ok(Arc::new(view))
+}
+
 /// Check for volume markers without opening a writer session or contacting the witness.
 /// A marker is sufficient to require explicit authorization before benchmarking.
 pub fn volume_layout_present(config: &VolumeConfig) -> Result<bool, DaemonError> {

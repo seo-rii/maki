@@ -148,7 +148,9 @@ daemon, `check` and `volume inspect` refuse it and name that command
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing
 the backing and is not created by these commands. New paths remain supported by
-`volume create`.
+`volume create`. A root the user running them may not write, such as one on a
+read-only mount, is opened read-only, and what the check then reports means
+less ([checking a backing that cannot be written](#checking-a-backing-that-cannot-be-written)).
 
 The inspect output includes `maximum units`, `maximum shards`, `full slot span
 bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
@@ -257,10 +259,11 @@ configuration; like the check, it stops on a protected backing whose
 `backing.rollback_protection.capacity` differs.
 
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
-It recreates a missing `volume.lock` (a restore or copy can drop the empty
-file); run as root, it creates the file for the owner of the backing root, so
-the daemon can still take the lock and nothing has to be handed back unless a
-crash interrupted the run (above).
+On a backing root it can write it recreates a missing `volume.lock` (a restore
+or copy can drop the empty file); run as root, it creates the file for the
+owner of the backing root, so the daemon can still take the lock and nothing
+has to be handed back unless a crash interrupted the run (above). On one it
+cannot write it creates nothing ([below](#checking-a-backing-that-cannot-be-written)).
 When checking a backing root directly, `maki-check` needs no segment size:
 like recovery, it bounds each journal segment file by the largest file a
 writer can produce under any valid `journal_segment_size` (at most 1 GiB), so
@@ -271,7 +274,9 @@ limit changes the verdict.
 The deep report states one of three verdicts as an `info: deep check verdict:`
 line, printed before any `warning:` and `ERROR:` lines; the report ends with
 `check passed` or `check FAILED`. The verdict describes the volume: a
-configuration mismatch (above) fails the check whatever the verdict says.
+configuration mismatch (above) fails the check whatever the verdict says. A
+check of a backing root it may not write states a fourth, `unproven`, in place
+of `clean` and `recoverable` ([below](#checking-a-backing-that-cannot-be-written)).
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
@@ -300,6 +305,54 @@ will make of it.
 
 Run offline checks only after the daemon or nbdkit process has released the
 volume lock.
+
+### Checking a backing that cannot be written
+
+`volume inspect`, `check`, `check --deep` and `maki-check` ask the kernel
+first whether the user running them may write the backing root directory:
+the answer is no on a read-only mount (a read-only bind mount too), for a
+directory without write permission for that user, and for an immutable
+directory. Where it may, they open the backing as they always did. Where it
+may not, a plain backing is opened read-only, and nothing below the root is
+created, written, synced or removed. Only the root decides: a writable root
+whose files the user may not write still fails ("Permission denied", or
+"Operation not permitted" for an immutable file), so make the root unwritable
+too (or mount the backing read-only) to check such a copy. `maki` asks about
+`backing.root`, and `maki-check` about the root it is given.
+
+A read-only check reads exactly what a writable one reads and finds the same
+damage, but it proves less, and its report says so in a `warning: read-only
+check:` line. Recovery rewrites and syncs everything it accepts, and repairs
+what it must, before a writer resumes; through a read-only backing none of
+that can happen, and what was read may exist only in the page cache (a failed
+writeback, or a process that stopped before its sync, leaves bytes there that
+the disk does not hold). Therefore:
+
+- the deep verdict is `unproven` where a writable check would say `clean` or
+  `recoverable`; an `ERROR:` still makes it `unrecoverable`;
+- records newer than the checkpoint, which recovery would replay, and the
+  journal repairs it would make (a torn tail to truncate, an unfinished
+  segment to discard) are `warning:` lines, not `info:` lines;
+- the deep check takes the volume lock shared, through a read-only
+  descriptor. A writer is excluded as before (a daemon that starts during the
+  check fails to take the lock, and the check refuses a volume a daemon
+  holds), and other read-only checks are admitted. It cannot create a missing
+  `volume.lock`, so without one it does not run and fails with `volume lock:
+  volume.lock is missing`;
+- the report still ends with `check passed` when nothing is wrong with what
+  was read, and the exit status is the same as for a writable check.
+
+| `deep check verdict:` | Meaning | Operator action |
+|---|---|---|
+| `unproven` | Read-only check only: nothing that attach refuses was found in what was read, but none of it is shown to be on disk, and nothing recovery would replay or repair (the `warning:` lines) was done | Attach where the backing can be written, which recovers it, or check it there for a `clean` verdict |
+
+`volume inspect` prints the same fields read-only, and the fast check reports
+the same lines plus the warning. A rollback-protected backing has no
+read-only open: opening it re-publishes its authenticated state and the
+witness anchor before anything is read. Where the user may not write its
+backing root or its witness directory, `check` and `volume inspect` refuse it
+with the directory, the setting that names it and that reason, before they
+open anything.
 
 ## Swap dependency checks
 

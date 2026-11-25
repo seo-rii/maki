@@ -970,7 +970,9 @@ fn existing_backing(
     maki_backing::configured::BACKING_ROOT
         .reachable(std::path::Path::new(&cfg.backing.root))
         .map_err(|error| error.to_string())?;
-    maki_nbdkit::daemon::build_backing(cfg).map_err(|error| error.to_string())
+    // A root this process may not write (a read-only mount) is read through
+    // a view that changes nothing, and the check says so.
+    maki_nbdkit::daemon::build_backing_to_read(cfg).map_err(|error| error.to_string())
 }
 
 fn inspect(config: &std::path::Path) -> Result<(), String> {

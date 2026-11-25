@@ -18,10 +18,23 @@ by volume configuration, which also reports each setting fixed at creation
 whose configured value differs from the volume's (attach refuses each one),
 use
 .BR "maki check" .
+A root the user running
+.B maki-check
+may not write (a read-only mount, a read-only bind mount, a directory without
+write permission for that user, an immutable one) is opened read-only:
+nothing is created, written, synced or removed, the report adds a
+.B "warning: read-only check:"
+line, and the deep check takes the volume lock shared and reports
+.B "deep check verdict: unproven"
+where a writable one says
+.BR clean " or " recoverable .
 .TP
 .B \-\-deep
 Acquire the volume lock and inspect checkpoint state, key canary, journal and
-data slots. Detach the volume before running this check.
+data slots. Detach the volume before running this check. On a root that
+cannot be written the lock is taken shared and a missing
+.I volume.lock
+fails the check, since it cannot be created there.
 .TP
 .BI \-\-journal-segment-size " bytes"
 Accepted for compatibility. The deep check bounds each journal segment file by

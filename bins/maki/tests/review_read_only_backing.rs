@@ -290,6 +290,40 @@ fn a_protected_backing_it_cannot_write_is_refused_with_the_reason() {
     }
 }
 
+/// A protected root is never read as a plain one because its configuration
+/// stanza went missing: the read-only open refuses it as the writable one
+/// does.
+#[test]
+fn a_protected_root_without_its_configuration_is_refused_read_only_too() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root().join("rollback.format"), b"").unwrap();
+    let config = fixture.config();
+    let config = config.to_str().unwrap();
+    let refused = || {
+        for args in [
+            &["volume", "inspect", config][..],
+            &["check", config],
+            &["check", config, "--deep"],
+        ] {
+            let output = maki(args);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {}", text(&output));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("protected backing requires [backing.rollback_protection]"),
+                "{args:?}: {}",
+                text(&output)
+            );
+        }
+    };
+    refused();
+    set_modes(&fixture.root(), 0o400, 0o500);
+    let result = std::panic::catch_unwind(refused);
+    set_modes(&fixture.root(), 0o600, 0o700);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Detaches the read-only bind mount on drop, before the fixture's
 /// directories are removed.
 struct Mounted(std::ffi::CString);

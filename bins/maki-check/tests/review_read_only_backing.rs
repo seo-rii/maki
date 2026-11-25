@@ -11,8 +11,8 @@
 //!
 //! Root ignores mode bits, so a root run drops CAP_DAC_OVERRIDE from the
 //! command's bounding set before it starts. The read-only mount needs a
-//! private mount namespace, which needs root: without it that case prints
-//! why it is skipped.
+//! private mount namespace and the immutable flag needs root: without it
+//! those cases print why they are skipped.
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -178,6 +178,66 @@ fn maki_check_reads_a_tree_it_may_not_write() {
         "{}",
         text(&deep)
     );
+}
+
+const FS_IMMUTABLE_FL: libc::c_int = 0x10;
+
+fn set_immutable(path: &Path, immutable: bool) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path)?;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the descriptor is open and both ioctls access one c_int.
+    unsafe {
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if immutable {
+            flags |= FS_IMMUTABLE_FL;
+        } else {
+            flags &= !FS_IMMUTABLE_FL;
+        }
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Clears the immutable flag again on drop.
+struct Immutable(Vec<PathBuf>);
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = set_immutable(path, false);
+        }
+    }
+}
+
+/// An immutable tree refuses even root's writes, and its directory answers
+/// the write-access probe EPERM, not EROFS or EACCES.
+#[test]
+fn maki_check_reads_an_immutable_root() {
+    if !running_as_root() {
+        eprintln!("skipping: setting the immutable flag needs root");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = volume(directory.path());
+    let mut immutable = Immutable(Vec::new());
+    for (path, _, _, _) in tree(&root) {
+        if let Err(error) = set_immutable(&path, true) {
+            eprintln!("skipping: the filesystem refuses the immutable flag ({error})");
+            return;
+        }
+        immutable.0.push(path);
+    }
+    let error = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("superblock.a"))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    read_only_checks(&root);
 }
 
 /// Detaches the read-only bind mount on drop, before the fixture's

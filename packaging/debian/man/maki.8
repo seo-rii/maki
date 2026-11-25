@@ -40,6 +40,25 @@ loads no credential and contacts no provider, so a different key under the
 same name, an unavailable credential and a provider that fails its self-test
 are found only at attach.
 .PP
+.BR "volume inspect" " and " check
+first ask whether the user running them may write the backing root: not on a
+read-only mount, a read-only bind mount, a directory without write permission
+for that user or an immutable one. There they open the backing read-only and
+create, write, sync and remove nothing; elsewhere they open it as before.
+A read-only check adds a
+.B "warning: read-only check:"
+line: what it read may exist only in the page cache, and recovery's rewrites
+and repairs could not be made, so the deep check reports
+.B "deep check verdict: unproven"
+where a writable one says
+.BR clean " or " recoverable ,
+and the records recovery would replay and the journal repairs it would make
+are warnings. The deep check then takes the volume lock shared, which still
+excludes a daemon, and fails without running when
+.I volume.lock
+is missing, which it cannot create. A rollback-protected backing whose root or
+witness directory cannot be written is refused: it has no read-only open.
+.PP
 An attached daemon exposes the
 .BR status ", " metrics ", " checkpoint ", " drain " and " reload
 control commands. Use a volume configuration or specify the control endpoint

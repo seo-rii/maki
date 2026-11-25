@@ -114,6 +114,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Default v2/v3 backings cannot detect restoration of an older, internally
   valid volume image (historical rollback). Only the experimental
   rollback-protected backing addresses this, and it is not qualified.
+- A backing root the user may not write (a read-only mount, for example) is
+  checked and inspected read-only. Such a check cannot show that what it
+  reads is on disk, or make the rewrites and repairs recovery makes, so its
+  deep verdict is `unproven`, never `clean`. A rollback-protected backing
+  there is refused: opening one rewrites its authenticated state
+  ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
 - `local-aes-xts` returns garbage rather than an error for a wrong key once
   the canary check is bypassed by an empty volume; use `local-aes-gcm-siv`.
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,

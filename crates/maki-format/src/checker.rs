@@ -30,8 +30,24 @@ impl CheckReport {
     }
 }
 
+/// The warning of a check through a backing that only reads
+/// ([`Backing::is_read_only`]): what it read proves less than the same bytes
+/// read by a check whose next step can be a recovery. Recovery rewrites and
+/// syncs everything it accepts, and repairs what it must, before a writer
+/// resumes (SPEC §27); through a read-only backing none of that can happen,
+/// and bytes that a failed writeback or a process that stopped before its
+/// sync left only in the page cache read like durable ones.
+pub const READ_ONLY_CHECK: &str = "read-only check: the backing was opened read-only, so \
+     nothing was written, synced or repaired. What was read may exist only in the page cache \
+     (a failed writeback, or a process that stopped before its sync, leaves such bytes): this \
+     check cannot show that the disk holds it, nor make the rewrites and repairs recovery makes \
+     before a writer resumes, so a deep check through this backing is never `clean`";
+
 pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
     let mut report = CheckReport::default();
+    if backing.is_read_only() {
+        report.warnings.push(READ_ONLY_CHECK.to_string());
+    }
 
     let (envelope, invalid_copy) = match load_volume_superblock_with_fallback(backing) {
         Ok(envelope) => envelope,

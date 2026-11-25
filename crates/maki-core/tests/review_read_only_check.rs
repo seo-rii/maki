@@ -79,6 +79,8 @@ fn writable(root: &Path) -> Arc<dyn Backing> {
 /// Every entry below `root`: its path, its length, its bytes if it is a
 /// file, and its modification time, which a rewrite of identical bytes, a
 /// truncation, and a created or removed entry (in its directory) change.
+/// The lock file's bytes (it holds none) are not read: Windows refuses a
+/// read of a file another handle holds locked, as an attached writer does.
 fn tree(root: &Path) -> Vec<(PathBuf, u64, Option<Vec<u8>>, SystemTime)> {
     let mut entries = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -88,6 +90,8 @@ fn tree(root: &Path) -> Vec<(PathBuf, u64, Option<Vec<u8>>, SystemTime)> {
             for entry in std::fs::read_dir(&path).unwrap() {
                 pending.push(entry.unwrap().path());
             }
+            None
+        } else if path.ends_with(layout::VOLUME_LOCK) {
             None
         } else {
             Some(std::fs::read(&path).unwrap())
@@ -239,6 +243,97 @@ fn a_read_only_deep_check_refuses_a_volume_a_writer_holds() {
     drop(volume);
     let report = deep_check(read_only(&root), SEGMENT).unwrap();
     assert!(report.ok(), "{}", lines(&report));
+}
+
+/// The read-only view of a root that, when the deep check reads the key
+/// canary (after its lock, before the journal and the slots), asks whether a
+/// writer could take the volume lock now.
+struct WriterProbe {
+    view: FileBacking,
+    root: PathBuf,
+    writer: std::sync::Mutex<Option<std::io::ErrorKind>>,
+}
+
+impl Backing for WriterProbe {
+    fn open(
+        &self,
+        path: &str,
+        create: bool,
+    ) -> std::io::Result<Arc<dyn maki_backing::BackingFile>> {
+        if path == layout::KEY_CANARY_A {
+            let attempt = FileBacking::new(&self.root)
+                .unwrap()
+                .try_lock(layout::VOLUME_LOCK)
+                .map(drop);
+            *self.writer.lock().unwrap() = Some(match attempt {
+                Ok(()) => std::io::ErrorKind::Other,
+                Err(error) => error.kind(),
+            });
+        }
+        self.view.open(path, create)
+    }
+    fn exists(&self, path: &str) -> std::io::Result<bool> {
+        self.view.exists(path)
+    }
+    fn remove(&self, path: &str) -> std::io::Result<()> {
+        self.view.remove(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        self.view.rename(from, to)
+    }
+    fn create_dir_all(&self, path: &str) -> std::io::Result<()> {
+        self.view.create_dir_all(path)
+    }
+    fn list(&self, dir: &str) -> std::io::Result<Vec<String>> {
+        self.view.list(dir)
+    }
+    fn list_skipping_non_utf8(&self, dir: &str) -> std::io::Result<Vec<String>> {
+        self.view.list_skipping_non_utf8(dir)
+    }
+    fn sync_dir(&self, dir: &str) -> std::io::Result<()> {
+        self.view.sync_dir(dir)
+    }
+    fn try_lock(&self, path: &str) -> std::io::Result<Box<dyn maki_backing::VolumeLock>> {
+        self.view.try_lock(path)
+    }
+    fn is_read_only(&self) -> bool {
+        self.view.is_read_only()
+    }
+    fn try_lock_shared_existing(
+        &self,
+        path: &str,
+    ) -> std::io::Result<Box<dyn maki_backing::VolumeLock>> {
+        self.view.try_lock_shared_existing(path)
+    }
+}
+
+/// The shared lock excludes a writer for the whole check, and only then is
+/// released: a daemon that starts meanwhile is refused, as it is by a
+/// writable deep check's exclusive lock.
+#[test]
+fn a_read_only_deep_check_excludes_a_writer_while_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("volume");
+    let mut volume = attach(&root);
+    volume.write_ct(2, &ct(2), true).unwrap();
+    volume.checkpoint().unwrap();
+    drop(volume);
+
+    let probe = Arc::new(WriterProbe {
+        view: FileBacking::read_only(&root).unwrap(),
+        root: root.clone(),
+        writer: std::sync::Mutex::new(None),
+    });
+    let report = deep_check(probe.clone() as Arc<dyn Backing>, SEGMENT).unwrap();
+    assert!(report.ok(), "{}", lines(&report));
+    assert_eq!(verdict(&report), Some("unproven"), "{}", lines(&report));
+    assert_eq!(
+        *probe.writer.lock().unwrap(),
+        Some(std::io::ErrorKind::WouldBlock),
+        "a writer could take the volume lock during the check"
+    );
+    // Released with the check.
+    drop(attach(&root));
 }
 
 #[test]

@@ -432,6 +432,16 @@ impl Directory {
         )?))
     }
 
+    /// Whether this process may create entries in the pinned root: the
+    /// answer of [`writable_directory`], with an immutable directory
+    /// (EPERM) answering `false` too.
+    pub(super) fn may_write(&self) -> io::Result<bool> {
+        match writable_directory(&self.0) {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(false),
+            answer => answer,
+        }
+    }
+
     pub(super) fn root_metadata(&self) -> io::Result<std::fs::Metadata> {
         self.0.metadata()
     }
@@ -1114,6 +1124,14 @@ impl Backing for FileBacking {
             )),
             Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn try_lock_shared_existing(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        super::lock_shared(self.directory.open_file(path, false, true)?)
     }
 
     fn free_bytes(&self) -> io::Result<Option<u64>> {
