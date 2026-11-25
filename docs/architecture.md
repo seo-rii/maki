@@ -45,6 +45,7 @@ crypto credentials.
 | `maki-privileged` | Auditable attach, detach, mount, and growth plans |
 | `maki-witness` | Remote witness client and server, etcd quorum store, and frontend failover |
 | `maki-test-support` | Durability oracle, crash backing, fake provider, manual clock, and failpoints |
+| `maki-fuzz-harness` | Entry functions of the `fuzz/` targets and the generator of their committed seeds |
 
 ## Backing namespace
 
