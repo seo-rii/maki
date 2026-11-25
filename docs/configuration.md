@@ -359,7 +359,14 @@ or payload encoding without a compatible migration requires a new identity and
 must not attach to an existing volume.
 
 Maki stores the provider type, compatibility identity, and key name in the
-superblock and refuses attach when the configuration disagrees. The provider
+superblock and refuses attach when the configuration disagrees, before it
+loads any provider credential or builds a provider transport. Process
+hardening (the memory budget, core dumps, memory locking and the swap policy)
+comes first, and so do opening the backing and recovery, since the superblock
+that is compared is the one recovery selects inside the backing; with a remote
+witness, opening it loads the witness client's TLS identity and claims a writer
+at the authority. `maki check` reports each setting that
+disagrees (see [Operations](operations.md#volume-lifecycle)). The provider
 self-test verifies supported unit sizes, ciphertext bounds, response ordering,
 round trips, and integrity claims; the key canary (see
 [Operations](operations.md#key-binding-at-first-attach)) then proves that the
@@ -1203,7 +1210,8 @@ geometry or on-disk format changes as migrations, not hot reloads. Attach
 compares configured device block size, crypto unit size, shard logical size,
 slot alignment, maximum ciphertext size and virtual size with the recovered
 superblock before provider initialization. A mismatch refuses readiness with
-the field and both values. Advertised NBD minimum I/O must also be a multiple
+the field and both values, and `maki check` reports every such mismatch.
+Advertised NBD minimum I/O must also be a multiple
 of, and at least as large as, the stored device block size. Mutable request and
 resource limits remain independently validated operational settings.
 

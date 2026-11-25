@@ -231,6 +231,31 @@ stored structure and volume identity; actual key verification happens at
 attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
+`maki check` and `maki check --deep` also compare the configuration with the
+volume, with the comparison attach makes before it loads any provider
+credential or builds a provider transport: the geometry
+(`volume.device_block_size`, `volume.crypto_unit_size`,
+`volume.shard_logical_size`, `volume.max_virtual_size`,
+`backing.slot_alignment`, `crypto.capabilities.max_ciphertext_size`),
+`crypto.provider`, the key's name (`crypto.key.name`, stored as the volume's
+key identity), `crypto.crypto_compatibility_id` and
+`crypto.random_prefix_bytes`. Each setting that differs is an
+`ERROR: configuration mismatch:` line with the configured value and the
+volume's, and the check fails. These settings are fixed at creation: correct
+the configuration to the volume's values. The values printed are sizes,
+provider and credential names and compatibility ids, never key material. A
+protected backing's `backing.rollback_protection.capacity` is
+compared when the backing is opened: a mismatch stops the command before the
+check, with both values. The check loads no credential and contacts no
+provider, so attach alone finds a different key under the same name (the key
+canary), a credential that is unavailable or does not fit the provider, a
+provider that fails its self-test, endpoints that are unreachable or not
+interchangeable, and the memory and swap checks. `maki-check <root>` reads no
+configuration and compares none. `maki volume inspect` reports what the volume
+stores and does not compare the geometry or crypto identity with the
+configuration; like the check, it stops on a protected backing whose
+`backing.rollback_protection.capacity` differs.
+
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
 It recreates a missing `volume.lock` (a restore or copy can drop the empty
 file); run as root, it creates the file for the owner of the backing root, so
@@ -245,7 +270,8 @@ limit changes the verdict.
 
 The deep report states one of three verdicts as an `info: deep check verdict:`
 line, printed before any `warning:` and `ERROR:` lines; the report ends with
-`check passed` or `check FAILED`:
+`check passed` or `check FAILED`. The verdict describes the volume: a
+configuration mismatch (above) fails the check whatever the verdict says.
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|

@@ -14,6 +14,7 @@ use maki_crypto_local::keysource::{
     systemd_credential_source, EnvKeySource, FileKeySource, KeySource,
 };
 use maki_crypto_local::{AesGcmSivProvider, AesXtsProvider};
+use maki_format::checker::CheckReport;
 use maki_format::config::{parse_config, ConfigError, CredentialRef, VolumeConfig};
 use maki_format::superblock::Superblock;
 use maki_format::{init, FormatError};
@@ -241,8 +242,11 @@ fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, Strin
     }
 }
 
-/// Build the configured crypto provider (SPEC §12: profile mismatch is
-/// caught later by the attach self-test).
+/// Build the configured crypto provider. A remote provider's endpoints are
+/// probed against the volume, which is recovered for them and compared with
+/// the configuration ([`configuration_mismatches`]) before any probe; a local
+/// provider is only built, and attach compares the configuration before it
+/// builds one.
 pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
     Ok(build_provider_with_endpoints(config).await?.0)
 }
@@ -785,7 +789,7 @@ async fn dispatch_endpoint_set(
             &recovered
         }
     };
-    validate_recovered_geometry(config, volume)?;
+    refuse_configuration_mismatch(config, volume.superblock())?;
     use maki_crypto::checked::CheckedProvider;
     use maki_crypto::clock::SystemClock;
     use maki_crypto::endpoint::{DispatchConfig, EndpointValidator};
@@ -795,15 +799,6 @@ async fn dispatch_endpoint_set(
     let prefix_bytes = config.crypto.random_prefix_bytes;
     let compat = config.crypto.effective_compatibility_id();
     let superblock = volume.superblock();
-    if superblock.provider_type != config.crypto.provider
-        || superblock.crypto_compatibility_id != compat
-        || superblock.geometry.crypto_unit_size != config.volume.crypto_unit_size
-        || superblock.geometry.max_ciphertext_size != config.crypto.capabilities.max_ciphertext_size
-    {
-        return Err(DaemonError::Unsupported(
-            "remote configuration does not match the locked volume identity/geometry".into(),
-        ));
-    }
     let context = maki_crypto::CryptoContext {
         volume_uuid: superblock.volume_uuid,
         format_version: superblock.format_version,
@@ -1113,60 +1108,303 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
     }
 }
 
-/// Recovered storage fields are immutable even when both individual
-/// configurations are valid. Compare before constructing any provider.
-fn validate_recovered_geometry(config: &VolumeConfig, volume: &Volume) -> Result<(), DaemonError> {
+/// A setting fixed at creation (SPEC §20) whose configured value differs
+/// from what the volume's superblock stores. Attach refuses the
+/// configuration at the first one, before it loads any provider credential
+/// or builds a provider transport, and
+/// `maki check` reports every one: both go through
+/// [`configuration_mismatches`], so the check cannot pass a configuration
+/// that attach refuses for its identity or geometry. The values are sizes,
+/// provider names, credential names and compatibility ids, which the
+/// configuration and the superblock hold in plain text; never key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationMismatch {
+    /// The setting, as the configuration file names it.
+    pub setting: &'static str,
+    /// The configured value, as a volume created now would store it.
+    pub configured: String,
+    /// What the volume stores.
+    pub stored: String,
+    refusal: Refusal,
+}
+
+/// How attach refuses a [`ConfigurationMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// Geometry, or an NBD size the stored geometry cannot serve.
+    Unsupported(String),
+    /// The crypto identity: provider type, key identity, compatibility id.
+    Identity(String),
+}
+
+impl std::fmt::Display for ConfigurationMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is {} in the configuration, the volume has {}",
+            self.setting, self.configured, self.stored
+        )
+    }
+}
+
+impl From<ConfigurationMismatch> for DaemonError {
+    fn from(mismatch: ConfigurationMismatch) -> Self {
+        match mismatch.refusal {
+            Refusal::Unsupported(message) => DaemonError::Unsupported(message),
+            Refusal::Identity(message) => {
+                DaemonError::Attach(AttachError::IdentityMismatch(message))
+            }
+        }
+    }
+}
+
+/// Every setting fixed at creation whose configured value `superblock`
+/// does not store, in the order attach compares them: the geometry, the NBD
+/// sizes it must serve, the provider type, the key identity and the
+/// compatibility id. Nothing here loads a credential or contacts a provider.
+pub fn configuration_mismatches(
+    config: &VolumeConfig,
+    superblock: &Superblock,
+) -> Result<Vec<ConfigurationMismatch>, DaemonError> {
+    let mut mismatches = Vec::new();
     let expected = config.geometry()?;
-    let stored = &volume.superblock().geometry;
-    for (field, configured, recovered) in [
+    let stored = &superblock.geometry;
+    for (field, setting, configured, recovered) in [
         (
             "device_block_size",
+            "volume.device_block_size",
             u64::from(expected.device_block_size),
             u64::from(stored.device_block_size),
         ),
         (
             "crypto_unit_size",
+            "volume.crypto_unit_size",
             u64::from(expected.crypto_unit_size),
             u64::from(stored.crypto_unit_size),
         ),
         (
             "shard_logical_size",
+            "volume.shard_logical_size",
             expected.shard_logical_size,
             stored.shard_logical_size,
         ),
         (
             "slot_alignment",
+            "backing.slot_alignment",
             u64::from(expected.slot_alignment),
             u64::from(stored.slot_alignment),
         ),
         (
             "max_ciphertext_size",
+            "crypto.capabilities.max_ciphertext_size",
             u64::from(expected.max_ciphertext_size),
             u64::from(stored.max_ciphertext_size),
         ),
         (
             "max_virtual_size",
+            "volume.max_virtual_size",
             expected.max_virtual_size,
             stored.max_virtual_size,
         ),
     ] {
         if configured != recovered {
-            return Err(DaemonError::Unsupported(format!("volume geometry {field} mismatch: configuration {configured}, stored {recovered}; migration is required")));
+            mismatches.push(ConfigurationMismatch {
+                setting,
+                configured: configured.to_string(),
+                stored: recovered.to_string(),
+                refusal: Refusal::Unsupported(format!(
+                    "volume geometry {field} mismatch: configuration {configured}, stored \
+                     {recovered}; migration is required"
+                )),
+            });
         }
     }
-    let block = stored.device_block_size;
-    if config.nbd.minimum_io < block || !config.nbd.minimum_io.is_multiple_of(block) {
-        return Err(DaemonError::Unsupported(format!("NBD minimum_io {} is incompatible with stored volume geometry device_block_size {block}", config.nbd.minimum_io)));
+    // Validation ties the NBD sizes to the configured geometry, so only a
+    // configuration that did not go through it can fail these once the
+    // geometry matches; with a geometry mismatch they would say it again.
+    if mismatches.is_empty() {
+        let block = stored.device_block_size;
+        let minimum = config.nbd.minimum_io;
+        if minimum < block || !minimum.is_multiple_of(block) {
+            mismatches.push(ConfigurationMismatch {
+                setting: "nbd.minimum_io",
+                configured: minimum.to_string(),
+                stored: format!("device_block_size {block}, which it must be a multiple of"),
+                refusal: Refusal::Unsupported(format!(
+                    "NBD minimum_io {minimum} is incompatible with stored volume geometry \
+                     device_block_size {block}"
+                )),
+            });
+        }
+        if !stored.max_virtual_size.is_multiple_of(u64::from(minimum)) {
+            mismatches.push(ConfigurationMismatch {
+                setting: "nbd.minimum_io",
+                configured: minimum.to_string(),
+                stored: format!(
+                    "max_virtual_size {}, which it must divide",
+                    stored.max_virtual_size
+                ),
+                refusal: Refusal::Unsupported(format!(
+                    "NBD minimum_io {minimum} is incompatible with stored volume geometry \
+                     max_virtual_size {}; every exported byte must be accessible",
+                    stored.max_virtual_size
+                )),
+            });
+        }
     }
-    if !stored
-        .max_virtual_size
-        .is_multiple_of(u64::from(config.nbd.minimum_io))
+    if config.crypto.provider != superblock.provider_type {
+        mismatches.push(ConfigurationMismatch {
+            setting: "crypto.provider",
+            configured: format!("{:?}", config.crypto.provider),
+            stored: format!("{:?}", superblock.provider_type),
+            refusal: Refusal::Identity(format!(
+                "volume was created with provider {:?}, configuration says {:?}",
+                superblock.provider_type, config.crypto.provider
+            )),
+        });
+    }
+    // A remote configuration has no `[crypto].key` (validation refuses one)
+    // and a volume it created stores an empty key identity: say which side
+    // has none rather than show an empty name.
+    let key_identity = configured_key_identity(config, &superblock.key_identity);
+    if key_identity != superblock.key_identity {
+        let name = |identity: &str, missing: &str| match identity {
+            "" => missing.to_owned(),
+            identity => format!("{identity:?}"),
+        };
+        mismatches.push(ConfigurationMismatch {
+            setting: "crypto.key.name",
+            configured: name(&key_identity, "unset"),
+            stored: name(&superblock.key_identity, "none"),
+            refusal: Refusal::Identity(format!(
+                "volume was created with key identity {:?}, configuration says {:?}",
+                superblock.key_identity, key_identity
+            )),
+        });
+    }
+    // The provider reports the configured id, derived with the prefix
+    // length; its self-test then compares it with the volume's. Name the
+    // setting that differs.
+    let compatibility_id = config.crypto.effective_compatibility_id();
+    if compatibility_id != superblock.crypto_compatibility_id {
+        let refusal = Refusal::Identity(format!(
+            "volume was created with compatibility id {:?}, configuration says \
+             {compatibility_id:?}",
+            superblock.crypto_compatibility_id
+        ));
+        let (prefix, base) = split_random_prefix(&superblock.crypto_compatibility_id);
+        let prefix_differs = config.crypto.random_prefix_bytes != prefix;
+        if prefix_differs {
+            mismatches.push(ConfigurationMismatch {
+                setting: "crypto.random_prefix_bytes",
+                configured: config.crypto.random_prefix_bytes.to_string(),
+                stored: prefix.to_string(),
+                refusal: refusal.clone(),
+            });
+        }
+        if config.crypto.crypto_compatibility_id != base {
+            mismatches.push(ConfigurationMismatch {
+                setting: "crypto.crypto_compatibility_id",
+                configured: format!("{:?}", config.crypto.crypto_compatibility_id),
+                stored: format!("{base:?}"),
+                refusal,
+            });
+        } else if !prefix_differs {
+            // A derived id this build would spell otherwise: both in full.
+            mismatches.push(ConfigurationMismatch {
+                setting: "crypto.crypto_compatibility_id",
+                configured: format!("{compatibility_id:?}"),
+                stored: format!("{:?}", superblock.crypto_compatibility_id),
+                refusal,
+            });
+        }
+    }
+    Ok(mismatches)
+}
+
+/// The prefix length and base id of a stored compatibility id, as
+/// [`maki_format::config::CryptoSection::effective_compatibility_id`]
+/// derives it; an id without a prefix has length 0. Validation keeps a
+/// configured base id out of the reserved namespace.
+fn split_random_prefix(id: &str) -> (u32, &str) {
+    id.strip_prefix("maki-random-prefix-v1:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(bytes, base)| Some((bytes.parse().ok()?, base)))
+        .unwrap_or((0, id))
+}
+
+/// The key identity attach compares with `stored`: the configured key's
+/// name, or `stored` itself when it is that file path followed only by the
+/// trailing directory syntax older builds persisted (`key/`, `key/.`) and
+/// opened as `key`. The caller still supplies the validated file path and
+/// the engine still verifies the key canary.
+fn configured_key_identity(config: &VolumeConfig, stored: &str) -> String {
+    let Some(key) = &config.crypto.key else {
+        return String::new();
+    };
+    let legacy = key.source == "file"
+        && stored.strip_prefix(&key.name).is_some_and(|suffix| {
+            suffix.starts_with(std::path::is_separator)
+                && suffix
+                    .split(std::path::is_separator)
+                    .all(|part| part.is_empty() || part == ".")
+        });
+    if legacy {
+        stored.to_owned()
+    } else {
+        key.name.clone()
+    }
+}
+
+/// Refuse a configuration that does not match the recovered volume, with
+/// the first [`ConfigurationMismatch`]. Compare before constructing any
+/// provider.
+fn refuse_configuration_mismatch(
+    config: &VolumeConfig,
+    superblock: &Superblock,
+) -> Result<(), DaemonError> {
+    match configuration_mismatches(config, superblock)?
+        .into_iter()
+        .next()
     {
-        return Err(DaemonError::Unsupported(format!(
-            "NBD minimum_io {} is incompatible with stored volume geometry max_virtual_size {}; \
-             every exported byte must be accessible",
-            config.nbd.minimum_io, stored.max_virtual_size
-        )));
+        Some(mismatch) => Err(mismatch.into()),
+        None => Ok(()),
+    }
+}
+
+/// Add every [`ConfigurationMismatch`] between `config` and the volume in
+/// `backing` to `report` as an error, as `maki check` and `maki check
+/// --deep` do after the format checks. The report's other lines, and the
+/// deep check's verdict, describe the volume; a mismatch means the
+/// configuration is wrong for it. A backing without a valid superblock has
+/// nothing to compare with, and the format checks have said so.
+pub fn report_configuration_mismatches(
+    config: &VolumeConfig,
+    backing: &dyn Backing,
+    report: &mut CheckReport,
+) -> Result<(), DaemonError> {
+    let superblock = match maki_format::superblock::load_volume_superblock(backing) {
+        Ok(envelope) => envelope.superblock,
+        Err(error @ FormatError::Io(_)) => return Err(error.into()),
+        Err(error) => {
+            if report.ok() {
+                report.errors.push(format!("superblock: {error}"));
+            }
+            return Ok(());
+        }
+    };
+    let mismatches = configuration_mismatches(config, &superblock)?;
+    if mismatches.is_empty() {
+        report.info.push(
+            "configuration matches the volume's provider, key identity, compatibility id and \
+             geometry"
+                .to_string(),
+        );
+    }
+    for mismatch in mismatches {
+        report.errors.push(format!(
+            "configuration mismatch: {mismatch}; attach refuses this configuration"
+        ));
     }
     Ok(())
 }
@@ -1240,23 +1478,14 @@ async fn attach_hardened(
         .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
         .map_err(AttachError::from)?,
     );
-    validate_recovered_geometry(config, &volume)?;
-    // Older builds opened `key/.` and `key/` as `key` but persisted the
-    // original string. Recognize only that trailing directory syntax on a
-    // stored file identity. The caller still supplies the validated file
-    // path and the engine still verifies the key canary.
-    if let (Some(key), Some(identity)) = (&config.crypto.key, &mut options.identity) {
-        let stored = &volume.superblock().key_identity;
-        if key.source == "file"
-            && stored.strip_prefix(&key.name).is_some_and(|suffix| {
-                suffix.starts_with(std::path::is_separator)
-                    && suffix
-                        .split(std::path::is_separator)
-                        .all(|part| part.is_empty() || part == ".")
-            })
-        {
-            identity.key_identity.clone_from(stored);
-        }
+    // Everything the configuration fixes at creation, before any provider
+    // credential is loaded or transport built; `maki check` reports the same
+    // comparison. Opening the backing (for a remote witness, its TLS
+    // identity and a writer claim) and recovery come first: the superblock
+    // is inside the backing.
+    refuse_configuration_mismatch(config, volume.superblock())?;
+    if let Some(identity) = &mut options.identity {
+        identity.key_identity = configured_key_identity(config, &volume.superblock().key_identity);
     }
     let prepared = match prepared {
         Some(provider) => provider,
@@ -1703,5 +1932,160 @@ mod startup_reference_tests {
             .collect();
         assert!(!flags["a"]);
         assert!(flags["b"] && flags["c"]);
+    }
+}
+
+#[cfg(test)]
+mod configuration_mismatch_tests {
+    use super::*;
+
+    fn config(prefix: u32) -> VolumeConfig {
+        let config = parse_config(&format!(
+            r#"
+config_schema_version = 1
+[volume]
+name = "mismatch"
+max_virtual_size = "1MiB"
+device_block_size = 512
+crypto_unit_size = 4096
+shard_logical_size = "64KiB"
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "local-profile-v1"
+random_prefix_bytes = {prefix}
+key = {{ source = "env", name = "mismatch-key" }}
+[crypto.capabilities]
+supported_plaintext_sizes = [{}]
+max_ciphertext_size = 4384
+[backing]
+root = "/unused-mismatch"
+"#,
+            4096 + prefix
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    fn settings(config: &VolumeConfig, superblock: &Superblock) -> Vec<String> {
+        configuration_mismatches(config, superblock)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_configuration_matches_the_superblock_its_creation_writes() {
+        for prefix in [0, 32] {
+            let config = config(prefix);
+            let superblock = new_superblock(&config).unwrap();
+            assert_eq!(settings(&config, &superblock), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn attach_refuses_with_the_words_and_kinds_it_used_before() {
+        let config = config(0);
+        let mut superblock = new_superblock(&config).unwrap();
+        superblock.geometry.max_virtual_size = 2 << 20;
+        superblock.provider_type = "local-aes-xts".into();
+        let error = refuse_configuration_mismatch(&config, &superblock).unwrap_err();
+        assert!(
+            matches!(&error, DaemonError::Unsupported(message) if message ==
+                "volume geometry max_virtual_size mismatch: configuration 1048576, stored \
+                 2097152; migration is required"),
+            "{error}"
+        );
+        superblock.geometry = config.geometry().unwrap();
+        let error = refuse_configuration_mismatch(&config, &superblock).unwrap_err();
+        assert!(
+            matches!(&error, DaemonError::Attach(AttachError::IdentityMismatch(message))
+                if message == "volume was created with provider \"local-aes-xts\", \
+                               configuration says \"local-aes-gcm-siv\""),
+            "{error}"
+        );
+    }
+
+    /// Validation keeps the NBD sizes within the configured geometry, so
+    /// these refusals are reached only by a configuration that skipped it.
+    #[test]
+    fn nbd_sizes_are_compared_once_the_geometry_matches() {
+        let mut config = config(0);
+        let superblock = new_superblock(&config).unwrap();
+        config.nbd.minimum_io = 256;
+        assert_eq!(
+            settings(&config, &superblock),
+            [
+                "nbd.minimum_io is 256 in the configuration, the volume has device_block_size \
+              512, which it must be a multiple of"
+            ]
+        );
+        config.nbd.minimum_io = 3 << 20;
+        assert_eq!(
+            settings(&config, &superblock),
+            [
+                "nbd.minimum_io is 3145728 in the configuration, the volume has \
+              max_virtual_size 1048576, which it must divide"
+            ]
+        );
+        assert!(matches!(
+            refuse_configuration_mismatch(&config, &superblock),
+            Err(DaemonError::Unsupported(message)) if message.contains("minimum_io 3145728")
+        ));
+        // A geometry mismatch says what is wrong; the sizes would repeat it.
+        config.volume.device_block_size = 4096;
+        assert_eq!(
+            settings(&config, &superblock),
+            ["volume.device_block_size is 4096 in the configuration, the volume has 512"]
+        );
+    }
+
+    #[test]
+    fn a_derived_id_spelled_otherwise_is_named_in_full() {
+        let config = config(16);
+        let mut superblock = new_superblock(&config).unwrap();
+        superblock.crypto_compatibility_id = "maki-random-prefix-v1:016:local-profile-v1".into();
+        assert_eq!(
+            settings(&config, &superblock),
+            [
+                "crypto.crypto_compatibility_id is \"maki-random-prefix-v1:16:local-profile-v1\" \
+              in the configuration, the volume has \
+              \"maki-random-prefix-v1:016:local-profile-v1\""
+            ]
+        );
+        // Both parts differ: both settings are named, with the base ids.
+        superblock.crypto_compatibility_id = "maki-random-prefix-v1:32:local-profile-v0".into();
+        assert_eq!(
+            settings(&config, &superblock),
+            [
+                "crypto.random_prefix_bytes is 16 in the configuration, the volume has 32",
+                "crypto.crypto_compatibility_id is \"local-profile-v1\" in the configuration, \
+                 the volume has \"local-profile-v0\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stored_id_is_split_only_where_the_derivation_put_a_prefix() {
+        for (id, split) in [
+            ("local-profile-v1", (0, "local-profile-v1")),
+            ("maki-random-prefix-v1:32:local", (32, "local")),
+            ("maki-random-prefix-v1:32:a:b", (32, "a:b")),
+            (
+                "maki-random-prefix-v1:local",
+                (0, "maki-random-prefix-v1:local"),
+            ),
+            (
+                "maki-random-prefix-v1:x:local",
+                (0, "maki-random-prefix-v1:x:local"),
+            ),
+            (
+                "x-maki-random-prefix-v1:32:local",
+                (0, "x-maki-random-prefix-v1:32:local"),
+            ),
+        ] {
+            assert_eq!(split_random_prefix(id), split, "{id}");
+        }
     }
 }
