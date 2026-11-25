@@ -226,8 +226,8 @@ attach. Combine these checks with provider authentication and application
 recovery/backup verification before accepting recovered data.
 
 `maki check` and `maki check --deep` also compare the configuration with the
-volume, with the comparison attach makes before it loads any credential: the
-geometry (`volume.device_block_size`, `volume.crypto_unit_size`,
+volume, with the comparison attach makes before it loads any provider
+credential or builds a provider transport: the geometry (`volume.device_block_size`, `volume.crypto_unit_size`,
 `volume.shard_logical_size`, `volume.max_virtual_size`,
 `backing.slot_alignment`, `crypto.capabilities.max_ciphertext_size`),
 `crypto.provider`, the key's name (`crypto.key.name`, stored as the volume's
@@ -244,8 +244,10 @@ provider, so attach alone finds a different key under the same name (the key
 canary), a credential that is unavailable or does not fit the provider, a
 provider that fails its self-test, endpoints that are unreachable or not
 interchangeable, and the memory and swap checks. `maki-check <root>` reads no
-configuration and compares none, and `maki volume inspect` reports what the
-volume stores without comparing it.
+configuration and compares none. `maki volume inspect` reports what the volume
+stores and does not compare the geometry or crypto identity with the
+configuration; like the check, it stops on a protected backing whose
+`backing.rollback_protection.capacity` differs.
 
 `--deep` takes the volume lock and refuses to run while a daemon is attached.
 It recreates a missing `volume.lock` (a restore or copy can drop the empty

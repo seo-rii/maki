@@ -65,8 +65,10 @@ pub enum AttachError {
     Core(#[from] CoreError),
     #[error("configuration: {0}")]
     Config(String),
-    /// The configured provider type or key identity differs from what the
-    /// superblock records (SPEC §20: immutable after creation).
+    /// The configured provider type, key identity or compatibility id
+    /// differs from what the superblock records (SPEC §20: immutable after
+    /// creation). The engine compares the first two itself; the daemon
+    /// compares all three before it builds the provider.
     #[error("crypto identity mismatch: {0}")]
     IdentityMismatch(String),
     /// The provider could not decrypt the volume's key canary back to its

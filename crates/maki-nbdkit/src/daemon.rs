@@ -242,8 +242,11 @@ fn resolve_key_source(cred: &CredentialRef) -> Result<(Box<dyn KeySource>, Strin
     }
 }
 
-/// Build the configured crypto provider (SPEC §12: profile mismatch is
-/// caught later by the attach self-test).
+/// Build the configured crypto provider. A remote provider's endpoints are
+/// probed against the volume, which is recovered for them and compared with
+/// the configuration ([`configuration_mismatches`]) before any probe; a local
+/// provider is only built, and attach compares the configuration before it
+/// builds one.
 pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvider>, DaemonError> {
     Ok(build_provider_with_endpoints(config).await?.0)
 }
@@ -1107,7 +1110,8 @@ pub fn engine_options(config: &VolumeConfig) -> EngineOptions {
 
 /// A setting fixed at creation (SPEC §20) whose configured value differs
 /// from what the volume's superblock stores. Attach refuses the
-/// configuration at the first one, before it loads any credential, and
+/// configuration at the first one, before it loads any provider credential
+/// or builds a provider transport, and
 /// `maki check` reports every one: both go through
 /// [`configuration_mismatches`], so the check cannot pass a configuration
 /// that attach refuses for its identity or geometry. The values are sizes,
@@ -1474,8 +1478,11 @@ async fn attach_hardened(
         .map_err(|e| DaemonError::Unsupported(format!("recovery worker failed: {e}")))?
         .map_err(AttachError::from)?,
     );
-    // Everything the configuration fixes at creation, before any
-    // credential is loaded; `maki check` reports the same comparison.
+    // Everything the configuration fixes at creation, before any provider
+    // credential is loaded or transport built; `maki check` reports the same
+    // comparison. Opening the backing (for a remote witness, its TLS
+    // identity and a writer claim) and recovery come first: the superblock
+    // is inside the backing.
     refuse_configuration_mismatch(config, volume.superblock())?;
     if let Some(identity) = &mut options.identity {
         identity.key_identity = configured_key_identity(config, &volume.superblock().key_identity);

@@ -360,8 +360,11 @@ must not attach to an existing volume.
 
 Maki stores the provider type, compatibility identity, and key name in the
 superblock and refuses attach when the configuration disagrees, before it
-loads any credential; `maki check` reports each setting that disagrees (see
-[Operations](operations.md#volume-lifecycle)). The provider
+loads any provider credential or builds a provider transport. Only opening the
+backing and recovery come first, since the superblock is inside the backing;
+with a remote witness, opening it loads the witness client's TLS identity and
+claims a writer at the authority. `maki check` reports each setting that
+disagrees (see [Operations](operations.md#volume-lifecycle)). The provider
 self-test verifies supported unit sizes, ciphertext bounds, response ordering,
 round trips, and integrity claims; the key canary (see
 [Operations](operations.md#key-binding-at-first-attach)) then proves that the

@@ -14,8 +14,9 @@ The default check inspects the on-disk metadata.
 Pass the backing directory itself.
 .B maki-check
 reads no configuration, so it does not compare one with the volume. To check
-by volume configuration, which also reports a configuration that attach
-refuses for the volume, use
+by volume configuration, which also reports each setting fixed at creation
+whose configured value differs from the volume's (attach refuses each one),
+use
 .BR "maki check" .
 .TP
 .B \-\-deep

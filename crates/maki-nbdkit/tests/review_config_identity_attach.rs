@@ -1,19 +1,21 @@
 //! Attach compares the configuration's crypto identity with the volume's
-//! before it loads a credential, as it does the geometry.
+//! before it loads a provider credential, as it does the geometry.
 //!
 //! The provider type, the key identity and the compatibility id (which the
-//! random prefix length derives) are fixed at creation (SPEC §20). Attach
-//! compared them only after it had built the provider, so a changed
-//! configuration loaded the key first and was then refused, or failed on the
-//! key itself (a 32-byte key read as an XTS key) without naming the setting.
+//! random prefix length derives) are fixed at creation (SPEC §20). For a
+//! local provider, attach compared them only after it had built the
+//! provider, so a changed configuration loaded the key first and was then
+//! refused, or failed on the key itself (a 32-byte key read as an XTS key)
+//! without naming the setting.
 //! `maki check` compares the same settings with the same function, which
 //! needs the comparison to stand on its own: here no key exists at all, and
 //! each changed setting must still be refused as an identity mismatch that
 //! names both values. A remote provider's configuration is compared the
-//! same way, before any request reaches an endpoint, also when only the
-//! provider is built (`build_provider_with_endpoints`), where a changed
-//! compatibility id was refused as "remote configuration does not match the
-//! locked volume identity/geometry" without saying which setting or values.
+//! same way, before any request reaches an endpoint, at attach and when only
+//! the provider is built (`build_provider_with_endpoints`). In both, the
+//! dispatcher refused a changed compatibility id or provider type as
+//! "remote configuration does not match the locked volume identity/geometry"
+//! without saying which setting or values.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
