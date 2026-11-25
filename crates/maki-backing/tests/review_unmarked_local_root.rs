@@ -20,6 +20,7 @@ use maki_backing::RollbackBacking;
 const CAPACITY: u64 = 4 * 4096;
 const CONTINUES: &str = "which running volume create again continues";
 const STOPPED: &str = "volume create does not continue a creation here";
+const MAY_NOT_OPEN: &str = "which this user may not open";
 
 fn dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
     let root = tempfile::tempdir().unwrap();
@@ -114,21 +115,32 @@ fn an_interrupted_creation_is_still_offered_to_create_which_continues_it() {
 #[test]
 fn a_reserved_name_that_is_not_a_regular_file_is_not_offered_to_create() {
     type Plant = fn(&Path, &Path);
-    let plants: [(&str, Plant); 5] = [
+    let plants: [(&str, Plant); 9] = [
         ("rollback.arena", |root, _| {
             std::fs::create_dir(root.join("rollback.arena")).unwrap();
+        }),
+        ("rollback.arena", |root, _| {
+            std::os::unix::fs::symlink("elsewhere", root.join("rollback.arena")).unwrap();
         }),
         ("rollback.format.next", |root, _| {
             std::os::unix::fs::symlink("elsewhere", root.join("rollback.format.next")).unwrap();
         }),
-        ("rollback.manifest.0", |root, _| {
-            let path = std::ffi::CString::new(
-                root.join("rollback.manifest.0")
-                    .into_os_string()
-                    .into_encoded_bytes(),
+        ("rollback.format.next", |root, _| {
+            std::fs::create_dir(root.join("rollback.format.next")).unwrap();
+        }),
+        ("rollback.format.next", |root, _| {
+            mkfifo(&root.join("rollback.format.next"))
+        }),
+        ("rollback.format.next", |root, outside| {
+            std::fs::write(root.join("rollback.format.next"), b"MAKI").unwrap();
+            std::fs::hard_link(
+                root.join("rollback.format.next"),
+                outside.join("second-name"),
             )
             .unwrap();
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }),
+        ("rollback.manifest.0", |root, _| {
+            mkfifo(&root.join("rollback.manifest.0"))
         }),
         ("rollback.manifest.1", |root, _| {
             std::fs::create_dir(root.join("rollback.manifest.1")).unwrap();
@@ -150,6 +162,78 @@ fn a_reserved_name_that_is_not_a_regular_file_is_not_offered_to_create() {
             "{name}: the refused creation published its marker"
         );
     }
+}
+
+fn mkfifo(path: &Path) {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path; mkfifo only creates the entry.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+/// The staged marker (`rollback.format.next`) is never read. A regular
+/// file there that this user may not open is what a creation run as root
+/// leaves when it is killed between creating the name and giving the file
+/// to the directory's owner (review_root_staged_marker.rs runs that case as
+/// the daemon user). It is offered to `volume create`, which removes it,
+/// stages the marker anew and continues in one run.
+#[test]
+fn a_staged_marker_this_user_may_not_open_is_replaced_in_one_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
+    let staged = root.path().join("rollback.format.next");
+    std::fs::write(&staged, b"").unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root may open a mode-000 file (CAP_DAC_OVERRIDE): only another user
+    // is refused one.
+    if std::fs::File::open(&staged).is_ok() {
+        eprintln!("needs a user that a mode-000 file refuses (not root); skipping");
+        return;
+    }
+    let message = open_refusal(root.path(), witness.path());
+    assert!(message.contains(CONTINUES), "{message}");
+    drop(RollbackBacking::create(root.path(), witness.path(), CAPACITY).unwrap());
+    drop(RollbackBacking::open(root.path(), witness.path()).unwrap());
+    assert!(!staged.exists());
+}
+
+/// A reserved file this user may not open (the root-owned arena or slot a
+/// creation run as root leaves when it is killed before it gives the file
+/// to the directory's owner) is refused before anything changes, as a file
+/// this user may not open, with the way out; never as something an
+/// interrupted creation does not leave.
+#[test]
+fn a_reserved_file_this_user_may_not_open_is_named_with_the_way_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some((root, witness)) = dirs() else {
+        return;
+    };
+    let arena = root.path().join("rollback.arena");
+    std::fs::write(&arena, b"").unwrap();
+    std::fs::set_permissions(&arena, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root may open a mode-000 file (CAP_DAC_OVERRIDE): only another user
+    // is refused one. review_root_staged_marker.rs runs the root-owned case
+    // as the daemon user.
+    if std::fs::File::open(&arena).is_ok() {
+        eprintln!("needs a user that a mode-000 file refuses (not root); skipping");
+        return;
+    }
+    let message = open_refusal(root.path(), witness.path());
+    assert!(!message.contains(CONTINUES), "{message}");
+    assert!(
+        !message.contains("an interrupted creation does not leave"),
+        "{message}"
+    );
+    assert!(message.contains("\"rollback.arena\""), "{message}");
+    assert!(message.contains(MAY_NOT_OPEN), "{message}");
+    let refused = RollbackBacking::create(root.path(), witness.path(), CAPACITY)
+        .err()
+        .expect("create refuses the pair");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("rollback.arena"), "{refused}");
+    assert!(refused.to_string().contains(MAY_NOT_OPEN), "{refused}");
+    assert!(!root.path().join("rollback.format").exists());
 }
 
 /// Where the entries cannot all be listed (a name that is not UTF-8), what a
