@@ -4,8 +4,11 @@
 //! replace the dialer, so a name can resolve to addresses that never answer
 //! or refuse at once beside a real loopback listener; the TEST-NET addresses
 //! below are never dialed for real. One test keeps the system resolver.
+//! When the host has addresses of both families, the other family's
+//! attempts start 300 ms after the first one, as the gRPC transport's
+//! connector does, and the attempt that loses is dropped.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
 
@@ -13,6 +16,8 @@ const HOST: &str = "provider.test";
 const PORT: u16 = 7000;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(1);
+/// When the other address family's attempts start, after the first attempt.
+const OTHER_FAMILY_AFTER: Duration = Duration::from_millis(300);
 
 /// What a test address does when it is dialed.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +28,8 @@ enum Answer {
     Refuse,
     /// The connect reaches this loopback listener.
     Serve(SocketAddr),
+    /// The connect reaches this loopback listener after this long.
+    After(Duration, SocketAddr),
 }
 
 enum Resolution {
@@ -34,6 +41,23 @@ struct TestDialer {
     resolution: Resolution,
     asked: parking_lot::Mutex<Vec<(String, u16)>>,
     dialed: parking_lot::Mutex<Vec<(SocketAddr, tokio::time::Instant)>>,
+    /// Attempts dropped before they finished.
+    cancelled: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+}
+
+/// Records its attempt as cancelled when dropped before it finished.
+struct Attempt {
+    address: SocketAddr,
+    finished: bool,
+    cancelled: Arc<parking_lot::Mutex<Vec<SocketAddr>>>,
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled.lock().push(self.address);
+        }
+    }
 }
 
 impl TestDialer {
@@ -42,7 +66,12 @@ impl TestDialer {
             resolution,
             asked: Default::default(),
             dialed: Default::default(),
+            cancelled: Default::default(),
         })
+    }
+
+    fn cancelled(&self) -> Vec<SocketAddr> {
+        self.cancelled.lock().clone()
     }
 
     fn dialed(&self) -> Vec<SocketAddr> {
@@ -91,18 +120,40 @@ impl Dialer for TestDialer {
             .find(|(candidate, _)| *candidate == address)
             .map(|(_, answer)| *answer)
             .expect("only resolved addresses are dialed");
-        match answer {
-            Answer::Never => Box::pin(std::future::pending()),
-            Answer::Refuse => {
-                Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)) })
-            }
-            Answer::Serve(listener) => Box::pin(TcpStream::connect(listener)),
-        }
+        let attempt = Attempt {
+            address,
+            finished: false,
+            cancelled: self.cancelled.clone(),
+        };
+        Box::pin(async move {
+            // Move the whole guard in: assigning its field alone would
+            // capture a copy of the flag and drop the guard here.
+            let mut attempt = attempt;
+            let result = match answer {
+                Answer::Never => std::future::pending().await,
+                Answer::Refuse => Err(std::io::ErrorKind::ConnectionRefused.into()),
+                Answer::Serve(listener) => TcpStream::connect(listener).await,
+                Answer::After(delay, listener) => {
+                    tokio::time::sleep(delay).await;
+                    TcpStream::connect(listener).await
+                }
+            };
+            attempt.finished = true;
+            result
+        })
     }
 }
 
 fn test_net(last: u8) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)), PORT)
+}
+
+/// An IPv6 documentation address, never dialed for real either.
+fn doc_net(last: u16) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)),
+        PORT,
+    )
 }
 
 fn provider(url: &str, tls: Option<WsTlsOptions>, dialer: &Arc<TestDialer>) -> WsCryptoProvider {
@@ -293,6 +344,163 @@ async fn a_request_to_addresses_that_never_answer_fails_retryable_and_unsent_wit
         started.elapsed()
     );
     assert_eq!(dialer.dialed(), [test_net(1), test_net(2)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dead_ipv6_address_gives_way_to_ipv4_after_300_ms() {
+    let (listener, _server) = websocket_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (doc_net(1), Answer::Never),
+        (test_net(2), Answer::Serve(listener)),
+    ]));
+    let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    let started = tokio::time::Instant::now();
+    let connection = provider.connect();
+    tokio::pin!(connection);
+
+    assert!(futures_util::poll!(&mut connection).is_pending());
+    assert_eq!(dialer.dialed(), [doc_net(1)]);
+    tokio::time::advance(OTHER_FAMILY_AFTER - TICK).await;
+    assert!(futures_util::poll!(&mut connection).is_pending());
+    assert_eq!(dialer.dialed(), [doc_net(1)], "IPv4 started early");
+    tokio::time::advance(2 * TICK).await;
+    let _ = futures_util::poll!(&mut connection);
+    assert_eq!(
+        dialer.dialed(),
+        [doc_net(1), test_net(2)],
+        "the other family must start {OTHER_FAMILY_AFTER:?} after the first attempt"
+    );
+    let connection = without_advancing(connection)
+        .await
+        .expect("the IPv4 address serves the upgrade");
+    assert!(
+        started.elapsed() <= OTHER_FAMILY_AFTER + 2 * TICK,
+        "connected after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        dialer.cancelled(),
+        [doc_net(1)],
+        "the IPv6 attempt that lost must be dropped"
+    );
+    drop(connection);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_preferred_address_that_connects_after_the_other_family_started_drops_that_attempt() {
+    let (listener, _server) = websocket_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (
+            doc_net(1),
+            Answer::After(OTHER_FAMILY_AFTER + Duration::from_millis(100), listener),
+        ),
+        (test_net(2), Answer::Never),
+    ]));
+    let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    let connection = provider.connect();
+    tokio::pin!(connection);
+
+    assert!(futures_util::poll!(&mut connection).is_pending());
+    tokio::time::advance(OTHER_FAMILY_AFTER + TICK).await;
+    assert!(futures_util::poll!(&mut connection).is_pending());
+    assert_eq!(dialer.dialed(), [doc_net(1), test_net(2)]);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let connection = without_advancing(connection)
+        .await
+        .expect("the IPv6 address serves the upgrade");
+    assert_eq!(
+        dialer.cancelled(),
+        [test_net(2)],
+        "the IPv4 attempt that lost must be dropped"
+    );
+    drop(connection);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_preferred_family_starts_the_other_family_at_once() {
+    let (listener, _server) = websocket_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (doc_net(1), Answer::Refuse),
+        (doc_net(2), Answer::Refuse),
+        (test_net(3), Answer::Serve(listener)),
+    ]));
+    let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    let started = tokio::time::Instant::now();
+    let connection = provider.connect();
+    tokio::pin!(connection);
+
+    let _ = futures_util::poll!(&mut connection);
+    assert_eq!(
+        dialer.dialed(),
+        [doc_net(1), doc_net(2), test_net(3)],
+        "a family that failed outright must not hold the other one back"
+    );
+    without_advancing(connection)
+        .await
+        .expect("the IPv4 address serves the upgrade");
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert!(dialer.cancelled().is_empty(), "{:?}", dialer.cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn both_families_dead_fail_at_the_deadline_with_each_family_dialed_on_its_schedule() {
+    // The resolver's order mixes the families; each keeps its own order.
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (doc_net(1), Answer::Never),
+        (test_net(1), Answer::Never),
+        (doc_net(2), Answer::Never),
+        (test_net(2), Answer::Never),
+    ]));
+    let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    let started = tokio::time::Instant::now();
+    let connection = provider.connect();
+    tokio::pin!(connection);
+    assert!(futures_util::poll!(&mut connection).is_pending());
+
+    // IPv6 first: half the deadline each. IPv4 from 300 ms: half of what is
+    // left then each, so its second address starts at 5.15 s.
+    let schedule = [
+        (Duration::ZERO, doc_net(1)),
+        (OTHER_FAMILY_AFTER, test_net(1)),
+        (TIMEOUT / 2, doc_net(2)),
+        (
+            OTHER_FAMILY_AFTER + (TIMEOUT - OTHER_FAMILY_AFTER) / 2,
+            test_net(2),
+        ),
+    ];
+    for (index, (at, address)) in schedule.iter().enumerate() {
+        tokio::time::advance(*at + TICK - started.elapsed()).await;
+        assert!(futures_util::poll!(&mut connection).is_pending());
+        assert_eq!(
+            dialer.dialed().get(index),
+            Some(address),
+            "dialed {:?} by {:?}",
+            dialer.dialed(),
+            started.elapsed()
+        );
+        let dialed_at = dialer.dialed_at(started)[index];
+        assert!(
+            dialed_at >= *at && dialed_at <= *at + 2 * TICK,
+            "{address} dialed at {dialed_at:?}, due at {at:?}"
+        );
+    }
+    assert_eq!(dialer.dialed().len(), 4);
+    tokio::time::advance(TIMEOUT - started.elapsed() - TICK).await;
+    assert!(futures_util::poll!(&mut connection).is_pending());
+    tokio::time::advance(2 * TICK).await;
+    let result = futures_util::poll!(&mut connection);
+    assert!(
+        matches!(&result, std::task::Poll::Ready(result) if is_connect_timeout(result)),
+        "the connect must fail as a timeout at its deadline"
+    );
+    let mut cancelled = dialer.cancelled();
+    cancelled.sort();
+    let mut all = dialer.dialed();
+    all.sort();
+    assert_eq!(
+        cancelled, all,
+        "every attempt that did not finish is dropped"
+    );
 }
 
 #[tokio::test(start_paused = true)]
