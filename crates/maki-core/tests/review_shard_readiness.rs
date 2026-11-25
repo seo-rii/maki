@@ -230,8 +230,10 @@ fn cached_catalog_entry_after_failed_sync_is_stored_before_fua() {
         drop(volume); // A plain restart: the page cache still names shard 0.
         assert!(catalog(&backing).contains(0));
         let mut volume = recover(&backing);
+        // No checkpoint before the power loss: a checkpoint stores the
+        // catalog too, and would hide whether the entry was durable before
+        // the record was accepted.
         assert_eq!(volume.write_ct(0, &[0x53; 520], true).unwrap(), 1);
-        volume.checkpoint().unwrap();
         complete_and_power_loss(&backing, volume, &[0x53; 520]);
     }
 }
