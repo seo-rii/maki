@@ -371,51 +371,58 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
         }
     };
 
-    // The opener lets go a moment after the acknowledgement.
+    // The opener lets go during the second sleep, 200 ms after the
+    // acknowledgement.
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let attributes = sysfs.join("nbd5");
-    let mut closing = None;
+    let mut clock = ScriptedClock::new(|slept| {
+        if slept == 2 {
+            // The kernel removes them in this order.
+            std::fs::remove_file(attributes.join("pid")).unwrap();
+            std::fs::remove_file(attributes.join("backend")).unwrap();
+        }
+    });
     disconnect_raw_with(
         &sysfs,
         "/dev/nbd5",
         OURS,
         Duration::from_secs(10),
-        &mut RealClock,
-        |step| {
-            closing = Some(std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                // The kernel removes them in this order.
-                std::fs::remove_file(attributes.join("pid")).unwrap();
-                std::fs::remove_file(attributes.join("backend")).unwrap();
-            }));
-            disconnects("/dev/nbd5")(step)
-        },
+        &mut clock,
+        disconnects("/dev/nbd5"),
     )
     .unwrap();
+    assert_eq!(clock.sleeps, [NBD_RELEASE_INTERVAL; 2]);
     assert_eq!(
         nbd_backend_at(&sysfs, "/dev/nbd5").unwrap(),
         None,
         "returned while the device still showed the connection"
     );
-    closing.unwrap().join().unwrap();
 
-    // Nothing lets go: a failure that says what the state is.
+    // Nothing lets go: a failure, at the end of the patience, that says
+    // what the state is.
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let patience = Duration::from_millis(250);
-    let started = Instant::now();
+    let mut clock = ScriptedClock::new(|_| {});
     let error = disconnect_raw_with(
         &sysfs,
         "/dev/nbd5",
         OURS,
         patience,
-        &mut RealClock,
+        &mut clock,
         disconnects("/dev/nbd5"),
     )
     .expect_err("a device that still shows the connection")
     .to_string();
-    assert!(started.elapsed() >= patience, "{:?}", started.elapsed());
+    assert_eq!(
+        clock.sleeps,
+        [
+            NBD_RELEASE_INTERVAL,
+            NBD_RELEASE_INTERVAL,
+            Duration::from_millis(50)
+        ]
+    );
     for expected in [
         "acknowledged the disconnect",
         "/dev/nbd5 still shows the connection",
@@ -429,18 +436,13 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
-    disconnect_raw_with(
-        &sysfs,
-        "/dev/nbd5",
-        OURS,
-        patience,
-        &mut RealClock,
-        |step| {
-            std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
-            disconnects("/dev/nbd5")(step)
-        },
-    )
+    let mut clock = ScriptedClock::new(|_| {});
+    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, &mut clock, |step| {
+        std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
     .unwrap();
+    assert!(clock.sleeps.is_empty(), "{:?}", clock.sleeps);
 
     // What cannot be read is not "gone". The kernel removes `pid` before
     // `backend`, so a `pid` without an identifier is no state that this
@@ -449,23 +451,18 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
-    let error = disconnect_raw_with(
-        &sysfs,
-        "/dev/nbd5",
-        OURS,
-        patience,
-        &mut RealClock,
-        |step| {
-            std::fs::remove_file(&backend).unwrap();
-            disconnects("/dev/nbd5")(step)
-        },
-    )
+    let mut clock = ScriptedClock::new(|_| {});
+    let error = disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, &mut clock, |step| {
+        std::fs::remove_file(&backend).unwrap();
+        disconnects("/dev/nbd5")(step)
+    })
     .expect_err("an unreadable device was taken for a disconnected one")
     .to_string();
     assert!(
         error.contains("backend identifier is unreadable"),
         "{error}"
     );
+    assert!(clock.sleeps.is_empty(), "{:?}", clock.sleeps);
 
     // Without the connection there is no request, and nothing to wait for.
     let fixture = Fixture::new();
@@ -477,24 +474,11 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
         ],
     );
     let no_request = |_: &PlannedStep| -> Result<(), ExecError> { panic!("a disconnect was sent") };
-    disconnect_raw_with(
-        &sysfs,
-        "/dev/nbd4",
-        OURS,
-        patience,
-        &mut RealClock,
-        no_request,
-    )
-    .unwrap();
-    assert!(disconnect_raw_with(
-        &sysfs,
-        "/dev/nbd6",
-        OURS,
-        patience,
-        &mut RealClock,
-        no_request
-    )
-    .is_err());
+    let mut clock = ScriptedClock::new(|_| panic!("a wait without a disconnect"));
+    disconnect_raw_with(&sysfs, "/dev/nbd4", OURS, patience, &mut clock, no_request).unwrap();
+    assert!(
+        disconnect_raw_with(&sysfs, "/dev/nbd6", OURS, patience, &mut clock, no_request).is_err()
+    );
 }
 
 /// A step whose kernel answer could not be read stays an I/O error of its
@@ -573,9 +557,9 @@ enum BackendFault {
 }
 
 /// A device that goes on showing its connection after an acknowledged
-/// disconnect, as long as something has it open (udev's probe after the
-/// disconnect's change event): after the executor's sleep number `sleeps`
-/// since the disconnect, `then` happens.
+/// disconnect while something that held it open at the disconnect (a probe
+/// of an earlier event, a monitoring tool) still does: after the executor's
+/// sleep number `sleeps` since the disconnect, `then` happens.
 #[derive(Clone, Copy, Debug)]
 struct Linger {
     sleeps: usize,
@@ -598,6 +582,33 @@ enum Released {
 fn manual_epoch() -> Instant {
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
+}
+
+/// A manual clock for a wait outside the executor's [`System`]: every
+/// sleep, in order, and `on_sleep` run after each with its number, counted
+/// from 1.
+struct ScriptedClock<F: FnMut(usize)> {
+    sleeps: Vec<Duration>,
+    on_sleep: F,
+}
+
+impl<F: FnMut(usize)> ScriptedClock<F> {
+    fn new(on_sleep: F) -> Self {
+        Self {
+            sleeps: Vec::new(),
+            on_sleep,
+        }
+    }
+}
+
+impl<F: FnMut(usize)> Clock for ScriptedClock<F> {
+    fn now(&self) -> Instant {
+        manual_epoch() + self.sleeps.iter().sum::<Duration>()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.sleeps.push(duration);
+        (self.on_sleep)(self.sleeps.len());
+    }
 }
 
 #[derive(Default)]
@@ -1441,12 +1452,12 @@ fn tear_down(
     }
 }
 
-/// The kernel acknowledges a disconnect before the device lets go of the
-/// connection: it keeps `pid` and `backend` until the last opener has
-/// closed the device, and udev probes a device on the change event of every
-/// disconnect. Detach and cleanup wait for that as `nbd-disconnect` does,
-/// looking every 100 ms, and retire the record in the same run once the
-/// device shows no connection, without a second disconnect.
+/// While something holds the device open at the disconnect, the kernel
+/// acknowledges the disconnect before the device lets go of the connection:
+/// it keeps `pid` and `backend` until that opener has closed the device.
+/// Detach and cleanup wait for that as `nbd-disconnect` does, looking every
+/// 100 ms, and retire the record in the same run once the device shows no
+/// connection, without a second disconnect.
 #[test]
 fn detach_and_cleanup_wait_for_a_backend_that_outlives_its_disconnect() {
     for verb in ["detach", "cleanup"] {

@@ -1751,8 +1751,8 @@ fn every_verb_keeps_the_record_of_a_backend_that_outlived_its_disconnect() {
     case.restart().unwrap();
 }
 
-/// An opener that lets go while detach or cleanup waits after the
-/// disconnect, as udev's probe after the disconnect's change event does: the
+/// An opener that held the device at the disconnect (a probe of an earlier
+/// event, a monitoring tool) and lets go while detach or cleanup waits: the
 /// verb retires the record in the same run, without a second disconnect,
 /// also when the opener lets go at the last look, 15 s after the
 /// disconnect; with the daemon still serving and after it stopped.
@@ -1799,6 +1799,83 @@ fn a_teardown_retires_its_record_once_the_opener_lets_go_during_its_wait() {
             case.checks().unwrap();
             case.restart().unwrap();
         }
+    }
+}
+/// The failed-start hook rolls an interrupted activation back with detach's
+/// steps and waits after its disconnect as detach does. An opener that held
+/// the device at the disconnect and lets go during the wait leaves nothing
+/// live and no record after the one run. One that stays keeps the record,
+/// after 150 looks, and the coordinator's cleanup ends it once the opener
+/// has let go. The hook's deadline for its commands ends the wait.
+#[test]
+fn the_failed_start_hook_waits_for_an_opener_after_its_disconnect() {
+    let rollback = ["c1:vgchange-deactivate-scoped", "c2:nbd-disconnect"];
+    for lvm_select_matches_nothing in [false, true] {
+        for sleeps in [1, 30, 150] {
+            let context = format!(
+                "select matches nothing {lvm_select_matches_nothing}, opener lets go after \
+                 sleep {sleeps}"
+            );
+            let mut case = interrupted_activation(lvm_select_matches_nothing);
+            case.world.set_opener(true);
+            let schedule = Schedule {
+                opener_closes_after_sleep: Some(sleeps),
+                ..Schedule::default()
+            };
+            let outcome = case.run_scheduled(None, schedule, Verb::FailedStartHook);
+            assert_eq!(outcome, Outcome::Done, "{context}");
+            assert_eq!(case.commands_run(), rollback, "{context}");
+            assert_eq!(
+                case.world.sleeps,
+                vec![NBD_RELEASE_INTERVAL; sleeps],
+                "{context}"
+            );
+            assert!(case.clean(), "{context}: {:?}", case.live());
+            case.checks().unwrap();
+            case.restart().unwrap();
+        }
+
+        let context = format!("select matches nothing {lvm_select_matches_nothing}");
+        let mut case = interrupted_activation(lvm_select_matches_nothing);
+        case.world.set_opener(true);
+        let outcome = case.run(None, Verb::FailedStartHook);
+        assert!(
+            matches!(&outcome, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+            "{context}: {outcome:?}"
+        );
+        assert_eq!(case.commands_run(), rollback, "{context}");
+        assert_eq!(
+            case.world.sleeps,
+            vec![NBD_RELEASE_INTERVAL; 150],
+            "{context}"
+        );
+        assert!(case.lingering() && case.record().is_some(), "{context}");
+        case.checks().unwrap();
+        // The coordinator stops the daemon before its cleanup.
+        case.world.set_opener(false);
+        case.world.stop_daemon();
+        assert_eq!(case.run(None, Verb::Cleanup), Outcome::Done, "{context}");
+        assert!(case.clean(), "{context}: {:?}", case.live());
+        case.restart().unwrap();
+
+        let budget = Duration::from_millis(1950);
+        let mut case = interrupted_activation(lvm_select_matches_nothing);
+        case.world.set_opener(true);
+        let outcome = {
+            let _bounded = command::finish_by(Instant::now() + budget);
+            case.run(None, Verb::FailedStartHook)
+        };
+        assert!(
+            matches!(&outcome, Outcome::Refused(text) if text.contains("disconnect has not completed")),
+            "{context}, {budget:?}: {outcome:?}"
+        );
+        let waited = case.world.sleeps.iter().sum::<Duration>();
+        assert!(
+            !waited.is_zero() && waited <= budget,
+            "{context}: waited {waited:?}"
+        );
+        assert!(case.lingering() && case.record().is_some(), "{context}");
+        case.checks().unwrap();
     }
 }
 
