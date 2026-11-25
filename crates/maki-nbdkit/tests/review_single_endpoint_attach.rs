@@ -50,9 +50,9 @@ impl Transport {
 
     /// The URL of the IPv4 listener `port`, by its address. On Windows
     /// `localhost` resolves to ::1 first, which the listener does not serve,
-    /// and a refused connect there takes about 2 s: the WebSocket transport
-    /// gives ::1 half of the 2 s transport timeout before it tries
-    /// 127.0.0.1, which leaves the handshake and the probe little time. The
+    /// and a refused connect there takes about 2 s: every transport tries
+    /// 127.0.0.1 300 ms after ::1, which the 2 s transport timeout absorbs,
+    /// and the address keeps the test off the host's resolver. The
     /// certificate names another host whichever name is used.
     fn tls_url(self, port: u16) -> String {
         let scheme = match self {

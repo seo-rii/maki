@@ -408,10 +408,12 @@ from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` are ignored), so
 plaintext only goes to the configured endpoint. It removes request
 URLs from transport errors before classification and formatting, keeping query
 credentials out of those error messages. The WebSocket transport resolves the
-endpoint's host itself and connects straight to its addresses, one at a time,
-each but the last for an equal share of what is left of the connect deadline,
-then runs TLS (verified for the URL's host) and the upgrade on the first
-connection made. Each WebSocket connection generation
+endpoint's host itself and connects straight to its addresses as the gRPC
+transport's connector does: the other address family starts 300 ms after the
+first, and each family's addresses are tried one at a time, each but the last
+for an equal share of what is left of the connect deadline. TLS (verified for
+the URL's host) and the upgrade run on the first connection made, and the other
+attempt is dropped. Each WebSocket connection generation
 owns both reader and writer futures in one task. Timeout, request cancellation,
 connection replacement, and provider drop retire that generation, cancel its
 task, release its socket, and fail its pending requests without disturbing a

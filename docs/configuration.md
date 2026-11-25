@@ -572,12 +572,16 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 completes the handshake is abandoned then and the next request reconnects.
 
 A WebSocket request's `timeout` covers the connection it opens. The endpoint's
-host is resolved and its addresses are tried one at a time, in the resolver's
-order, each but the last for at most an equal share of what is left of
-`timeout`, so an address that does not answer leaves the next one time. The TLS
-handshake and the upgrade then run on the first connection made, with the
-certificate verified for the URL's host, never for the address it resolved to;
-their failure is not retried at another address. No proxy is used.
+host is resolved and its addresses are dialed as the gRPC transport's
+connector dials them: the family of the first address goes first, and the
+other family starts 300 ms later, or at once when the first family has failed.
+Within a family the addresses are tried one at a time, in the resolver's order,
+each but the last for at most an equal share of what is left of `timeout`, so
+an address that does not answer leaves the next one time. The first connection
+made wins and the other attempt is dropped. The TLS handshake and the upgrade
+then run on that connection, with the certificate verified for the URL's host,
+never for the address it resolved to; their failure is not retried at another
+address. No proxy is used.
 
 Providers that do not declare `retry_safe` are sent every request at most
 once: the dispatcher performs no retry or failover after a request may have

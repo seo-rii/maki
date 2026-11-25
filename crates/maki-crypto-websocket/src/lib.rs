@@ -27,9 +27,11 @@
 //! upgrade) is marked as not sent, so the dispatcher may fail it over.
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
-//! A connect resolves the URL's host and dials its addresses one at a time,
-//! each but the last with an equal share of what is left of the timeout, so
-//! one that never answers does not use it up; TLS verifies the URL's host.
+//! A connect resolves the URL's host and dials its addresses as the gRPC
+//! transport's connector does: the other address family starts 300 ms after
+//! the first, and each family's addresses but the last have an equal share
+//! of what is left of the timeout, so one that never answers does not use
+//! it up. TLS verifies the URL's host.
 
 // Diagnostics go through `tracing`: the `print!` family panics when the
 // write fails (a closed pipe, a full disk). Tests may print.
@@ -317,14 +319,57 @@ impl Dialer for SystemDialer {
     }
 }
 
+/// How long the first address family has before the other one starts, as
+/// in the gRPC transport's connector (hyper-util's default).
+const OTHER_FAMILY_DELAY: Duration = Duration::from_millis(300);
+
+/// Dial the resolved `addresses` as hyper-util's connector does for the gRPC
+/// transport. The family of the first address goes first, the other family
+/// starts `OTHER_FAMILY_DELAY` later, or at once when the first family has
+/// failed outright, and each family's addresses are dialed in turn
+/// (`dial_in_turn`). The first stream that connects wins; the other
+/// family's attempt is dropped, which closes its socket. Only the TCP
+/// connect is raced: TLS and the upgrade run on the stream that won, and
+/// their failure is never retried at another address.
+async fn dial_addresses(
+    dialer: &dyn Dialer,
+    addresses: Vec<SocketAddr>,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<TcpStream> {
+    use futures_util::future::{select, Either};
+
+    let first_is_ipv6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let (first, other): (Vec<_>, Vec<_>) = addresses
+        .into_iter()
+        .partition(|address| address.is_ipv6() == first_is_ipv6);
+    if other.is_empty() {
+        return dial_in_turn(dialer, first, deadline).await;
+    }
+    let first = std::pin::pin!(dial_in_turn(dialer, first, deadline));
+    // Not polled, so not dialed, before the delay or the first family's end.
+    let other = std::pin::pin!(dial_in_turn(dialer, other, deadline));
+    let delay = std::pin::pin!(tokio::time::sleep(OTHER_FAMILY_DELAY));
+    let (result, rest) = match select(first, delay).await {
+        Either::Left((result, _delay)) => (result, Either::Right(other)),
+        Either::Right(((), first)) => match select(first, other).await {
+            Either::Left((result, other)) => (result, Either::Right(other)),
+            Either::Right((result, first)) => (result, Either::Left(first)),
+        },
+    };
+    match result {
+        // Returning drops the attempt still pending.
+        Ok(socket) => Ok(socket),
+        Err(_) => rest.await,
+    }
+}
+
 /// Dial `addresses` in the resolver's order, one at a time, and return the
 /// first stream that connects, or the last failure. Each address but the
 /// last may take an equal share of the time left to `deadline`, so one that
 /// never answers leaves the others their time; the last has what remains,
 /// bounded by the connect deadline itself. An address that fails sooner
-/// leaves its time to those after it. Only the TCP connect moves on: TLS and
-/// the upgrade run on the first stream that connects, and their failure is
-/// never retried at another address.
+/// leaves its time to those after it, and one whose share runs out is
+/// dropped.
 async fn dial_in_turn(
     dialer: &dyn Dialer,
     addresses: Vec<SocketAddr>,
@@ -554,10 +599,10 @@ impl WsCryptoProvider {
     }
 
     /// `connect_async_tls_with_config` with the TCP connection made here: the
-    /// URL's host and port, its addresses from the dialer, each given its
-    /// share of the time left to `deadline`, then TLS and the upgrade over
-    /// the stream. TLS verifies the certificate against the URL's host, never
-    /// an address it resolved to.
+    /// URL's host and port, its addresses from the dialer, dialed within
+    /// `deadline` by `dial_addresses`, then TLS and the upgrade over the
+    /// stream. TLS verifies the certificate against the URL's host, never an
+    /// address it resolved to.
     async fn open_websocket(
         &self,
         deadline: Option<tokio::time::Instant>,
@@ -586,7 +631,7 @@ impl WsCryptoProvider {
                 })
                 .ok_or(Error::Url(UrlError::UnsupportedUrlScheme))?;
             let addresses = self.dialer.resolve(&host, port).await?;
-            let socket = dial_in_turn(&*self.dialer, addresses, deadline).await?;
+            let socket = dial_addresses(&*self.dialer, addresses, deadline).await?;
             tokio_tungstenite::client_async_tls_with_config(
                 request,
                 socket,
@@ -619,8 +664,9 @@ impl WsCryptoProvider {
         // Resolution, the TCP connect and the HTTP upgrade have no timeout of
         // their own: a peer that accepts and never answers would hold the
         // connection mutex forever, and with it every request on this
-        // provider (C-05). The deadline also divides the time among the
-        // resolved addresses, so one that never answers cannot spend it all.
+        // provider (C-05). The deadline also divides the time among each
+        // family's resolved addresses, so one that never answers cannot
+        // spend it all.
         let connection = self.open_websocket(deadline, config, connector);
         let ws = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, connection)
