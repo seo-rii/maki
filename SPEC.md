@@ -2021,10 +2021,11 @@ MUST NOT re-encode a valid copy and MUST make the selected copy durable before
 touching the other, so an interruption at any point never destroys a copy that
 was already durable. Read-only checks and inspection MUST NOT write it.
 
-`maki check`, `maki-check` and `maki volume inspect` open a backing root that
-the running process may not write (a read-only mount, a directory without
-write permission for it, an immutable directory) read-only, and any other
-root as before. Through that view they MUST NOT create, write, sync or remove
+On Linux, `maki check`, `maki-check` and `maki volume inspect` open a backing
+root that the running process may not write (a read-only mount, a directory
+without write permission for it, an immutable directory) read-only, and any
+other root as before; other platforms, which serve development only, open
+every root as before. Through that view they MUST NOT create, write, sync or remove
 anything. The deep check MUST take the volume lock shared through a read-only
 descriptor, which excludes a writer for the whole check, and MUST NOT run
 when the lock file is missing. A read-only check proves less than the same

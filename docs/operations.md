@@ -148,9 +148,9 @@ daemon, `check` and `volume inspect` refuse it and name that command
 `volume inspect` and `check`, including `check --deep`, require an existing
 backing-root directory. A missing root or parent is rejected before constructing
 the backing and is not created by these commands. New paths remain supported by
-`volume create`. A root the user running them may not write, such as one on a
-read-only mount, is opened read-only, and what the check then reports means
-less ([checking a backing that cannot be written](#checking-a-backing-that-cannot-be-written)).
+`volume create`. On Linux, a root the user running them may not write, such
+as one on a read-only mount, is opened read-only, and what the check then
+reports means less ([checking a backing that cannot be written](#checking-a-backing-that-cannot-be-written)).
 
 The inspect output includes `maximum units`, `maximum shards`, `full slot span
 bytes`, `allocation map A/B bytes`, `discard map A/B bytes`, and `catalog A/B bytes`.
@@ -308,17 +308,26 @@ volume lock.
 
 ### Checking a backing that cannot be written
 
-`volume inspect`, `check`, `check --deep` and `maki-check` ask the kernel
-first whether the user running them may write the backing root directory:
-the answer is no on a read-only mount (a read-only bind mount too), for a
-directory without write permission for that user, and for an immutable
-directory. Where it may, they open the backing as they always did. Where it
-may not, a plain backing is opened read-only, and nothing below the root is
-created, written, synced or removed. Only the root decides: a writable root
-whose files the user may not write still fails ("Permission denied", or
-"Operation not permitted" for an immutable file), so make the root unwritable
-too (or mount the backing read-only) to check such a copy. `maki` asks about
-`backing.root`, and `maki-check` about the root it is given.
+On Linux, `volume inspect`, `check`, `check --deep` and `maki-check` ask the
+kernel first whether the user running them may write the backing root
+directory: the answer is no on a read-only mount (a read-only bind mount
+too), for a directory without write permission for that user, and for an
+immutable directory. Where it may, they open the backing as they always did.
+Where it may not, a plain backing is opened read-only, and nothing below the
+root is created, written, synced or removed. Other platforms, which serve
+development only, do not ask and open every root as before. `maki` asks
+about `backing.root`, and `maki-check` about the root it is given.
+
+Only the root decides, in both directions. A writable root whose files the
+user may not write still fails ("Permission denied", or "Operation not
+permitted" for an immutable file), so make the root unwritable too (or mount
+the backing read-only) to check such a copy. Conversely, a root the user may
+not write is checked read-only even when its files are writable (a `0500`
+volume directory holding `0600` files, which was checked as a writable
+backing before): its deep verdict is now `unproven` where it was `clean`,
+and a missing `volume.lock` is not recreated there. The deep check stops
+with `volume lock: volume.lock is missing` (before, creating the file in
+such a directory failed with "Permission denied").
 
 A read-only check reads exactly what a writable one reads and finds the same
 damage, but it proves less, and its report says so in a `warning: read-only
@@ -340,7 +349,10 @@ the disk does not hold). Therefore:
   `volume.lock`, so without one it does not run and fails with `volume lock:
   volume.lock is missing`;
 - the report still ends with `check passed` when nothing is wrong with what
-  was read, and the exit status is the same as for a writable check.
+  was read, and the exit status is the same as for a writable check: zero
+  with `unproven`, so a script that gates on the exit status alone does not
+  learn that the volume is `clean` (nor does it from a writable
+  `recoverable`); read the verdict line.
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
