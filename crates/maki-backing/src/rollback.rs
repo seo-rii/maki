@@ -729,8 +729,8 @@ fn require_unpublished_local(disk: &dyn Backing, witness: &dyn Backing) -> io::R
                     io::ErrorKind::PermissionDenied,
                     format!(
                         "the backing directory holds {name:?}, which this user may not open \
-                         ({error}): give it to the user this command runs as (chown) and run \
-                         the command again"
+                         ({error}): give it to the user this command runs as (chown), let that \
+                         user read and write it (chmod) and run the command again"
                     ),
                 ))
             }
@@ -869,7 +869,8 @@ fn no_marker(disk: &dyn Backing, witness: io::Result<Vec<String>>) -> io::Error 
             if !unopenable.is_empty() {
                 reasons.push(format!(
                     "the backing directory holds {}, which this user may not open: give it to \
-                     the user this command runs as (chown) and run the command again",
+                     the user this command runs as (chown), let that user read and write it \
+                     (chmod) and run the command again",
                     entry_names(unopenable)
                 ));
             }
