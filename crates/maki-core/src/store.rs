@@ -192,7 +192,10 @@ pub struct SlotStore {
     /// did not list, or the loaded copy itself may be cache-only after a
     /// failed sync and a plain restart (K-01). Stored by the next
     /// allocation persist, which every reservation of a loaded shard runs
-    /// first, so no record is accepted while a shard's entry is volatile.
+    /// first, so no write record is accepted while a shard's entry is
+    /// volatile. A v3 discard tombstone is appended without a reservation;
+    /// it needs no slot, and replay applies it to the shard in memory,
+    /// cataloged or adopted, so a volatile entry puts nothing at risk.
     catalog_dirty: bool,
     // Counts of shards that still need the corresponding metadata barrier.
     // A failed barrier keeps its count until directory durability is proven.
@@ -618,14 +621,6 @@ impl SlotStore {
                     len,
                     progress,
                 )?;
-            if adopted.contains(&shard_idx) && !never_written && len < physical {
-                tracing::warn!(
-                    shard = shard_idx,
-                    len,
-                    "uncataloged shard data file holds written slots although no loaded \
-                     allocation copy lists one: its short file is truncation"
-                );
-            }
             let short = if never_written {
                 if len < physical {
                     tracing::warn!(
@@ -667,6 +662,7 @@ impl SlotStore {
                     len,
                     physical,
                     marked,
+                    uncataloged = adopted.contains(&shard_idx),
                     "shard data file truncated below its physical size; unlisted slots \
                      beyond its end are marked allocated and read as EIO until rewritten"
                 );
