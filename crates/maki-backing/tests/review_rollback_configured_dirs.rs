@@ -160,6 +160,34 @@ fn a_path_that_is_not_a_directory_is_named_with_what_is_wrong() {
     drop(RollbackBacking::open(root.path(), witness.path()).unwrap());
 }
 
+/// The same for the backing root, which keeps the system's NotADirectory in
+/// every case.
+#[test]
+fn a_backing_root_path_that_is_not_a_directory_is_named_with_what_is_wrong() {
+    let Some((root, witness)) = pair() else {
+        return;
+    };
+    drop(RollbackBacking::create(root.path(), witness.path(), 4 * 4096).unwrap());
+    let links = tempfile::tempdir().unwrap();
+    let to_root = links.path().join("root");
+    std::os::unix::fs::symlink(root.path(), &to_root).unwrap();
+    let to_parent = links.path().join("parent");
+    std::os::unix::fs::symlink(root.path().parent().unwrap(), &to_parent).unwrap();
+    let through = to_parent.join(root.path().file_name().unwrap());
+    let file = links.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let under_file = file.join("root");
+    for (path, says) in [
+        (&to_root, "is a symbolic link, which is not followed"),
+        (&through, "is reached through a symbolic link"),
+        (&under_file, "a component of its path is not a directory"),
+    ] {
+        let error = open_error(path, witness.path());
+        assert_names(&error, path, ROOT_KEY, io::ErrorKind::NotADirectory, says);
+    }
+    drop(RollbackBacking::open(root.path(), witness.path()).unwrap());
+}
+
 /// Restores a directory's mode before it is removed.
 struct Mode<'a>(&'a Path);
 
