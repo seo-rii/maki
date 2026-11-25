@@ -94,6 +94,9 @@ elif name == "pvs":
     print(os.environ["BOOTSTRAP_PV"])
 elif name == "maki" and args[:2] == ["volume", "inspect"]:
     print("uuid: " + os.environ["BOOTSTRAP_UUID"])
+elif name == "maki" and args[:1] == ["check"] and scenario == "racing-record":
+    # A record appears while a fresh run checks the volume.
+    (root / "etc/maki/attach/demo.bootstrap").write_text("someone else's\n")
 elif name == "maki-attach":
     # The helper's provisioning verbs, not its volume lifecycle, with the
     # helper's rules: a connect refuses a device that shows a connection, a
@@ -764,6 +767,14 @@ class ProvisioningContract(unittest.TestCase):
         self.assertEqual(state["config"], (expected, 0o600))
         self.assertEqual(state["staged"], [])
         self.assertEqual(records[1], (None, None))
+
+    def test_a_record_that_appears_during_a_fresh_run_is_never_replaced(self):
+        runs, records, state = self.run_again("racing-record")
+        (result, calls), = runs
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(records[0][0], "someone else's\n")
+        self.assertFalse({"systemctl", "maki-attach"} & {call[0] for call in calls})
+        self.assertNotIn(self.CONTINUES, result.stderr)
 
     def test_the_next_run_uses_only_the_mountpoint_it_made(self):
         def at_mountpoint(make):
