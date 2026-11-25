@@ -123,15 +123,17 @@ fn install_capture() {
     INSTALL.call_once(|| tracing::subscriber::set_global_default(Capture).unwrap());
 }
 
-/// The `WARN` lines logged so far that name a stopped session and `cause`.
-fn stop_warnings(cause: &str) -> Vec<String> {
+/// The tests of this file run one at a time, so the lines a test counts
+/// are its own.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The `WARN` lines logged since `from` (a count of [`events`]) that name a
+/// stopped session.
+fn stop_warnings(from: usize) -> Vec<String> {
     events()
+        .split_off(from)
         .into_iter()
-        .filter(|line| {
-            line.starts_with("WARN ")
-                && line.contains("rollback session stopped")
-                && line.contains(cause)
-        })
+        .filter(|line| line.starts_with("WARN ") && line.contains("rollback session stopped"))
         .collect()
 }
 
@@ -174,6 +176,8 @@ impl Rpc for RoleRpc {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_takeover_beside_a_live_engine_degrades_it_at_its_first_refused_request() {
     install_capture();
+    let _serial = SERIAL.lock().await;
+    let logged = events().len();
     let root = tempfile::tempdir().unwrap();
     let authority = private_dir::tempdir().unwrap();
     let store = Arc::new(Mutex::new(
@@ -227,11 +231,15 @@ async fn a_takeover_beside_a_live_engine_degrades_it_at_its_first_refused_reques
     assert!(old.flush().await.is_err());
     assert!(old.checkpoint().await.is_err());
     assert_stopped(&old, "remote writer revoked").await;
+    let warnings = stop_warnings(logged);
     assert_eq!(
-        stop_warnings("remote writer revoked").len(),
+        warnings.len(),
         1,
-        "one WARN line when the session stops: {:?}",
-        events()
+        "one WARN line when the session stops: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("remote writer revoked"),
+        "{warnings:?}"
     );
 
     // The new writer serves the acknowledged data.
@@ -247,6 +255,8 @@ async fn a_takeover_beside_a_live_engine_degrades_it_at_its_first_refused_reques
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_older_local_anchor_put_back_degrades_the_engine_at_its_first_refused_request() {
     install_capture();
+    let _serial = SERIAL.lock().await;
+    let logged = events().len();
     let root = tempfile::tempdir().unwrap();
     let Some(witness) = other_filesystem::tempdir(root.path()) else {
         return;
@@ -279,11 +289,12 @@ async fn an_older_local_anchor_put_back_degrades_the_engine_at_its_first_refused
     assert_stopped(&engine, "anchor changed").await;
     assert!(engine.read(UNIT as u64, UNIT as usize).await.is_err());
     assert_stopped(&engine, "anchor changed").await;
+    let warnings = stop_warnings(logged);
     assert_eq!(
-        stop_warnings("anchor changed").len(),
+        warnings.len(),
         1,
-        "one WARN line when the session stops: {:?}",
-        events()
+        "one WARN line when the session stops: {warnings:?}"
     );
+    assert!(warnings[0].contains("anchor changed"), "{warnings:?}");
     drop((engine, backing, root, witness));
 }
