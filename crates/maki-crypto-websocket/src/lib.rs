@@ -1083,6 +1083,9 @@ mod response_secret_tests;
 mod connect_deadline_tests;
 
 #[cfg(test)]
+mod connect_address_tests;
+
+#[cfg(test)]
 mod cancellation_tests;
 
 #[cfg(test)]
