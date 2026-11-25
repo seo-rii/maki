@@ -199,6 +199,43 @@ fn cached_b_after_failed_sync_is_redirtied_before_fua() {
     assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![0x51; 520]);
 }
 
+/// The catalog copy that first names a shard is as unproven after a failed
+/// sync and a restart as its allocation copies: the next recovery reads it
+/// back from the page cache. A record for the shard must not be accepted
+/// until the catalog entry is durable again, or the next power loss leaves
+/// a shard that no catalog copy names under data acknowledged as durable.
+#[test]
+fn cached_catalog_entry_after_failed_sync_is_stored_before_fua() {
+    let _serial = failpoints::test_lock();
+    for discard in [false, true] {
+        let backing = fixture(discard);
+        let mut volume = recover(&backing);
+        // Creation publishes the first catalog copy as side A; the store
+        // that names shard 0 therefore targets side B.
+        let target = layout::SHARD_CATALOG_B;
+        let armed = Arc::new(AtomicBool::new(true));
+        let observed = armed.clone();
+        backing.set_fault_hook(Some(Arc::new(move |op| match op {
+            FaultOp::SyncData { path }
+                if *path == target && observed.swap(false, Ordering::SeqCst) =>
+            {
+                Some(io::Error::other("catalog writeback EIO"))
+            }
+            _ => None,
+        })));
+        assert!(volume.write_ct(0, &[0x52; 520], true).is_err());
+        assert!(!armed.load(Ordering::SeqCst));
+        assert_eq!(volume.journal_appended_sequence(), 0);
+        backing.set_fault_hook(None);
+        drop(volume); // A plain restart: the page cache still names shard 0.
+        assert!(catalog(&backing).contains(0));
+        let mut volume = recover(&backing);
+        assert_eq!(volume.write_ct(0, &[0x53; 520], true).unwrap(), 1);
+        volume.checkpoint().unwrap();
+        complete_and_power_loss(&backing, volume, &[0x53; 520]);
+    }
+}
+
 #[test]
 fn second_copy_sync_failure_denies_fua_and_same_process_retry_completes_it() {
     let _serial = failpoints::test_lock();
