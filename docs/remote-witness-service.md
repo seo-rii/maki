@@ -130,9 +130,12 @@ failed rename or directory sync either state may be the published one, so
 `serve` answers every request as unavailable until it is restarted; it keeps
 running and does not exit by itself. The restart serves and re-publishes the
 state it reads, and clients resolve their pending request against it. A
-`remote.state` that changes, disappears or stops decoding while `serve` holds
-its lock also makes it answer unavailable until a restart, which then serves
-whatever valid state the file holds: find out what changed it first.
+`remote.state` that changes or stops decoding while `serve` holds its lock
+makes it refuse the next request as invalid, which a client takes as final
+(it stops the session that sent it), and answer every later request as
+unavailable until a restart; one that disappears is answered as unavailable.
+`serve` logs nothing about either. The restart then serves whatever valid
+state the file holds: find out what changed it first.
 
 ## Initialize a replicated authority
 

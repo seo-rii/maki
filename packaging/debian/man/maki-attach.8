@@ -163,8 +163,8 @@ characters, such as
 .BI \-\-block-size " bytes"
 Accepted by
 .B nbd-connect
-only: the device's logical block size, a power of two from 512; 4096 by
-default.
+only: the device's logical block size, a power of two from 512 up to the
+kernel's page size (4096 on x86_64); 4096 by default.
 .SS Overrides
 Each of these options replaces one attachment setting.
 .BR attach ", " detach ", " recover ", " cleanup " and " grow
@@ -214,8 +214,11 @@ Zero indicates success. A failed action returns 1, as does an attachment
 file that cannot be read, is not trusted or does not parse. An error about
 the attachment file, the state directory
 .I /run/maki-attach
-or its lock names that path, and says to run the command as root when the
-caller lacks the permission. Invalid command
+or its lock names that path. When the caller lacks the permission, one
+about the state directory, its lock or the attachment file that
+.B verify
+reads also says to run the command as root; one about the attachment file
+of another command does not. Invalid command
 usage returns 2 and prints no plan: an unknown, repeated or misplaced
 option, a malformed volume name, which is checked first, or an option or
 setting value that fails validation, which is checked once the file has been
