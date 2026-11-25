@@ -252,7 +252,7 @@ async fn a_first_address_that_never_answers_leaves_the_next_one_its_share_of_the
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     assert!(futures_util::poll!(&mut connection).is_pending());
@@ -294,7 +294,7 @@ async fn an_address_refused_at_once_leaves_its_share_to_the_addresses_after_it()
         (test_net(3), Answer::Serve(listener)),
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     assert!(futures_util::poll!(&mut connection).is_pending());
@@ -321,7 +321,7 @@ async fn addresses_that_never_answer_fail_as_a_connect_timeout_at_the_deadline()
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     assert!(futures_util::poll!(&mut connection).is_pending());
@@ -430,7 +430,7 @@ async fn a_dead_ipv6_address_gives_way_to_ipv4_after_300_ms() {
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     assert!(futures_util::poll!(&mut connection).is_pending());
@@ -472,7 +472,7 @@ async fn a_preferred_address_that_connects_after_the_other_family_started_drops_
         (test_net(2), Answer::Never),
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     assert!(futures_util::poll!(&mut connection).is_pending());
@@ -501,7 +501,7 @@ async fn a_refused_preferred_family_starts_the_other_family_at_once() {
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
 
     let _ = futures_util::poll!(&mut connection);
@@ -528,7 +528,7 @@ async fn both_families_dead_fail_at_the_deadline_with_each_family_dialed_on_its_
     ]));
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect();
+    let connection = provider.connect(None);
     tokio::pin!(connection);
     assert!(futures_util::poll!(&mut connection).is_pending());
 
@@ -583,7 +583,7 @@ async fn a_resolution_that_never_returns_ends_at_the_connect_deadline() {
     let dialer = TestDialer::new(Resolution::Never);
     let provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
     let started = tokio::time::Instant::now();
-    let result = provider.connect().await;
+    let result = provider.connect(None).await;
     assert!(is_connect_timeout(&result));
     assert!(
         started.elapsed() <= TIMEOUT + TICK,
@@ -603,7 +603,7 @@ async fn the_resolver_is_asked_for_the_url_host_and_the_scheme_port() {
     ] {
         let dialer = TestDialer::new(Resolution::Addresses(Vec::new()));
         let provider = provider(url, None, &dialer);
-        let result = provider.connect().await;
+        let result = provider.connect(None).await;
         assert!(
             matches!(&result, Err(CryptoError::Retryable(message))
                 if message == "websocket connection failed before upgrade completed"),
@@ -640,7 +640,7 @@ async fn the_system_resolver_reaches_a_listener_by_name() {
     spec.url = format!("ws://localhost:{port}/");
     spec.timeout = TIMEOUT;
     let provider = WsCryptoProvider::new(spec);
-    tokio::time::timeout(TIMEOUT, provider.connect())
+    tokio::time::timeout(TIMEOUT, provider.connect(None))
         .await
         .expect("the connect has its own deadline")
         .expect("`localhost` resolves to a loopback address that serves");
@@ -722,7 +722,7 @@ mod tls {
             &dialer,
         );
         let connection = provider
-            .connect()
+            .connect(None)
             .await
             .expect("a certificate for the URL's host is accepted at any address");
         assert_eq!(sni.await.unwrap().as_deref(), Some(HOST));
@@ -744,7 +744,7 @@ mod tls {
             trusting(&identity),
             &dialer,
         );
-        let result = provider.connect().await;
+        let result = provider.connect(None).await;
         assert!(
             matches!(&result, Err(CryptoError::EndpointFatal(message))
                 if message == "websocket TLS authentication or protocol failure"),

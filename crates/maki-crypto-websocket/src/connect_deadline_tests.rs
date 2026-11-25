@@ -12,7 +12,7 @@ async fn exhausted_tls_preparation_budget_does_not_open_a_socket() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = provider(listener.local_addr().unwrap(), Duration::from_millis(10));
     let result = provider
-        .connect_with_tls(|| {
+        .connect_with_tls(None, || {
             std::thread::sleep(Duration::from_millis(20));
             Ok(None)
         })
@@ -33,7 +33,7 @@ async fn network_receives_only_the_budget_left_after_tls_preparation() {
     let budget = Duration::from_secs(5);
     let provider = provider(listener.local_addr().unwrap(), budget);
     let started = tokio::time::Instant::now();
-    let connection = provider.connect_with_tls(|| {
+    let connection = provider.connect_with_tls(None, || {
         // Model synchronous preparation while retaining deterministic control
         // of the subsequent network timeout. No task can advance a paused
         // current-thread runtime while this synchronous loader is running.
@@ -64,7 +64,7 @@ async fn unrepresentable_deadline_allows_a_successful_handshake() {
         let (socket, _) = listener.accept().await.unwrap();
         tokio_tungstenite::accept_async(socket).await.unwrap()
     });
-    let connection = tokio::time::timeout(Duration::from_secs(5), provider.connect())
+    let connection = tokio::time::timeout(Duration::from_secs(5), provider.connect(None))
         .await
         .expect("local handshake must complete")
         .expect("an unrepresentable deadline must not panic or reject the connection");

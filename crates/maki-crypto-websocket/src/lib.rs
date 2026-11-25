@@ -582,8 +582,14 @@ impl WsCryptoProvider {
         }
     }
 
-    async fn connect(&self) -> Result<Connection, CryptoError> {
-        self.connect_with_tls(|| {
+    /// Connect within `timeout`, and no later than `until`: a request's
+    /// attempt passes its own deadline, which may have run while it waited
+    /// for the connection mutex.
+    async fn connect(
+        &self,
+        until: Option<tokio::time::Instant>,
+    ) -> Result<Connection, CryptoError> {
+        self.connect_with_tls(until, || {
             match self
                 .tls_connector
                 .as_ref()
@@ -648,9 +654,18 @@ impl WsCryptoProvider {
     // also lets the deadline tests model a slow synchronous native-root scan.
     async fn connect_with_tls(
         &self,
+        until: Option<tokio::time::Instant>,
         prepare_tls: impl FnOnce() -> Result<Option<Connector>, CryptoError>,
     ) -> Result<Connection, CryptoError> {
-        let deadline = tokio::time::Instant::now().checked_add(self.spec.timeout);
+        // The addresses share what is left of this deadline, so it must not
+        // reach past the request that asked for the connection.
+        let deadline = [
+            tokio::time::Instant::now().checked_add(self.spec.timeout),
+            until,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let connector = prepare_tls()?;
         // Native-root discovery is synchronous and cannot be preempted here.
         // Once it returns, an exhausted budget must not open a socket, and
@@ -840,6 +855,7 @@ impl WsCryptoProvider {
         items: usize,
         encoded: SecretBuffer,
         handed_over: &AtomicBool,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Value, CryptoError> {
         let queued = Arc::new(parking_lot::Mutex::new(Some(request::into_message(
             encoded,
@@ -852,7 +868,7 @@ impl WsCryptoProvider {
             loop {
                 let connecting = guard.is_none();
                 if connecting {
-                    *guard = Some(self.connect().await?);
+                    *guard = Some(self.connect(deadline).await?);
                 }
                 let conn = guard.as_ref().unwrap();
                 // Publish the owner and reply under the same lock used to
@@ -953,9 +969,12 @@ impl WsCryptoProvider {
             // attempt keeps PendingRequest's generation-scoped cleanup and
             // live-sibling ownership unchanged.
             let handed_over = AtomicBool::new(false);
+            // A connection this attempt opens ends with the attempt, also
+            // after the attempt waited for the connection mutex.
+            let deadline = tokio::time::Instant::now().checked_add(self.spec.timeout);
             let result = tokio::time::timeout(
                 self.spec.timeout,
-                self.request_once(id, items.len(), encoded, &handed_over),
+                self.request_once(id, items.len(), encoded, &handed_over, deadline),
             )
             .await
             .unwrap_or_else(|_| Err(retryable("websocket request timeout")));
