@@ -1355,9 +1355,11 @@ Attaching an existing volume compares the configuration's value of each with
 the recovered superblock before any provider credential is loaded or any
 provider transport is built, and refuses a configuration that differs; the
 key identity is the key's name, and the key canary (§27) proves the key
-material itself. Opening the backing and recovery come first, because the
-superblock is inside the backing: with remote rollback protection, opening it
-loads the witness client's TLS identity and claims a writer at the authority.
+material itself. Process hardening (§36, §37) comes first, and so do opening
+the backing and recovery, because the superblock that is compared is the one
+recovery selects inside the backing: with remote rollback protection, opening
+it loads the witness client's TLS identity and claims a writer at the
+authority.
 `maki check` makes the same comparison and fails on a difference, naming the
 setting and both values.
 

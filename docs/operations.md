@@ -227,7 +227,8 @@ recovery/backup verification before accepting recovered data.
 
 `maki check` and `maki check --deep` also compare the configuration with the
 volume, with the comparison attach makes before it loads any provider
-credential or builds a provider transport: the geometry (`volume.device_block_size`, `volume.crypto_unit_size`,
+credential or builds a provider transport: the geometry
+(`volume.device_block_size`, `volume.crypto_unit_size`,
 `volume.shard_logical_size`, `volume.max_virtual_size`,
 `backing.slot_alignment`, `crypto.capabilities.max_ciphertext_size`),
 `crypto.provider`, the key's name (`crypto.key.name`, stored as the volume's
