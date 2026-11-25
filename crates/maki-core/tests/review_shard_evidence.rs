@@ -200,3 +200,89 @@ fn allocation_copies_that_list_nothing_without_a_data_file_stay_harmless() {
         }
     }
 }
+
+/// The newest catalog copy and the newest allocation copy of the volume's
+/// only shard are damaged, and its data file is cut inside slot 4 (or
+/// inside the header of unit 1, the first written slot). The older catalog
+/// copy does not name the shard and the older allocation copy is the empty
+/// map of its creation, so open took the shard for one whose creation never
+/// finished, whose short file proves nothing, although the header bytes of
+/// unit 1 below the cut show that a checkpoint wrote into it. Unit 5 then
+/// read as zeros, and the first checkpoint grew the file back and cataloged
+/// the shard, after which every later open and the deep check saw a healthy
+/// shard. Written slot header bytes are evidence that the file's size was
+/// proven: the file is truncated and the units beyond the cut read EIO,
+/// before and after a checkpoint and a restart.
+#[test]
+fn a_short_uncataloged_shard_with_a_written_slot_reads_eio_beyond_its_end() {
+    let _serial = failpoints::test_lock();
+    let cuts = [
+        (geometry().slot_offset(4) + 447, true),
+        (geometry().slot_offset(1) + 20, false),
+    ];
+    for (discard, (cut, unit_1_survives)) in [false, true]
+        .into_iter()
+        .flat_map(|discard| cuts.map(|cut| (discard, cut)))
+    {
+        let backing = fixture(discard);
+        let mut volume = recover(&backing).unwrap();
+        for unit in [1, 5] {
+            volume
+                .write_ct(unit, &ciphertext(0x50 + unit as u8), true)
+                .unwrap();
+        }
+        volume.checkpoint().unwrap();
+        // Unit 1's bit is already set: no later checkpoint stores the map.
+        for stamp in 0..24u8 {
+            volume.write_ct(1, &ciphertext(0x60 + stamp), true).unwrap();
+        }
+        volume.checkpoint().unwrap();
+        drop(volume);
+        backing.crash_all_lost();
+
+        damage_newest::<ShardCatalog>(&backing, layout::SHARD_CATALOG_A, layout::SHARD_CATALOG_B);
+        damage_newest::<AllocationMap>(
+            &backing,
+            &layout::shard_alloc_a(0),
+            &layout::shard_alloc_b(0),
+        );
+        let data = backing.open(&layout::shard_data(0), false).unwrap();
+        data.set_len(cut).unwrap();
+        data.sync_data().unwrap();
+        drop(data);
+
+        let mut failures = Vec::new();
+        if deep_check_errors(&backing).is_empty() {
+            failures.push("the deep check reports no error before the first attach".to_string());
+        }
+        for attach in 1..=2 {
+            let mut volume = recover(&backing).unwrap();
+            if unit_1_survives {
+                assert_eq!(volume.read_ct(1).unwrap().unwrap().1, ciphertext(0x60 + 23));
+            }
+            let beyond: &[u64] = if unit_1_survives { &[5] } else { &[1, 5] };
+            for &unit in beyond {
+                match volume.read_ct(unit) {
+                    Err(_) => {}
+                    Ok(read) => failures.push(format!(
+                        "attach {attach}: unit {unit} reads {:?} (None = zeros)",
+                        read.map(|(sequence, _)| sequence)
+                    )),
+                }
+            }
+            // What the worker does next: the idle checkpoint stores the
+            // repairs open made (the adopted shard, the damage marks).
+            volume.checkpoint().unwrap();
+            drop(volume);
+            if deep_check_errors(&backing).is_empty() {
+                failures.push(format!(
+                    "the deep check reports no error after attach {attach}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "discard {discard}, cut at {cut}: {failures:?}"
+        );
+    }
+}
