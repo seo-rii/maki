@@ -13,7 +13,10 @@
 //! missing metadata. Every catalog commit publishes the whole in-memory
 //! catalog, so a shard adopted at open (see below) gets its map stored
 //! before *any* commit — the one in `persist_allocations` and the one made
-//! by another shard's creation alike (K-03).
+//! by another shard's creation alike (K-03). The loaded catalog copy is not
+//! trusted as durable either: after a failed sync and a plain restart it can
+//! exist only in the page cache (K-01), so a catalog that names a shard is
+//! stored again before the first record for a loaded shard is accepted.
 //!
 //! Allocation persistence: a shard's dirty flag is cleared only after the
 //! data-directory fsync that makes the fresh A/B copy's dirent durable has
@@ -183,8 +186,12 @@ pub struct SlotStore {
     geometry: Geometry,
     catalog: ShardCatalog,
     catalog_ab: AbStore,
-    /// Shards adopted from the data directory that the loaded catalog copy
-    /// did not list; persisted with the next allocation persist.
+    /// The in-memory catalog is not proven durable in this store session:
+    /// it names shards adopted from the data directory that the loaded copy
+    /// did not list, or the loaded copy itself may be cache-only after a
+    /// failed sync and a plain restart (K-01). Stored by the next
+    /// allocation persist, which every reservation of a loaded shard runs
+    /// first, so no record is accepted while a shard's entry is volatile.
     catalog_dirty: bool,
     // Counts of shards that still need the corresponding metadata barrier.
     // A failed barrier keeps its count until directory durability is proven.
@@ -410,7 +417,13 @@ impl SlotStore {
             .load::<ShardCatalog>(backing.as_ref())?
             .ok_or_else(|| CoreError::Corrupt("no valid shard catalog".to_string()))?;
 
-        let mut catalog_dirty = false;
+        // A catalog copy that names a shard is no more proven durable than
+        // the allocation copies loaded below: after a failed sync and a plain
+        // restart the page cache still shows it (K-01). Store it again
+        // (preserve-first) before a record for any shard it names is
+        // accepted (SPEC §14), as the allocation maps are. The empty
+        // catalog of a new volume names nothing and is left as created.
+        let mut catalog_dirty = !catalog.is_empty();
         let mut orphans: Vec<u64> = Vec::new();
         // Only shard data file names matter here, and they are ASCII: any
         // other entry, one whose name is not UTF-8 included, is ignored.
