@@ -29,8 +29,10 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-# Exact: fuzz/Cargo.lock is not committed, and the workspace's lockfile that
-# the build starts from does not list it.
+# Exact, with libFuzzer's own dependency on `arbitrary`: fuzz/Cargo.lock is
+# not committed, and the workspace's lockfile that the build starts from
+# lists neither.
+arbitrary = "=1.5.0"
 libfuzzer-sys = "=0.4.13"
 # Every target's code: the stable suite runs it on the committed seeds.
 maki-fuzz-harness = { path = "harness" }

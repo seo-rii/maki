@@ -452,6 +452,8 @@ jobs:
     # input is uploaded.
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -475,7 +477,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in $(cargo fuzz list); do
+          # A list that cannot be read or is empty would run nothing.
+          targets="$(cargo fuzz list)"
+          test -n "$targets"
+          for target in $targets; do
             case "$target" in
               format_decoders|format_records) max_len=8192 ;;
               nbd_handshake) max_len=70000 ;;
