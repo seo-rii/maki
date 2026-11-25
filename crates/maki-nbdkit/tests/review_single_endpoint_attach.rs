@@ -486,6 +486,7 @@ fn an_endpoint_failure_in_any_probe_attempt_refuses_the_attach() {
 
 /// A WebSocket endpoint whose upgrade is refused with 503 while `refuse` is
 /// set, and that otherwise answers each request with its items XORed.
+#[allow(clippy::result_large_err)] // tungstenite fixes the handshake callback's error type
 async fn websocket_server(refuse: Arc<AtomicBool>) -> String {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
