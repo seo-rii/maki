@@ -440,7 +440,11 @@ import os
 import sys
 arguments = sys.argv[1:]
 if arguments == ["fuzz", "list"]:
-    print("\n".join(json.loads(os.environ["FUZZ_TARGETS"])))
+    listing = os.environ.get("FUZZ_LIST", "")
+    if listing == "fail":
+        sys.exit(2)
+    if listing != "empty":
+        print("\n".join(json.loads(os.environ["FUZZ_TARGETS"])))
     sys.exit(0)
 if arguments[:2] != ["fuzz", "run"]:
     sys.exit("fixture: unexpected cargo arguments: " + " ".join(arguments))
@@ -487,9 +491,18 @@ class FuzzJob(unittest.TestCase):
         self.assertLess(build.index("cp Cargo.lock fuzz/Cargo.lock\n"), build.index("cargo fuzz build"))
         self.assertLess(self.names.index("build every fuzz target"), self.names.index(FUZZ_STEP))
 
-    def test_libfuzzer_is_pinned_where_the_workspace_lockfile_cannot_pin_it(self):
-        self.assertNotIn("libfuzzer-sys", (ROOT / "Cargo.lock").read_text())
-        self.assertRegex(FUZZ_MANIFEST.read_text(), r'(?m)^libfuzzer-sys = "=\d+\.\d+\.\d+"$')
+    def test_crates_the_workspace_lockfile_cannot_pin_are_pinned_exactly(self):
+        # After `cp Cargo.lock fuzz/Cargo.lock` Cargo adds libFuzzer's crate
+        # and its `arbitrary` at whatever version is newest unless the
+        # manifest names one.
+        lockfile = (ROOT / "Cargo.lock").read_text()
+        for name in ("libfuzzer-sys", "arbitrary"):
+            with self.subTest(name=name):
+                self.assertNotIn(f'name = "{name}"', lockfile)
+                self.assertRegex(FUZZ_MANIFEST.read_text(), rf'(?m)^{name} = "=\d+\.\d+\.\d+"$')
+
+    def test_the_job_reads_the_repository_and_writes_nothing(self):
+        self.assertRegex(self.job, r"(?m)^    permissions:\n      contents: read\n    [a-z]")
 
     def test_the_fuzzed_code_uses_the_workspace_patches(self):
         # Without them the fuzzed serde_json and bytes would be the
@@ -546,6 +559,25 @@ class FuzzJob(unittest.TestCase):
                     if target == "nbd_handshake":
                         # Beyond the client's 64 KiB byte limit.
                         self.assertGreater(int(length[0].split("=")[1]), 64 * 1024)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_a_target_list_that_fails_or_is_empty_fails_the_step(self):
+        for listing in ("fail", "empty"):
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory(prefix="maki-ci-fuzz-") as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                cargo = binary / "cargo"
+                cargo.write_text(FAKE_CARGO_FUZZ)
+                cargo.chmod(0o700)
+                calls = root / "calls.jsonl"
+                environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                                   FUZZ_TARGETS=json.dumps(fuzz_targets()), FUZZ_CALLS=str(calls),
+                                   FUZZ_LIST=listing)
+                result = subprocess.run(["bash", "-e", "-c", step_script(FUZZ_STEP)], cwd=root,
+                                        env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(calls.exists(), "a target ran without a list")
 
     def test_a_crash_input_is_kept(self):
         upload = self.step("actions/upload-artifact@v4")

@@ -47,7 +47,11 @@ fn seed_dir() -> PathBuf {
 
 /// `(name, path)` of every `[[bin]]` in `fuzz/Cargo.toml`.
 fn binaries() -> Vec<(String, String)> {
-    let manifest = std::fs::read_to_string(fuzz_dir().join("Cargo.toml")).unwrap();
+    binaries_in(&std::fs::read_to_string(fuzz_dir().join("Cargo.toml")).unwrap())
+}
+
+/// `(name, path)` of every `[[bin]]` in the manifest `manifest`.
+fn binaries_in(manifest: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for section in manifest.split("\n[").skip(1) {
         let Some(body) = section.strip_prefix("[bin]]\n") else {
@@ -84,6 +88,19 @@ fn committed(target: &str) -> Vec<(String, Vec<u8>)> {
 
 fn sorted<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a str> {
     names.into_iter().collect()
+}
+
+/// A Windows checkout with `core.autocrlf` (Git for Windows's default, and
+/// the runners') gives `fuzz/Cargo.toml` CRLF line ends: its targets are the
+/// same.
+#[test]
+fn the_manifests_targets_are_read_whatever_its_line_ends() {
+    let manifest = std::fs::read_to_string(fuzz_dir().join("Cargo.toml"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let targets = binaries_in(&manifest);
+    assert_eq!(targets.len(), REQUIRED.len(), "{targets:?}");
+    assert_eq!(binaries_in(&manifest.replace('\n', "\r\n")), targets);
 }
 
 #[test]
