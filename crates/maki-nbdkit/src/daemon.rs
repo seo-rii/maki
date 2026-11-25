@@ -1259,12 +1259,19 @@ pub fn configuration_mismatches(
             )),
         });
     }
+    // A remote configuration has no `[crypto].key` (validation refuses one)
+    // and a volume it created stores an empty key identity: say which side
+    // has none rather than show an empty name.
     let key_identity = configured_key_identity(config, &superblock.key_identity);
     if key_identity != superblock.key_identity {
+        let name = |identity: &str, missing: &str| match identity {
+            "" => missing.to_owned(),
+            identity => format!("{identity:?}"),
+        };
         mismatches.push(ConfigurationMismatch {
             setting: "crypto.key.name",
-            configured: format!("{key_identity:?}"),
-            stored: format!("{:?}", superblock.key_identity),
+            configured: name(&key_identity, "unset"),
+            stored: name(&superblock.key_identity, "none"),
             refusal: Refusal::Identity(format!(
                 "volume was created with key identity {:?}, configuration says {:?}",
                 superblock.key_identity, key_identity
