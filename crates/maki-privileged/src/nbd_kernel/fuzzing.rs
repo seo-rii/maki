@@ -21,7 +21,7 @@ use super::netlink::{
     MAX_DATAGRAM, MAX_DATAGRAMS, NBD_ATTR_BACKEND_IDENTIFIER, NBD_ATTR_INDEX, NBD_CMD_CONNECT,
     NLMSG_ERROR, NLMSG_HDRLEN,
 };
-use super::{check_family, connected};
+use super::{check_family, connected, disconnected, resolved};
 
 /// The netlink port of the helper's socket.
 const PORT: u32 = 0x0000_1f4b;
@@ -117,14 +117,12 @@ pub fn netlink_answer(data: &[u8]) -> bool {
         }
         Err(Unacknowledged::Unanswered(_)) => {}
     }
+    // The readers `connect` and `disconnect` hand the answer to.
     match (request, answer) {
-        (Request::Lookup, Ok(replies)) => match replies.as_slice() {
-            [reply] => netlink::family(reply).is_ok_and(|found| {
-                assert_ne!(found.id, 0, "a family without an id");
-                check_family(&found).is_ok()
-            }),
-            _ => false,
-        },
+        (Request::Lookup, answer) => resolved(answer).is_ok_and(|found| {
+            assert_ne!(found.id, 0, "a family without an id");
+            check_family(&found).is_ok()
+        }),
         (Request::Connect, Ok(replies)) => {
             let ok = connected(INDEX, &replies).is_ok();
             if ok {
@@ -135,8 +133,9 @@ pub fn netlink_answer(data: &[u8]) -> bool {
             }
             ok
         }
-        (Request::Disconnect, Ok(replies)) => replies.is_empty(),
-        (_, Err(_)) => false,
+        // A refusal goes to the busy retries, which other tests cover.
+        (Request::Connect, Err(_)) => false,
+        (Request::Disconnect, answer) => disconnected(INDEX, answer).is_ok(),
     }
 }
 

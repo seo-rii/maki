@@ -198,6 +198,27 @@ fn validate_name(name: &str, empty: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// The step at which a manifest slot's bytes failed to be a manifest.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestRefusal {
+    /// They are not a manifest's JSON.
+    Encoding,
+    /// The manifest is not valid.
+    Content,
+    /// The manifest encodes beyond its capacity's bound.
+    Size,
+}
+
+/// The manifest `bytes` decode to, which is valid, and its canonical
+/// encoding. A reader accepts the bytes only if they are that encoding.
+fn parse_manifest(bytes: &[u8]) -> Result<(Manifest, Vec<u8>), ManifestRefusal> {
+    let manifest: Manifest =
+        serde_json::from_slice(bytes).map_err(|_| ManifestRefusal::Encoding)?;
+    manifest.validate().map_err(|_| ManifestRefusal::Content)?;
+    let canonical = manifest.encode().map_err(|_| ManifestRefusal::Size)?;
+    Ok((manifest, canonical))
+}
+
 /// A bounded Linux storage format. `capacity_bytes` is usable reserved
 /// logical page capacity; physical footprint is twice that plus two manifests.
 /// The witness MUST have an independent, durable restore policy. A different
@@ -467,15 +488,14 @@ impl RollbackBacking {
                 if digest(b"maki.rollback.manifest.v1\0", &bytes) != anchor.root {
                     return Err(invalid("manifest does not match independent witness"));
                 }
-                let manifest: Manifest = serde_json::from_slice(&bytes)
-                    .map_err(|_| invalid("invalid rollback manifest encoding"))?;
-                manifest
-                    .validate()
-                    .map_err(|_| invalid("invalid rollback manifest content"))?;
-                if manifest
-                    .encode()
-                    .map_err(|_| invalid("invalid rollback manifest size"))?
-                    != bytes
+                let (manifest, canonical) = parse_manifest(&bytes).map_err(|refusal| {
+                    invalid(match refusal {
+                        ManifestRefusal::Encoding => "invalid rollback manifest encoding",
+                        ManifestRefusal::Content => "invalid rollback manifest content",
+                        ManifestRefusal::Size => "invalid rollback manifest size",
+                    })
+                })?;
+                if canonical != bytes
                     || manifest.identity != anchor.identity
                     || manifest.generation != anchor.generation
                     || file.len()? != manifest_bound(manifest.capacity)
@@ -1647,20 +1667,19 @@ pub(crate) mod fuzzing {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
 
-    use super::{invalid, Backing, Entry, Manifest, Node, PageRef};
+    use super::{Backing, Entry, Manifest, Node, PageRef};
 
     pub(crate) use super::enrollment::fuzzing as enrollment;
 
     pub(crate) const MANIFESTS: [&str; 2] = super::MANIFESTS;
 
-    /// What opening a backing makes of a manifest's bytes: refused where
-    /// they do not decode or validate, else the canonical encoding, which
-    /// open requires them to be.
-    pub(crate) fn manifest(bytes: &[u8]) -> io::Result<Vec<u8>> {
-        let manifest: Manifest = serde_json::from_slice(bytes)
-            .map_err(|_| invalid("invalid rollback manifest encoding"))?;
-        manifest.validate()?;
-        manifest.encode()
+    /// The canonical encoding of the manifest `bytes` decode to, as both
+    /// readers of a witnessed manifest find it (`parse_manifest`), or
+    /// `None` where they refuse the bytes before comparing them with it.
+    pub(crate) fn manifest(bytes: &[u8]) -> Option<Vec<u8>> {
+        super::parse_manifest(bytes)
+            .ok()
+            .map(|(_, canonical)| canonical)
     }
 
     pub(crate) fn unpublished_slot(disk: &dyn Backing, index: usize) -> io::Result<bool> {

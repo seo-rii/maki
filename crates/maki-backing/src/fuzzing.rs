@@ -121,15 +121,15 @@ fn remote_state(body: &[u8], repair: bool) -> bool {
 }
 
 fn manifest(body: &[u8]) -> bool {
-    let Ok(canonical) = rollback::manifest(body) else {
+    let Some(canonical) = rollback::manifest(body) else {
         return false;
     };
     assert_eq!(
-        rollback::manifest(&canonical).ok().as_ref(),
+        rollback::manifest(&canonical).as_ref(),
         Some(&canonical),
         "a manifest's canonical encoding does not decode to itself"
     );
-    // Open accepts nothing but the canonical bytes.
+    // Both readers accept nothing but the canonical bytes.
     canonical == body
 }
 

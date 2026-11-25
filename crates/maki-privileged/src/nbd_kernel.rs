@@ -237,7 +237,16 @@ pub fn disconnect(index: u32) -> Result<(), NbdError> {
     let netlink = open_netlink()?;
     let family = resolve(&netlink, deadline)?;
     let request = netlink::disconnect_request(family.id, COMMAND_SEQUENCE, index);
-    match netlink.exchange(&request, COMMAND_SEQUENCE, family.id, deadline) {
+    disconnected(
+        index,
+        netlink.exchange(&request, COMMAND_SEQUENCE, family.id, deadline),
+    )
+}
+
+/// What the kernel's answer to `NBD_CMD_DISCONNECT` for `nbd<index>` says:
+/// an acknowledgement without a reply, or why not.
+fn disconnected(index: u32, answer: Result<Vec<Vec<u8>>, Unacknowledged>) -> Result<(), NbdError> {
+    match answer {
         Ok(replies) if replies.is_empty() => Ok(()),
         Ok(_) => Err(unknown(
             "NBD_CMD_DISCONNECT",
@@ -398,13 +407,19 @@ fn open_netlink() -> Result<netlink::Socket, NbdError> {
 /// Look up the `nbd` family. The lookup changes nothing: every failure is
 /// a plain one.
 fn resolve(netlink: &netlink::Socket, deadline: Instant) -> Result<netlink::Family, NbdError> {
+    let request = netlink::family_request(FAMILY_SEQUENCE);
+    resolved(netlink.exchange(&request, FAMILY_SEQUENCE, netlink::GENL_ID_CTRL, deadline))
+}
+
+/// The `nbd` family in the kernel's answer to the family lookup: one reply
+/// that describes it.
+fn resolved(answer: Result<Vec<Vec<u8>>, Unacknowledged>) -> Result<netlink::Family, NbdError> {
     let failed = |what: String| {
         NbdError::Failed(format!(
             "cannot look up the kernel's nbd netlink family: {what}"
         ))
     };
-    let request = netlink::family_request(FAMILY_SEQUENCE);
-    match netlink.exchange(&request, FAMILY_SEQUENCE, netlink::GENL_ID_CTRL, deadline) {
+    match answer {
         Ok(replies) => match replies.as_slice() {
             [reply] => netlink::family(reply).map_err(failed),
             _ => Err(failed(format!("{} replies instead of one", replies.len()))),
