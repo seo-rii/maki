@@ -781,7 +781,8 @@ fn leftover(disk: &dyn Backing, name: &str) -> io::Result<Leftover> {
     // `publish_marker` can remove neither; and any of them under a slot
     // fails the check of the slot's contents (`unpublished_slot`) with the
     // bare error of that open (the system's for a link or a directory,
-    // `FileBacking`'s own for a FIFO or a second name). The lock is taken before this, by both commands.
+    // `FileBacking`'s own for a FIFO or a second name). The lock is taken
+    // before this, by both commands.
     // The staged marker is never read, and `publish_marker` removes the
     // file under its name before it stages the marker, so one this user
     // may not open (what a root-run creation leaves when it is killed
