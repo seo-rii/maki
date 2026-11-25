@@ -1031,12 +1031,16 @@ fn inspect(config: &std::path::Path) -> Result<(), String> {
 fn check(config: &str, deep: bool) -> Result<bool, String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
-    let report = if deep {
-        maki_core::check::deep_check(backing, cfg.backing.journal_segment_size.0)
+    let mut report = if deep {
+        maki_core::check::deep_check(backing.clone(), cfg.backing.journal_segment_size.0)
             .map_err(|e| e.to_string())?
     } else {
         maki_format::checker::check_volume(backing.as_ref()).map_err(|e| e.to_string())?
     };
+    // After the deep verdict, which describes the volume: a configuration
+    // that attach refuses for it fails the check whatever the verdict says.
+    maki_nbdkit::daemon::report_configuration_mismatches(&cfg, backing.as_ref(), &mut report)
+        .map_err(|e| e.to_string())?;
     let mut text = String::new();
     for info in &report.info {
         text += &format!("info: {info}\n");
