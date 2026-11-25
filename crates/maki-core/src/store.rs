@@ -425,8 +425,11 @@ impl SlotStore {
         // catalog of a new volume names nothing and is left as created.
         let mut catalog_dirty = !catalog.is_empty();
         let mut orphans: Vec<u64> = Vec::new();
-        // Only shard data file names matter here, and they are ASCII: any
-        // other entry, one whose name is not UTF-8 included, is ignored.
+        // Shards with an allocation-map copy, whether or not they have a
+        // data file (see below).
+        let mut mapped: BTreeSet<u64> = BTreeSet::new();
+        // Only shard file names matter here, and they are ASCII: any other
+        // entry, one whose name is not UTF-8 included, is ignored.
         let data_entries = backing
             .list_skipping_non_utf8(layout::DATA_DIR)
             .map_err(|e| match e.kind() {
@@ -441,6 +444,8 @@ impl SlotStore {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
                 }
+            } else if let Some(idx) = layout::parse_shard_alloc(&name) {
+                mapped.insert(idx);
             }
         }
         orphans.sort_unstable();
@@ -453,6 +458,40 @@ impl SlotStore {
             catalog_dirty = true;
         }
         let adopted: BTreeSet<u64> = orphans.into_iter().collect();
+        // A shard the loaded catalog copy does not name and that has no data
+        // file is found by its allocation map. A map that lists a slot was
+        // stored by a checkpoint (or by open marking a truncated file's
+        // slots), and a checkpoint writes into a shard only after its
+        // creation made the data file and its dirent durable: the shard's
+        // data is lost, and attach refuses, as for a cataloged shard whose
+        // data file is missing. A map that lists nothing is what an
+        // interrupted creation leaves (its maps are stored before the data
+        // directory sync that publishes the data file): never written into,
+        // so its units read as zeros and the next write creates the shard.
+        for idx in mapped {
+            if catalog.contains(idx) || idx >= geometry.num_shards() {
+                continue;
+            }
+            let alloc_ab = map_store(
+                layout::shard_alloc_a(idx),
+                layout::shard_alloc_b(idx),
+                &geometry,
+            );
+            let Some(alloc) = alloc_ab.load::<AllocationMap>(backing.as_ref())? else {
+                continue;
+            };
+            if alloc.units() != geometry.units_per_shard() {
+                return Err(CoreError::Corrupt(format!(
+                    "shard {idx}: allocation map size mismatch"
+                )));
+            }
+            if (0..addressable_units(&geometry, idx)).any(|in_shard| alloc.get(in_shard)) {
+                return Err(CoreError::Corrupt(format!(
+                    "shard {idx}: data file missing: the loaded catalog copy does not name the \
+                     shard, but its allocation map lists written slots"
+                )));
+            }
+        }
         progress();
 
         let mut shards = HashMap::new();

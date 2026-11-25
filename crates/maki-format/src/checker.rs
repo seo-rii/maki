@@ -161,6 +161,15 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
         }
         Err(error) => return Err(error.into()),
     };
+    let mut data_files = std::collections::BTreeSet::new();
+    let mut mapped = std::collections::BTreeSet::new();
+    for name in &entries {
+        if let Some(idx) = layout::parse_shard_data(name) {
+            data_files.insert(idx);
+        } else if let Some(idx) = layout::parse_shard_alloc(name) {
+            mapped.insert(idx);
+        }
+    }
     for name in entries {
         let Some(idx) = layout::parse_shard_data(&name) else {
             continue;
@@ -191,6 +200,34 @@ pub fn check_volume(backing: &dyn Backing) -> Result<CheckReport, FormatError> {
             )
         };
         report.warnings.push(warning);
+    }
+
+    // A shard with neither a catalog entry nor a data file: recovery finds
+    // it by its allocation map. A map that lists a slot belongs to a shard a
+    // checkpoint wrote into, whose data file is lost, and recovery refuses
+    // it; one that lists nothing is what an interrupted creation leaves.
+    for idx in mapped {
+        if catalog.contains(idx) || data_files.contains(&idx) || idx >= geometry.num_shards() {
+            continue;
+        }
+        let units = geometry.units_per_shard();
+        let store = AbStore::new(layout::shard_alloc_a(idx), layout::shard_alloc_b(idx))
+            .with_max_len(AllocationMap::encoded_len(units));
+        let Some(map) = store.load::<AllocationMap>(backing)? else {
+            continue;
+        };
+        let in_device = units.min(geometry.num_units().saturating_sub(idx * units));
+        if map.units() != units {
+            report.errors.push(format!(
+                "shard {idx}: allocation map covers {} units, geometry says {units}",
+                map.units()
+            ));
+        } else if (0..in_device).any(|in_shard| map.get(in_shard)) {
+            report.errors.push(format!(
+                "shard {idx}: data file is missing: the loaded catalog copy does not name the \
+                 shard, but its allocation map lists written slots; recovery refuses the volume"
+            ));
+        }
     }
 
     Ok(report)

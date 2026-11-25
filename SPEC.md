@@ -1644,7 +1644,13 @@ slots the last checkpoint filled. Therefore:
   slot by slot at open and every slot with a valid header for its unit is
   marked allocated;
 - a cataloged shard with *no* valid allocation copy refuses attach
-  (offline repair territory), as does a missing data file.
+  (offline repair territory), as does a missing data file;
+- a shard the loaded catalog copy does not name and that has no data file
+  is found by its allocation map: a valid copy that lists a slot refuses
+  attach as well (a checkpoint wrote into the shard, so its data file was
+  lost), while one that lists nothing is what an interrupted creation
+  leaves (its maps are stored before the data directory sync that
+  publishes the data file) and the shard stays unwritten.
 
 Record layouts (notation in §21). A shard's allocation map is stored A/B as
 `data/shard-<index>.alloc.a` and `data/shard-<index>.alloc.b`, with `<index>`
