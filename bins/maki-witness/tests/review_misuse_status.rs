@@ -89,6 +89,35 @@ fn a_volume_identity_that_is_not_a_uuid_exits_2_before_anything_is_created() {
     );
 }
 
+/// The nil UUID parses as a UUID, so `init` went on to create the state
+/// store, which refuses a nil identity, and exited 1; `init-etcd` read its
+/// configuration first. `maki volume resume-enrollment` refuses a nil
+/// identity as misuse, with status 2.
+#[test]
+fn a_nil_volume_identity_exits_2_before_anything_is_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config = dir.path().join("missing.toml");
+    let nil = "00000000-0000-0000-0000-000000000000";
+    for args in [
+        ["init", text(&state), nil],
+        ["init-etcd", text(&config), nil],
+    ] {
+        let output = witness(&args);
+        let stderr = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("volume identity must be nonzero"),
+            "{args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    assert!(
+        !state.exists(),
+        "a refused init created its state directory"
+    );
+}
+
 /// The working directory holds a file of each such name whose contents
 /// are neither a configuration nor a certificate, so a command that opened
 /// one would fail with status 1.
