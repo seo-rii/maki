@@ -407,7 +407,11 @@ rather than re-sending plaintext to a server-chosen URL) and never uses a proxy
 from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` are ignored), so
 plaintext only goes to the configured endpoint. It removes request
 URLs from transport errors before classification and formatting, keeping query
-credentials out of those error messages. Each WebSocket connection generation
+credentials out of those error messages. The WebSocket transport resolves the
+endpoint's host itself and connects straight to its addresses, one at a time,
+each but the last for an equal share of what is left of the connect deadline,
+then runs TLS (verified for the URL's host) and the upgrade on the first
+connection made. Each WebSocket connection generation
 owns both reader and writer futures in one task. Timeout, request cancellation,
 connection replacement, and provider drop retire that generation, cancel its
 task, release its socket, and fail its pending requests without disturbing a

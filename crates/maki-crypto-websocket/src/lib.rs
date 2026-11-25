@@ -27,6 +27,9 @@
 //! upgrade) is marked as not sent, so the dispatcher may fail it over.
 //! Frame sizes are bounded in both directions. Invalid receive framing is
 //! an endpoint contract failure, so that operation is never resent to it.
+//! A connect resolves the URL's host and dials its addresses one at a time,
+//! each but the last with an equal share of what is left of the timeout, so
+//! one that never answers does not use it up; TLS verifies the URL's host.
 
 // Diagnostics go through `tracing`: the `print!` family panics when the
 // write fails (a closed pipe, a full disk). Tests may print.
@@ -314,15 +317,35 @@ impl Dialer for SystemDialer {
     }
 }
 
-/// Dial `addresses` in the resolver's order and return the first stream
-/// that connects, or the last failure.
+/// Dial `addresses` in the resolver's order, one at a time, and return the
+/// first stream that connects, or the last failure. Each address but the
+/// last may take an equal share of the time left to `deadline`, so one that
+/// never answers leaves the others their time; the last has what remains,
+/// bounded by the connect deadline itself. An address that fails sooner
+/// leaves its time to those after it. Only the TCP connect moves on: TLS and
+/// the upgrade run on the first stream that connects, and their failure is
+/// never retried at another address.
 async fn dial_in_turn(
     dialer: &dyn Dialer,
     addresses: Vec<SocketAddr>,
+    deadline: Option<tokio::time::Instant>,
 ) -> std::io::Result<TcpStream> {
     let mut last_error = None;
+    let mut left = addresses.len();
     for address in addresses {
-        match dialer.dial(address).await {
+        let attempt = dialer.dial(address);
+        left -= 1;
+        let result = match deadline {
+            Some(deadline) if left > 0 => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let share = remaining / u32::try_from(left + 1).unwrap_or(u32::MAX);
+                tokio::time::timeout(share, attempt)
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+            }
+            _ => attempt.await,
+        };
+        match result {
             Ok(socket) => return Ok(socket),
             Err(error) => last_error = Some(error),
         }
@@ -531,11 +554,13 @@ impl WsCryptoProvider {
     }
 
     /// `connect_async_tls_with_config` with the TCP connection made here: the
-    /// URL's host and port, its addresses from the dialer, then TLS and the
-    /// upgrade over the stream. TLS verifies the certificate against the
-    /// URL's host, never an address it resolved to.
+    /// URL's host and port, its addresses from the dialer, each given its
+    /// share of the time left to `deadline`, then TLS and the upgrade over
+    /// the stream. TLS verifies the certificate against the URL's host, never
+    /// an address it resolved to.
     async fn open_websocket(
         &self,
+        deadline: Option<tokio::time::Instant>,
         config: WebSocketConfig,
         connector: Option<Connector>,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, CryptoError> {
@@ -561,7 +586,7 @@ impl WsCryptoProvider {
                 })
                 .ok_or(Error::Url(UrlError::UnsupportedUrlScheme))?;
             let addresses = self.dialer.resolve(&host, port).await?;
-            let socket = dial_in_turn(&*self.dialer, addresses).await?;
+            let socket = dial_in_turn(&*self.dialer, addresses, deadline).await?;
             tokio_tungstenite::client_async_tls_with_config(
                 request,
                 socket,
@@ -594,8 +619,9 @@ impl WsCryptoProvider {
         // Resolution, the TCP connect and the HTTP upgrade have no timeout of
         // their own: a peer that accepts and never answers would hold the
         // connection mutex forever, and with it every request on this
-        // provider (C-05).
-        let connection = self.open_websocket(config, connector);
+        // provider (C-05). The deadline also divides the time among the
+        // resolved addresses, so one that never answers cannot spend it all.
+        let connection = self.open_websocket(deadline, config, connector);
         let ws = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, connection)
                 .await

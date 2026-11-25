@@ -124,13 +124,13 @@ See [cache reload](operations.md#growth-and-cache-reload).
   `Unavailable`), not as a TLS authentication failure: the refusal arrives
   after the handshake and the HTTP/2 library does not keep the TLS error
   ([provider error signals](configuration.md#provider-error-signals)).
-- The WebSocket transport runs its whole connect under one `timeout` and
-  tries the endpoint host's addresses in turn, so a host whose first address
-  does not answer loses that time on every connect: `localhost` that
-  resolves to `::1` first costs about 2 s on Windows for a listener on IPv4
-  only, and an IPv6 route that drops packets makes every connect time out.
-  The gRPC transport divides its connect timeout across the addresses, and
-  the HTTP transport tries the other address family after 300 ms.
+- The WebSocket transport tries the endpoint host's addresses one at a
+  time, in the resolver's order, and gives each but the last an equal share
+  of what is left of `timeout` (the last has the rest), so an address that
+  does not answer costs its share on every connect, no longer the whole
+  timeout: half of it for a host with one IPv6 and one IPv4 address whose
+  IPv6 route drops packets. It does not start the other address family
+  early, as the HTTP and gRPC transports do after 300 ms.
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs

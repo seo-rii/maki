@@ -1,9 +1,9 @@
 //! The connect resolves the URL's host and dials its addresses itself. An
 //! address that never answers (a route that drops packets) must not spend
-//! the whole connect deadline: the next address still gets time. The dialer
-//! is replaced here, so a name can resolve to addresses that never answer or
-//! refuse at once beside a real loopback listener. The TEST-NET addresses
-//! below are never dialed for real.
+//! the whole connect deadline: the next address still gets time. Most tests
+//! replace the dialer, so a name can resolve to addresses that never answer
+//! or refuse at once beside a real loopback listener; the TEST-NET addresses
+//! below are never dialed for real. One test keeps the system resolver.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -332,6 +332,35 @@ async fn the_resolver_is_asked_for_the_url_host_and_the_scheme_port() {
             "{url}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_system_resolver_reaches_a_listener_by_name() {
+    let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = v4.local_addr().unwrap().port();
+    // Serve ::1 too where the host has it, so that whichever loopback
+    // address the resolver lists first answers at once.
+    let v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
+    let _server = tokio::spawn(async move {
+        let (socket, _) = match &v6 {
+            Some(v6) => tokio::select! {
+                accepted = v4.accept() => accepted,
+                accepted = v6.accept() => accepted,
+            },
+            None => v4.accept().await,
+        }
+        .unwrap();
+        let _peer = tokio_tungstenite::accept_async(socket).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let mut spec = super::decoded_response_tests::provider().spec;
+    spec.url = format!("ws://localhost:{port}/");
+    spec.timeout = TIMEOUT;
+    let provider = WsCryptoProvider::new(spec);
+    tokio::time::timeout(TIMEOUT, provider.connect())
+        .await
+        .expect("the connect has its own deadline")
+        .expect("`localhost` resolves to a loopback address that serves");
 }
 
 mod tls {
