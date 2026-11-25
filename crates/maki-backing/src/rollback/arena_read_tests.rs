@@ -136,6 +136,17 @@ fn read(file: &dyn BackingFile) -> Vec<u8> {
     bytes
 }
 
+/// The cause the backing recorded when its session stopped.
+fn stop_cause(backing: &RollbackBacking) -> String {
+    let stopped = backing
+        .session_stopped()
+        .expect("the session stopped and recorded why");
+    stopped
+        .strip_prefix("rollback session stopped: ")
+        .unwrap_or_else(|| panic!("{stopped}"))
+        .to_owned()
+}
+
 fn first_page_offset(backing: &RollbackBacking) -> u64 {
     let state = backing.state.lock();
     let Entry::File(id) = &state.entries["data"] else {
@@ -162,6 +173,7 @@ fn transient_reads_preserve_errors_and_allow_existing_handles_to_retry() {
         assert!(fixture.arena.read_fault.lock().is_none());
         assert_eq!(fixture.anchor(), anchor);
         backing.check_freshness().unwrap();
+        assert_eq!(backing.session_stopped(), None);
         assert_eq!(read(file.as_ref()), vec![0x52; 2 * PAGE as usize]);
         assert_eq!(read(peer.as_ref()), vec![0x52; 2 * PAGE as usize]);
 
@@ -243,6 +255,12 @@ fn retry_authenticates_pages_and_damage_stops_all_handles_after_restoration() {
                 io::ErrorKind::InvalidData
             }
         );
+        let cause = stop_cause(&backing);
+        if truncate {
+            assert_eq!(cause, format!("arena page read failed: {error}"));
+        } else {
+            assert_eq!(cause, "rollback arena page authentication failed");
+        }
         arena.set_len(original.len() as u64).unwrap();
         arena.write_at(0, &original).unwrap();
         assert_eq!(fixture.anchor(), anchor);
@@ -250,6 +268,7 @@ fn retry_authenticates_pages_and_damage_stops_all_handles_after_restoration() {
         assert!(peer.write_at(0, b"refused").is_err());
         assert!(peer.sync_data().is_err());
         assert!(backing.check_freshness().is_err());
+        assert_eq!(stop_cause(&backing), cause, "the first cause stays");
     }
 }
 
@@ -262,6 +281,10 @@ fn missing_or_invalid_page_errors_still_stop_the_session() {
             .arena
             .fail_read(0, io::Error::new(kind, "invalid referenced page"));
         assert_eq!(file.read_at(0, &mut [0; 1]).unwrap_err().kind(), kind);
+        assert_eq!(
+            stop_cause(&backing),
+            "arena page read failed: invalid referenced page"
+        );
         assert!(fixture.arena.read_fault.lock().is_none());
         assert!(file.read_at(0, &mut [0; 1]).is_err());
         assert!(backing.check_freshness().is_err());
@@ -279,6 +302,13 @@ fn partial_arena_write_failure_still_requires_reopen() {
         Some(libc::EIO)
     );
     assert!(!fixture.arena.fail_write.load(Ordering::Relaxed));
+    assert_eq!(
+        stop_cause(&backing),
+        format!(
+            "arena page write failed: {}",
+            io::Error::from_raw_os_error(libc::EIO)
+        )
+    );
     assert_eq!(fixture.anchor(), anchor);
     assert!(file.read_at(0, &mut [0; 1]).is_err());
     assert!(file.sync_data().is_err());
@@ -288,5 +318,51 @@ fn partial_arena_write_failure_still_requires_reopen() {
     assert_eq!(
         read(reopened.open("data", false).unwrap().as_ref()),
         vec![0x52; 2 * PAGE as usize]
+    );
+}
+
+/// The rollback this backing detects at the page level: the bytes an older
+/// commit stored for a page, put back where the current manifest's page
+/// lives. They are what that page once held, but not what the witnessed
+/// manifest names, so the read fails authentication and stops the session,
+/// and putting the current bytes back does not resume it.
+#[test]
+fn an_older_page_put_back_stops_the_session_on_authentication() {
+    let (fixture, backing) = Fixture::new();
+    let file = backing.open("data", false).unwrap();
+    let arena = &fixture.arena.inner;
+    let older_offset = first_page_offset(&backing);
+    let mut older = vec![0; PAGE as usize];
+    arena.read_at(older_offset, &mut older).unwrap();
+    file.write_at(0, &[0x63; PAGE as usize]).unwrap();
+    file.sync_data().unwrap();
+    let current_offset = first_page_offset(&backing);
+    assert_ne!(current_offset, older_offset, "a commit copies on write");
+    let mut current = vec![0; PAGE as usize];
+    arena.read_at(current_offset, &mut current).unwrap();
+
+    arena.write_at(current_offset, &older).unwrap();
+    let error = file.read_at(0, &mut [0; 1]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        stop_cause(&backing),
+        "rollback arena page authentication failed"
+    );
+    arena.write_at(current_offset, &current).unwrap();
+    assert!(file.read_at(0, &mut [0; 1]).is_err());
+    assert!(backing.check_freshness().is_err());
+    assert_eq!(
+        stop_cause(&backing),
+        "rollback arena page authentication failed"
+    );
+
+    drop((file, backing));
+    let reopened = fixture.reopen();
+    assert_eq!(reopened.session_stopped(), None);
+    let mut expected = vec![0x52; 2 * PAGE as usize];
+    expected[..PAGE as usize].fill(0x63);
+    assert_eq!(
+        read(reopened.open("data", false).unwrap().as_ref()),
+        expected
     );
 }
