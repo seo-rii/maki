@@ -37,10 +37,10 @@
 //!
 //! A data file is created at its physical size and synced before the shard
 //! is used, so a shorter file was truncated (media damage), unless the shard
-//! was never checkpointed into (uncataloged, empty allocation map: creation
-//! never finished, and after a failed sync plus a restart even a full-size
-//! page-cache view proves nothing — the size is re-established before the
-//! shard is written to or cataloged). A truncated file's cleared slots
+//! was never written into (uncataloged, empty allocation map, no slot header
+//! below the end of the file: creation never finished, and after a failed
+//! sync plus a restart even a full-size page-cache view proves nothing — the
+//! size is re-established before the shard is written to or cataloged). A truncated file's cleared slots
 //! beyond the end are marked allocated at open, because the next slot write
 //! past the end would zero-fill them and turn the evidence into holes; they
 //! read as EIO until rewritten (`ShortFile`, `prove_data_file`).
@@ -75,9 +75,10 @@ pub enum SlotRead {
 /// it never legitimately ends before a slot once the shard is in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShortFile {
-    /// Not named by the loaded catalog copy and with an empty allocation
-    /// map: no checkpoint ever wrote into the shard, so its creation never
-    /// finished and nothing proves the file's size durable — the `set_len`
+    /// Not named by the loaded catalog copy, with an empty allocation map
+    /// and no written slot header below the end of the file: nothing ever
+    /// wrote into the shard, so its creation never finished and nothing
+    /// proves the file's size durable — the `set_len`
     /// was lost with the crash (short file), or its sync failed before a
     /// plain restart and the page cache still shows the full size (K-01).
     /// No slot holds data, so its holes are holes; the size is
@@ -105,7 +106,7 @@ struct Shard {
     /// and their dirents before this flag is set.
     map_stored: bool,
     /// The data file's physical size is not proven durable (short at open,
-    /// or never checkpointed into). `prove_data_file` re-establishes and
+    /// or never written into). `prove_data_file` re-establishes and
     /// syncs it before the first slot write into the shard and before the
     /// shard is cataloged, after persisting the damage marks the extension
     /// would otherwise erase; a restart before then re-derives the same
@@ -235,8 +236,8 @@ fn catalog_store(geometry: &Geometry) -> AbStore {
 
 /// What the slot of a unit whose allocation bit is clear holds.
 enum Probe {
-    /// An all-zero header (or, in a shard never checkpointed into, a slot
-    /// beyond the end of the file): never written.
+    /// An all-zero header (or, in a shard never written into, a slot beyond
+    /// the end of the file): never written.
     Unwritten,
     /// A header for this unit: the allocation copy is behind the slot.
     Header(SlotHeader),
@@ -292,6 +293,42 @@ fn probe_header(
         .ok()
         .filter(|h| h.unit_index == unit)
         .map_or(Probe::Damaged, Probe::Header))
+}
+
+/// Whether a slot of a shard data file, at a position of the device, has
+/// header bytes below the end of the file that are not all zero (a header
+/// the end of the file cuts counts with the part that remains). Only a slot
+/// write puts bytes there, and the data file's size is proven durable
+/// before the first slot write into a shard (`prove_data_file`, or the
+/// synced creation in `ensure_shard`): such a file is not one whose
+/// creation never finished, whatever its catalog and allocation copies say.
+/// One header read per slot, stopping at the first written one.
+fn holds_written_slot(
+    geometry: &Geometry,
+    data: &dyn BackingFile,
+    shard: u64,
+    in_device: u64,
+    len: u64,
+    progress: &crate::recovery::RecoveryProgress<'_>,
+) -> Result<bool, CoreError> {
+    let mut header = [0u8; 64];
+    for in_shard in 0..in_device {
+        if in_shard > 0 && in_shard.is_multiple_of(256) {
+            progress();
+        }
+        let offset = geometry.slot_offset(in_shard);
+        if offset >= len {
+            break;
+        }
+        let part = &mut header[..(len - offset).min(64) as usize];
+        let unit = shard * geometry.units_per_shard() + in_shard;
+        data.read_at(offset, part)
+            .map_err(|error| slot_read_error(unit, "slot", error))?;
+        if part.iter().any(|b| *b != 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Only these slots belong to the export; the on-disk maps use full shard geometry.
@@ -556,19 +593,40 @@ impl SlotStore {
             // shard's positions past the device's last unit never hold data
             // (R5-027).
             let in_device = addressable_units(&geometry, shard_idx);
-            // Creation finished ⇔ the shard was ever checkpointed into: the
+            // Creation finished ⇔ the shard was ever written into: the
             // catalog names it (its commit follows the synced full-size
-            // file), or an allocation copy lists a slot (a checkpoint wrote
-            // into it, and the size had been proven before that write). A
+            // file), an allocation copy lists a slot (a checkpoint wrote
+            // into it, and the size had been proven before that write), or
+            // a slot holds a header (only a slot write puts bytes there, and
+            // every slot write follows `prove_data_file`). The catalog and
+            // the allocation maps are accelerators that can both fall back
+            // to a generation from before the first checkpoint into the
+            // shard; the slot headers below the end of the file cannot. A
             // leftover empty allocation copy alone proves nothing — an
             // earlier attempt can leave one behind after its never-dir-synced
             // data file vanished in the crash. Nor does the observed length:
             // after a failed sync and a plain restart the page cache shows
             // the full size that the disk does not have (K-01). Only a bit
             // at an in-device position lists a slot.
-            let short = if adopted.contains(&shard_idx)
+            let never_written = adopted.contains(&shard_idx)
                 && !(0..in_device).any(|in_shard| alloc.get(in_shard))
-            {
+                && !holds_written_slot(
+                    &geometry,
+                    data.as_ref(),
+                    shard_idx,
+                    in_device,
+                    len,
+                    progress,
+                )?;
+            if adopted.contains(&shard_idx) && !never_written && len < physical {
+                tracing::warn!(
+                    shard = shard_idx,
+                    len,
+                    "uncataloged shard data file holds written slots although no loaded \
+                     allocation copy lists one: its short file is truncation"
+                );
+            }
+            let short = if never_written {
                 if len < physical {
                     tracing::warn!(
                         shard = shard_idx,
