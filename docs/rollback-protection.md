@@ -330,7 +330,14 @@ manifest, and a witness directory that holds only `witness.lock` and
 `anchor.next`. The staged marker, the arena and the slots must each be a
 regular file with one name, which the creation writes again: a directory,
 a symbolic link, a FIFO or a file with a second name under one of those
-names is refused before anything changes, and named. Every volume that committed anything wrote its second slot,
+names is refused before anything changes, and named. A creation run as
+root that is killed between creating one of these files and giving it to
+the directory's owner leaves a file the daemon user may not open. Under
+the staged marker's name, which nothing reads, such a file is removed and
+the marker staged anew, so the daemon user's `volume create` continues
+in one run. An arena or a slot that the user running `volume create` may
+not open is refused before anything changes, with a message that says to
+give the file to that user (`chown`) and run the command again. Every volume that committed anything wrote its second slot,
 so `create` never creates over one, whatever the witness directory holds
 and short of both slots lost or zeroed entirely (an all-zero slot is an
 unwritten one): a witness mount that is missing (an empty directory in its
