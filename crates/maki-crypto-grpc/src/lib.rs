@@ -15,7 +15,9 @@
 //! status text and details are never read. A status tonic made locally from
 //! a TLS failure (its source holds a rustls error, as after a failed
 //! reconnect inside a cached channel) is an endpoint failure whatever its
-//! code; a status a peer sends has no source.
+//! code. Nothing a peer sends can put one there: a status decoded from its
+//! trailers has no source, and the chain of one made from an HTTP/2 reset
+//! or GOAWAY ends in an `h2::Error`, which has no source of its own.
 //!
 //! The provider's private wire items erase their owned data on drop and field
 //! replacement. This does not erase tonic's separate codec or HTTP/TLS buffers.
@@ -103,11 +105,13 @@ pub fn map_status(status: &tonic::Status) -> CryptoError {
     // under it closes, the next call reconnects, and a handshake that fails
     // there (a server restarted with a certificate this client does not
     // trust) reaches the call as a status with the transport error as its
-    // source. Like a failed connection attempt it is an endpoint failure. A
-    // status a peer sends carries no source, so neither its code nor its
-    // text can claim one. A TLS 1.3 server's refusal of the client
-    // certificate also arrives inside the call, but the HTTP/2 library keeps
-    // only the kind and text of that error, so its status's code decides.
+    // source. Like a failed connection attempt it is an endpoint failure.
+    // Nothing a peer sends can claim one: a status decoded from trailers has
+    // no source, and the source chain of one made from an HTTP/2 reset or
+    // GOAWAY ends in an `h2::Error`, which has no source of its own (h2
+    // keeps an I/O error only as its kind and text). The same is why a TLS 1.3 server's
+    // refusal of the client certificate, which also arrives inside the
+    // call, is decided by its status's code.
     if let Some(error) = local_tls_failure(status) {
         return error;
     }

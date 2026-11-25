@@ -7,8 +7,9 @@
 //! error. That status is an endpoint failure too, and the channel is retired
 //! so the following call reconnects through the provider's own attempt.
 //!
-//! A status that a peer sends carries no source, so neither its code nor
-//! its text can claim a local TLS failure.
+//! Nothing a peer sends can claim a local TLS failure: a status decoded
+//! from its trailers has no source, and the source of one made from an
+//! HTTP/2 reset is an `h2::Error`, which has no source of its own.
 //!
 //! One case cannot be recognised: under TLS 1.3 a server checks the client
 //! certificate after the client has finished its side of the handshake, so
