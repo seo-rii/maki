@@ -68,6 +68,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "nbd_handshake"
+path = "fuzz_targets/nbd_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nbd_netlink"
+path = "fuzz_targets/nbd_netlink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backing_records"
+path = "fuzz_targets/backing_records.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

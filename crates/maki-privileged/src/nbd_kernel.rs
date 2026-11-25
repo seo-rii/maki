@@ -74,6 +74,9 @@ use std::time::{Duration, Instant};
 
 use netlink::{Unacknowledged, COMMAND_SEQUENCE, FAMILY_SEQUENCE};
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod handshake;
 pub(crate) mod netlink;
 

@@ -1113,6 +1113,7 @@ name = "maki-fuzz-harness"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "maki-backing",
  "maki-format",
  "maki-privileged",
  "uuid",

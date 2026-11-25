@@ -16,6 +16,10 @@ workspace = "../.."
 
 [dependencies]
 crc32fast.workspace = true
+# `fuzzing` exposes the decoders of maki-backing's own records and the
+# root helper's reading of the kernel's netlink answer; nothing else
+# enables it.
+maki-backing = { workspace = true, features = ["fuzzing"] }
 maki-format.workspace = true
-maki-privileged.workspace = true
+maki-privileged = { workspace = true, features = ["fuzzing"] }
 uuid.workspace = true

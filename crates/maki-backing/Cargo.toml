@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# `fuzzing` builds `maki_backing::fuzzing`, the fuzz harness's way into the
+# decoders of this crate's own records (fuzz/harness, target
+# backing_records). Only the harness enables it; it adds no dependency.
+[features]
+fuzzing = []
+
 [dependencies]
 thiserror.workspace = true
 parking_lot.workspace = true

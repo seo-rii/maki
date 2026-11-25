@@ -72,6 +72,13 @@ pub fn all() -> Vec<Seed> {
     add("config_parse", config_parse());
     add("endpoint_url", endpoint_url());
     add("probe_parsers", probe_parsers());
+    // The helper's code is Linux's. The kernel's netlink answers are in its
+    // byte order; the committed ones are little-endian.
+    #[cfg(target_os = "linux")]
+    add("nbd_handshake", crate::nbd::handshake_seeds());
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    add("nbd_netlink", crate::nbd::netlink_seeds());
+    add("backing_records", maki_backing::fuzzing::seeds());
     seeds
 }
 

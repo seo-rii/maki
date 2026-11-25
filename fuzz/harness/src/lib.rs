@@ -8,7 +8,12 @@
 //! (libFuzzer reports that as a crash), and otherwise returns whether the
 //! code accepted the input. [`seeds`] writes the committed seeds.
 
+#[cfg(target_os = "linux")]
+mod nbd;
 pub mod seeds;
+
+#[cfg(target_os = "linux")]
+pub use nbd::{nbd_handshake, nbd_netlink};
 
 use maki_format::ab::AbRecord;
 use maki_format::allocation::AllocationMap;
@@ -62,7 +67,29 @@ pub const TARGETS: &[Target] = &[
         name: "probe_parsers",
         entry: Some(probe_parsers),
     },
+    Target {
+        name: "nbd_handshake",
+        entry: NBD_HANDSHAKE,
+    },
+    Target {
+        name: "nbd_netlink",
+        entry: NBD_NETLINK,
+    },
+    Target {
+        name: "backing_records",
+        entry: Some(backing_records),
+    },
 ];
+
+// The root helper's kernel NBD code is built on Linux only.
+#[cfg(target_os = "linux")]
+const NBD_HANDSHAKE: Option<Entry> = Some(nbd_handshake);
+#[cfg(target_os = "linux")]
+const NBD_NETLINK: Option<Entry> = Some(nbd_netlink);
+#[cfg(not(target_os = "linux"))]
+const NBD_HANDSHAKE: Option<Entry> = None;
+#[cfg(not(target_os = "linux"))]
+const NBD_NETLINK: Option<Entry> = None;
 
 /// Every on-disk decoder of `maki-format`, on raw bytes. A decoder must
 /// reject any corrupt image with an error — never panic, over-allocate, or
@@ -270,6 +297,15 @@ pub fn config_parse(data: &[u8]) -> bool {
 /// policy). It must classify any string without panicking.
 pub fn endpoint_url(data: &[u8]) -> bool {
     std::str::from_utf8(data).is_ok_and(|text| parse_endpoint_url(text).is_ok())
+}
+
+/// The decoders of maki-backing's own records: the local witness's anchor,
+/// the remote enrollment binding, the remote witness's state, the rollback
+/// manifest and a manifest slot, and the name of a remote namespace
+/// (`maki_backing::fuzzing::records`, which describes the input). An input
+/// is accepted when the record decodes.
+pub fn backing_records(data: &[u8]) -> bool {
+    maki_backing::fuzzing::records(data)
 }
 
 /// The privileged helper's pure parsers, which read `/proc/self/mountinfo`

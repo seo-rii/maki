@@ -130,6 +130,31 @@ impl Enrollment {
     }
 }
 
+/// The binding's codec, for the fuzz harness ([`crate::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzzing {
+    use std::io;
+
+    pub(crate) const LENGTH: usize = super::LENGTH;
+    /// The bytes the checksum covers.
+    pub(crate) const COVERED: usize = 32;
+
+    /// The identity and the capacity that `bytes` binds.
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<([u8; 16], u64)> {
+        super::Enrollment::decode(bytes).map(|binding| (binding.identity, binding.capacity))
+    }
+
+    pub(crate) fn encode(identity: [u8; 16], capacity: u64) -> io::Result<[u8; LENGTH]> {
+        super::Enrollment { identity, capacity }.encode()
+    }
+
+    /// The checksum a binding whose first [`COVERED`] bytes are `covered`
+    /// ends with.
+    pub(crate) fn checksum(covered: &[u8]) -> [u8; 32] {
+        super::digest(super::DOMAIN, covered)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
