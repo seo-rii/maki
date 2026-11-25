@@ -56,6 +56,13 @@ documents.
   expects its path, is now refused with the usage and status 2 before
   anything is opened or created; `--help` after a command is refused the
   same way. A file whose name starts with `-` is named `./-name` (maki(8)).
+- **`maki-benchmark` exits 1 for a backing root that is a symbolic link to a
+  volume** (AUD-184, 2026-11-25;
+  [#391](https://github.com/seo-rii/maki/pull/391)). Without
+  `--destroy-data` it exited 2 and asked for that option. It now refuses the
+  root, which no backing follows through a symbolic link, with "the backing
+  root <root> (`backing.root`) is a symbolic link, which is not followed:
+  configure the directory itself", and exits 1.
 - **On RHEL 9 Maki is removed with `rpm -e maki`; `dnf remove maki` is always
   refused** (AUD-161, AUD-173, 2026-11-24;
   [#384](https://github.com/seo-rii/maki/pull/384)). rpm cannot stop a
@@ -947,17 +954,20 @@ documents.
   the setting that names it (`backing.root`,
   `backing.rollback_protection.witness_root`) and what to check, where they
   printed the bare system error; `check` and `inspect` word a backing root
-  this way for plain volumes too, and `maki-benchmark` on a symbolically
-  linked backing root that holds a volume exits 1 where it exited 2. A local
-  backing without its format marker is offered `volume create` only where
-  `create` continues it; otherwise the refusal names the entries that stop
-  a creation, such as a `lost+found`. `volume create` refuses a root whose
-  arena, manifest slot or staged marker is not a regular file with one name
-  before it publishes anything, where it published its marker and then
-  failed at every run; it removes a staged marker that its user may not
-  open, as a creation run as root and killed before it gave the file away
-  leaves one, and continues in one run; and it refuses an arena or slot its
-  user may not open with the way out (`chown`, `chmod`)
+  this way for plain volumes too. A local backing without its format
+  marker is offered `volume create` only where `create` continues it;
+  otherwise the refusal names the entries that stop a creation, such as a
+  `lost+found`. `volume create` refuses a root whose arena, manifest slot or
+  staged marker is not a regular file with one name before it publishes
+  anything and names the entry. It used to publish its marker and then fail
+  at every run for such an arena, fail every run before the marker for a
+  link or a directory under the staged marker's name, and fail with the
+  bare system error for a slot; a FIFO or a second name under the staged
+  marker's name, which the failed first run removed, is now refused until
+  it is removed. It removes a staged marker that its user may not open, as
+  a creation run as root and killed before it gave the file away leaves
+  one, and continues in one run; and it refuses an arena or slot its user
+  may not open with the way out (`chown`, `chmod`)
   ([local creation](docs/rollback-protection.md#local-configuration-and-creation)).
 - **2026-11-24 eighth round: `maki-attach` messages** (AUD-166, AUD-168;
   [#385](https://github.com/seo-rii/maki/pull/385)). An executed connect step
