@@ -21,6 +21,13 @@ use maki_backing::RollbackBacking;
 const WITNESS_KEY: &str = "backing.rollback_protection.witness_root";
 const ROOT_KEY: &str = "backing.root";
 
+/// A backing root and a witness directory on another filesystem.
+fn pair() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+    let root = tempfile::tempdir().unwrap();
+    let witness = other_filesystem::tempdir(root.path())?;
+    Some((root, witness))
+}
+
 fn open_error(root: &Path, witness: &Path) -> io::Error {
     RollbackBacking::open(root, witness)
         .err()
@@ -83,6 +90,74 @@ fn a_witness_path_that_is_a_file_is_named_with_its_setting() {
         io::ErrorKind::InvalidInput,
         "is not a directory",
     );
+}
+
+#[test]
+fn a_backing_root_that_is_a_file_is_named_with_its_setting() {
+    let parent = tempfile::tempdir().unwrap();
+    let witness = tempfile::tempdir().unwrap();
+    let root = parent.path().join("volume");
+    std::fs::write(&root, b"").unwrap();
+    let error = open_error(&root, witness.path());
+    assert_names(
+        &error,
+        &root,
+        ROOT_KEY,
+        io::ErrorKind::NotADirectory,
+        "is not a directory",
+    );
+}
+
+/// A configured path is never followed through a symbolic link, and one
+/// that leads through a file is not a directory either. The refusal says
+/// which, and keeps the kind opening the pair has always given: only a
+/// witness path that is, followed, something other than a directory is
+/// InvalidInput; the others are the system's NotADirectory.
+#[test]
+fn a_path_that_is_not_a_directory_is_named_with_what_is_wrong() {
+    let Some((root, witness)) = pair() else {
+        return;
+    };
+    drop(RollbackBacking::create(root.path(), witness.path(), 4 * 4096).unwrap());
+    drop(RollbackBacking::open(root.path(), witness.path()).unwrap());
+    let links = tempfile::tempdir().unwrap();
+    let to_witness = links.path().join("witness");
+    std::os::unix::fs::symlink(witness.path(), &to_witness).unwrap();
+    let to_parent = links.path().join("parent");
+    std::os::unix::fs::symlink(witness.path().parent().unwrap(), &to_parent).unwrap();
+    let through = to_parent.join(witness.path().file_name().unwrap());
+    let file = links.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let under_file = file.join("witness");
+    let to_file = links.path().join("to-file");
+    std::os::unix::fs::symlink(&file, &to_file).unwrap();
+    for (path, kind, says) in [
+        (
+            &to_witness,
+            io::ErrorKind::NotADirectory,
+            "is a symbolic link, which is not followed",
+        ),
+        (
+            &through,
+            io::ErrorKind::NotADirectory,
+            "is reached through a symbolic link",
+        ),
+        (
+            &under_file,
+            io::ErrorKind::NotADirectory,
+            "a component of its path is not a directory",
+        ),
+        (
+            &to_file,
+            io::ErrorKind::InvalidInput,
+            "is a symbolic link, which is not followed",
+        ),
+    ] {
+        let error = open_error(root.path(), path);
+        assert_names(&error, path, WITNESS_KEY, kind, says);
+    }
+    // The pair itself still opens.
+    drop(RollbackBacking::open(root.path(), witness.path()).unwrap());
 }
 
 /// Restores a directory's mode before it is removed.
