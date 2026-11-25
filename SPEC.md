@@ -1611,12 +1611,17 @@ slot has an all-zero header and would read as a hole. Open therefore marks
 every cleared slot beyond the end *allocated* (persisted before the file is
 grown back), so it reads as allocated-but-invalid, EIO, until it is
 rewritten. The only legitimately short data file belongs to a shard that was
-never checkpointed into: not named by the loaded catalog copy and with an
-empty allocation map (a stale empty copy from an earlier creation attempt
-proves nothing). Its creation (§14) never finished, so no slot of it holds
+never written into: not named by the loaded catalog copy, with an empty
+allocation map (a stale empty copy from an earlier creation attempt proves
+nothing), and with no slot below the end of the file whose header bytes are
+not all zero. Its creation (§14) never finished, so no slot of it holds
 data and its holes stay holes. Nothing proves such a file's size durable —
 not even a full-size page-cache view after a restart (§27) — so the
 size is set and synced again before the shard is written to or cataloged.
+The catalog and the allocation map can both fall back to a generation from
+before the first checkpoint into a shard; a written slot header cannot,
+since only a slot write puts bytes there and the file's size is proven
+before the first one, so such a header makes a short file a truncated one.
 
 ```text
 allocation bit = 1
@@ -1644,7 +1649,13 @@ slots the last checkpoint filled. Therefore:
   slot by slot at open and every slot with a valid header for its unit is
   marked allocated;
 - a cataloged shard with *no* valid allocation copy refuses attach
-  (offline repair territory), as does a missing data file.
+  (offline repair territory), as does a missing data file;
+- a shard the loaded catalog copy does not name and that has no data file
+  is found by its allocation map: a valid copy that lists a slot refuses
+  attach as well (a checkpoint wrote into the shard, so its data file was
+  lost), while one that lists nothing is what an interrupted creation
+  leaves (its maps are stored before the data directory sync that
+  publishes the data file) and the shard stays unwritten.
 
 Record layouts (notation in §21). A shard's allocation map is stored A/B as
 `data/shard-<index>.alloc.a` and `data/shard-<index>.alloc.b`, with `<index>`

@@ -13,7 +13,10 @@
 //! missing metadata. Every catalog commit publishes the whole in-memory
 //! catalog, so a shard adopted at open (see below) gets its map stored
 //! before *any* commit — the one in `persist_allocations` and the one made
-//! by another shard's creation alike (K-03).
+//! by another shard's creation alike (K-03). The loaded catalog copy is not
+//! trusted as durable either: after a failed sync and a plain restart it can
+//! exist only in the page cache (K-01), so a catalog that names a shard is
+//! stored again before the first record for a loaded shard is accepted.
 //!
 //! Allocation persistence: a shard's dirty flag is cleared only after the
 //! data-directory fsync that makes the fresh A/B copy's dirent durable has
@@ -34,10 +37,10 @@
 //!
 //! A data file is created at its physical size and synced before the shard
 //! is used, so a shorter file was truncated (media damage), unless the shard
-//! was never checkpointed into (uncataloged, empty allocation map: creation
-//! never finished, and after a failed sync plus a restart even a full-size
-//! page-cache view proves nothing — the size is re-established before the
-//! shard is written to or cataloged). A truncated file's cleared slots
+//! was never written into (uncataloged, empty allocation map, no slot header
+//! below the end of the file: creation never finished, and after a failed
+//! sync plus a restart even a full-size page-cache view proves nothing — the
+//! size is re-established before the shard is written to or cataloged). A truncated file's cleared slots
 //! beyond the end are marked allocated at open, because the next slot write
 //! past the end would zero-fill them and turn the evidence into holes; they
 //! read as EIO until rewritten (`ShortFile`, `prove_data_file`).
@@ -72,9 +75,10 @@ pub enum SlotRead {
 /// it never legitimately ends before a slot once the shard is in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShortFile {
-    /// Not named by the loaded catalog copy and with an empty allocation
-    /// map: no checkpoint ever wrote into the shard, so its creation never
-    /// finished and nothing proves the file's size durable — the `set_len`
+    /// Not named by the loaded catalog copy, with an empty allocation map
+    /// and no written slot header below the end of the file: nothing ever
+    /// wrote into the shard, so its creation never finished and nothing
+    /// proves the file's size durable — the `set_len`
     /// was lost with the crash (short file), or its sync failed before a
     /// plain restart and the page cache still shows the full size (K-01).
     /// No slot holds data, so its holes are holes; the size is
@@ -102,7 +106,7 @@ struct Shard {
     /// and their dirents before this flag is set.
     map_stored: bool,
     /// The data file's physical size is not proven durable (short at open,
-    /// or never checkpointed into). `prove_data_file` re-establishes and
+    /// or never written into). `prove_data_file` re-establishes and
     /// syncs it before the first slot write into the shard and before the
     /// shard is cataloged, after persisting the damage marks the extension
     /// would otherwise erase; a restart before then re-derives the same
@@ -183,8 +187,15 @@ pub struct SlotStore {
     geometry: Geometry,
     catalog: ShardCatalog,
     catalog_ab: AbStore,
-    /// Shards adopted from the data directory that the loaded catalog copy
-    /// did not list; persisted with the next allocation persist.
+    /// The in-memory catalog is not proven durable in this store session:
+    /// it names shards adopted from the data directory that the loaded copy
+    /// did not list, or the loaded copy itself may be cache-only after a
+    /// failed sync and a plain restart (K-01). Stored by the next
+    /// allocation persist, which every reservation of a loaded shard runs
+    /// first, so no write record is accepted while a shard's entry is
+    /// volatile. A v3 discard tombstone is appended without a reservation;
+    /// it needs no slot, and replay applies it to the shard in memory,
+    /// cataloged or adopted, so a volatile entry puts nothing at risk.
     catalog_dirty: bool,
     // Counts of shards that still need the corresponding metadata barrier.
     // A failed barrier keeps its count until directory durability is proven.
@@ -228,8 +239,8 @@ fn catalog_store(geometry: &Geometry) -> AbStore {
 
 /// What the slot of a unit whose allocation bit is clear holds.
 enum Probe {
-    /// An all-zero header (or, in a shard never checkpointed into, a slot
-    /// beyond the end of the file): never written.
+    /// An all-zero header (or, in a shard never written into, a slot beyond
+    /// the end of the file): never written.
     Unwritten,
     /// A header for this unit: the allocation copy is behind the slot.
     Header(SlotHeader),
@@ -285,6 +296,42 @@ fn probe_header(
         .ok()
         .filter(|h| h.unit_index == unit)
         .map_or(Probe::Damaged, Probe::Header))
+}
+
+/// Whether a slot of a shard data file, at a position of the device, has
+/// header bytes below the end of the file that are not all zero (a header
+/// the end of the file cuts counts with the part that remains). Only a slot
+/// write puts bytes there, and the data file's size is proven durable
+/// before the first slot write into a shard (`prove_data_file`, or the
+/// synced creation in `ensure_shard`): such a file is not one whose
+/// creation never finished, whatever its catalog and allocation copies say.
+/// One header read per slot, stopping at the first written one.
+fn holds_written_slot(
+    geometry: &Geometry,
+    data: &dyn BackingFile,
+    shard: u64,
+    in_device: u64,
+    len: u64,
+    progress: &crate::recovery::RecoveryProgress<'_>,
+) -> Result<bool, CoreError> {
+    let mut header = [0u8; 64];
+    for in_shard in 0..in_device {
+        if in_shard > 0 && in_shard.is_multiple_of(256) {
+            progress();
+        }
+        let offset = geometry.slot_offset(in_shard);
+        if offset >= len {
+            break;
+        }
+        let part = &mut header[..(len - offset).min(64) as usize];
+        let unit = shard * geometry.units_per_shard() + in_shard;
+        data.read_at(offset, part)
+            .map_err(|error| slot_read_error(unit, "slot", error))?;
+        if part.iter().any(|b| *b != 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Only these slots belong to the export; the on-disk maps use full shard geometry.
@@ -410,10 +457,19 @@ impl SlotStore {
             .load::<ShardCatalog>(backing.as_ref())?
             .ok_or_else(|| CoreError::Corrupt("no valid shard catalog".to_string()))?;
 
-        let mut catalog_dirty = false;
+        // A catalog copy that names a shard is no more proven durable than
+        // the allocation copies loaded below: after a failed sync and a plain
+        // restart the page cache still shows it (K-01). Store it again
+        // (preserve-first) before a record for any shard it names is
+        // accepted (SPEC §14), as the allocation maps are. The empty
+        // catalog of a new volume names nothing and is left as created.
+        let mut catalog_dirty = !catalog.is_empty();
         let mut orphans: Vec<u64> = Vec::new();
-        // Only shard data file names matter here, and they are ASCII: any
-        // other entry, one whose name is not UTF-8 included, is ignored.
+        // Shards with an allocation-map copy, whether or not they have a
+        // data file (see below).
+        let mut mapped: BTreeSet<u64> = BTreeSet::new();
+        // Only shard file names matter here, and they are ASCII: any other
+        // entry, one whose name is not UTF-8 included, is ignored.
         let data_entries = backing
             .list_skipping_non_utf8(layout::DATA_DIR)
             .map_err(|e| match e.kind() {
@@ -428,6 +484,8 @@ impl SlotStore {
                 if !catalog.contains(idx) && idx < geometry.num_shards() {
                     orphans.push(idx);
                 }
+            } else if let Some(idx) = layout::parse_shard_alloc(&name) {
+                mapped.insert(idx);
             }
         }
         orphans.sort_unstable();
@@ -440,6 +498,40 @@ impl SlotStore {
             catalog_dirty = true;
         }
         let adopted: BTreeSet<u64> = orphans.into_iter().collect();
+        // A shard the loaded catalog copy does not name and that has no data
+        // file is found by its allocation map. A map that lists a slot was
+        // stored by a checkpoint (or by open marking a truncated file's
+        // slots), and a checkpoint writes into a shard only after its
+        // creation made the data file and its dirent durable: the shard's
+        // data is lost, and attach refuses, as for a cataloged shard whose
+        // data file is missing. A map that lists nothing is what an
+        // interrupted creation leaves (its maps are stored before the data
+        // directory sync that publishes the data file): never written into,
+        // so its units read as zeros and the next write creates the shard.
+        for idx in mapped {
+            if catalog.contains(idx) || idx >= geometry.num_shards() {
+                continue;
+            }
+            let alloc_ab = map_store(
+                layout::shard_alloc_a(idx),
+                layout::shard_alloc_b(idx),
+                &geometry,
+            );
+            let Some(alloc) = alloc_ab.load::<AllocationMap>(backing.as_ref())? else {
+                continue;
+            };
+            if alloc.units() != geometry.units_per_shard() {
+                return Err(CoreError::Corrupt(format!(
+                    "shard {idx}: allocation map size mismatch"
+                )));
+            }
+            if (0..addressable_units(&geometry, idx)).any(|in_shard| alloc.get(in_shard)) {
+                return Err(CoreError::Corrupt(format!(
+                    "shard {idx}: data file missing: the loaded catalog copy does not name the \
+                     shard, but its allocation map lists written slots"
+                )));
+            }
+        }
         progress();
 
         let mut shards = HashMap::new();
@@ -504,19 +596,32 @@ impl SlotStore {
             // shard's positions past the device's last unit never hold data
             // (R5-027).
             let in_device = addressable_units(&geometry, shard_idx);
-            // Creation finished ⇔ the shard was ever checkpointed into: the
+            // Creation finished ⇔ the shard was ever written into: the
             // catalog names it (its commit follows the synced full-size
-            // file), or an allocation copy lists a slot (a checkpoint wrote
-            // into it, and the size had been proven before that write). A
+            // file), an allocation copy lists a slot (a checkpoint wrote
+            // into it, and the size had been proven before that write), or
+            // a slot holds a header (only a slot write puts bytes there, and
+            // every slot write follows `prove_data_file`). The catalog and
+            // the allocation maps are accelerators that can both fall back
+            // to a generation from before the first checkpoint into the
+            // shard; the slot headers below the end of the file cannot. A
             // leftover empty allocation copy alone proves nothing — an
             // earlier attempt can leave one behind after its never-dir-synced
             // data file vanished in the crash. Nor does the observed length:
             // after a failed sync and a plain restart the page cache shows
             // the full size that the disk does not have (K-01). Only a bit
             // at an in-device position lists a slot.
-            let short = if adopted.contains(&shard_idx)
+            let never_written = adopted.contains(&shard_idx)
                 && !(0..in_device).any(|in_shard| alloc.get(in_shard))
-            {
+                && !holds_written_slot(
+                    &geometry,
+                    data.as_ref(),
+                    shard_idx,
+                    in_device,
+                    len,
+                    progress,
+                )?;
+            let short = if never_written {
                 if len < physical {
                     tracing::warn!(
                         shard = shard_idx,
@@ -557,6 +662,7 @@ impl SlotStore {
                     len,
                     physical,
                     marked,
+                    uncataloged = adopted.contains(&shard_idx),
                     "shard data file truncated below its physical size; unlisted slots \
                      beyond its end are marked allocated and read as EIO until rewritten"
                 );
@@ -943,8 +1049,10 @@ impl SlotStore {
         //    at open needs its map on disk first as well (K-03 residual: an
         //    interrupted checkpoint after this commit, then a power loss,
         //    otherwise leaves a cataloged shard with no allocation copy,
-        //    which every later attach refuses).
+        //    which every later attach refuses), and every shard's size must
+        //    be proven, an adopted shard whose maps are stored included.
         self.commit_adopted_maps()?;
+        self.prove_unproven_data_files(&|| {})?;
         self.persist_discards()?;
         fp("store.shard_dirsync")?;
         self.backing.sync_dir(layout::DATA_DIR)?;
@@ -1002,6 +1110,31 @@ impl SlotStore {
         shard.data.set_len(physical)?;
         shard.data.sync_data()?;
         shard.short = None;
+        Ok(())
+    }
+
+    /// Prove the size of every loaded shard's data file that is not proven
+    /// yet (`short` is set), in shard order. Both catalog commits run this
+    /// first: a commit publishes the whole in-memory catalog, and a
+    /// cataloged shard's short file is truncation damage, so a shard whose
+    /// size was never proven must not be named. The map state does not tell
+    /// which shards need it: an adopted shard's maps can be stored while
+    /// the size proof that followed failed.
+    fn prove_unproven_data_files(
+        &mut self,
+        progress: &crate::recovery::RecoveryProgress<'_>,
+    ) -> Result<(), CoreError> {
+        let mut unproven: Vec<u64> = self
+            .shards
+            .iter()
+            .filter(|(_, s)| s.short.is_some())
+            .map(|(idx, _)| *idx)
+            .collect();
+        unproven.sort_unstable();
+        for idx in unproven {
+            self.prove_data_file(idx)?;
+            progress();
+        }
         Ok(())
     }
 
@@ -1162,21 +1295,11 @@ impl SlotStore {
         // with no allocation copy, which no later attach could open (K-03).
         // The commit also asserts every named shard's data-file size (a
         // cataloged shard's short file is truncation damage), so an adopted
-        // shard's size is proven first, as `commit_adopted_maps` does before
-        // `ensure_shard`'s commit: a zero-length orphan cataloged as is would
-        // read as damage (EIO) after the next power loss.
+        // shard's size is proven first, as `ensure_shard` does before its
+        // commit: a zero-length orphan cataloged as is would read as damage
+        // (EIO) after the next power loss.
         if self.catalog_dirty {
-            let mut unproven: Vec<u64> = self
-                .shards
-                .iter()
-                .filter(|(_, s)| s.short.is_some())
-                .map(|(idx, _)| *idx)
-                .collect();
-            unproven.sort_unstable();
-            for idx in unproven {
-                self.prove_data_file(idx)?;
-                progress();
-            }
+            self.prove_unproven_data_files(progress)?;
             fp("store.catalog_store")?;
             self.catalog_ab
                 .store(self.backing.as_ref(), &mut self.catalog)?;

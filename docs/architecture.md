@@ -291,7 +291,8 @@ store adopts data files the catalog copy does not list and, for a shard with an
 invalid or absent allocation copy, audits its slot headers and repairs the map
 in memory (the next checkpoint persists it; the deep check reports it). Reading
 a cleared slot probes its header before answering zeros. A cataloged shard with
-no valid allocation copy at all refuses attach.
+no valid allocation copy at all refuses attach, as does a shard whose data file
+is missing while the catalog names it or its allocation map lists a slot.
 
 In debug builds the overlay, journal, and volume verify their invariants after
 every mutation (`check_invariants`), so the randomized suites described in

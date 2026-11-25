@@ -79,6 +79,19 @@ pub mod layout {
         format!("{DATA_DIR}/shard-{shard:08x}.alloc.b")
     }
 
+    /// Parse an allocation-map copy name (an entry of [`DATA_DIR`]) back to
+    /// its shard index. Only the exact spellings [`shard_alloc_a`] and
+    /// [`shard_alloc_b`] produce are accepted.
+    pub fn parse_shard_alloc(name: &str) -> Option<u64> {
+        let rest = name.strip_prefix("shard-")?;
+        let hex = rest
+            .strip_suffix(".alloc.a")
+            .or_else(|| rest.strip_suffix(".alloc.b"))?;
+        let index = u64::from_str_radix(hex, 16).ok()?;
+        let path = format!("{DATA_DIR}/{name}");
+        (shard_alloc_a(index) == path || shard_alloc_b(index) == path).then_some(index)
+    }
+
     pub fn shard_discard_a(shard: u64) -> String {
         format!("{DATA_DIR}/shard-{shard:08x}.discard.a")
     }

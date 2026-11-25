@@ -199,6 +199,45 @@ fn cached_b_after_failed_sync_is_redirtied_before_fua() {
     assert_eq!(volume.read_ct(0).unwrap().unwrap().1, vec![0x51; 520]);
 }
 
+/// The catalog copy that first names a shard is as unproven after a failed
+/// sync and a restart as its allocation copies: the next recovery reads it
+/// back from the page cache. A record for the shard must not be accepted
+/// until the catalog entry is durable again, or the next power loss leaves
+/// a shard that no catalog copy names under data acknowledged as durable.
+#[test]
+fn cached_catalog_entry_after_failed_sync_is_stored_before_fua() {
+    let _serial = failpoints::test_lock();
+    for discard in [false, true] {
+        let backing = fixture(discard);
+        let mut volume = recover(&backing);
+        // Creation publishes the first catalog copy as side A; the store
+        // that names shard 0 therefore targets side B.
+        let target = layout::SHARD_CATALOG_B;
+        let armed = Arc::new(AtomicBool::new(true));
+        let observed = armed.clone();
+        backing.set_fault_hook(Some(Arc::new(move |op| match op {
+            FaultOp::SyncData { path }
+                if *path == target && observed.swap(false, Ordering::SeqCst) =>
+            {
+                Some(io::Error::other("catalog writeback EIO"))
+            }
+            _ => None,
+        })));
+        assert!(volume.write_ct(0, &[0x52; 520], true).is_err());
+        assert!(!armed.load(Ordering::SeqCst));
+        assert_eq!(volume.journal_appended_sequence(), 0);
+        backing.set_fault_hook(None);
+        drop(volume); // A plain restart: the page cache still names shard 0.
+        assert!(catalog(&backing).contains(0));
+        let mut volume = recover(&backing);
+        // No checkpoint before the power loss: a checkpoint stores the
+        // catalog too, and would hide whether the entry was durable before
+        // the record was accepted.
+        assert_eq!(volume.write_ct(0, &[0x53; 520], true).unwrap(), 1);
+        complete_and_power_loss(&backing, volume, &[0x53; 520]);
+    }
+}
+
 #[test]
 fn second_copy_sync_failure_denies_fua_and_same_process_retry_completes_it() {
     let _serial = failpoints::test_lock();
@@ -378,5 +417,75 @@ fn fresh_shard_prepares_metadata_before_fua_positive_control() {
         let mut volume = recover(&backing);
         assert_eq!(volume.write_ct(0, &[0x72; 520], true).unwrap(), 1);
         complete_and_power_loss(&backing, volume, &[0x72; 520]);
+    }
+}
+
+/// Fail the next `fdatasync` of `path` once; the flag says whether it fired.
+fn fail_next_sync_of(backing: &Arc<CrashableBacking>, path: String) -> Arc<AtomicBool> {
+    let armed = Arc::new(AtomicBool::new(true));
+    let observed = armed.clone();
+    backing.set_fault_hook(Some(Arc::new(move |op| match op {
+        FaultOp::SyncData { path: synced }
+            if *synced == path && observed.swap(false, Ordering::SeqCst) =>
+        {
+            Some(io::Error::other("data file writeback EIO"))
+        }
+        _ => None,
+    })));
+    armed
+}
+
+/// An adopted shard whose allocation copies were stored but whose data-file
+/// size could not be proven is still unproven: the catalog commit of another
+/// shard's creation names every shard in memory, the adopted one included,
+/// and must prove its size first, as the allocation persist's catalog
+/// commit does. Otherwise the next power loss leaves a cataloged shard whose
+/// file is shorter than its physical size, and every unit of it, none of
+/// which was ever written, reads as EIO.
+#[test]
+fn adopted_shard_whose_size_proof_failed_is_sized_before_another_shard_catalogs_it() {
+    let _serial = failpoints::test_lock();
+    let per_shard = geometry().units_per_shard();
+    for discard in [false, true] {
+        let backing = fixture(discard);
+        let mut volume = recover(&backing);
+        // Shard 0's creation fails at its data file's first sync.
+        let armed = fail_next_sync_of(&backing, layout::shard_data(0));
+        assert!(volume.write_ct(1, &[0x81; 520], true).is_err());
+        assert!(!armed.load(Ordering::SeqCst));
+        backing.set_fault_hook(None);
+        drop(volume); // A plain restart: the page cache still shows the file.
+        assert!(backing.exists(&layout::shard_data(0)).unwrap());
+        assert!(!catalog(&backing).contains(0));
+
+        // Shard 0 is adopted as never written into. The idle checkpoint
+        // stores its maps, then its size proof fails.
+        let mut volume = recover(&backing);
+        let armed = fail_next_sync_of(&backing, layout::shard_data(0));
+        assert!(volume.checkpoint().is_err());
+        assert!(!armed.load(Ordering::SeqCst));
+        backing.set_fault_hook(None);
+        // A write into shard 1 creates it and commits the whole catalog.
+        assert_eq!(
+            volume.write_ct(per_shard + 1, &[0x82; 520], true).unwrap(),
+            1
+        );
+        drop(volume);
+        backing.crash_all_lost();
+
+        let volume = recover(&backing);
+        for unit in 0..per_shard {
+            let read = volume.read_ct(unit);
+            assert!(
+                matches!(read, Ok(None)),
+                "discard {discard}: unit {unit} of the adopted shard was never written, \
+                 but reads {:?}",
+                read.map(|read| read.map(|(sequence, _)| sequence))
+            );
+        }
+        assert_eq!(
+            volume.read_ct(per_shard + 1).unwrap().unwrap().1,
+            vec![0x82; 520]
+        );
     }
 }
