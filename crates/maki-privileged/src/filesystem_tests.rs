@@ -17,6 +17,15 @@ struct FilesystemSystem {
     replace_mapping_after_probe: bool,
 }
 
+impl Clock for FilesystemSystem {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+}
+
 impl System for FilesystemSystem {
     fn lvm_preflight(
         &mut self,

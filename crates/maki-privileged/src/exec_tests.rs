@@ -376,15 +376,22 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let attributes = sysfs.join("nbd5");
     let mut closing = None;
-    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, Duration::from_secs(10), |step| {
-        closing = Some(std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            // The kernel removes them in this order.
-            std::fs::remove_file(attributes.join("pid")).unwrap();
-            std::fs::remove_file(attributes.join("backend")).unwrap();
-        }));
-        disconnects("/dev/nbd5")(step)
-    })
+    disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd5",
+        OURS,
+        Duration::from_secs(10),
+        &mut RealClock,
+        |step| {
+            closing = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                // The kernel removes them in this order.
+                std::fs::remove_file(attributes.join("pid")).unwrap();
+                std::fs::remove_file(attributes.join("backend")).unwrap();
+            }));
+            disconnects("/dev/nbd5")(step)
+        },
+    )
     .unwrap();
     assert_eq!(
         nbd_backend_at(&sysfs, "/dev/nbd5").unwrap(),
@@ -403,6 +410,7 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
         "/dev/nbd5",
         OURS,
         patience,
+        &mut RealClock,
         disconnects("/dev/nbd5"),
     )
     .expect_err("a device that still shows the connection")
@@ -421,10 +429,17 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
-    disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
-        std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
-        disconnects("/dev/nbd5")(step)
-    })
+    disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd5",
+        OURS,
+        patience,
+        &mut RealClock,
+        |step| {
+            std::fs::write(&backend, "maki-bootstrap-another\n").unwrap();
+            disconnects("/dev/nbd5")(step)
+        },
+    )
     .unwrap();
 
     // What cannot be read is not "gone". The kernel removes `pid` before
@@ -434,10 +449,17 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
     let fixture = Fixture::new();
     let sysfs = raw_sysfs(&fixture, &[("nbd5", true, Some(OURS))]);
     let backend = sysfs.join("nbd5/backend");
-    let error = disconnect_raw_with(&sysfs, "/dev/nbd5", OURS, patience, |step| {
-        std::fs::remove_file(&backend).unwrap();
-        disconnects("/dev/nbd5")(step)
-    })
+    let error = disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd5",
+        OURS,
+        patience,
+        &mut RealClock,
+        |step| {
+            std::fs::remove_file(&backend).unwrap();
+            disconnects("/dev/nbd5")(step)
+        },
+    )
     .expect_err("an unreadable device was taken for a disconnected one")
     .to_string();
     assert!(
@@ -455,8 +477,24 @@ fn a_raw_disconnect_waits_until_the_device_shows_no_connection() {
         ],
     );
     let no_request = |_: &PlannedStep| -> Result<(), ExecError> { panic!("a disconnect was sent") };
-    disconnect_raw_with(&sysfs, "/dev/nbd4", OURS, patience, no_request).unwrap();
-    assert!(disconnect_raw_with(&sysfs, "/dev/nbd6", OURS, patience, no_request).is_err());
+    disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd4",
+        OURS,
+        patience,
+        &mut RealClock,
+        no_request,
+    )
+    .unwrap();
+    assert!(disconnect_raw_with(
+        &sysfs,
+        "/dev/nbd6",
+        OURS,
+        patience,
+        &mut RealClock,
+        no_request
+    )
+    .is_err());
 }
 
 /// A step whose kernel answer could not be read stays an I/O error of its
@@ -534,6 +572,34 @@ enum BackendFault {
     Unreadable,
 }
 
+/// A device that goes on showing its connection after an acknowledged
+/// disconnect, as long as something has it open (udev's probe after the
+/// disconnect's change event): after the executor's sleep number `sleeps`
+/// since the disconnect, `then` happens.
+#[derive(Clone, Copy, Debug)]
+struct Linger {
+    sleeps: usize,
+    then: Released,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Released {
+    /// The last opener closes: the device shows no connection.
+    Gone,
+    /// Another netlink client connects the device under its own backend
+    /// identifier.
+    Replaced,
+    /// A client connects it without an identifier (`pid`, no `backend`),
+    /// which reads as unreadable.
+    Unreadable,
+}
+
+/// Where the manual clocks of the test systems start.
+fn manual_epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
 #[derive(Default)]
 struct FakeSystem {
     lvm_report: Option<serde_json::Value>,
@@ -550,6 +616,12 @@ struct FakeSystem {
     replace_on_failure: bool,
     replace_after_deactivate: bool,
     defer_disconnect: bool,
+    /// See [`Linger`]; the device the disconnect left lingering, and the
+    /// sleeps since.
+    linger: Option<Linger>,
+    lingering: Option<(String, usize)>,
+    /// The executor's waits, on a manual clock: every sleep, in order.
+    sleeps: Vec<Duration>,
     resource_after_disconnect: Option<&'static str>,
     obstruct_record_cleanup: Option<PathBuf>,
     mounted: bool,
@@ -616,6 +688,15 @@ impl InventorySystem {
             }
         }
         result
+    }
+}
+
+impl Clock for InventorySystem {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.inner.sleep(duration);
     }
 }
 
@@ -892,6 +973,35 @@ fn lvm_preflight_cachevol_metadata_never_reaches_activation() {
     assert!(!system.steps.contains(&"lvm-activate"));
 }
 
+impl Clock for FakeSystem {
+    fn now(&self) -> Instant {
+        manual_epoch() + self.sleeps.iter().sum::<Duration>()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.sleeps.push(duration);
+        let Some((device, slept)) = &mut self.lingering else {
+            return;
+        };
+        *slept += 1;
+        let Some(linger) = self.linger.filter(|linger| linger.sleeps == *slept) else {
+            return;
+        };
+        let device = device.clone();
+        self.lingering = None;
+        match linger.then {
+            Released::Gone => {
+                self.backends.remove(&device);
+            }
+            Released::Replaced => {
+                self.backends.insert(device, "other-connection".into());
+            }
+            Released::Unreadable => {
+                self.backend_fault_after = Some(("nbd-disconnect", BackendFault::Unreadable));
+            }
+        }
+    }
+}
+
 impl System for FakeSystem {
     fn lvm_preflight(
         &mut self,
@@ -1012,7 +1122,9 @@ impl System for FakeSystem {
                     .insert(device.clone(), identifier.unwrap().to_string());
             }
             PlannedStep::NbdDisconnect { device } => {
-                if !self.defer_disconnect {
+                if self.linger.is_some() {
+                    self.lingering = Some((device.clone(), 0));
+                } else if !self.defer_disconnect {
                     self.backends.remove(device);
                 }
                 match self.resource_after_disconnect {
@@ -1312,6 +1424,272 @@ fn acknowledged_but_incomplete_disconnect_preserves_cleanup_authority_for_retry(
         assert!(system.backends.is_empty());
         execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
         assert!(system.mounted);
+    }
+}
+
+/// Detach or cleanup of `request`'s attachment by `system`.
+fn tear_down(
+    verb: &str,
+    request: &AttachRequest,
+    state: &TrustedState,
+    system: &mut FakeSystem,
+) -> Result<(), ExecError> {
+    match verb {
+        "detach" => execute_with(&plan_detach(request), Some(state), system),
+        "cleanup" => cleanup_with(&plan_detach(request), state, system),
+        _ => unreachable!("{verb}"),
+    }
+}
+
+/// The kernel acknowledges a disconnect before the device lets go of the
+/// connection: it keeps `pid` and `backend` until the last opener has
+/// closed the device, and udev probes a device on the change event of every
+/// disconnect. Detach and cleanup wait for that as `nbd-disconnect` does,
+/// looking every 100 ms, and retire the record in the same run once the
+/// device shows no connection, without a second disconnect.
+#[test]
+fn detach_and_cleanup_wait_for_a_backend_that_outlives_its_disconnect() {
+    for verb in ["detach", "cleanup"] {
+        for sleeps in [1, 7, 150] {
+            let fixture = Fixture::new();
+            let state = fixture.state();
+            let request = request();
+            let mut system = FakeSystem::default();
+            execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+            system.steps.clear();
+            system.linger = Some(Linger {
+                sleeps,
+                then: Released::Gone,
+            });
+
+            tear_down(verb, &request, &state, &mut system)
+                .unwrap_or_else(|error| panic!("{verb}, {sleeps} sleeps: {error}"));
+
+            assert_eq!(
+                system.steps,
+                ["umount", "lvm-deactivate", "nbd-disconnect"],
+                "{verb}, {sleeps} sleeps"
+            );
+            assert_eq!(
+                system.sleeps,
+                vec![NBD_RELEASE_INTERVAL; sleeps],
+                "{verb}, {sleeps} sleeps"
+            );
+            assert!(
+                state.read("pg").unwrap().is_none(),
+                "{verb}, {sleeps} sleeps: the record was kept"
+            );
+            execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+            assert!(system.mounted, "{verb}, {sleeps} sleeps");
+        }
+    }
+}
+
+/// A device that still shows the connection when the wait is over keeps
+/// the record, with the refusal of a detach that does not wait, and a later
+/// run finishes once the opener has let go. The wait looks every 100 ms
+/// for 15 s.
+#[test]
+fn a_backend_that_outlives_the_wait_keeps_the_record() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.linger = Some(Linger {
+            sleeps: 151,
+            then: Released::Gone,
+        });
+
+        let error = tear_down(verb, &request, &state, &mut system)
+            .expect_err("retired the record of a device that shows the connection")
+            .to_string();
+
+        assert_eq!(
+            error,
+            "step \"nbd-identity\" failed: disconnect has not completed; keeping the attach \
+             record for cleanup retry",
+            "{verb}"
+        );
+        assert_eq!(
+            system.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"],
+            "{verb}"
+        );
+        assert_eq!(system.sleeps, vec![NBD_RELEASE_INTERVAL; 150], "{verb}");
+        assert_eq!(
+            system.sleeps.iter().sum::<Duration>(),
+            NBD_RELEASE_TIMEOUT,
+            "{verb}"
+        );
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{verb}");
+
+        // The opener lets go: the next run disconnects again, which the
+        // kernel acknowledges again, and finishes.
+        system.linger = None;
+        system.lingering = None;
+        system.steps.clear();
+        system.sleeps.clear();
+        tear_down(verb, &request, &state, &mut system).unwrap();
+        assert_eq!(system.steps, ["nbd-disconnect"], "{verb}");
+        assert!(system.sleeps.is_empty(), "{verb}");
+        assert!(state.read("pg").unwrap().is_none(), "{verb}");
+    }
+}
+
+/// A connection that another client makes while the device lets go of
+/// this one, under a backend identifier of its own, means that this one is
+/// gone, as for `nbd-disconnect`: the wait ends there. The device then
+/// carries a connection that is not the record's, so the record is kept as
+/// before, nothing touches that connection, and a later cleanup decides by
+/// the rules of a displaced record.
+#[test]
+fn another_connection_during_the_wait_ends_it_and_keeps_the_record() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.linger = Some(Linger {
+            sleeps: 3,
+            then: Released::Replaced,
+        });
+
+        let error = tear_down(verb, &request, &state, &mut system)
+            .expect_err("retired the record of a device that carries a connection")
+            .to_string();
+
+        assert!(
+            error.contains("disconnect has not completed"),
+            "{verb}: {error}"
+        );
+        assert_eq!(system.sleeps, vec![NBD_RELEASE_INTERVAL; 3], "{verb}");
+        assert_eq!(
+            system.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"],
+            "{verb}"
+        );
+        assert_eq!(
+            system.backends.get("/dev/nbd3").map(String::as_str),
+            Some("other-connection"),
+            "{verb}"
+        );
+        assert_eq!(state.read("pg").unwrap(), Some(record.clone()), "{verb}");
+
+        // The other connection is never disconnected, and the record goes
+        // only when the host shows that nothing of it remains, which this
+        // system cannot show.
+        system.steps.clear();
+        system.sleeps.clear();
+        let error = cleanup_with(&plan_detach(&request), &state, &mut system)
+            .expect_err("retired a displaced record without observing the host")
+            .to_string();
+        assert!(
+            error.contains("connected under another identity"),
+            "{verb}: {error}"
+        );
+        assert!(system.steps.is_empty(), "{verb}: {:?}", system.steps);
+        assert!(system.sleeps.is_empty(), "{verb}");
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{verb}");
+    }
+}
+
+/// A look that cannot be read ends the wait and fails the verb, as for
+/// `nbd-disconnect`: a connection without an identifier (an ioctl client's)
+/// is never taken for a released device. The record is kept.
+#[test]
+fn an_unreadable_backend_during_the_wait_fails_and_keeps_the_record() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.linger = Some(Linger {
+            sleeps: 2,
+            then: Released::Unreadable,
+        });
+
+        let error = tear_down(verb, &request, &state, &mut system)
+            .expect_err("an unreadable device was taken for a released one");
+
+        assert!(
+            error.to_string().contains("fixture backend unreadable"),
+            "{verb}: {error}"
+        );
+        assert_eq!(system.sleeps, vec![NBD_RELEASE_INTERVAL; 2], "{verb}");
+        assert_eq!(
+            system.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"],
+            "{verb}"
+        );
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{verb}");
+    }
+}
+
+/// The wait ends by the deadline the caller set for all of its commands
+/// (the failed-start hook's), as the disconnect step itself does: its last
+/// sleep is cut short to end there. A deadline that has passed leaves one
+/// look.
+#[test]
+fn the_wait_ends_by_the_callers_deadline() {
+    for budget in [Duration::from_millis(1950), Duration::ZERO] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.linger = Some(Linger {
+            sleeps: 151,
+            then: Released::Gone,
+        });
+
+        let started = Instant::now();
+        let error = {
+            let _bounded = command::finish_by(started + budget);
+            cleanup_with(&plan_detach(&request), &state, &mut system)
+        }
+        .expect_err("retired the record of a device that shows the connection");
+
+        assert!(
+            error.to_string().contains("disconnect has not completed"),
+            "{budget:?}: {error}"
+        );
+        let waited = system.sleeps.iter().sum::<Duration>();
+        assert!(waited <= budget, "{budget:?}: waited {waited:?}");
+        assert!(
+            system
+                .sleeps
+                .iter()
+                .all(|sleep| *sleep <= NBD_RELEASE_INTERVAL),
+            "{budget:?}: {:?}",
+            system.sleeps
+        );
+        if budget.is_zero() {
+            assert!(system.sleeps.is_empty(), "{:?}", system.sleeps);
+        } else {
+            // What the steps before the wait took of the budget is left out.
+            assert!(
+                waited + started.elapsed() >= budget,
+                "{budget:?}: waited {waited:?}"
+            );
+            assert!(
+                system.sleeps.last() < Some(&NBD_RELEASE_INTERVAL),
+                "{budget:?}: {:?}",
+                system.sleeps
+            );
+        }
+        assert_eq!(state.read("pg").unwrap(), Some(record), "{budget:?}");
     }
 }
 
@@ -2034,6 +2412,15 @@ impl ReviewForeignMountSystem {
     }
 }
 
+impl Clock for ReviewForeignMountSystem {
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+}
+
 impl System for ReviewForeignMountSystem {
     fn lvm_preflight(
         &mut self,
@@ -2204,6 +2591,15 @@ impl ObservedSystem {
         } else {
             String::new()
         }
+    }
+}
+
+impl Clock for ObservedSystem {
+    fn now(&self) -> Instant {
+        self.fake.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.fake.sleep(duration);
     }
 }
 

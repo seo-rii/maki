@@ -57,6 +57,8 @@ impl GrowthSystem {
     }
 }
 
+impl Clock for GrowthSystem {}
+
 impl System for GrowthSystem {
     fn run_step(&mut self, step: &PlannedStep, _: Option<&str>) -> Result<(), ExecError> {
         self.steps.push(step.kind());
