@@ -358,7 +358,7 @@ Events that matter operationally:
 | Level | Event |
 |---|---|
 | `ERROR` | control socket server stopped; shutdown during unload failed; panic caught at the NBD boundary; `maki-attach` rollback halted (attach record kept) |
-| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings; automatic remote namespace GC did not complete, or kept namespaces it could not examine or could not finish retiring |
+| `WARN` | checkpoint worker: journal sync failed / checkpoint failed; rollback session stopped; endpoint quarantined at attach; allocation map repaired from slot headers; adopted or truncated shard data file; swap policy findings; automatic remote namespace GC did not complete, or kept namespaces it could not examine or could not finish retiring |
 | `INFO` | default threshold; lifecycle milestones |
 | `DEBUG` | free-space query failures, control session lifecycle |
 
@@ -1443,6 +1443,15 @@ calls.
   daemon; recovery rebuilds the state from disk and keeps every write a FLUSH
   or FUA acknowledged. `maki drain` fails meanwhile, which is correct: it
   cannot prove durability through that state.
+- When the session of a rollback-protected volume stops (another writer took
+  the volume over or restored it, the witness changed, or the outcome of a
+  commit is uncertain; see [rollback protection](rollback-protection.md)),
+  every later request fails with EIO and `maki status` reports `state:
+  degraded` with a reason starting `rollback session stopped:`, and
+  `maki_volume_state` is 2, from the first request that finds it, and the log
+  has one `WARN` line with the cause. Nothing clears it. After a takeover or a
+  restore leave the daemon stopped; otherwise find out what changed the
+  witness before you restart it.
 - A volume configuration that is a symlink, has a second hard link, is owned
   by a user other than root and the loading process's user, or is writable by
   its group or others is refused before it is parsed, by the daemon (attach

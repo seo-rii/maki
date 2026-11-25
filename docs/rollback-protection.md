@@ -29,6 +29,8 @@ Replacing an old valid ciphertext page fails authentication against the current
 manifest. Restoring an older complete backing fails comparison with the current
 witness. Missing or corrupt committed evidence refuses attachment; an observed
 witness mismatch or uncertain storage commit stops every handle in that session.
+From then on `maki status` reports `state: degraded` with a reason starting
+`rollback session stopped:` and the daemon logs one `WARN` line with the cause.
 A transient arena read error refuses only that operation and preserves its I/O
 error. The next operation checks the witness and authenticates the page again;
 missing, short or invalid referenced pages and hash mismatches still stop the

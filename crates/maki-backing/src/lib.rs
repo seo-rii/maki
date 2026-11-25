@@ -196,6 +196,15 @@ pub trait Backing: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Why this backing's session stopped for good, if it has: a backing
+    /// with a freshness authority that observed a change it did not make,
+    /// or could not tell the outcome of its own commit, refuses every later
+    /// operation until the volume is opened again. Answers at once, without
+    /// storage or witness I/O, so a status query never waits for either.
+    fn session_stopped(&self) -> Option<String> {
+        None
+    }
+
     /// Open a file. With `create = true`, creates it (volatile until the
     /// parent directory is synced).
     fn open(&self, path: &str, create: bool) -> io::Result<Arc<dyn BackingFile>>;
