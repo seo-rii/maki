@@ -214,9 +214,25 @@ See [cache reload](operations.md#growth-and-cache-reload).
   attached a kernel NBD device did so through nbd-client (3.27.1 where the
   report names the version; 3.24 in the 2026-09-02 privileged run) and
   predates the helper's own connect; the others attached none. Unit
-  tests, tests against a real nbdkit and Maki's plugin, and a root-only kernel
-  test in CI (whose runners load the `nbd` module) cover the helper's connect;
-  no external campaign has run it yet.
+  tests, tests against a real nbdkit and Maki's plugin, a root-only kernel
+  test in CI (whose runners load the `nbd` module) and CI's whole attachments
+  (next item) cover the helper's connect; no external campaign has run it yet.
+- On every change, CI's `kernel-lifecycle` job drives whole attachments
+  through the kernel NBD, udev, device-mapper, LVM and XFS of a disposable
+  GitHub Ubuntu runner, not the Debian 12 primary platform
+  ([testing](testing.md#automated-ci)). The privileged runner attaches, writes
+  and fsyncs data, detaches while another process holds the device open, so
+  that the detach must wait until it closes (AUD-197), attaches again and
+  reads the data back, then kills nbdkit under the mount, cleans up without
+  it, starts a new nbdkit, attaches a third time and detaches. The Debian
+  guide's install steps, the quick start and its first-volume bootstrap
+  (AUD-199) then run as written on the package built from the same commit,
+  under systemd with the installed units, including the attach unit's
+  `ExecStop` cleanup on two planned stops. That is one local-provider volume
+  at a time on one runner kernel, and nbdkit is killed once, while the
+  filesystem is idle after a sync. How often something holds a device open at a detach on a production
+  host, and many volumes stopping together while their devices are held open,
+  have not been measured.
 
 ## Where the evidence lives
 
