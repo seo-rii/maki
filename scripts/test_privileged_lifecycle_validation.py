@@ -55,6 +55,8 @@ class LifecycleOrder(unittest.TestCase):
     def test_every_run_detaches_with_an_opener_and_attaches_again(self):
         self.assert_in_order(
             self.lifecycle,
+            # What the release checks look for is there before the detach.
+            '\nrequire_attached "the first attach"\n',
             # Written and fsynced, then hashed, while attached.
             'dd if=/dev/urandom of="$mountpoint/work/lifecycle.dat" bs=1M count=32 conv=fsync',
             'sync -f "$mountpoint/work"',
@@ -62,12 +64,15 @@ class LifecycleOrder(unittest.TestCase):
             # The detach's disconnect finds the device held open.
             "\nhold_device_open\n",
             "\nrun_helper detach maki-detach ||",
+            # The opener had closed the device when the detach returned.
+            "if ! grep -q ' closing after holding it ' \"$run_dir/detach-opener.txt\"; then",
             "\nfinish_opener\n",
             '\nrequire_released "detach with an opener of $device"\n',
             # Later attaches no longer create the sentinel.
             "s/^init_sentinel = true$/init_sentinel = false/",
             'sudo -n install -m 0600 -o root -g root "$run_dir/attach-reattach.toml" "$attach_config_path"',
             "\nrun_helper attach maki-reattach ||",
+            '\nrequire_attached "the second attach"\n',
             "\nrun_helper verify maki-verify-reattach ||",
             "\ncheck_lifecycle_data reattach\n",
             'if [[ "$kill_daemon" == true ]]; then\n',
@@ -90,6 +95,7 @@ class LifecycleOrder(unittest.TestCase):
             'config="$config_path" >>"$run_dir/nbdkit.log" 2>&1 &',
             'nbdinfo "$nbd_uri"',
             "\n    run_helper attach maki-attach-after-kill ||",
+            '\n    require_attached "the attach after nbdkit was killed"\n',
             "\n    run_helper verify maki-verify-after-kill ||",
             "\n    check_lifecycle_data restart\n",
             "\n    run_helper detach maki-detach-final ||",
@@ -185,8 +191,10 @@ class LifecycleFragments(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = SCRIPT.read_text()
-        cls.functions = fragment(source, "run_helper() {\n", 'log "writing and fsyncing')
+        cls.functions = fragment(source, "run_helper() {\n", '\nrequire_attached "the first attach"\n')
         cls.nbd_has_pid = fragment(source, "nbd_has_pid() {\n", "\n}\n") + "\n}\n"
+        cls.detach = fragment(source, 'log "detaching while another process holds $device open"\n',
+                              "\n# The sentinel exists now.")
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="maki-lifecycle-")
@@ -226,7 +234,7 @@ sudo() {
     case "$1" in
         env) shift 2; "$@" ;;
         blockdev) cat "$FIXTURE/size" ;;
-        test) [[ ! -e "$FIXTURE$3" ]] && return 1 || return 0 ;;
+        sh) shift; [[ -z "${SUDO_FAILS:-}" ]] || return 1; sh "$1" "$2" "$3" "$FIXTURE$4" ;;
         python3) shift 3; "$FIXTURE/opener" "$@" ;;
         *) return 98 ;;
     esac
@@ -272,6 +280,82 @@ sudo() {
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(message.replace("$mountpoint", str(self.root / "mnt")), result.stdout)
                 self.assertNotIn("PASS:", result.stdout)
+
+    def test_a_record_that_cannot_be_looked_for_fails_both_ways(self):
+        # sudo failing is no proof that the record is gone, or that it exists.
+        for check in ("require_released detach", "require_attached attach"):
+            with self.subTest(check=check):
+                self.setUp()
+                if check.startswith("require_attached"):
+                    self.attached()
+                result = self.run_fragment(check, SUDO_FAILS="1")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("DIE: could not look for the attach record "
+                              "/run/maki-attach/privval-1000-42.nbd", result.stdout)
+                self.assertNotIn("PASS:", result.stdout)
+
+    def attached(self):
+        (self.root / "mounted").touch()
+        (self.sysfs / "backend").write_text("maki-1529f24b\n")
+        (self.sysfs / "pid").write_text("123\n")
+        (self.root / "size").write_text("536870912\n")
+        (self.root / "run/maki-attach/privval-1000-42.nbd").write_text("{}")
+
+    def test_an_attachment_shows_what_a_teardown_must_remove(self):
+        # The positive control of require_released: what it looks for is
+        # there while attached, under the names it looks for.
+        self.attached()
+        result = self.run_fragment("require_attached attach")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: attach shows the mount, the connection maki-1529f24b and the attach "
+                      "record", result.stdout)
+        missing = {
+            "mount": (lambda: (self.root / "mounted").unlink(), "left $mountpoint unmounted"),
+            "backend": (lambda: (self.sysfs / "backend").unlink(),
+                        "left /dev/nbd15 without the attachment's backend identifier (none)"),
+            "foreign backend": (lambda: (self.sysfs / "backend").write_text("other\n"),
+                                "without the attachment's backend identifier (other)"),
+            "record": (lambda: (self.root / "run/maki-attach/privval-1000-42.nbd").unlink(),
+                       "left no attach record at /run/maki-attach/privval-1000-42.nbd"),
+        }
+        for name, (remove, message) in missing.items():
+            with self.subTest(missing=name):
+                self.setUp()
+                self.attached()
+                remove()
+                result = self.run_fragment("require_attached attach")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message.replace("$mountpoint", str(self.root / "mnt")), result.stdout)
+                self.assertNotIn("PASS:", result.stdout)
+
+    def run_detach(self, helper):
+        """The runner's detach section with an opener that closes the
+        device half a second after it starts holding it."""
+        self.opener('echo "  0.000s holding the device open; it shows backend \'maki-1\'"\n'
+                    'sleep 0.5\n'
+                    'echo "  0.500s closing after holding it 2.0 s more; the device shows backend \'maki-1\'"\n'
+                    'touch "$FIXTURE/closed"\n'
+                    'echo "  0.500s the connection\'s attributes outlived the acknowledged disconnect '
+                    'until the close"\n')
+        self.helper.write_text("#!/bin/sh\n" + helper)
+        return self.run_fragment(self.detach)
+
+    def test_a_detach_that_returns_before_the_opener_closed_the_device_fails(self):
+        # The helper returned without waiting: the device was still held.
+        result = self.run_detach('echo "detach returns at once"\n')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("DIE: maki-attach detach returned while the opener still held /dev/nbd15",
+                      result.stdout)
+        self.assertNotIn("PASS: detach waited", result.stdout)
+
+    def test_a_detach_that_returns_once_the_opener_closed_the_device_passes(self):
+        result = self.run_detach('for _ in $(seq 1 200); do [ -e "$FIXTURE/closed" ] && exit 0; '
+                                 'sleep 0.02; done\nexit 9\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: detach with an opener of /dev/nbd15 left no mount, holder, connection "
+                      "or attach record", result.stdout)
+        self.assertIn("PASS: detach waited for the opener to close /dev/nbd15 and completed in one run",
+                      result.stdout)
 
     def test_data_that_changed_after_the_detach_fails(self):
         work = self.root / "mnt/work"
@@ -326,7 +410,8 @@ sudo() {
 
 
 class ScriptedDevice:
-    """A device whose reads follow a script: True serves, an errno fails."""
+    """A device whose reads follow a script: True serves a block, an int
+    fails with that errno, ("bytes", n) returns n bytes."""
 
     def __init__(self, reads, on_close):
         self.reads = list(reads)
@@ -335,8 +420,11 @@ class ScriptedDevice:
 
     def read(self):
         outcome = self.reads.pop(0) if self.reads else True
-        if outcome is not True:
-            raise OSError(outcome, os.strerror(outcome))
+        if outcome is True:
+            return 4096
+        if isinstance(outcome, tuple):
+            return outcome[1]
+        raise OSError(outcome, os.strerror(outcome))
 
     def close(self):
         self.closed = True
@@ -362,9 +450,15 @@ class Opener(unittest.TestCase):
         cls.module = load_opener()
 
     def hold(self, reads, *, shown_at_failure="maki-1", gone_after_close=True, stop_after=None,
-             hold_seconds=2.0):
-        state = {"backend": "maki-1", "reads": 0}
+             hold_seconds=2.0, initial="maki-1", during_hold="maki-1"):
+        state = {"backend": initial, "reads": 0}
         clock = Clock()
+
+        def sleep(seconds):
+            # The backend the device shows while it is held after the failure.
+            if seconds == hold_seconds:
+                state["backend"] = during_hold
+            clock.sleep(seconds)
         output = []
 
         def on_close():
@@ -377,7 +471,7 @@ class Opener(unittest.TestCase):
         def read():
             state["reads"] += 1
             try:
-                original_read()
+                return original_read()
             except OSError:
                 state["backend"] = shown_at_failure
                 raise
@@ -386,7 +480,7 @@ class Opener(unittest.TestCase):
         status = self.module.hold(
             device, lambda: state["backend"],
             lambda: stop_after is not None and state["reads"] >= stop_after,
-            clock=clock, sleep=clock.sleep, say=output.append, hold_seconds=hold_seconds)
+            clock=clock, sleep=sleep, say=output.append, hold_seconds=hold_seconds)
         return status, "\n".join(output), device, clock
 
     def test_an_acknowledged_disconnect_while_held_open_is_the_expected_case(self):
@@ -403,9 +497,16 @@ class Opener(unittest.TestCase):
     def test_attributes_gone_while_held_open_are_refused(self):
         # The kernel would then not have kept the connection's attributes:
         # the detach's wait for its opener was not exercised.
-        status, output, _, _ = self.hold([True, errno.EIO], shown_at_failure=None)
-        self.assertEqual(status, 8, output)
-        self.assertIn("stopped showing the connection while it was held open", output)
+        for case in ({"shown_at_failure": None, "during_hold": None},
+                     {"shown_at_failure": "maki-2", "during_hold": "maki-2"},
+                     # Gone or another at the failure, shown again at the close.
+                     {"shown_at_failure": None}, {"shown_at_failure": "maki-2"},
+                     # Shown at the failure, gone before the close.
+                     {"during_hold": None}, {"during_hold": "maki-2"}):
+            with self.subTest(**case):
+                status, output, _, _ = self.hold([True, errno.EIO], **case)
+                self.assertEqual(status, 8, output)
+                self.assertIn("stopped showing the connection while it was held open", output)
 
     def test_attributes_that_outlive_the_close_are_refused(self):
         status, output, _, clock = self.hold([True, errno.EIO], gone_after_close=False)
@@ -413,11 +514,47 @@ class Opener(unittest.TestCase):
         self.assertIn("still shows a connection 5 s after the close", output)
 
     def test_a_failure_before_any_served_read_or_other_than_eio_is_refused(self):
-        status, output, _, _ = self.hold([errno.EIO])
+        status, output, device, _ = self.hold([errno.EIO])
         self.assertEqual(status, 6, output)
+        self.assertTrue(device.closed)
+        # A device that showed no connection when it was opened proves
+        # nothing about one, whatever its reads did.
+        status, output, device, _ = self.hold([True, True, errno.EIO], initial=None)
+        self.assertEqual(status, 6, output)
+        self.assertTrue(device.closed)
         status, output, _, _ = self.hold([True, errno.EINVAL])
         self.assertEqual(status, 7, output)
         self.assertIn("reported EINVAL, not EIO", output)
+
+    def test_a_short_read_is_not_a_served_read(self):
+        for count in (0, 512):
+            with self.subTest(count=count):
+                status, output, device, _ = self.hold([True, ("bytes", count), errno.EIO])
+                self.assertEqual(status, 9, output)
+                self.assertIn(f"refused: a read returned {count} bytes, not 4096", output)
+                self.assertTrue(device.closed)
+
+    def test_the_device_reads_one_whole_block_directly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "device"
+            path.write_bytes(bytes(range(256)) * 32)
+            try:
+                device = self.module.Device(str(path))
+            except OSError as error:
+                if error.errno == errno.EINVAL:
+                    self.skipTest(f"{directory} does not take O_DIRECT")
+                raise
+            try:
+                self.assertEqual(device.read(), 4096)
+                self.assertEqual(bytes(device.buffer[:4]), bytes([0, 1, 2, 3]))
+            finally:
+                device.close()
+            path.write_bytes(b"")
+            device = self.module.Device(str(path))
+            try:
+                self.assertEqual(device.read(), 0)
+            finally:
+                device.close()
 
     def test_a_stop_request_or_no_disconnect_ends_the_hold_without_a_verdict(self):
         status, output, device, _ = self.hold([], stop_after=2)

@@ -557,6 +557,30 @@ class KernelLifecycleJob(unittest.TestCase):
         # The quick start's attachment takes the lowest free device.
         self.assertNotEqual(device, "/dev/nbd0")
 
+    def test_the_essential_steps_are_not_skipped(self):
+        conditions = {name: re.findall(r"(?m)^        if: (.*)$", body) for name, body in self.steps}
+        for name in ("runner host", "load the NBD module", KERNEL_RUNNER_STEP):
+            self.assertEqual(conditions[name], [], name)
+        # Also after the runner failed: the quick start's verdict is its own.
+        for name in ("packaged binaries", QUICKSTART_STEP):
+            self.assertEqual(conditions[name], ["${{ !cancelled() }}"], name)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_runners_status_is_the_steps(self):
+        for status in ("0", "7"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "scripts").mkdir()
+                runner = root / "scripts/privileged-linux-validation.sh"
+                runner.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/../arguments"\n'
+                                  f'exit {status}\n')
+                runner.chmod(0o700)
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+                                         step_script(KERNEL_RUNNER_STEP)], cwd=root,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, status == "0", result.stdout + result.stderr)
+                self.assertEqual((root / "arguments").read_text().split(), self.runner_command()[1:])
+
     def test_the_package_from_this_commit_runs_the_documented_quick_start(self):
         # The package's tmpfiles close /run/maki to the runner's own nbdkit.
         order = [self.names.index(name) for name in (
@@ -691,7 +715,10 @@ class KernelLifecycleJob(unittest.TestCase):
             # Each tool's version under the command that printed it, also
             # where the tool is missing, and in the job's log.
             versions = (root / "temp/kernel-lifecycle-logs/versions.txt").read_text()
-            for command in ("uname -srvm", "nbdkit --version", "lvm version", "mkfs.xfs -V",
+            # LVM's version lines need root (it opens /dev/mapper/control)
+            # and its warnings about inherited descriptors suppressed.
+            for command in ("uname -srvm", "nbdkit --version",
+                            "sudo env LVM_SUPPRESS_FD_WARNINGS=1 lvm version", "mkfs.xfs -V",
                             "udevadm --version", "sudo --version"):
                 self.assertIn(f"$ {command}\n", versions)
             self.assertIn(versions, result.stdout)

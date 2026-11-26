@@ -70,6 +70,7 @@ class DocumentedSteps(unittest.TestCase):
         self.assertIn("install -m 0640 -o root -g maki demo.toml /etc/maki/volumes/demo.toml\n",
                       self.blocks[4])
 
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
     def test_the_program_holds_each_block_verbatim_in_order(self):
         program = self.driver.program(self.steps)
         position = 0
@@ -103,6 +104,7 @@ class DocumentedSteps(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "0 toml blocks"):
                     self.driver.configuration()
 
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
     def test_the_files_are_written_once(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "quickstart"
@@ -119,6 +121,51 @@ class DocumentedSteps(unittest.TestCase):
                 with self.assertRaises(FileExistsError), mock.patch("builtins.print"):
                     self.driver.main([str(target)])
                 self.assertEqual((target / name).read_text(), "an earlier run's\n")
+
+
+@unittest.skipUnless(shutil.which("bash"), "requires Bash")
+class UnguardedLists(unittest.TestCase):
+    """set -e does not stop at a failed command in an && or || list that is
+    not the last of its block, and the block's status is its last command's:
+    the program would go on. The writer refuses such a block, read as Bash
+    reads it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.driver = load_driver()
+
+    def test_a_list_before_the_last_command_is_refused(self):
+        for block in ("false && true\ntouch after", "false || false\ntouch after",
+                      "true\na && b; c", "{ a; } && b\nc",
+                      # Inside a subshell set -e does not stop at it either.
+                      "(\nset -e\na && b\nc\n)\nd"):
+            with self.subTest(block=block):
+                with self.assertRaises(ValueError) as raised:
+                    self.driver.program([("block one", "true"), ("block two", block)])
+                self.assertIn("block two has an && or || list before its last command",
+                              str(raised.exception))
+
+    def test_a_block_bash_cannot_read_is_refused_before_anything_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "ran"
+            for block in ("}\ntouch " + str(marker), "if true; then"):
+                with self.subTest(block=block):
+                    with self.assertRaisesRegex(ValueError, "Bash cannot read block two"):
+                        self.driver.program([("block two", block)])
+            self.assertFalse(marker.exists())
+
+    def test_lists_that_end_their_block_or_never_run_at_its_level_are_accepted(self):
+        for block in ("a && b && c", "a\nb || c", "f() {\n  a || return 1\n  b\n}\nc && d",
+                      "{ findmnt /srv/demo || echo unmounted; }",
+                      "bash <<'BASH'\na && b\nc || d\nBASH",
+                      "python3 - <<PY\nx = 1 if a and b else 2\nPY\nok",
+                      "if a; then\n  b\nfi\nc"):
+            with self.subTest(block=block):
+                self.driver.program([("block", block)])
+
+    def test_the_guides_have_no_unguarded_list(self):
+        # The program CI runs is written from them, so this is what CI runs.
+        self.driver.program(self.driver.steps())
 
 
 @unittest.skipUnless(shutil.which("bash"), "requires Bash")
@@ -153,10 +200,13 @@ class ProgramMechanics(unittest.TestCase):
 
     def test_the_first_failure_stops_the_program_and_names_its_step(self):
         cases = {
-            # Inside an && list, which set -e does not stop.
+            # An && list that ends the block: set -e does not stop at it, the
+            # block's status check does.
             "chain": "true && false && touch after-chain",
             # A command before the block's last.
             "sequence": "false\ntouch after-sequence",
+            # Any stage of a pipeline, before the block's last command too.
+            "pipeline": "false | cat\ntouch after-pipeline",
             "subshell": "(\nset -euo pipefail\nfalse\n)",
             "heredoc": "bash <<'BASH'\nexit 4\nBASH",
         }
