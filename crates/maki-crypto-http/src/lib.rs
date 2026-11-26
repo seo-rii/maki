@@ -974,9 +974,20 @@ impl HttpCryptoProvider {
         // The TLS configuration is the provider's, not reqwest's: reqwest's
         // own trusts only its compiled-in roots, never the host's store
         // (`client_tls_config`).
+        // The connect timeout gives each resolved address a share: hyper-
+        // util divides it equally among the addresses of each family and
+        // tries them one at a time, so one that never answers leaves the
+        // next one time (without it, the first held the request to its
+        // end). reqwest also bounds the whole connect, resolution and TLS
+        // included, by it. Equal to `timeout`, whose timer starts first, it
+        // never lets a connect outlast its request; a connect that hyper-
+        // util finishes in the background for its pool ends at this bound
+        // as well. The other family still starts after hyper-util's fixed
+        // 300 ms, which reqwest 0.12 does not expose.
         let tls = client_tls_config(spec.tls.as_ref())?;
         let client = reqwest::Client::builder()
             .timeout(spec.timeout)
+            .connect_timeout(spec.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
