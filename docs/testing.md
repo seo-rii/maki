@@ -191,10 +191,11 @@ failed command that `set -e` stops at, a pipeline included, and at a block
 whose last command failed, an `&&` list that ends the block included. `set
 -e` does not stop at a failure inside an `&&` or `||` list before a block's
 last command. The writer refuses a block that Bash cannot read, and one with
-`&&` or `||` on a line Bash prints at the block's own level, or in a subshell
-there, of a command before its last command (the last command's own lines are
-not read), matched as text, so a
-condition, a test expression or quoted text there is refused too. It does not
+`&&` or `||`, matched as text, on any line that Bash's `declare -f`
+prints at the block's own level (a subshell's commands print there too) up to
+the last such line, before the block's final printed line, that ends in `;` or
+holds a here-document's command; so a condition, a test expression or quoted
+text there is refused too. It does not
 see lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
 functions, nor a negated or a background command, where a failure lets the
 program go on; in the guides, apart from here-documents, which run in a
