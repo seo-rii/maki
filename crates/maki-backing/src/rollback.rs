@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::witness::FileWitness;
+use crate::witness::{Anchor, FileWitness};
 
 #[cfg(all(test, target_os = "linux"))]
 mod arena_read_tests;
@@ -25,10 +25,12 @@ pub mod gc;
 mod local_creation_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod local_load_tests;
+mod read_only;
 mod remote;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod review_restore;
 use crate::{configured, path, Backing, BackingFile, FileBacking, VolumeLock};
+pub use read_only::ReadOnlyRollbackBacking;
 use remote::Witness;
 
 const PAGE: u64 = 4096;
@@ -450,101 +452,12 @@ impl RollbackBacking {
         witness: impl FnOnce() -> io::Result<FileWitness>,
     ) -> io::Result<Self> {
         let disk_lock = disk.try_lock(LOCK)?;
-        let marker = disk.open(MARKER, false).map_err(|error| {
-            if error.kind() != io::ErrorKind::NotFound {
-                return error;
-            }
-            no_marker(disk.as_ref(), listing())
-        })?;
-        let mut magic = vec![0; MAGIC.len()];
-        if marker.len()? != MAGIC.len() as u64 {
-            return Err(invalid("invalid rollback format marker"));
-        }
-        marker.read_at(0, &mut magic)?;
-        if magic != MAGIC {
-            return Err(invalid("unsupported rollback format"));
-        }
+        let marker = open_marker(disk.as_ref(), listing)?;
         let witness = witness()?;
-        let anchor = witness.anchor();
-        let mut selected = None;
-        let mut storage_error = None;
-        for (slot, name) in MANIFESTS.iter().enumerate() {
-            let candidate = (|| {
-                let file = disk.open(name, false)?;
-                let mut header = [0; 8];
-                file.read_at(0, &mut header)?;
-                let len = u64::from_le_bytes(header);
-                // The length is unauthenticated. A canonical manifest fits
-                // its slot, so refuse one the file cannot hold before
-                // allocating for it.
-                if len == 0
-                    || len > manifest_bound(MAX_CAPACITY) - 8
-                    || len > file.len()?.saturating_sub(8)
-                {
-                    return Err(invalid("invalid rollback manifest length"));
-                }
-                let mut bytes = vec![0; len as usize];
-                file.read_at(8, &mut bytes)?;
-                if digest(b"maki.rollback.manifest.v1\0", &bytes) != anchor.root {
-                    return Err(invalid("manifest does not match independent witness"));
-                }
-                let (manifest, canonical) = parse_manifest(&bytes).map_err(|refusal| {
-                    invalid(match refusal {
-                        ManifestRefusal::Encoding => "invalid rollback manifest encoding",
-                        ManifestRefusal::Content => "invalid rollback manifest content",
-                        ManifestRefusal::Size => "invalid rollback manifest size",
-                    })
-                })?;
-                if canonical != bytes
-                    || manifest.identity != anchor.identity
-                    || manifest.generation != anchor.generation
-                    || file.len()? != manifest_bound(manifest.capacity)
-                {
-                    return Err(invalid("noncanonical or foreign rollback manifest"));
-                }
-                Ok(manifest)
-            })();
-            match candidate {
-                Ok(manifest) => {
-                    selected = Some((slot, manifest));
-                    break;
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound
-                            | io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::InvalidData
-                    ) => {}
-                Err(error) => {
-                    // A readable exact copy can still recover the backing.
-                    // If neither candidate can be authenticated, preserve
-                    // inability to read storage instead of claiming rollback.
-                    if storage_error.is_none() {
-                        storage_error = Some(error);
-                    }
-                }
-            }
-        }
-        let (slot, manifest) = selected.ok_or_else(|| {
-            storage_error.unwrap_or_else(|| {
-                invalid("no exact witnessed manifest: backing may be rolled back or incomplete")
-            })
-        })?;
-        let arena = disk.open(ARENA, false)?;
-        if arena.len()? != manifest.capacity * 2 {
-            return Err(invalid("rollback arena size mismatch"));
-        }
+        let (slot, manifest) = select_manifest(disk.as_ref(), witness.anchor())?;
+        let arena = open_arena(disk.as_ref(), &manifest)?;
         // Authenticate every committed extent before exposing readiness.
-        let mut bytes = vec![0; PAGE as usize];
-        for node in manifest.files.values() {
-            for page in node.pages.values() {
-                arena.read_at(page.slot * PAGE, &mut bytes)?;
-                if page_digest(&manifest.identity, &bytes) != page.hash {
-                    return Err(invalid("rollback arena page authentication failed"));
-                }
-            }
-        }
+        authenticate_pages(arena.as_ref(), &manifest)?;
         // File lengths and authenticated bytes do not prove that a sparse
         // backup/restore preserved physical reservations. Reestablish them
         // before any caller can depend on the recorded capacity promises.
@@ -556,6 +469,7 @@ impl RollbackBacking {
         // Re-dirty every selected page before admitting another writer. Keep
         // the buffer bounded, and recheck each page immediately before the
         // rewrite; all pages were authenticated before any mutation above.
+        let mut bytes = vec![0; PAGE as usize];
         for node in manifest.files.values() {
             for page in node.pages.values() {
                 arena.read_at(page.slot * PAGE, &mut bytes)?;
@@ -626,6 +540,143 @@ impl RollbackBacking {
             id,
         }
     }
+}
+
+/// Open the local format marker of `disk` and check that it is this
+/// format's. A missing marker is refused in the words of [`no_marker`], for
+/// which `listing` lists the witness directory.
+fn open_marker(
+    disk: &dyn Backing,
+    listing: impl FnOnce() -> io::Result<Vec<String>>,
+) -> io::Result<Arc<dyn BackingFile>> {
+    let marker = disk.open(MARKER, false).map_err(|error| {
+        if error.kind() != io::ErrorKind::NotFound {
+            return error;
+        }
+        no_marker(disk, listing())
+    })?;
+    let mut magic = vec![0; MAGIC.len()];
+    if marker.len()? != MAGIC.len() as u64 {
+        return Err(invalid("invalid rollback format marker"));
+    }
+    marker.read_at(0, &mut magic)?;
+    if magic != MAGIC {
+        return Err(invalid("unsupported rollback format"));
+    }
+    Ok(marker)
+}
+
+/// The manifest slot of `disk` that holds exactly the manifest `anchor`
+/// selects, and that manifest: its bytes hash to the anchor's root, are the
+/// canonical encoding of a valid manifest of the anchor's identity and
+/// generation, and the slot has the size of the manifest's capacity.
+fn select_manifest(disk: &dyn Backing, anchor: &Anchor) -> io::Result<(usize, Manifest)> {
+    let mut storage_error = None;
+    for (slot, name) in MANIFESTS.iter().enumerate() {
+        let candidate = (|| {
+            let file = disk.open(name, false)?;
+            let mut header = [0; 8];
+            file.read_at(0, &mut header)?;
+            let len = u64::from_le_bytes(header);
+            // The length is unauthenticated. A canonical manifest fits
+            // its slot, so refuse one the file cannot hold before
+            // allocating for it.
+            if len == 0
+                || len > manifest_bound(MAX_CAPACITY) - 8
+                || len > file.len()?.saturating_sub(8)
+            {
+                return Err(invalid("invalid rollback manifest length"));
+            }
+            let mut bytes = vec![0; len as usize];
+            file.read_at(8, &mut bytes)?;
+            if digest(b"maki.rollback.manifest.v1\0", &bytes) != anchor.root {
+                return Err(invalid("manifest does not match independent witness"));
+            }
+            let (manifest, canonical) = parse_manifest(&bytes).map_err(|refusal| {
+                invalid(match refusal {
+                    ManifestRefusal::Encoding => "invalid rollback manifest encoding",
+                    ManifestRefusal::Content => "invalid rollback manifest content",
+                    ManifestRefusal::Size => "invalid rollback manifest size",
+                })
+            })?;
+            if canonical != bytes
+                || manifest.identity != anchor.identity
+                || manifest.generation != anchor.generation
+                || file.len()? != manifest_bound(manifest.capacity)
+            {
+                return Err(invalid("noncanonical or foreign rollback manifest"));
+            }
+            Ok(manifest)
+        })();
+        match candidate {
+            Ok(manifest) => return Ok((slot, manifest)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::InvalidData
+                ) => {}
+            Err(error) => {
+                // A readable exact copy can still recover the backing.
+                // If neither candidate can be authenticated, preserve
+                // inability to read storage instead of claiming rollback.
+                if storage_error.is_none() {
+                    storage_error = Some(error);
+                }
+            }
+        }
+    }
+    Err(storage_error.unwrap_or_else(|| {
+        invalid("no exact witnessed manifest: backing may be rolled back or incomplete")
+    }))
+}
+
+/// Open the arena of `disk`, which must have the size `manifest`'s
+/// capacity gives it.
+fn open_arena(disk: &dyn Backing, manifest: &Manifest) -> io::Result<Arc<dyn BackingFile>> {
+    let arena = disk.open(ARENA, false)?;
+    if arena.len()? != manifest.capacity * 2 {
+        return Err(invalid("rollback arena size mismatch"));
+    }
+    Ok(arena)
+}
+
+/// Authenticate every page `manifest` references in `arena` against its
+/// digest.
+fn authenticate_pages(arena: &dyn BackingFile, manifest: &Manifest) -> io::Result<()> {
+    let mut bytes = vec![0; PAGE as usize];
+    for node in manifest.files.values() {
+        for page in node.pages.values() {
+            arena.read_at(page.slot * PAGE, &mut bytes)?;
+            if page_digest(&manifest.identity, &bytes) != page.hash {
+                return Err(invalid("rollback arena page authentication failed"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is a directory in `entries` (the root always is): a
+/// missing one is `NotFound`, and a file on the way to it `NotADirectory`.
+fn lookup_directory(entries: &BTreeMap<String, Entry>, name: &str) -> io::Result<()> {
+    if name.is_empty() || entries.get(name) == Some(&Entry::Directory) {
+        return Ok(());
+    }
+    let mut path = name;
+    while !path.is_empty() {
+        match entries.get(path) {
+            Some(Entry::File(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    path.to_owned(),
+                ))
+            }
+            Some(Entry::Directory) => break,
+            None => path = path::parent(path),
+        }
+    }
+    Err(missing())
 }
 
 fn directory_entries<'a>(
@@ -1028,23 +1079,7 @@ impl State {
     }
 
     fn directory(&self, name: &str) -> io::Result<()> {
-        if name.is_empty() || self.entries.get(name) == Some(&Entry::Directory) {
-            return Ok(());
-        }
-        let mut path = name;
-        while !path.is_empty() {
-            match self.entries.get(path) {
-                Some(Entry::File(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotADirectory,
-                        path.to_owned(),
-                    ))
-                }
-                Some(Entry::Directory) => break,
-                None => path = path::parent(path),
-            }
-        }
-        Err(missing())
+        lookup_directory(&self.entries, name)
     }
 
     fn open_file(&mut self, name: &str, create: bool) -> io::Result<u64> {

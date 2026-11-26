@@ -36,9 +36,10 @@ a geometry, provider, key name, compatibility id or random prefix length that
 differs from what the volume stores fails the check with an
 .B "ERROR: configuration mismatch:"
 line that names the setting, the configured value and the volume's. The check
-loads no credential and contacts no provider, so a different key under the
-same name, an unavailable credential and a provider that fails its self-test
-are found only at attach.
+loads no provider credential and contacts no provider (with a remote witness
+it loads the witness client's TLS identity, to ask the authority), so a
+different key under the same name, an unavailable credential and a provider
+that fails its self-test are found only at attach.
 .PP
 .BR "volume inspect" " and " check
 first ask, on Linux, whether the user running them may write the backing
@@ -58,7 +59,14 @@ are warnings. The deep check then takes the volume lock shared, which still
 excludes a daemon, and fails without running when
 .I volume.lock
 is missing, which it cannot create. A rollback-protected backing whose root or
-witness directory cannot be written is refused: it has no read-only open.
+witness directory cannot be written, and every one with a remote witness, is
+read the same way, through a view that authenticates it against its witness
+as attach does and writes nothing below its root or in its witness
+directory; it asks a remote witness only to inspect, and never claims a
+writer there. That view takes the locks a writer holds shared, so there
+.B "volume inspect"
+and both checks refuse a backing that a daemon holds, and one whose lock file
+is missing.
 .PP
 An attached daemon exposes the
 .BR status ", " metrics ", " checkpoint ", " drain " and " reload

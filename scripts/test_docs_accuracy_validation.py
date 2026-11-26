@@ -430,8 +430,11 @@ class HelperAndWitnessStatements(DocumentTest):
                        "io::Error::new(io::ErrorKind::InvalidInput, message) }", "maki-witness lib.rs")
         session = flat("crates/maki-backing/src/rollback/remote.rs")
         stops = session[session.index("fn stops_session("):]
-        self.has(stops[:stops.index("fn ", 3)], "Self::Remote(_) => matches!( error.kind(), "
-                 "io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput", "stops_session")
+        self.has(stops[:stops.index("fn ", 3)], "Self::Remote(_) => stops_remote_session(error)",
+                 "stops_session")
+        remote = session[session.index("fn stops_remote_session("):]
+        self.has(remote[:remote.index("fn ", 3)], "-> bool { matches!( error.kind(), "
+                 "io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput", "stops_remote_session")
         guide = prose("docs/remote-witness-service.md")
         self.lacks(guide, "stops decoding while `serve` holds its lock also makes it answer "
                           "unavailable until a restart", "remote-witness-service.md")

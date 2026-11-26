@@ -6,7 +6,8 @@
 //! below are never dialed for real. One test keeps the system resolver.
 //! When the host has addresses of both families, the other family's
 //! attempts start 300 ms after the first one, as the gRPC transport's
-//! connector does, and the attempt that loses is dropped.
+//! connector does, or halfway to the deadline if that is sooner, and the
+//! attempt that loses is dropped.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -459,6 +460,98 @@ async fn a_dead_ipv6_address_gives_way_to_ipv4_after_300_ms() {
         "the IPv6 attempt that lost must be dropped"
     );
     drop(connection);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_timeout_starts_the_other_family_at_half_of_what_is_left() {
+    // The other family starts 300 ms after the first attempt, or when half
+    // of what is left of the deadline has passed if that is sooner, so it
+    // always has at least half of it.
+    for (timeout, other_after) in [
+        (Duration::from_millis(200), Duration::from_millis(100)),
+        (Duration::from_millis(400), Duration::from_millis(200)),
+        (Duration::from_millis(600), OTHER_FAMILY_AFTER),
+        (TIMEOUT, OTHER_FAMILY_AFTER),
+    ] {
+        let (listener, _server) = websocket_server().await;
+        let dialer = TestDialer::new(Resolution::Addresses(vec![
+            (doc_net(1), Answer::Never),
+            (test_net(2), Answer::Serve(listener)),
+        ]));
+        let mut provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+        provider.spec.timeout = timeout;
+        let started = tokio::time::Instant::now();
+        let connection = provider.connect(None);
+        tokio::pin!(connection);
+
+        assert!(futures_util::poll!(&mut connection).is_pending());
+        tokio::time::advance(other_after - TICK).await;
+        assert!(futures_util::poll!(&mut connection).is_pending());
+        assert_eq!(
+            dialer.dialed(),
+            [doc_net(1)],
+            "{timeout:?}: IPv4 started early"
+        );
+        tokio::time::advance(2 * TICK).await;
+        let _ = futures_util::poll!(&mut connection);
+        assert_eq!(
+            dialer.dialed(),
+            [doc_net(1), test_net(2)],
+            "{timeout:?}: the other family must start {other_after:?} after the first attempt"
+        );
+        let connection = without_advancing(connection)
+            .await
+            .unwrap_or_else(|error| panic!("{timeout:?}: IPv4 must serve the upgrade: {error:?}"));
+        assert!(
+            started.elapsed() <= other_after + 2 * TICK,
+            "{timeout:?}: connected after {:?}",
+            started.elapsed()
+        );
+        drop(connection);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_with_little_time_left_after_a_wait_starts_the_other_family_at_half_of_it() {
+    const LEFT: Duration = Duration::from_millis(200);
+    let listener = echo_server().await;
+    let dialer = TestDialer::new(Resolution::Addresses(vec![
+        (doc_net(1), Answer::Never),
+        (test_net(2), Answer::Serve(listener)),
+    ]));
+    let mut provider = provider(&format!("ws://{HOST}:{PORT}/"), None, &dialer);
+    // One attempt: the request has one timeout in all.
+    provider.spec.capabilities.retry_safe = false;
+    // Another caller holds the connection for all but 200 ms of the
+    // request's timeout.
+    let held = provider.connection.lock().await;
+    let started = tokio::time::Instant::now();
+    let (context, units) = (context(), [unit()]);
+    let request = provider.encrypt_batch(&context, &units);
+    tokio::pin!(request);
+    assert!(futures_util::poll!(&mut request).is_pending());
+    tokio::time::advance(TIMEOUT - LEFT).await;
+    drop(held);
+    assert!(futures_util::poll!(&mut request).is_pending());
+    assert_eq!(dialer.dialed(), [doc_net(1)]);
+
+    // 300 ms would be past the request's end: the other family starts when
+    // half of the 200 ms left has passed.
+    tokio::time::advance(LEFT / 2 - TICK).await;
+    assert!(futures_util::poll!(&mut request).is_pending());
+    assert_eq!(dialer.dialed(), [doc_net(1)], "IPv4 started early");
+    tokio::time::advance(2 * TICK).await;
+    let _ = futures_util::poll!(&mut request);
+    assert_eq!(
+        dialer.dialed(),
+        [doc_net(1), test_net(2)],
+        "the other family must start within what the request has left"
+    );
+    let ciphertext = without_advancing(request)
+        .await
+        .expect("the IPv4 address answers within the request's timeout");
+    assert_eq!(ciphertext.len(), 1);
+    assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
 }
 
 #[tokio::test(start_paused = true)]

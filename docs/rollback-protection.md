@@ -392,16 +392,19 @@ directory or that it may not open the same way, and a volume it reuses as
 the daemon does; where the backing root holds no volume, or does not exist,
 it creates one as `volume create` does, witness directory included.
 
-These acquire the exclusive witness session and reestablish the selected
-witness record's durability without advancing it, by writing the record to a
-new file renamed over the old one, and rewrite and sync the backing's
-authenticated pages, manifest and format marker. So they need write access to
-both directories, which a plain backing does not need
+Where the user running them may write both directories, these acquire the
+exclusive witness session and reestablish the selected witness record's
+durability without advancing it, by writing the record to a new file renamed
+over the old one, and rewrite and sync the backing's authenticated pages,
+manifest and format marker, as attach does. Where the user may not write the
+backing root or the witness directory, either of them (a read-only mount, for
+example), `check` and `volume inspect` open the pair read-only instead
 ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)):
-where the user running them may not write the backing root or the witness
-directory (a read-only mount, for example), `check` and `volume inspect`
-refuse with that directory, its setting and the reason before they open
-anything. They also recreate a lock file
+the same authentication against the witness, nothing created, written,
+synced or removed in either directory, `rollback.lock` and `witness.lock`
+taken shared, and the deep verdict `unproven`. That open refuses a pair
+whose lock file is missing, which it cannot create, and one that a daemon
+holds. The writable open also recreates a lock file
 (`rollback.lock`, `witness.lock`) or inactive manifest slot that is missing
 (after a partial restore, for example). Run as root, they create every such
 file for the owner of its directory, so the daemon can still open both paths
@@ -531,10 +534,12 @@ complete recovery plan.
    backing under its trusted configuration, owned by the daemon user like the
    original (`chown -R maki:maki` it if the copy did not keep its owners), and
    run `maki check <config.toml> --deep` offline, as the daemon user or root
-   ([which user](#local-configuration-and-creation)). This acquires the
-   witness lock and verifies structural consistency and restores physical
-   reservations. Provide the complete fixed footprint even when the restored
-   copy is sparse; reservation failure keeps it offline. Normal attach
+   ([which user](#local-configuration-and-creation)), where it may write both
+   directories. This acquires the witness lock and verifies structural
+   consistency and restores physical reservations; where it may not write
+   one of them, the check is read-only and restores nothing. Provide the
+   complete fixed footprint even when the restored copy is sparse;
+   reservation failure keeps it offline. Normal attach
    additionally verifies the crypto key and provider.
    Require application-level readback before permitting writes.
    Never run two writable copies against one witness.

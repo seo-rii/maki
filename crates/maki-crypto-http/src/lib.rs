@@ -41,6 +41,11 @@ pub mod fuzzing;
 mod request;
 mod response;
 
+// A loopback address that never answers needs Linux: a listener whose
+// accept queue is full drops the SYNs sent to it.
+#[cfg(all(test, target_os = "linux"))]
+mod connect_tests;
+
 #[cfg(test)]
 mod request_tests;
 
@@ -802,8 +807,11 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     // hyper-util hands a request to a connection only after that succeeded,
     // and resends only a request a connection returned unwritten; this
     // client never resends one itself (see `retry::never` in `new`). So no
-    // byte of the request was written. Everything else, timeouts included,
-    // may follow a written request and stays unmarked.
+    // byte of the request was written. That includes a connect timeout: an
+    // address's share of the connect timeout, or reqwest's bound over the
+    // whole connect, running out is `is_connect` and is marked. Everything
+    // else, the request's own `timeout` included, may follow a written
+    // request and stays unmarked.
     let not_sent = e.is_connect();
     let error = classify_transport_error(e);
     if not_sent {
@@ -818,7 +826,15 @@ fn classify_transport_error(e: reqwest::Error) -> CryptoError {
     // it before either classification or logging can expose query secrets.
     let e = e.without_url();
     if e.is_timeout() {
-        return CryptoError::Retryable(format!("request timeout: {e}"));
+        // A connect that ran out its time (an address's share) failed
+        // before any byte of the request was written, and can end well
+        // before the request's `timeout`: say which timeout it was.
+        let what = if e.is_connect() {
+            "connect timeout"
+        } else {
+            "request timeout"
+        };
+        return CryptoError::Retryable(format!("{what}: {e}"));
     }
     // The pinned hyper parser preserves typed provenance for definite HTTP
     // head and chunk-framing violations. A decode/body error by itself is not
@@ -937,6 +953,16 @@ fn classify_status(
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        Self::with_client(spec, std::convert::identity)
+    }
+
+    /// `new`, with the client's builder passed through `adjust` last, so a
+    /// test can resolve the endpoint's host to addresses of its own
+    /// (`connect_tests.rs`).
+    fn with_client(
+        spec: HttpProviderSpec,
+        adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, CryptoError> {
         for op in [&spec.encrypt, &spec.decrypt] {
             maki_format::config::check_http_header_names(
                 op.headers.iter().map(|(k, _)| k.as_str()),
@@ -962,13 +988,25 @@ impl HttpCryptoProvider {
         // The TLS configuration is the provider's, not reqwest's: reqwest's
         // own trusts only its compiled-in roots, never the host's store
         // (`client_tls_config`).
+        // The connect timeout gives each resolved address a share: hyper-
+        // util divides it equally among the addresses of each family and
+        // tries them one at a time, so one that never answers leaves the
+        // next one time (without it, the first held the request to its
+        // end). reqwest also bounds the whole connect, resolution and TLS
+        // included, by it. Equal to `timeout`, whose timer starts first, it
+        // never lets a connect outlast its request; a connect that hyper-
+        // util finishes in the background for its pool ends at this bound
+        // as well. The other family still starts after hyper-util's fixed
+        // 300 ms, which reqwest 0.12 does not expose.
         let tls = client_tls_config(spec.tls.as_ref())?;
         let client = reqwest::Client::builder()
             .timeout(spec.timeout)
+            .connect_timeout(spec.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
-            .use_preconfigured_tls(tls)
+            .use_preconfigured_tls(tls);
+        let client = adjust(client)
             .build()
             .map_err(|e| fatal(format!("http client build failed: {e}")))?;
         Ok(Self { client, spec })

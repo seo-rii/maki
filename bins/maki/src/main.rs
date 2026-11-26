@@ -955,23 +955,15 @@ fn remote_volume(config: &str, command: RemoteVolume<'_>) -> Result<String, Stri
 fn existing_backing(
     cfg: &maki_format::config::VolumeConfig,
 ) -> Result<std::sync::Arc<dyn maki_backing::Backing>, String> {
-    // Opening a remote RollbackBacking claims a writer and forks a namespace.
-    // Diagnostic commands must not mutate the authority, even if they fail or
-    // are killed before Drop can release that session.
-    if cfg
-        .backing
-        .rollback_protection
-        .as_ref()
-        .is_some_and(|r| r.remote.is_some())
-    {
-        return Err("read-only remote backing inspection is not supported; use `maki volume witness` to inspect the authority without claiming a writer".into());
-    }
     // An existing directory only: opening it read-only creates nothing.
     maki_backing::configured::BACKING_ROOT
         .reachable(std::path::Path::new(&cfg.backing.root))
         .map_err(|error| error.to_string())?;
     // A root this process may not write (a read-only mount) is read through
-    // a view that changes nothing, and the check says so.
+    // a view that changes nothing, and the check says so. So is every
+    // remote-protected backing: opening one to write claims a writer at the
+    // authority and forks a namespace, which a diagnostic command must never
+    // do, even if it fails or is killed before it could release that session.
     maki_nbdkit::daemon::build_backing_to_read(cfg).map_err(|error| error.to_string())
 }
 

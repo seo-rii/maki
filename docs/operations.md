@@ -246,10 +246,11 @@ key identity), `crypto.crypto_compatibility_id` and
 volume's, and the check fails. These settings are fixed at creation: correct
 the configuration to the volume's values. The values printed are sizes,
 provider and credential names and compatibility ids, never key material. A
-protected backing's `backing.rollback_protection.capacity` is
-compared when the backing is opened: a mismatch stops the command before the
-check, with both values. The check loads no credential and contacts no
-provider, so attach alone finds a different key under the same name (the key
+protected backing's `backing.rollback_protection.capacity` is compared when
+the backing is opened: a mismatch stops the command before the check, with
+both values. The check loads no provider credential and contacts no provider
+(with a remote witness it loads the witness client's TLS identity, to ask the
+authority), so attach alone finds a different key under the same name (the key
 canary), a credential that is unavailable or does not fit the provider, a
 provider that fails its self-test, endpoints that are unreachable or not
 interchangeable, and the memory and swap checks. `maki-check <root>` reads no
@@ -318,16 +319,18 @@ root is created, written, synced or removed. Other platforms, which serve
 development only, do not ask and open every root as before. `maki` asks
 about `backing.root`, and `maki-check` about the root it is given.
 
-Only the root decides, in both directions. A writable root whose files the
+For a plain backing only the root decides, in both directions (a local
+rollback-protected backing, below, also asks about its witness directory, and
+a remote one is read read-only on every root). A writable root whose files the
 user may not write still fails ("Permission denied", or "Operation not
 permitted" for an immutable file), so make the root unwritable too (or mount
 the backing read-only) to check such a copy. Conversely, a root the user may
 not write is checked read-only even when its files are writable (a `0500`
-volume directory holding `0600` files, which was checked as a writable
-backing before): its deep verdict is now `unproven` where it was `clean`,
-and a missing `volume.lock` is not recreated there. The deep check stops
-with `volume lock: volume.lock is missing` (before, creating the file in
-such a directory failed with "Permission denied").
+volume directory holding `0600` files, which was checked as a writable backing
+before): its deep verdict is now `unproven` where it was `clean`, and a
+missing `volume.lock` is not recreated there. The deep check stops with
+`volume lock: volume.lock is missing` (before, creating the file in such a
+directory failed with "Permission denied").
 
 A read-only check reads exactly what a writable one reads and finds the same
 damage, but it proves less, and its report says so in a `warning: read-only
@@ -359,12 +362,53 @@ the disk does not hold). Therefore:
 | `unproven` | Read-only check only: nothing that attach refuses was found in what was read, but none of it is shown to be on disk, and nothing recovery would replay or repair (the `warning:` lines) was done | Attach where the backing can be written, which recovers it, or check it there for a `clean` verdict |
 
 `volume inspect` prints the same fields read-only, and the fast check reports
-the same lines plus the warning. A rollback-protected backing has no
-read-only open: opening it re-publishes its authenticated state and the
-witness anchor before anything is read. Where the user may not write its
-backing root or its witness directory, `check` and `volume inspect` refuse it
-with the directory, the setting that names it and that reason, before they
-open anything.
+the same lines plus the warning.
+
+A rollback-protected backing is read read-only too: with a local witness where
+the user may not write its backing root or its witness directory, either of
+them, and with a remote witness always. Opening one to write, as attach does,
+rewrites and syncs its authenticated pages, manifest and format marker and
+publishes the witness anchor again by creating a new record in the witness
+directory and renaming it over the old one; with a remote witness it claims a
+writer at the authority and copies the current state into a namespace of its
+own, which a command that only reads must never do. A local backing whose two
+directories can both be written is opened to write, as before. Where the
+witness directory cannot be written, that open would fail when it publishes
+the anchor, before it writes anything in the backing. Where the backing root
+cannot be written, the root decides as it does for a plain backing: the pair
+is read read-only even when the files in the root could be written. (A
+writable open would succeed there, for a `0500` root holding `0600` files, and
+rewrite them, but could not recreate a missing lock file or manifest slot.)
+The read-only open makes the authentication attach makes before the command
+reads the volume: the format marker, the manifest the witness selects (exact,
+canonical, of the witness's generation), the sizes of its slot and of the
+arena, and every committed page against its digest. A damaged page, a manifest
+the witness does not select, a configured capacity that differs from the
+stored one and an unfinished creation are refused, as attach refuses them. It
+creates, writes, syncs and removes nothing below the backing root or in the
+witness directory, and asks a remote authority only to inspect: no claim, no
+namespace, no operation guard. It takes the locks that keep a writer out
+shared, and never creates them: `rollback.lock` and the witness directory's
+`witness.lock`, which a writer holds while the volume is attached, or with a
+remote witness the root's `remote.operation.lock`, which attach (while it
+opens the backing), takeover, restore, snapshot and GC hold, and the current
+namespace's `rollback.lock`, which its writer holds. It holds them before it
+reads anything in either directory, apart from a remote root's format marker.
+So, unlike on a plain backing, the fast check and `volume inspect` take a lock
+too:
+
+- `volume inspect`, `check` and `check --deep` all refuse a backing that a
+  daemon or another writer holds (`… is held by another process`), and a
+  missing lock file (`… is missing, and a read-only open cannot create it`);
+- a daemon that starts while one of them runs fails to take its lock, and
+  other read-only checks are admitted;
+- with a remote witness the authority's record is read again once both locks
+  are held, and one that changed in between refuses the command.
+
+Every read is authenticated again, and every operation first asks the
+witness whether it still selects what was read, as a writer's operations do:
+a witness that stops selecting it stops the command with an error. The deep
+verdict is `unproven`, as for a plain backing read read-only.
 
 ## Swap dependency checks
 

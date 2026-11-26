@@ -29,10 +29,11 @@
 //! an endpoint contract failure, so that operation is never resent to it.
 //! A connect resolves the URL's host and dials its addresses. The other
 //! address family starts 300 ms after the first, as in the gRPC transport's
-//! connector; each family's addresses but the last have an equal share of
-//! what is left of the request's timeout and the last has the rest (gRPC
-//! gives each a fixed share), so one that never answers does not use it up.
-//! TLS verifies the URL's host.
+//! connector, or halfway to the connect's deadline if that is sooner, so a
+//! short timeout still reaches it. Each family's addresses but the last
+//! have an equal share of what is left of the request's timeout and the
+//! last has the rest (gRPC gives each a fixed share), so one that never
+//! answers does not use it up. TLS verifies the URL's host.
 
 // Diagnostics go through `tracing`: the `print!` family panics when the
 // write fails (a closed pipe, a full disk). Tests may print.
@@ -324,19 +325,21 @@ impl Dialer for SystemDialer {
 }
 
 /// How long the first address family has before the other one starts, as
-/// in the gRPC transport's connector (hyper-util's default).
+/// in the gRPC transport's connector (hyper-util's default), unless the
+/// deadline is nearer (`dial_addresses`).
 const OTHER_FAMILY_DELAY: Duration = Duration::from_millis(300);
 
 /// Dial the resolved `addresses`, racing the two families as hyper-util's
 /// connector does for the gRPC transport. The family of the first address
-/// goes first, the other family starts `OTHER_FAMILY_DELAY` later, or at
+/// goes first, the other family starts `OTHER_FAMILY_DELAY` later, or once
+/// half of what is left of `deadline` has passed if that is sooner, or at
 /// once when the first family has failed outright, and each family's
 /// addresses are dialed in turn (`dial_in_turn`). Unlike that connector,
-/// which gives every address a fixed `timeout / n` and keeps a family's
-/// first error, a family shares out what is left of `deadline`, its last
-/// address has the rest, and the last error is returned; so with
-/// `deadline` 300 ms away or less, a first family that never answers is
-/// never left. The first stream that connects wins; the other family's
+/// which waits the 300 ms whatever its timeout, gives every address a fixed
+/// `timeout / n` and keeps a family's first error, the other family always
+/// has at least half of what is left, a family shares out what is left of
+/// `deadline`, its last address has the rest, and the last error is
+/// returned. The first stream that connects wins; the other family's
 /// attempt is dropped, which closes its socket. Only the TCP connect is
 /// raced: TLS and the upgrade run on the stream that won, and their failure
 /// is never retried at another address.
@@ -357,7 +360,13 @@ async fn dial_addresses(
     let first = std::pin::pin!(dial_in_turn(dialer, first, deadline));
     // Not polled, so not dialed, before the delay or the first family's end.
     let other = std::pin::pin!(dial_in_turn(dialer, other, deadline));
-    let delay = std::pin::pin!(tokio::time::sleep(OTHER_FAMILY_DELAY));
+    // With less than 600 ms left, a fixed 300 ms would leave the other
+    // family less than half of it, or none: start it halfway instead.
+    let delay = deadline.map_or(OTHER_FAMILY_DELAY, |deadline| {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        OTHER_FAMILY_DELAY.min(left / 2)
+    });
+    let delay = std::pin::pin!(tokio::time::sleep(delay));
     let (result, rest) = match select(first, delay).await {
         Either::Left((result, _delay)) => (result, Either::Right(other)),
         Either::Right(((), first)) => match select(first, other).await {

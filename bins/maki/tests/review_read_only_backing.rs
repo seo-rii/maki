@@ -9,8 +9,13 @@
 //! synced, created or removed, the deep check takes the volume lock shared
 //! through a read-only descriptor, and the report says that it was read-only
 //! and what that cannot prove (the deep verdict is `unproven`, never
-//! `clean`). A rollback-protected backing has no read-only open and is
-//! refused with the reason.
+//! `clean`). A rollback-protected backing whose backing root or witness
+//! directory cannot be written was refused, since opening it rewrites its
+//! authenticated state and the witness record. It is now read through a
+//! read-only view too: the same authentication, shared locks, nothing
+//! written in either directory, and the verdict `unproven`; a damaged page,
+//! a manifest the witness does not select and a backing in use are still
+//! refused.
 //!
 //! Root ignores mode bits, so a root run drops CAP_DAC_OVERRIDE from the
 //! command's bounding set before it starts. The read-only mount needs a
@@ -20,6 +25,9 @@
 
 #[path = "support/volume_config.rs"]
 mod volume_config;
+
+#[path = "support/other_filesystem.rs"]
+mod other_filesystem;
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -106,10 +114,14 @@ fn succeeded(what: &str, output: &Output) {
     assert!(output.status.success(), "{what}: {}", text(output));
 }
 
+/// An entry with its mode, its bytes if it is a file, and its modification
+/// time.
+type Entry = (PathBuf, u32, Option<Vec<u8>>, SystemTime);
+
 /// Every entry below `root` with its mode, its bytes if it is a file, and
 /// its modification time, which a rewrite of identical bytes and a created
 /// or removed entry (in its directory) change.
-fn tree(root: &Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>, SystemTime)> {
+fn tree(root: &Path) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -169,24 +181,94 @@ impl Fixture {
     fn config(&self) -> PathBuf {
         self.directory.path().join("volume.toml")
     }
+}
 
-    /// A configuration of a rollback-protected backing at the volume's
-    /// root, with a witness directory beside it.
-    fn protected(&self) -> (PathBuf, PathBuf) {
-        let witness = self.directory.path().join("witness");
-        std::fs::create_dir_all(&witness).unwrap();
-        let path = self.directory.path().join("protected.toml");
-        volume_config::write(&path, config(&self.root(), Some(&witness))).unwrap();
-        (path, witness)
+/// A rollback-protected volume created by `maki volume create`, its witness
+/// directory on another filesystem.
+struct Protected {
+    directory: tempfile::TempDir,
+    witness_parent: tempfile::TempDir,
+}
+
+impl Protected {
+    /// `None`, after a notice, without a second filesystem for the witness.
+    fn new() -> Option<Self> {
+        let directory = tempfile::tempdir().unwrap();
+        let witness_parent = other_filesystem::tempdir(directory.path())?;
+        let protected = Self {
+            directory,
+            witness_parent,
+        };
+        volume_config::write(
+            protected.config(),
+            config(&protected.root(), Some(&protected.witness())),
+        )
+        .unwrap();
+        succeeded(
+            "create",
+            &maki(&["volume", "create", protected.config().to_str().unwrap()]),
+        );
+        Some(protected)
+    }
+
+    fn root(&self) -> PathBuf {
+        self.directory.path().join("volume")
+    }
+
+    fn witness(&self) -> PathBuf {
+        self.witness_parent.path().join("witness")
+    }
+
+    fn config(&self) -> PathBuf {
+        self.directory.path().join("protected.toml")
+    }
+
+    /// Set the modes of the backing root and of the witness directory (not
+    /// of what they hold), run `run`, and give both their `0700` back.
+    fn with_modes(&self, root: u32, witness: u32, run: impl FnOnce()) {
+        let set = |root, witness| {
+            std::fs::set_permissions(self.root(), std::fs::Permissions::from_mode(root)).unwrap();
+            std::fs::set_permissions(self.witness(), std::fs::Permissions::from_mode(witness))
+                .unwrap();
+        };
+        set(root, witness);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+        set(0o700, 0o700);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The manifest slot the witness selects, which holds the newest
+    /// generation, with the manifest it holds, and the other slot's index.
+    fn newest_manifest(&self) -> (usize, serde_json::Value, usize) {
+        let (newest, manifest) = (0..2)
+            .filter_map(|index| {
+                let bytes =
+                    std::fs::read(self.root().join(format!("rollback.manifest.{index}"))).unwrap();
+                let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(bytes.get(8..8 + len)?).ok()?;
+                Some((index, manifest))
+            })
+            .max_by_key(|(_, manifest)| manifest["generation"].as_u64().unwrap())
+            .expect("a manifest");
+        (newest, manifest, 1 - newest)
     }
 }
 
-/// `inspect`, `check` and `check --deep` read the volume without changing
-/// it and say that they read it read-only.
-fn read_only_commands(fixture: &Fixture) {
-    let config = fixture.config();
+/// `inspect`, `check` and `check --deep` read the volume of `config`
+/// without changing anything in `directories` and say that they read it
+/// read-only.
+fn read_only_commands(config: &Path, directories: &[PathBuf]) {
     let config = config.to_str().unwrap();
-    let before = tree(&fixture.root());
+    let trees = || {
+        directories
+            .iter()
+            .map(|path| tree(path))
+            .collect::<Vec<_>>()
+    };
+    let before = trees();
 
     let inspect = maki(&["volume", "inspect", config]);
     succeeded("inspect", &inspect);
@@ -214,17 +296,19 @@ fn read_only_commands(fixture: &Fixture) {
         "{}",
         text(&deep)
     );
-    assert_eq!(
-        tree(&fixture.root()),
-        before,
-        "a read-only command changed the backing"
-    );
+    assert_eq!(trees(), before, "a read-only command changed the backing");
 }
 
-/// A rollback-protected configuration whose backing root or witness
-/// directory cannot be written is refused, naming the directory, before
-/// anything is opened.
-fn protected_refused(config: &Path, directory: &Path, setting: &str) {
+/// `inspect`, `check` and `check --deep` of `config` each fail with an
+/// error that contains `expected`, and change nothing in `directories`.
+fn refused(config: &Path, directories: &[PathBuf], expected: &str) {
+    let trees = || {
+        directories
+            .iter()
+            .map(|path| tree(path))
+            .collect::<Vec<_>>()
+    };
+    let before = trees();
     for args in [
         &["volume", "inspect", config.to_str().unwrap()][..],
         &["check", config.to_str().unwrap()],
@@ -232,24 +316,21 @@ fn protected_refused(config: &Path, directory: &Path, setting: &str) {
     ] {
         let output = maki(args);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {}", text(&output));
-        let expected = format!(
-            "{} (`{setting}`) cannot be written by this process, and a rollback-protected \
-             backing cannot be checked or inspected read-only",
-            directory.display()
-        );
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains(&expected),
+            String::from_utf8_lossy(&output.stderr).contains(expected),
             "{args:?}: {}",
             text(&output)
         );
     }
+    assert_eq!(trees(), before, "a refused command changed the backing");
 }
 
 #[test]
 fn check_and_inspect_read_a_tree_they_may_not_write() {
     let fixture = Fixture::new();
     set_modes(&fixture.root(), 0o400, 0o500);
-    let result = std::panic::catch_unwind(|| read_only_commands(&fixture));
+    let result =
+        std::panic::catch_unwind(|| read_only_commands(&fixture.config(), &[fixture.root()]));
     set_modes(&fixture.root(), 0o600, 0o700);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -265,29 +346,170 @@ fn check_and_inspect_read_a_tree_they_may_not_write() {
     );
 }
 
+/// A rollback-protected backing whose backing root, witness directory or
+/// both this process may not write is read through a view that writes
+/// neither: it was refused. Where both can be written the commands take
+/// the writable path, as before.
 #[test]
-fn a_protected_backing_it_cannot_write_is_refused_with_the_reason() {
-    let fixture = Fixture::new();
-    let (config, witness) = fixture.protected();
-    let root = fixture.root();
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let result = std::panic::catch_unwind(|| protected_refused(&config, &root, "backing.root"));
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
+fn a_protected_backing_it_cannot_write_is_checked_read_only() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let directories = [protected.root(), protected.witness()];
+    for (root, witness) in [(0o500, 0o700), (0o700, 0o500), (0o500, 0o500)] {
+        protected.with_modes(root, witness, || {
+            read_only_commands(&protected.config(), &directories)
+        });
     }
-    std::fs::set_permissions(&witness, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let result = std::panic::catch_unwind(|| {
-        protected_refused(
-            &config,
-            &witness,
-            "backing.rollback_protection.witness_root",
+    let deep = maki(&["check", protected.config().to_str().unwrap(), "--deep"]);
+    succeeded("writable check --deep", &deep);
+    let report = String::from_utf8_lossy(&deep.stdout);
+    assert!(
+        report.contains("info: deep check verdict: clean\n") && !report.contains("read-only"),
+        "{}",
+        text(&deep)
+    );
+}
+
+/// The read-only view authenticates every committed page, as opening the
+/// backing to write does: a damaged one fails every command.
+#[test]
+fn a_damaged_page_of_a_protected_backing_it_cannot_write_is_an_error() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let (_, manifest, _) = protected.newest_manifest();
+    let slot = manifest["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find_map(|node| node["pages"].as_object().unwrap().values().next())
+        .expect("a committed page")["slot"]
+        .as_u64()
+        .unwrap();
+    let arena = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(protected.root().join("rollback.arena"))
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let mut byte = [0];
+    arena.read_exact_at(&mut byte, slot * 4096).unwrap();
+    arena.write_all_at(&[byte[0] ^ 1], slot * 4096).unwrap();
+    drop(arena);
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &[protected.root(), protected.witness()],
+            "rollback arena page authentication failed",
         )
     });
-    std::fs::set_permissions(&witness, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
+}
+
+/// Only the manifest the witness selects is read: with the newest slot
+/// rolled back to the older manifest, which is valid and canonical, every
+/// command fails.
+#[test]
+fn a_protected_backing_whose_witness_selects_no_manifest_in_it_is_an_error() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let (newest, _, older) = protected.newest_manifest();
+    std::fs::copy(
+        protected.root().join(format!("rollback.manifest.{older}")),
+        protected.root().join(format!("rollback.manifest.{newest}")),
+    )
+    .unwrap();
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &[protected.root(), protected.witness()],
+            "no exact witnessed manifest",
+        )
+    });
+}
+
+/// The read-only view takes the locks a writer holds, shared: a backing
+/// that a writer has open (an attached volume) is refused, and so is one
+/// whose lock file is missing, which the view cannot create.
+#[test]
+fn a_protected_backing_in_use_or_without_its_lock_is_refused_read_only() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let directories = [protected.root(), protected.witness()];
+    let writer =
+        maki_backing::RollbackBacking::open(&protected.root(), &protected.witness()).unwrap();
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &directories,
+            "rollback.lock is held by another process",
+        )
+    });
+    drop(writer);
+    std::fs::remove_file(protected.root().join("rollback.lock")).unwrap();
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &directories,
+            "rollback.lock is missing, and a read-only open cannot create it",
+        )
+    });
+}
+
+/// What the commands refuse once the writable open has opened the pair,
+/// they refuse after the read-only open too: a configured capacity that is
+/// not the stored one.
+#[test]
+fn a_protected_backing_of_another_capacity_is_refused_read_only_too() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let other = protected.directory.path().join("other-capacity.toml");
+    volume_config::write(
+        &other,
+        config(&protected.root(), Some(&protected.witness()))
+            .replace("capacity = \"8MiB\"", "capacity = \"12MiB\""),
+    )
+    .unwrap();
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &other,
+            &[protected.root(), protected.witness()],
+            "protected backing capacity mismatch: configuration 12582912, stored 8388608",
+        )
+    });
+}
+
+/// A pair whose creation stopped after its witness anchor holds no volume:
+/// read-only too, the commands say so and name what continues it.
+#[test]
+fn an_unfinished_protected_creation_is_named_read_only_too() {
+    let directory = tempfile::tempdir().unwrap();
+    let Some(witness_parent) = other_filesystem::tempdir(directory.path()) else {
+        return;
+    };
+    let protected = Protected {
+        directory,
+        witness_parent,
+    };
+    drop(
+        maki_backing::RollbackBacking::create(&protected.root(), &protected.witness(), 8 << 20)
+            .unwrap(),
+    );
+    volume_config::write(
+        protected.config(),
+        config(&protected.root(), Some(&protected.witness())),
+    )
+    .unwrap();
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &[protected.root(), protected.witness()],
+            "this volume's creation did not complete",
+        )
+    });
 }
 
 /// A protected root is never read as a plain one because its configuration
@@ -374,15 +596,25 @@ fn bind_read_only(path: &Path) -> Mounted {
 fn check_and_inspect_read_a_backing_on_a_read_only_mount() {
     if std::env::var_os(MOUNT_CHILD).is_some() {
         let fixture = Fixture::new();
-        let (protected, _) = fixture.protected();
-        let _mounted = bind_read_only(&fixture.root());
+        let mounted = bind_read_only(&fixture.root());
         let error = std::fs::OpenOptions::new()
             .write(true)
             .open(fixture.root().join("superblock.a"))
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
-        read_only_commands(&fixture);
-        protected_refused(&protected, &fixture.root(), "backing.root");
+        read_only_commands(&fixture.config(), &[fixture.root()]);
+        drop(mounted);
+        // A rollback-protected backing whose root, witness directory or
+        // both are mounted read-only is read through its read-only view.
+        let Some(protected) = Protected::new() else {
+            return;
+        };
+        let directories = [protected.root(), protected.witness()];
+        for (root, witness) in [(true, false), (false, true), (true, true)] {
+            let _root = root.then(|| bind_read_only(&protected.root()));
+            let _witness = witness.then(|| bind_read_only(&protected.witness()));
+            read_only_commands(&protected.config(), &directories);
+        }
         return;
     }
     if !running_as_root() {
