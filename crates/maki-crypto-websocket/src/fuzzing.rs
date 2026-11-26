@@ -487,3 +487,43 @@ pub fn seeds() -> Vec<(String, Vec<u8>)> {
     add("noise-three-items", input(text(3), &noise));
     seeds
 }
+
+#[cfg(test)]
+mod tests {
+    use super::reads_raw_value;
+
+    /// The oracle skips exactly the documents serde_json's `Value` reads
+    /// otherwise: an object whose first key decodes to the raw-value token,
+    /// at any depth. Every other document is compared, so a classifier that
+    /// skipped everything would leave the target without its oracle.
+    #[test]
+    fn only_a_first_key_that_decodes_to_the_token_skips_the_reference() {
+        for flagged in [
+            r#"{"$serde_json::private::RawValue":"1"}"#,
+            r#"{"\u0024serde_json::private::RawValue":"1"}"#,
+            r#"{"$s\u0065rde_json::private::RawValue":"1"}"#,
+            r#"{"$serde_json\u003a:private::RawValue":"1"}"#,
+            r#"{"id":5,"trace":{"$serde_json::private::RawValue":"[1]"}}"#,
+            r#"[1,{"$serde_json::private::RawValue":"{}"}]"#,
+        ] {
+            assert!(reads_raw_value(flagged.as_bytes()), "{flagged}");
+        }
+        for compared in [
+            r#"{"id":1,"$serde_json::private::RawValue":"1"}"#,
+            r#"{"id":1,"note":"$serde_json::private::RawValue"}"#,
+            r#"{"$serde_json::private::RawValueX":"1"}"#,
+            r#"["$serde_json::private::RawValue"]"#,
+            r#"{"id":5,"items":[{"unit":20,"data":"YQ=="}],"error":null}"#,
+            "",
+            "[",
+        ] {
+            assert!(!reads_raw_value(compared.as_bytes()), "{compared}");
+        }
+        // The token as a second key is a member like any other, with the
+        // `raw_value` feature or without it (the harness turns it on
+        // through the witness; this crate's own tests do not).
+        let second: serde_json::Value =
+            serde_json::from_str(r#"{"id":1,"$serde_json::private::RawValue":"1"}"#).unwrap();
+        assert_eq!(second["$serde_json::private::RawValue"], "1");
+    }
+}
