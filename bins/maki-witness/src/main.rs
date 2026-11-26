@@ -157,9 +157,10 @@ impl From<io::Error> for Failure {
 fn volume_identity(text: &str) -> Result<Uuid, Failure> {
     let identity = Uuid::parse_str(text)
         .map_err(|_| Failure::Usage("volume identity must be a UUID".into()))?;
-    // The store refuses the nil identity too, but only after `init` began to
-    // create it and `init-etcd` read its configuration: a bad argument is
-    // misuse, refused before anything is read or created.
+    // `init`'s state store refuses the nil identity too, before it opens or
+    // creates anything, but `init-etcd` reads its configuration first, and
+    // either failure exits 1: a bad argument is misuse, refused with status
+    // 2 before anything is read or created.
     if identity.is_nil() {
         return Err(Failure::Usage("volume identity must be nonzero".into()));
     }

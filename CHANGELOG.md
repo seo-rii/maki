@@ -38,7 +38,10 @@ documents.
   configuration does not match the locked volume identity/geometry`, and a
   volume that records a key identity is refused before any endpoint is
   contacted. The geometry and NBD messages are unchanged (maki(8), [volume
-  lifecycle](docs/operations.md#volume-lifecycle), SPEC §20).
+  lifecycle](docs/operations.md#volume-lifecycle), SPEC §20). *Changed on
+  2026-11-26 (AUD-202, [#407](https://github.com/seo-rii/maki/pull/407)): `maki
+  check` now also reads a remote-protected backing, and to ask its authority
+  loads the witness client's TLS identity, still no provider credential.*
 - **`maki-witness init` and `init-etcd` refuse a nil volume identity with
   status 2** (AUD-196, 2026-11-25;
   [#397](https://github.com/seo-rii/maki/pull/397)). The nil UUID parsed as a
@@ -596,6 +599,47 @@ documents.
 
 ### Added
 
+- **A CI job drives whole attachments and the documented quick start through a
+  runner's kernel** (AUD-203, 2026-11-26;
+  [#406](https://github.com/seo-rii/maki/pull/406)). For developers:
+  `kernel-lifecycle` runs on every pull request, push to `main`, dispatch and
+  scheduled run, on GitHub's `ubuntu-latest` VM with its kernel, udev and
+  systemd. It runs `scripts/privileged-linux-validation.sh --install-missing
+  --kill-daemon` on `/dev/nbd15`. After its workload the runner now writes and
+  fsyncs data, detaches while `scripts/privileged_validation_opener.py` holds
+  the device open and requires that the detach returned only after the
+  opener began to close it (AUD-197), attaches again and compares the data;
+  with the new `--kill-daemon` it kills nbdkit under the mount, cleans up
+  without it, starts a new nbdkit, attaches a third time and detaches, and it
+  writes more evidence files, which the runbook lists. The job then builds
+  the Debian package from the commit and runs the Debian guide's install
+  blocks, the quick start and its first-volume bootstrap, which
+  `scripts/documented_quickstart.py` writes into one program, under systemd
+  with the installed units. It builds in release mode twice and keeps its logs
+  as `kernel-lifecycle-logs`. The runner is Ubuntu, not the Debian 12 primary
+  platform, and the job qualifies nothing ([automated
+  CI](docs/testing.md#automated-ci), [privileged validation
+  runbook](docs/qualification/privileged-linux-validation.md)).
+- **Fuzz targets for the witness's RPC and etcd readers, the remote providers'
+  response readers and the root helper's readers of command output and
+  sysfs** (AUD-204, 2026-11-26;
+  [#408](https://github.com/seo-rii/maki/pull/408)). For developers: `fuzz/`
+  gains `witness_rpc`, `witness_etcd`, `http_response`, `websocket_response`,
+  `grpc_response`, `helper_reports` and `helper_sysfs` (the last two Linux
+  only), with 270 more seeds in `fuzz/seeds/<target>/`, which the default
+  suite replays (`helper_sysfs`'s create and remove temporary directories). A
+  change to one of these readers may need its seeds written again
+  (`MAKI_FUZZ_WRITE_SEEDS=1 cargo test -p maki-fuzz-harness --test
+  review_fuzz_corpus`). `maki-witness`, `maki-crypto-http`,
+  `maki-crypto-websocket` and `maki-crypto-grpc` gain a `fuzzing` feature,
+  and `maki-privileged`'s now also exposes the executor's readers. Only the
+  harness enables them: `cargo build --workspace` turns them on through
+  feature unification, a release build does not, and no packaged binary
+  changes. `fuzz/Cargo.toml` also patches the vendored `hyper`, `rustls` and
+  `tungstenite`, the scheduled `fuzz` job runs the seven targets too, and a
+  big-endian host replays netlink seeds made in its own byte order
+  ([fuzzing](docs/testing.md#fuzzing)).
+
 - **Fuzz targets for the root helper's NBD handshake and netlink answer and
   for `maki-backing`'s records, committed seeds, and a scheduled fuzz job**
   (AUD-200, 2026-11-25; [#401](https://github.com/seo-rii/maki/pull/401)). For
@@ -785,6 +829,71 @@ documents.
 
 ### Changed
 
+- **`maki check` and `maki volume inspect` read a rollback-protected backing
+  they cannot write, and every remote-protected one, read-only** (AUD-202,
+  2026-11-26; [#407](https://github.com/seo-rii/maki/pull/407)). On Linux a
+  local protected backing whose backing root or witness directory the user
+  may not write was refused with "… cannot be written by this process, and a
+  rollback-protected backing cannot be checked or inspected read-only: …",
+  and `maki` refused a remote-protected one on every root with "read-only
+  remote backing inspection is not supported; …". The commands now read such
+  a backing through a view that authenticates it against its witness as
+  attach does (the manifest the witness selects, every committed page),
+  creates, writes, syncs and removes nothing below the backing root or in the
+  witness directory, and asks a remote authority only to inspect, never
+  claiming a writer there. The report has a `warning: read-only check:` line
+  and the deep verdict is `unproven`; exit statuses are unchanged. To ask a
+  remote authority the commands now load the witness client's TLS identity
+  (`client_key_file` and its certificates), but no volume key or provider
+  credential. Unlike on a plain backing, `volume inspect` and the fast check
+  take a lock here too: all three take the writer's locks shared
+  (`rollback.lock` and `witness.lock`, or `remote.operation.lock` and the
+  current namespace's `rollback.lock`), and refuse a backing that a daemon or
+  another writer holds ("… is held by another process") and one whose lock
+  file is missing ("… is missing, and a read-only open cannot create it"); a
+  daemon that starts meanwhile fails to take its lock, with a remote witness
+  at attach's operation lock. With a remote witness a record that changes
+  while the locks are taken refuses the command ("the remote authority
+  changed while the backing was opened read-only: run the command again"),
+  and each backing operation inspects the authority again, over a connection
+  of its own, so a deep check of a large volume sends many requests. By the
+  code, a configuration pointed at a snapshot destination is refused, since a
+  snapshot has no `rollback.lock` in its namespace; that was not tested.
+  Damage, a manifest the witness does not select, a capacity mismatch and an
+  unfinished creation are refused as attach refuses them. A local pair whose
+  two directories can both be written is opened to write, as before, and
+  `maki-check <root>` still refuses protected roots ([checking a backing that
+  cannot be written](docs/operations.md#checking-a-backing-that-cannot-be-written),
+  [diagnostic
+  commands](docs/remote-witness-service.md#diagnostic-commands-and-writer-ownership),
+  maki(8), maki-check(8), SPEC §27).
+- **An HTTP connect gives each of the endpoint host's addresses a share of the
+  timeout, and the WebSocket transport reaches the other address family with
+  a short timeout** (AUD-201, 2026-11-26;
+  [#405](https://github.com/seo-rii/maki/pull/405)). An HTTP endpoint host's
+  address that did not answer held the request until its `timeout`, and a
+  live address after it in the same family was never tried. Each of a
+  family's `n` addresses may now take `timeout / n` to connect, so a dead
+  address before a live one costs half the `timeout` for two. When every
+  address fails within its share, the request fails then, before its
+  `timeout`, retryable and marked unsent, so the dispatcher may send it to
+  another endpoint even for a provider that is not `retry_safe`; it reads
+  `connect timeout: …` when the first address's share ran out and `transport
+  error: …` when the first refused the connection, where it used to fail at
+  its `timeout` with `request timeout: …`. The shares are fixed: a live
+  address slower than its share to accept the connection is given up, so keep
+  `timeout` well above `n` times the expected connect time (one lost SYN
+  delays a Linux connect by 1 s). A host with one address per family behaves
+  as before. The other family still starts after 300 ms, which reqwest does
+  not let Maki change, so with an HTTP `timeout` of 300 ms or less it is never
+  tried when the first does not answer. With less than 600 ms of a connect
+  left when it dials, the WebSocket transport starts the other family halfway
+  to the deadline instead of after 300 ms, so a `timeout` of 300 ms or less
+  still reaches it ([remote HTTP
+  mapping](docs/configuration.md#remote-http-mapping), [WebSocket and gRPC
+  contracts](docs/configuration.md#websocket-and-grpc-contracts), [known
+  limitations](docs/status.md#known-limitations)).
+
 - **Detach and cleanup wait for the device to let go of a disconnected
   connection** (AUD-197, 2026-11-25;
   [#398](https://github.com/seo-rii/maki/pull/398)). When something held
@@ -820,7 +929,11 @@ documents.
   connect timeout, so there a dead address before a live one of the same
   family can still take the whole request `timeout` ([WebSocket and gRPC
   contracts](docs/configuration.md#websocket-and-grpc-contracts), [known
-  limitations](docs/status.md#known-limitations)).
+  limitations](docs/status.md#known-limitations)). *Changed on 2026-11-26
+  (AUD-201, [#405](https://github.com/seo-rii/maki/pull/405)): with less than
+  600 ms of a connect left the WebSocket transport starts the other family
+  halfway to the deadline, and the HTTP transport gives each address of a
+  family a share of its `timeout`.*
 - **On Linux, `maki check`, `maki-check` and `maki volume inspect` read a
   backing root they may not write, read-only** (AUD-195, 2026-11-25;
   [#403](https://github.com/seo-rii/maki/pull/403)). On a read-only mount, on
@@ -842,7 +955,9 @@ documents.
   is refused with the directory, its setting and the reason, since opening one
   rewrites its authenticated state ([checking a backing that cannot be
   written](docs/operations.md#checking-a-backing-that-cannot-be-written),
-  maki(8), maki-check(8), SPEC §27).
+  maki(8), maki-check(8), SPEC §27). *Changed on 2026-11-26 (AUD-202,
+  [#407](https://github.com/seo-rii/maki/pull/407)): such a backing, and every
+  one with a remote witness, is now read read-only.*
 - **Attach probes a lone remote endpoint and refuses one that cannot serve
   as configured** (AUD-188, AUD-189, 2026-11-25;
   [#392](https://github.com/seo-rii/maki/pull/392)). Under the default
@@ -1611,6 +1726,19 @@ observable behaviour:
 
 ### Documentation
 
+- **2026-11-26 second follow-up round** (AUD-203;
+  [#406](https://github.com/seo-rii/maki/pull/406)). The first-volume block
+  exports `LVM_SUPPRESS_FD_WARNINGS=1` before it opens the attach lock on
+  descriptor 9, which the LVM commands it runs inherit, so they no longer
+  print `File descriptor 9 (/run/maki-attach/attach.lock) leaked on …
+  invocation` each; what the block runs and records is unchanged ([first
+  volume](docs/getting-started/first-volume.md#1-provision-and-record-the-layout)).
+  The records change corrects the operations guide on where a writable open
+  of a pair whose witness directory cannot be written fails (it creates a
+  missing `rollback.lock` before it fails at the witness) and the comment of
+  `maki-witness`'s `volume_identity`. `v0.1.0-rc.2` was tagged at `92d4dd4`
+  on 2026-11-26, before this round.
+
 - **2026-11-25 follow-up round** (AUD-199;
   [#402](https://github.com/seo-rii/maki/pull/402)). The first-volume block
   writes a record of its run, `/etc/maki/attach/<volume>.bootstrap` (root,
@@ -1623,8 +1751,10 @@ observable behaviour:
   else on the device or the VG ([recovering from a failed
   bootstrap](docs/getting-started/first-volume.md#recovering-from-a-failed-bootstrap)).
   The records change says on the status page that only Linux checks a backing
-  root it may not write read-only. No release candidate has been tagged since
-  `v0.1.0-rc.1`, which predates this round, the ninth and the eighth.
+  root it may not write read-only. When this entry was written, no release
+  candidate had been tagged since `v0.1.0-rc.1`, which predates this round,
+  the ninth and the eighth. *`v0.1.0-rc.2` was tagged at `92d4dd4` on
+  2026-11-26, after this round.*
 - **2026-11-25 ninth round** (AUD-192;
   [#390](https://github.com/seo-rii/maki/pull/390)). maki-attach(8) says
   which errors tell a caller without the permission to run the command as
@@ -1637,8 +1767,10 @@ observable behaviour:
   answers unavailable until a restart, and that `serve` logs nothing about
   it. The records change adds to the status page's known limitations that
   the WebSocket transport does not divide its connect deadline across the
-  endpoint host's addresses. No release candidate has been tagged since
-  `v0.1.0-rc.1`, which predates this round and the eighth. *Changed on
+  endpoint host's addresses. When this entry was written, no release
+  candidate had been tagged since `v0.1.0-rc.1`, which predates this round
+  and the eighth; `v0.1.0-rc.2`, tagged at `92d4dd4` on 2026-11-26, includes
+  them. *Changed on
   2026-11-25 (AUD-198, [#400](https://github.com/seo-rii/maki/pull/400)): the
   transport now races the address families and shares its connect deadline
   among the addresses; the status page states what remains.*

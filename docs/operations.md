@@ -373,12 +373,15 @@ directory and renaming it over the old one; with a remote witness it claims a
 writer at the authority and copies the current state into a namespace of its
 own, which a command that only reads must never do. A local backing whose two
 directories can both be written is opened to write, as before. Where the
-witness directory cannot be written, that open would fail when it publishes
-the anchor, before it writes anything in the backing. Where the backing root
-cannot be written, the root decides as it does for a plain backing: the pair
-is read read-only even when the files in the root could be written. (A
-writable open would succeed there, for a `0500` root holding `0600` files, and
-rewrite them, but could not recreate a missing lock file or manifest slot.)
+witness directory cannot be written, that open would fail at the witness,
+when it takes the witness's lock or publishes the anchor, before it writes a
+page, the manifest or the marker; it would already have taken the backing
+root's lock, creating `rollback.lock` there if that file was missing. Where
+the backing root cannot be written, the root decides as it does for a plain
+backing: the pair is read read-only even when the files in the root could be
+written. (A writable open would succeed there, for a `0500` root holding
+`0600` files, and rewrite them, but could not recreate a missing lock file or
+manifest slot.)
 The read-only open makes the authentication attach makes before the command
 reads the volume: the format marker, the manifest the witness selects (exact,
 canonical, of the witness's generation), the sizes of its slot and of the
