@@ -804,8 +804,11 @@ fn classify_transport(e: reqwest::Error) -> CryptoError {
     // hyper-util hands a request to a connection only after that succeeded,
     // and resends only a request a connection returned unwritten; this
     // client never resends one itself (see `retry::never` in `new`). So no
-    // byte of the request was written. Everything else, timeouts included,
-    // may follow a written request and stays unmarked.
+    // byte of the request was written. That includes a connect timeout: an
+    // address's share of the connect timeout, or reqwest's bound over the
+    // whole connect, running out is `is_connect` and is marked. Everything
+    // else, the request's own `timeout` included, may follow a written
+    // request and stays unmarked.
     let not_sent = e.is_connect();
     let error = classify_transport_error(e);
     if not_sent {
@@ -820,7 +823,15 @@ fn classify_transport_error(e: reqwest::Error) -> CryptoError {
     // it before either classification or logging can expose query secrets.
     let e = e.without_url();
     if e.is_timeout() {
-        return CryptoError::Retryable(format!("request timeout: {e}"));
+        // A connect that ran out its time (an address's share) failed
+        // before any byte of the request was written, and can end well
+        // before the request's `timeout`: say which timeout it was.
+        let what = if e.is_connect() {
+            "connect timeout"
+        } else {
+            "request timeout"
+        };
+        return CryptoError::Retryable(format!("{what}: {e}"));
     }
     // The pinned hyper parser preserves typed provenance for definite HTTP
     // head and chunk-framing violations. A decode/body error by itself is not
