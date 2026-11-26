@@ -213,9 +213,11 @@ fn check_protected_capacity(
 /// as [`build_backing`]'s open, without its rewrites of the authenticated
 /// state and of the witness anchor (the failed writeback rule, K-01), with
 /// the locks taken shared. The directories decide, as the root does for a
-/// plain backing: that open fails publishing the anchor in a witness
-/// directory it may not write, and a root it may not write is read
-/// read-only even where its files could be rewritten. Where both can be
+/// plain backing: in a witness directory it may not write, that open fails
+/// at the witness, when it takes `witness.lock` or publishes the anchor
+/// (after taking the root's `rollback.lock`, which it creates if it is
+/// missing), and a root it may not write is read read-only even where its
+/// files could be rewritten. Where both can be
 /// written it is [`build_backing`], as before. A remote
 /// one always opens as a [`ReadOnlyRollbackBacking`], which sends the
 /// authority only inspections: [`build_backing`] claims a writer at the
