@@ -18,8 +18,9 @@ block whose last command failed, an `&&` list that ends the block included,
 and says which step it was in. `set -e` does not stop at a failure inside an
 `&&` or `||` list before a block's last command. The writer refuses a block
 that Bash cannot read, and one with `&&` or `||` on a line that Bash prints
-at the block's own level, or in a subshell there, before the line that ends
-its last command; it matches them as text, so a condition, a test expression,
+at the block's own level, or in a subshell there, of a command before its
+last command (the last command's own lines, however many, are not read); it
+matches them as text, so a condition, a test expression,
 quoted text or a command substitution there is refused too. It does not see
 lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
 functions, nor `set -e`'s other exemptions (a negated or a background
@@ -130,13 +131,16 @@ def without_heredoc_bodies(block):
 
 def has_unguarded_list(label, block):
     """Whether `block` has `&&` or `||`, matched as text, on a line that Bash
-    prints at the block's own level or in a subshell there, before the line
-    that ends its last command. Lists deeper down (in compound-command bodies,
-    brace groups and functions) are not read.
+    prints at the block's own level or in a subshell there, up to the last
+    such line that ends a command (in `;`, or a here-document's command
+    line): the lines of every command before the last one. The last command's own lines, however many, are not read, nor are
+    lists deeper down (in compound-command bodies, brace groups and
+    functions).
 
-    Bash prints a function's body one command to a line, four spaces in at
-    its own level, each command but the last ended by `;` (a here-document's
-    command line by its body). The block is first only read (`bash -n`): a
+    Bash prints a function's body four spaces in at its own level, a command
+    that is not compound on one line and a compound one over several, each
+    command but the last ended by `;` (a here-document's command line by its
+    body). The block is first only read (`bash -n`): a
     block that Bash reads alone cannot close the function it is put in, so
     defining that function runs none of it."""
     bash = shutil.which("bash")

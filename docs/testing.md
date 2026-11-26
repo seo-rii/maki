@@ -192,7 +192,8 @@ whose last command failed, an `&&` list that ends the block included. `set
 -e` does not stop at a failure inside an `&&` or `||` list before a block's
 last command. The writer refuses a block that Bash cannot read, and one with
 `&&` or `||` on a line Bash prints at the block's own level, or in a subshell
-there, before the line that ends its last command, matched as text, so a
+there, of a command before its last command (the last command's own lines are
+not read), matched as text, so a
 condition, a test expression or quoted text there is refused too. It does not
 see lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
 functions, nor a negated or a background command, where a failure lets the
