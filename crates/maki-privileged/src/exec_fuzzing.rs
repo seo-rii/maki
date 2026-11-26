@@ -360,10 +360,19 @@ pub fn sysfs(data: &[u8]) -> bool {
     if std::fs::create_dir(&root).is_err() {
         return false;
     }
-    build(&root, spec);
-    let accepted = read(selector % 8, mounts, &root);
-    let _ = std::fs::remove_dir_all(&root);
-    accepted
+    let root = Tree(root);
+    build(&root.0, spec);
+    read(selector % 8, mounts, &root.0)
+}
+
+/// A tree this process made, removed when the reader is done with it, also
+/// when one of the target's assertions fails.
+struct Tree(PathBuf);
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn read(reader: u8, mounts: &[u8], sysfs: &Path) -> bool {

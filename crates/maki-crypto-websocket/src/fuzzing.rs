@@ -99,11 +99,9 @@ pub fn message(data: &[u8]) -> bool {
             reason: Utf8Bytes::from(reason.to_string()),
         })),
     };
-    // With the `raw_value` feature (the witness enables it), serde_json's
-    // `Value` reads an object whose first key is its private raw-value token as
-    // the JSON text of its value: such a frame has no reference.
+    // A frame serde_json's `Value` reads otherwise has no reference.
     let reference = text
-        .filter(|text| !text.contains("$serde_json::private::"))
+        .filter(|text| !reads_raw_value(text.as_bytes()))
         .map(serde_json::from_str::<Document>);
     if kind == TEXT {
         if let (Some(text), Some(reference)) = (text, &reference) {
@@ -210,6 +208,83 @@ pub fn message(data: &[u8]) -> bool {
         Err(_) => {}
     }
     results.is_ok()
+}
+
+/// Whether serde_json's `Value` reads some object of `json` as something
+/// else. With the `raw_value` feature, which the witness enables and
+/// feature unification spreads, `Value` reads an object whose first key,
+/// decoded, is serde_json's private raw-value token as the JSON text of
+/// that key's string value. The walk decodes keys as `Value` does (an
+/// escaped token is the token) and stops where the document stops parsing,
+/// which is where `Value` stops before it meets one.
+fn reads_raw_value(json: &[u8]) -> bool {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+    use std::cell::Cell;
+
+    const TOKEN: &str = "$serde_json::private::RawValue";
+
+    struct Walk<'a>(&'a Cell<bool>);
+
+    impl<'de> DeserializeSeed<'de> for Walk<'_> {
+        type Value = ();
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Walk<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON value")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+            while sequence.next_element_seed(Walk(self.0))?.is_some() {}
+            Ok(())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut first = true;
+            while let Some(key) = map.next_key::<String>()? {
+                if first && key == TOKEN {
+                    self.0.set(true);
+                }
+                first = false;
+                map.next_value_seed(Walk(self.0))?;
+            }
+            Ok(())
+        }
+    }
+
+    let found = Cell::new(false);
+    let _ = Walk(&found).deserialize(&mut serde_json::Deserializer::from_slice(json));
+    found.get()
 }
 
 /// The frame parser accepts what serde_json accepts and reads the id, the
@@ -373,6 +448,22 @@ pub fn seeds() -> Vec<(String, Vec<u8>)> {
         input(
             text(1),
             br#"{"id":5,"id":5,"error":{"class":"integrity","reason":"auth-tag-mismatch"}}"#,
+        ),
+    );
+    add(
+        "refused-error-unsupported-context-duplicate-id",
+        input(
+            text(1),
+            br#"{"id":1,"id":1,"error":{"class":"unsupported-context","reason":"unsupported-format-version"}}"#,
+        ),
+    );
+    // serde_json's `Value` would read this as `{"id":7,"items":[]}`; the
+    // reader finds an object without an id.
+    add(
+        "refused-raw-value-token-escaped",
+        input(
+            text(1),
+            br#"{"\u0024serde_json::private::RawValue":"{\"id\":7,\"items\":[]}"}"#,
         ),
     );
     add(

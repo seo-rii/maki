@@ -1314,9 +1314,6 @@ impl System for LinuxSystem {
     }
 }
 
-/// The refusal of a verb that finds the recorded device connected under an
-/// identity other than the recorded one. Nothing is changed and the record
-/// is kept.
 /// The size `blockdev --getsize64` printed.
 fn lv_size_of(out: &std::process::Output) -> Result<u64, ExecError> {
     if !out.status.success() {
@@ -1329,6 +1326,9 @@ fn lv_size_of(out: &std::process::Output) -> Result<u64, ExecError> {
         .ok_or_else(|| identity_error("logical volume size probe returned invalid bytes"))
 }
 
+/// The refusal of a verb that finds the recorded device connected under an
+/// identity other than the recorded one. Nothing is changed and the record
+/// is kept.
 fn other_identity_message(record: &BoundDeviceRecord, refused: &str) -> String {
     format!(
         "{device} is recorded for volume {volume} but is connected under another identity; \

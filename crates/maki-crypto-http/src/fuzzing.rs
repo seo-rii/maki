@@ -125,14 +125,9 @@ pub fn response(data: &[u8]) -> bool {
         return raw(*parameter, body);
     }
     let (spec, batch) = mapping(selector);
-    // With the `raw_value` feature (the witness enables it), serde_json's
-    // `Value` reads an object whose first key is its private raw-value token as
-    // the JSON text of its value: such a body has no reference.
-    let reference = (!body
-        .expose()
-        .windows(22)
-        .any(|w| w == b"$serde_json::private::"))
-    .then(|| serde_json::from_slice::<Document>(body.expose()));
+    // A body serde_json's `Value` reads otherwise has no reference.
+    let reference = (!reads_raw_value(body.expose()))
+        .then(|| serde_json::from_slice::<Document>(body.expose()));
     let op = operation(spec);
     if batch {
         let count = 1 + usize::from(parameter % 4);
@@ -183,6 +178,83 @@ pub fn response(data: &[u8]) -> bool {
         }
         parsed.is_ok()
     }
+}
+
+/// Whether serde_json's `Value` reads some object of `json` as something
+/// else. With the `raw_value` feature, which the witness enables and
+/// feature unification spreads, `Value` reads an object whose first key,
+/// decoded, is serde_json's private raw-value token as the JSON text of
+/// that key's string value. The walk decodes keys as `Value` does (an
+/// escaped token is the token) and stops where the document stops parsing,
+/// which is where `Value` stops before it meets one.
+fn reads_raw_value(json: &[u8]) -> bool {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+    use std::cell::Cell;
+
+    const TOKEN: &str = "$serde_json::private::RawValue";
+
+    struct Walk<'a>(&'a Cell<bool>);
+
+    impl<'de> DeserializeSeed<'de> for Walk<'_> {
+        type Value = ();
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Walk<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON value")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+            while sequence.next_element_seed(Walk(self.0))?.is_some() {}
+            Ok(())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut first = true;
+            while let Some(key) = map.next_key::<String>()? {
+                if first && key == TOKEN {
+                    self.0.set(true);
+                }
+                first = false;
+                map.next_value_seed(Walk(self.0))?;
+            }
+            Ok(())
+        }
+    }
+
+    let found = Cell::new(false);
+    let _ = Walk(&found).deserialize(&mut serde_json::Deserializer::from_slice(json));
+    found.get()
 }
 
 /// `body` as the provider holds it after reading it in three chunks within
@@ -516,6 +588,16 @@ pub fn seeds() -> Vec<(String, Vec<u8>)> {
             3,
             0,
             format!("\"{}\"", hex(&payload(5)).to_uppercase()).as_bytes(),
+        ),
+    );
+    // serde_json's `Value` would read this as `{"ciphertext":"YQ=="}`; the
+    // provider reads an object with one member it does not look for.
+    add(
+        "refused-single-raw-value-token-escaped",
+        input(
+            0,
+            7,
+            br#"{"\u0024serde_json::private::RawValue":"{\"ciphertext\":\"YQ==\"}"}"#,
         ),
     );
     add(
