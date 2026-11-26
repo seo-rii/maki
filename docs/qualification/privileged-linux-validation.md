@@ -42,17 +42,22 @@ The automated run checks:
 - a SQLite WAL checkpoint with `synchronous=FULL` and `integrity_check`;
 - 32 MiB written with `fsync` beside the database, and the SHA-256 of both;
 - a `maki-attach detach` while `scripts/privileged_validation_opener.py`
-  holds the device open: the opener reads it until a read fails with `EIO`
-  (the kernel acknowledged the disconnect), keeps it open two seconds more,
-  and requires that the device showed the connection until it closed and
-  shows none after, so the detach must wait for it (AUD-197) and succeed in
-  one run; and
+  holds the device open: the opener reads whole blocks until a read fails
+  with `EIO` (the kernel acknowledged the disconnect), keeps the device open
+  two seconds more, writes that it is closing it, closes it, and requires
+  that the device showed the connection until then and shows none after.
+  The run requires that line to be there when the detach returns, so the
+  detach must have waited for the close (AUD-197), and must succeed in one
+  run; and
 - a second attach with `init_sentinel = false`, the workload gate and the
   same hashes.
 
-After each detach, and after each cleanup that ends an attachment, the
-mountpoint must be unmounted, the device must have no holders, no `backend` or `pid` attribute and size 0, and the
-helper's attach record must be gone. Without `--kill-daemon` the run then
+Each attach must show the mount, the attachment's backend identifier on the
+device and the helper's attach record. After each detach, and after each
+cleanup that ends an attachment, the mountpoint must be unmounted, the device
+must have no holders, no `backend` or `pid` attribute and size 0, and the
+attach record must be gone. The record is looked for as root, and a look that
+fails stops the run. Without `--kill-daemon` the run then
 ends the attachment with `maki-attach cleanup`. With `--kill-daemon` it
 instead sends `SIGKILL` to its nbdkit under the mounted attachment (exit
 status 137 required), requires `maki-attach cleanup` to release the
@@ -151,7 +156,7 @@ filesystem. A stable symlink points to the newest run:
 ├── maki-verify-reattach.txt
 ├── lifecycle-check-reattach.txt
 ├── maki-cleanup.txt                 (without --kill-daemon)
-├── maki-cleanup-dead-daemon.txt     (with --kill-daemon, and the next five)
+├── maki-cleanup-dead-daemon.txt     (--kill-daemon: this, the next five)
 ├── nbdinfo-after-kill.txt
 ├── maki-attach-after-kill.txt
 ├── maki-verify-after-kill.txt

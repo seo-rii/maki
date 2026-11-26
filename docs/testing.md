@@ -159,38 +159,54 @@ runner user, with the checks its
 installs its tools, it builds `maki`, `maki-attach` and the plugin from a
 snapshot of the commit, starts nbdkit as that user and goes through kernel
 NBD, raw fio, LVM, XFS and the helper's attach, verify, file fio and SQLite.
+
 It then writes and fsyncs 32 MiB beside the database and records their
-hashes, detaches while `scripts/privileged_validation_opener.py` holds
-`/dev/nbd15` open, which requires the detach's final teardown to wait until
-the opener closes it (AUD-197; the opener requires that its reads fail with
-`EIO` once the disconnect is acknowledged and that the device shows the
-connection until it closes), attaches again with `init_sentinel` off and
-compares the hashes, kills nbdkit with `SIGKILL` under the mount, requires
-`maki-attach cleanup` to release the attachment without it, starts a new
-nbdkit on the same backing, attaches a third time, compares the hashes and
-detaches. After each detach, and after each cleanup that ends an attachment,
-the mount, the device's holders, its connection and size and the attach record
-must be gone. The package built
-from the same commit (`packaging/debian/build-deb.py`) then runs the
-documented procedure as written: `scripts/documented_quickstart.py` writes
-the Debian guide's "Install the Maki package" blocks, the
-[quick start](getting-started/quickstart.md)'s blocks and, as its step 4, the
+hashes, and detaches while `scripts/privileged_validation_opener.py` holds
+`/dev/nbd15` open (AUD-197). The opener requires that its reads fail with
+`EIO` once the disconnect is acknowledged, that the device shows the
+connection until the opener closes it and none after; the run requires that
+the detach returned only once the opener had written that it was closing
+the device, so the detach's final teardown must have waited for the close.
+It attaches again with `init_sentinel` off and compares the hashes, kills
+nbdkit with `SIGKILL` under the mount, requires `maki-attach cleanup` to
+release the attachment without it, starts a new nbdkit on the same backing,
+attaches a third time, compares the hashes and detaches. Each attach must
+show the mount, the attachment's backend identifier and the attach record;
+after each detach, and after each cleanup that ends an attachment, the
+mount, the device's holders, its connection and size and the attach record
+must be gone, and a look for the record that fails stops the run. In the
+job's first run on GitHub the killed daemon's device still showed its
+connection, so that cleanup took cleanup's detach path; its path for a
+backend known to be absent (disconnected recovery) has not run on a kernel.
+
+The package built from the same commit (`packaging/debian/build-deb.py`) then
+runs the documented procedure as written, also when the runner's step has
+failed: `scripts/documented_quickstart.py` writes the Debian guide's "Install
+the Maki package" blocks, the [quick start](getting-started/quickstart.md)'s
+blocks and, as its step 4, the
 [first-volume bootstrap](getting-started/first-volume.md#1-provision-and-record-the-layout)
-(AUD-199) into one program that runs them in order in one root shell and stops
-at the first failed command, also inside an `&&` list; the step then requires
-that no attach record, mount, connection or active unit of the volume
-remains. That covers the bootstrap's real `maki-attach nbd-connect` and
-`nbd-disconnect`, LVM, device-mapper and XFS commands and the installed units:
-`maki@` under its sandbox, the attach unit's start and its `ExecStop`
-cleanup on a planned stop after `maki drain` and on `systemctl disable
---now`. When a step fails or the job is cancelled, the job prints the
-runner's status and component logs, the kernel log, the units' journal, the
-NBD devices, mappings, mounts and attach records; it always prints the tool
-versions and keeps the logs, without the runner's source snapshot, builds and
-work tree or any key file, as the `kernel-lifecycle-logs` artifact. The runner is GitHub's `ubuntu-latest` image, not the Debian 12
-primary platform or RHEL 9, and its kernel changes with the image; the job
-uses the local provider only and kills nbdkit once while the filesystem is
-idle after a sync, which is not a power loss.
+(AUD-199) into one program that runs them in order in one root shell under
+`set -e -o pipefail` and checks each block's status after it. It stops at a
+failed command that `set -e` stops at, a pipeline included, and at a block
+whose last command failed, an `&&` list that ends the block included. `set
+-e` does not stop at a failure inside an `&&` or `||` list before a block's
+last command, so the writer refuses a block in which Bash reads one there, or
+which Bash cannot read; the guides have none. The step then requires that no
+attach record, mount, connection or active unit of the volume remains. That
+covers the bootstrap's real `maki-attach nbd-connect` and `nbd-disconnect`,
+LVM, device-mapper and XFS commands and the installed units: `maki@` under
+its sandbox, the attach unit's start and its `ExecStop` cleanup on a planned
+stop after `maki drain` and on `systemctl disable --now`.
+
+When a step fails or the job is cancelled, the job prints the runner's status
+and component logs, the kernel log, the units' journal, the NBD devices,
+mappings, mounts and attach records; it always prints the tool versions and
+keeps the logs, without the runner's source snapshot, builds and work tree or
+any key file, as the `kernel-lifecycle-logs` artifact. The runner is GitHub's
+`ubuntu-latest` image, not the Debian 12 primary platform or RHEL 9, and its
+kernel changes with the image; the job uses the local provider only and kills
+nbdkit once while the filesystem is idle after a sync, which is not a power
+loss.
 
 The `rhel9` job runs in the `quay.io/centos/centos:stream9` container; CentOS
 Stream 9 is the public upstream of RHEL 9. It installs its tools from BaseOS
@@ -542,7 +558,7 @@ packaged configuration without installing services or creating users.
 | Command-line output and exit status | `review_closed_output.rs` in all five binaries: stdout or stderr is a pipe whose read end is closed before the child starts, or `/dev/full`; a closed stdout keeps the command's own verdict, another failure to write a result exits 1 and names the verdict, a completed change only warns, and a diagnostic nobody reads leaves the status. `review_cli_help.rs` (`maki-attach`, `maki-witness`, `maki-benchmark`): `--help` and `--version` only as the sole argument. `review_misuse_status.rs` (`maki`, `maki-witness`): misuse, an option where a path belongs included, exits 2 before anything is read or created, a failed command 1, an argument that is not UTF-8 2. `scripts/test_doc_output_validation.py`: no two workspace targets document into one directory |
 | Test fixture locations | `maki-backing/tests/review_other_filesystem.rs`: the five copies of `tests/support/other_filesystem.rs` are identical, and a fixture without a second filesystem skips unless `MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1`, which makes it fail. `tests/support/short_dir.rs` keeps socket paths short; `tests/support/private_dir.rs`, `shared_dir.rs` and `witness_config.rs` set fixture modes explicitly, whatever the umask |
 | Packaged workload lifecycle (R3-007) | `maki-privileged/tests/regression_workload_lifecycle.rs`: daemon failure enters bounded recovery, registered workloads stop before attachment cleanup, cleanup success alone restarts the target, every workload start verifies identity, and target stop cleans attachment before daemon exit |
-| Current privileged runner contract | `regression_runner_without_nbd_client.rs` and `phase7_priv.rs`: the runner neither requires nor installs nbd-client, its raw fixture connects and disconnects with `maki-attach nbd-connect`/`nbd-disconnect`, the unprivileged disconnect probe runs the helper's own request, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice; `scripts/test_privileged_denial_validation.py` accepts only the kernel's `Operation not permitted` for `NBD_CMD_DISCONNECT` as denial evidence. `scripts/test_privileged_lifecycle_validation.py`: after the workload, every run writes and fsyncs data, detaches while an opener holds the device, attaches again without creating the sentinel and compares the data; `--kill-daemon` reaches the worker and adds `SIGKILL` of nbdkit (exit status 137), cleanup, a new nbdkit that must negotiate, a third attach, the comparison and a final detach, and without it cleanup ends the attachment; the exit trap asks an opener to close before any helper cleanup. Against mocks, a helper's output is kept with its exit status, each leftover (mount, holder, backend, `pid`, size, attach record) fails the release check, changed data fails the comparison, and an opener that does not hold the device stops the run. The opener's verdict is checked on a scripted device and clock: only reads served, then `EIO`, with the connection shown until the close and gone after it, pass |
+| Current privileged runner contract | `regression_runner_without_nbd_client.rs` and `phase7_priv.rs`: the runner neither requires nor installs nbd-client, its raw fixture connects and disconnects with `maki-attach nbd-connect`/`nbd-disconnect`, the unprivileged disconnect probe runs the helper's own request, root plans mode-0600 configuration, the control runtime is provisioned, and real cleanup is invoked twice; `scripts/test_privileged_denial_validation.py` accepts only the kernel's `Operation not permitted` for `NBD_CMD_DISCONNECT` as denial evidence. `scripts/test_privileged_lifecycle_validation.py`: after the workload, every run writes and fsyncs data, detaches while an opener holds the device, attaches again without creating the sentinel and compares the data; `--kill-daemon` reaches the worker and adds `SIGKILL` of nbdkit (exit status 137), cleanup, a new nbdkit that must negotiate, a third attach, the comparison and a final detach, and without it cleanup ends the attachment; the exit trap asks an opener to close before any helper cleanup. Against mocks, a helper's output is kept with its exit status, a detach that returns before the opener has closed the device fails, each attach must show the mount, a backend identifier and the record, each leftover (mount, holder, backend, `pid`, size, attach record) fails the release check, a look for the record that fails fails both checks, changed data fails the comparison, and an opener that does not hold the device stops the run. The opener's verdict is checked on a scripted device and clock: only whole blocks read while the device showed a connection, then `EIO`, with that connection shown at the failure and at the close and gone after it, pass. `scripts/test_documented_quickstart_validation.py`: the program holds every block of the Debian install section, the quick start and the bootstrap in order, stops at a failed command, pipeline stage or block, and is refused for a block with an `&&` or `||` list before its last command or one Bash cannot read |
 | Helper NBD handshake and netlink (SPEC §6) | `maki-privileged/src/nbd_kernel/handshake_tests.rs`: against scripted servers on a socketpair, the exact bytes sent (client flags, one `NBD_OPT_GO` for the default export), `NO_ZEROES` echoed only when offered, no fixed newstyle, oldstyle and bad magic, every GO error reply without an `EXPORT_NAME` fallback, a missing, repeated or malformed `NBD_INFO_EXPORT`, skipped information, unknown reply types and options, a reply over 4098 bytes refused before it is read, the 64 KiB total, truncation, stalls at the deadline, exports without `HAS_FLAGS`, `SEND_FLUSH` or `SEND_FUA`, size 0, and a negotiated socket left without timeouts. `netlink_tests.rs`: golden bytes of `CTRL_CMD_GETFAMILY`, `NBD_CMD_CONNECT` (libnl's order and `NLA_F_NESTED` nesting) and `NBD_CMD_DISCONNECT`, and the reading of replies (family id, connect index, ack, negative errno, truncation, sequence numbers, ports, senders). `header_tests.rs`: every constant against the installed UAPI headers through a C probe (`MAKI_TEST_REQUIRE_NBD_HEADERS=1` fails instead of skipping). `retry_tests.rs`, against a scripted daemon and kernel and a manual clock: an `EBUSY` connect retried every 100 ms on the negotiated connection after checking that the device still shows no connection, a fresh negotiation only for a connection that is no longer usable, an unavailable export (`NBD_REP_ERR_UNKNOWN`) retried the same way, the 5 s counted from the first busy answer, a device busy to the end told apart from every other refusal, an export unavailable to the end refused as busy with another connection or missing, no retry once the device shows a connection or past an earlier deadline, every other answer final; the family check (highest attribute 9 refused, 10 accepted). `property_tests.rs`: seeded noise and mutated transcripts never make the handshake read more than its limit, accept another export or read past the acknowledgement, 100,000 generated datagrams yield the kernel's verdict only in its own shape, and the socket reads its request's answer, another request's, a multipart answer and silence from the kernel's generic netlink controller. `tests.rs`, `command_tests.rs` and `exec_tests.rs`: flags and size forwarded unchanged, a blocking close-on-exec socket, a negotiated connection reusable only while open and silent, an earlier connection closed before the next negotiation, the deadline, the step limit and an earlier `finish_by` deadline, no program started for either step, an unanswered request kept as an I/O error of unknown outcome, and a device that stayed busy kept apart from a refusal |
 | Helper NBD handshake against nbdkit | `maki-privileged/tests/review_nbd_handshake_nbdkit.rs`: a real `nbdkit memory` export negotiates, and eval exports without FLUSH or FUA are refused. `maki-nbdkit/tests/review_helper_nbd_handshake.rs` compiles the helper's handshake source by path and runs it against Maki's plugin: FLUSH, FUA and write zeroes always, TRIM exactly with discard, never read-only; a second connection is answered "not available", as the handshake tells it apart, until the first is closed, and the daemon's log says why. Both skip without nbdkit unless `MAKI_TEST_REQUIRE_NBDKIT=1`; maki-privileged's tests start nbdkit on a private socket through `tests/support/nbdkit.rs` |
 | Kernel NBD connect (root) | `maki-privileged/tests/review_nbd_kernel.rs`, a root-only target: nbdkit serves a memory export, the helper connects a free `/dev/nbdN`, sysfs must show the backend identifier, the size, `queue/write_cache` `write back` and `queue/fua` 1, a second connect is the kernel's refusal, a write and an fsync pass, and the disconnect frees the device; the provisioning path (`connect_raw`/`disconnect_raw`) refuses another identifier's disconnect, and its own disconnect returns only once the device shows no connection; a device the test holds open is connected once it is released, not before. The three tests take different devices (the lowest and the two highest free ones), so none waits for udev's probe of another's device. It skips without root, the `nbd` module or nbdkit unless `MAKI_TEST_REQUIRE_NBD=1`, which CI's root-only step sets |

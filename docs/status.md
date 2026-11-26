@@ -221,18 +221,23 @@ See [cache reload](operations.md#growth-and-cache-reload).
   through the kernel NBD, udev, device-mapper, LVM and XFS of a disposable
   GitHub Ubuntu runner, not the Debian 12 primary platform
   ([testing](testing.md#automated-ci)). The privileged runner attaches, writes
-  and fsyncs data, detaches while another process holds the device open, so
-  that the detach must wait until it closes (AUD-197), attaches again and
-  reads the data back, then kills nbdkit under the mount, cleans up without
-  it, starts a new nbdkit, attaches a third time and detaches. The Debian
-  guide's install steps, the quick start and its first-volume bootstrap
-  (AUD-199) then run as written on the package built from the same commit,
-  under systemd with the installed units, including the attach unit's
-  `ExecStop` cleanup on two planned stops. That is one local-provider volume
-  at a time on one runner kernel, and nbdkit is killed once, while the
-  filesystem is idle after a sync. How often something holds a device open at a detach on a production
-  host, and many volumes stopping together while their devices are held open,
-  have not been measured.
+  and fsyncs data, and detaches while another process holds the device open;
+  it requires that the detach returned only after that process had begun to
+  close the device, which keeps showing the connection until then, so the
+  detach must have waited (AUD-197). It attaches again and reads the data
+  back, then kills nbdkit under the mount, cleans up without it, starts a new
+  nbdkit, attaches a third time and detaches. The Debian guide's install
+  steps, the quick start and its first-volume bootstrap (AUD-199) then run as
+  written on the package built from the same commit, under systemd with the
+  installed units, including the attach unit's `ExecStop` cleanup on two
+  planned stops. That is one local-provider volume at a time on one runner
+  kernel, and nbdkit is killed once, while the filesystem is idle after a
+  sync. In the job's first run the killed daemon's device still showed its
+  connection, so that cleanup took cleanup's detach path; its path for a
+  backend known to be absent (disconnected recovery) has not run on a kernel.
+  How often something holds a device open at a detach on a production host,
+  and many volumes stopping together while their devices are held open, have
+  not been measured.
 
 ## Where the evidence lives
 
