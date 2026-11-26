@@ -211,9 +211,12 @@ fn check_protected_capacity(
 /// process may not write, either of them, opens as a
 /// [`ReadOnlyRollbackBacking`]: the same authentication against the witness
 /// as [`build_backing`]'s open, without its rewrites of the authenticated
-/// state and of the witness anchor (the failed writeback rule, K-01), which
-/// it could not make in both directories, with the locks taken shared.
-/// Where both can be written it is [`build_backing`], as before. A remote
+/// state and of the witness anchor (the failed writeback rule, K-01), with
+/// the locks taken shared. The directories decide, as the root does for a
+/// plain backing: that open fails publishing the anchor in a witness
+/// directory it may not write, and a root it may not write is read
+/// read-only even where its files could be rewritten. Where both can be
+/// written it is [`build_backing`], as before. A remote
 /// one always opens as a [`ReadOnlyRollbackBacking`], which sends the
 /// authority only inspections: [`build_backing`] claims a writer at the
 /// authority and copies the current generation into a namespace of its own,

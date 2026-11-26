@@ -537,8 +537,9 @@ complete recovery plan.
    ([which user](#local-configuration-and-creation)), where it may write both
    directories. This acquires the witness lock and verifies structural
    consistency and restores physical reservations; where it may not write
-   one of them, the check is read-only and restores nothing. Provide the complete fixed footprint even when the restored
-   copy is sparse; reservation failure keeps it offline. Normal attach
+   one of them, the check is read-only and restores nothing. Provide the
+   complete fixed footprint even when the restored copy is sparse;
+   reservation failure keeps it offline. Normal attach
    additionally verifies the crypto key and provider.
    Require application-level readback before permitting writes.
    Never run two writable copies against one witness.

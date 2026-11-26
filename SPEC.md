@@ -2037,26 +2037,28 @@ records recovery would replay and the journal repairs it would make as
 warnings.
 
 A rollback-protected backing is read so, by `maki check` and `maki volume
-inspect`, where the running process may not write its backing root or, with
-a local witness, its witness directory, and with a remote witness always:
-opening it to write re-publishes its authenticated state and witness record
+inspect`, where the running process may not write its backing root or, with a
+local witness, its witness directory, and with a remote witness always: opening
+it to write re-publishes its authenticated state and witness record
 ([local configuration and creation](docs/rollback-protection.md#local-configuration-and-creation)),
-and with a remote witness also claims a writer at the authority. The
-read-only open MUST authenticate what that open authenticates (the format
-marker, the manifest the witness selects, exact and canonical, the sizes of
-its slot and of the arena, and every committed page against its digest) and
-MUST NOT create, write, sync or remove anything below the backing root or in
-the witness directory. It MUST take shared, without creating them, the locks
-that keep a writer out: with a local witness the backing's `rollback.lock`
-and the witness's `witness.lock`, which a writer holds for its whole
-session; with a remote one the root's operation lock, which every operation
-that changes the root holds while it runs, and the `rollback.lock` of the
-current namespace, which its writer holds for its whole session. It MUST NOT
-read the backing when one of them is missing. With a remote witness it MUST send
-the authority nothing but inspections, and MUST refuse a record that changed
+and with a remote witness also claims a writer at the authority. The read-only
+open MUST authenticate what that open authenticates (the format marker, the
+manifest the witness selects, exact and canonical, the sizes of its slot and of
+the arena, and every committed page against its digest) and MUST NOT create,
+write, sync or remove anything below the backing root or in the witness
+directory. It MUST take shared, without creating them, the locks that keep a
+writer out: with a local witness the backing's `rollback.lock` and the
+witness's `witness.lock`, which a writer holds for its whole session; with a
+remote one the root's operation lock, which every operation that changes the
+root holds while it runs, and the `rollback.lock` of the current namespace,
+which its writer holds for its whole session. It MUST hold them before it reads
+anything in the backing root or the witness directory, apart from a remote
+root's format marker, which tells whether the root is one, and MUST refuse the
+backing when one of them is missing. With a remote witness it MUST send the
+authority nothing but inspections, and MUST refuse a record that changed
 between the first inspection and the moment both locks are held. Every later
-read MUST be authenticated again, and a witness that no longer selects what
-was read MUST stop the view. The read-only check rules above then apply.
+read MUST be authenticated again, and a witness that no longer selects what was
+read MUST stop the view. The read-only check rules above then apply.
 
 Damage beyond the required final-tail boundary MAY be treated as torn unsynced
 data. An intact later record MUST NOT be used to infer earlier durability:

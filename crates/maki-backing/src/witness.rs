@@ -147,29 +147,38 @@ impl FileWitness {
         })
     }
 
-    /// Open the witness in `backing` for a reader that changes nothing, as
-    /// a read-only view of the backing it protects does
-    /// (`ReadOnlyRollbackBacking`): its lock is taken shared and never
-    /// created ([`Backing::try_lock_shared_existing`]), which keeps out a
-    /// writer, who holds it exclusively, while admitting other readers, and
-    /// the anchor is read and validated, never published again. `refusal`
-    /// words a lock that cannot be taken; a witness that holds neither the
-    /// lock nor the anchor is refused as one without its anchor.
-    /// [`Self::verify_current`] then reads the anchor as it does for a
-    /// writer. Only a writer advances a witness.
-    pub(crate) fn open_read_only(
-        backing: Arc<dyn Backing>,
+    /// Take the lock of the witness in `backing` for a reader that changes
+    /// nothing, as a read-only view of the backing it protects does
+    /// (`ReadOnlyRollbackBacking`): shared, through a read-only descriptor,
+    /// and never created ([`Backing::try_lock_shared_existing`]), which
+    /// keeps out a writer, who holds it exclusively, while admitting other
+    /// readers. Nothing in the directory is read. `refusal` words a lock
+    /// that cannot be taken; a witness that holds neither the lock nor the
+    /// anchor (which is looked up, not read) is refused as one without its
+    /// anchor.
+    pub(crate) fn lock_read_only(
+        backing: &dyn Backing,
         refusal: impl FnOnce(io::Error) -> io::Error,
-    ) -> io::Result<Self> {
-        let lock = match backing.try_lock_shared_existing(LOCK_FILE) {
-            Ok(lock) => lock,
+    ) -> io::Result<Box<dyn VolumeLock>> {
+        match backing.try_lock_shared_existing(LOCK_FILE) {
+            Ok(lock) => Ok(lock),
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && !backing.exists(ANCHOR_FILE)? =>
             {
-                return Err(no_anchor(error))
+                Err(no_anchor(error))
             }
-            Err(error) => return Err(refusal(error)),
-        };
+            Err(error) => Err(refusal(error)),
+        }
+    }
+
+    /// Open the witness in `backing` under `lock`, which
+    /// [`Self::lock_read_only`] took there: the anchor is read and
+    /// validated, never published again. [`Self::verify_current`] then reads
+    /// the anchor as it does for a writer. Only a writer advances a witness.
+    pub(crate) fn open_read_only(
+        backing: Arc<dyn Backing>,
+        lock: Box<dyn VolumeLock>,
+    ) -> io::Result<Self> {
         let anchor = read_anchor(backing.as_ref()).map_err(no_anchor)?;
         Ok(Self {
             backing,

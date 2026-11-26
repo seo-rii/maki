@@ -720,12 +720,13 @@ after authenticating it as attach does (the manifest the descriptor selects,
 exact and canonical, the sizes of its slot and of the arena, and every committed
 page), and creates, writes, syncs and removes nothing in the root. It takes the
 root's `remote.operation.lock` and the current namespace's `rollback.lock`
-shared, and never creates either: it refuses a volume whose writer is still
-running (an attached volume), reads one whose active writer has gone without
-releasing it (after a crash, before a takeover), and while it runs an attach,
-takeover, restore, snapshot or GC of that root fails to take the operation lock.
-It reads the authority's record again once it holds both locks and refuses one
-that changed in between, and every later operation inspects the authority again,
-as a writer's operations do. Its deep verdict is `unproven`. Like every check,
-it loads no key and decrypts nothing, so it does not replace an offline
-data-integrity check.
+shared, and never creates either, before it reads anything in the root but its
+format marker: it refuses a volume whose writer is still running (an attached
+volume), reads one whose active writer has gone without releasing it (after a
+crash, before a takeover), and while it runs an attach, takeover, restore,
+snapshot or GC of that root fails to take the operation lock. It reads the
+authority's record again once it holds both locks and refuses one that changed
+in between, and every later operation inspects the authority again, as a
+writer's operations do. Its deep verdict is `unproven`. It loads the witness
+client's TLS identity to ask the authority, but no volume key, and decrypts
+nothing, so it does not replace an offline data-integrity check.
