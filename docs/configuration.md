@@ -526,10 +526,14 @@ next one time: half the `timeout` for two. These shares are fixed: one refused
 at once does not leave its time to those after it, and a live address slower to
 accept the connection than its share is given up. When every address has
 failed within its share, the request fails then, before its `timeout`, as a
-connection failure that was not sent; when an address is still connecting at
-the `timeout`, the request fails as a timeout. reqwest does not expose the
-300 ms, so with a `timeout` of 300 ms or less the other family is never tried
-when the first one does not answer.
+connection failure that was not sent (a share that ran out reads "connect
+timeout"); when an address is still connecting at the `timeout`, the request
+fails as a request timeout. Keep `timeout` well above `n` times the time a
+connect is expected to take: with a short `timeout`, a host with many
+addresses can have every live one given up, and on Linux one lost SYN already
+delays a connect by 1 s. reqwest does not expose the 300 ms, so with a
+`timeout` of 300 ms or less the other family is never tried when the first one
+does not answer.
 
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
