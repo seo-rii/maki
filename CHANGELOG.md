@@ -24,8 +24,9 @@ documents.
   line per difference and exit 1; a matching configuration prints one more
   `info:` line. They load no credential and contact no provider, so a
   different key under the same name and the provider's own checks are still
-  found only at attach, and `maki-check <root>` and `maki volume inspect`
-  compare nothing. Attach of an existing volume refuses a changed provider,
+  found only at attach; `maki-check <root>` reads no configuration and
+  compares nothing, and `maki volume inspect` does not compare the geometry or
+  crypto identity. Attach of an existing volume refuses a changed provider,
   key name, compatibility id or prefix length before it loads any provider
   credential or builds a provider transport. For a local provider a
   compatibility id or prefix mismatch is now `crypto identity mismatch: volume
@@ -834,8 +835,9 @@ documents.
   line. The deep check takes the volume lock shared and fails without
   `volume.lock`, which it cannot create there. The root alone decides: a
   `0500` root with writable files, which a writable check used to read, is now
-  checked read-only, so its deep verdict is `unproven` where it was `clean`,
-  and a writable root whose files cannot be written still fails. A local
+  checked read-only, so its deep verdict is `unproven` where it was `clean` (a
+  script that needs `clean` sees `unproven` there, with status 0), and a
+  writable root whose files cannot be written still fails. A local
   rollback-protected backing whose root or witness directory cannot be written
   is refused with the directory, its setting and the reason, since opening one
   rewrites its authenticated state ([checking a backing that cannot be
