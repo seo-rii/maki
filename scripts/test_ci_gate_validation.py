@@ -1,14 +1,18 @@
 """The scheduled job must run every ignored release gate to completion, the
 pull-request job every script test module, the RHEL 9 job the packaged
-build, the native suites and the RPM in a RHEL 9 userspace, and the fuzz job
-every fuzz target from its committed seeds."""
+build, the native suites and the RPM in a RHEL 9 userspace, the kernel
+lifecycle job a whole attachment and the documented quick start on the
+runner's kernel, and the fuzz job every fuzz target from its committed
+seeds."""
 
 import fnmatch
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -24,6 +28,9 @@ DAEMON = ROOT / "crates" / "maki-nbdkit" / "src" / "daemon.rs"
 PLUGIN_STEP = "nbdkit plugin build (cdylib + plugin_init symbol)"
 BYTECODE_STEP = "Python suites leave no bytecode in the checkout (Linux)"
 FAKE_STEP = 'release build refuses provider = "fake"'
+KERNEL_RUNNER_STEP = "attach lifecycle through the privileged runner"
+QUICKSTART_STEP = "documented quick start on the installed package"
+RUNNER = ROOT / "scripts" / "privileged-linux-validation.sh"
 # What `maki volume create` prints for provider = "fake" without the feature.
 FAKE_REFUSAL = ('error: config invalid: provider "fake" is not compiled into this build '
                 "(feature `fake-provider`); it is a test-only, non-cryptographic provider")
@@ -432,6 +439,262 @@ class RhelUserspaceJob(unittest.TestCase):
         self.assertLess(script.index("rm /run/maki-attach/ci.nbd\n"), idle)
         removal = script.index("rpm -e maki\n", idle)
         self.assertLess(removal, script.index("test ! -e /etc/dnf/protected.d/maki.conf\n"))
+
+
+# Stands in for every command the quick start step runs, by the name it is
+# called by; it records each call with the directory it ran in.
+QUICKSTART_STUB = r"""#!@PYTHON@
+import json
+import os
+from pathlib import Path
+import sys
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+root = Path(os.environ["FIXTURE"])
+with (root / "calls.jsonl").open("a") as calls:
+    calls.write(json.dumps([name, os.getcwd(), *args]) + "\n")
+if name == "sudo":
+    if args[:1] == ["bash"]:
+        print("the documented program's output")
+        sys.exit(int(os.environ.get("QUICKSTART_STATUS", "0")))
+    if args[:1] == ["test"]:
+        assert args[1:3] == ["!", "-e"], args
+        sys.exit(1 if Path(args[3]).exists() else 0)
+    assert args[:1] == ["apt-get"], args
+elif name == "python3":
+    if args[:2] == ["-B", "scripts/documented_quickstart.py"]:
+        directory = Path(args[2])
+        directory.mkdir(parents=True)
+        (directory / "quickstart.sh").write_text("program\n")
+        (directory / "demo.toml").write_text("configuration\n")
+    else:
+        assert args[:2] == ["-B", "packaging/debian/build-deb.py"], args
+        assert "--no-shlibdeps" not in args, args
+        Path(args[args.index("--output") + 1]).write_text("package\n")
+elif name == "git":
+    print("1700000000")
+elif name == "dpkg":
+    print("amd64")
+elif name == "dpkg-deb":
+    print("nbdkit, lvm2, xfsprogs, util-linux, systemd (>= 249), kmod")
+elif name == "findmnt":
+    sys.exit(0 if os.environ.get("MOUNTED") else 1)
+elif name == "systemctl":
+    print(os.environ.get("ACTIVE_STATE", "inactive"))
+"""
+
+
+class KernelLifecycleJob(unittest.TestCase):
+    """A whole attachment on the runner's own kernel on every change: the
+    privileged runner's lifecycle, then the package built from the commit
+    running the documented install steps, quick start and bootstrap."""
+
+    def setUp(self):
+        self.job = jobs().get("kernel-lifecycle")
+        self.assertIsNotNone(self.job, "ci.yml has no kernel-lifecycle job")
+        self.steps = steps(self.job)
+        self.names = [name for name, _ in self.steps]
+
+    def step(self, name):
+        self.assertIn(name, self.names)
+        return dict(self.steps)[name]
+
+    def test_runs_on_every_change_on_a_runner_vm(self):
+        # A VM with systemd as PID 1, udev and the nbd module: not a container.
+        self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + self.job)
+        self.assertNotIn("container:", self.job)
+        self.assertRegex(self.job, r"(?m)^    timeout-minutes: \d+$")
+        self.assertNotRegex(self.job, r"(?m)^    (?:if|needs|continue-on-error):")
+        self.assertNotIn("continue-on-error", self.job)
+        # pipefail: a command whose output goes through tee keeps its status.
+        self.assertRegex(self.job, r"(?m)^    defaults:\n      run:\n        shell: bash\n")
+        workflow = WORKFLOW.read_text()
+        triggers = workflow[workflow.index("\non:\n"):workflow.index("\njobs:\n")]
+        for trigger in ("\n  pull_request:", "\n  workflow_dispatch:",
+                        "\n  push:\n    branches: [main, master]\n"):
+            self.assertIn(trigger, triggers)
+
+    def test_uses_the_baseline_toolchain_and_its_own_cache(self):
+        pull_request = [name for name, _ in steps(jobs()["pr"])]
+        toolchain = [name for name in pull_request if name.startswith("dtolnay/rust-toolchain@")]
+        self.assertEqual([name for name in self.names if name.startswith("dtolnay/")], toolchain[:1])
+        self.assertIn("actions/checkout@v4", self.names)
+        self.assertIn("key: kernel-lifecycle", self.step("Swatinem/rust-cache@v2"))
+
+    def test_loads_the_nbd_module_as_the_runner_asks_before_it_runs(self):
+        load = self.step("load the NBD module")
+        self.assertIn("sudo modprobe nbd nbds_max=16 max_part=8", load)
+        self.assertIn('sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"', load)
+        self.assertIn("test -d /sys/module/nbd", load)
+        # What the runner loads it with for /dev/nbd15, its device here.
+        self.assertIn('requested_devices=$((nbd_index + 1))\n((requested_devices >= 16)) || '
+                      'requested_devices=16\nsudo -n modprobe nbd "nbds_max=$requested_devices" '
+                      'max_part=8\n', RUNNER.read_text())
+        self.assertLess(self.names.index("load the NBD module"), self.names.index(KERNEL_RUNNER_STEP))
+
+    def runner_command(self):
+        run = step_script(KERNEL_RUNNER_STEP).replace("\\\n", " ")
+        lines = [line for line in run.splitlines() if "privileged-linux-validation.sh" in line]
+        self.assertEqual(len(lines), 1, run)
+        return shlex.split(lines[0])
+
+    def test_the_privileged_runner_drives_the_whole_lifecycle_as_the_runner_user(self):
+        self.assertRegex(self.step(KERNEL_RUNNER_STEP), r"(?m)^        timeout-minutes: \d+$")
+        words = self.runner_command()
+        # Not through sudo: the runner refuses root and calls sudo itself.
+        self.assertEqual(words[0], "scripts/privileged-linux-validation.sh")
+        # In the foreground, so that the step's status is the run's.
+        self.assertNotIn("--background", words)
+        self.assertIn("--install-missing", words)
+        # The detach and second attach run in every run; this adds the
+        # cleanup after a killed daemon, a third attach and a final detach.
+        self.assertIn("--kill-daemon", words)
+        self.assertIn("--kill-daemon)\n            kill_daemon=true\n", RUNNER.read_text())
+        device = words[words.index("--device") + 1]
+        self.assertRegex(device, r"^/dev/nbd(?:[0-9]|1[0-5])$", "a device the module loaded")
+        self.assertEqual(words[words.index("--confirm-wipe") + 1], device)
+        self.assertIn(f"test -b {device}\n", self.step("load the NBD module"))
+        # The quick start's attachment takes the lowest free device.
+        self.assertNotEqual(device, "/dev/nbd0")
+
+    def test_the_package_from_this_commit_runs_the_documented_quick_start(self):
+        # The package's tmpfiles close /run/maki to the runner's own nbdkit.
+        order = [self.names.index(name) for name in (
+            KERNEL_RUNNER_STEP, "packaged binaries", QUICKSTART_STEP)]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("run: cargo build --release --locked -p maki -p maki-attach -p maki-check "
+                      "-p maki-nbdkit\n", self.step("packaged binaries"))
+        script = step_script(QUICKSTART_STEP)
+        self.assertRegex(self.step(QUICKSTART_STEP), r"(?m)^        timeout-minutes: \d+$")
+        self.assertIn("python3 -B packaging/debian/build-deb.py --release-dir target/release", script)
+        # The guide's own block installs the package, from the directory it
+        # runs in, so the step does not.
+        self.assertIn('--output "$workdir/maki.deb"', script)
+        self.assertNotRegex(script, r"(?m)\b(?:apt|apt-get|dpkg) (?:-\S+ )*(?:install|-i)\b.*maki")
+        self.assertIn("sudo bash quickstart.sh 2>&1 | tee quickstart.log\n", script)
+
+    def run_quickstart_step(self, **environment):
+        directory = tempfile.TemporaryDirectory(prefix="maki-ci-quickstart-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        binary = root / "bin"
+        binary.mkdir()
+        stub = binary / "stub"
+        stub.write_text(QUICKSTART_STUB.replace("@PYTHON@", sys.executable))
+        stub.chmod(0o700)
+        for name in ("sudo", "python3", "git", "dpkg", "dpkg-deb", "findmnt", "systemctl", "nbdkit"):
+            (binary / name).symlink_to(stub)
+        (root / "run/maki-attach").mkdir(parents=True)
+        (root / "sys/block/nbd0").mkdir(parents=True)
+        if environment.pop("RECORD", None):
+            (root / "run/maki-attach/demo.nbd").write_text("{}")
+        if environment.pop("BACKEND", None):
+            (root / "sys/block/nbd0/backend").write_text("maki-demo\n")
+        script = step_script(QUICKSTART_STEP)
+        for old in ("/run/maki-attach/", "/sys/block/"):
+            self.assertIn(old, script)
+            script = script.replace(old, f"{root}{old}")
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                   FIXTURE=str(root), RUNNER_TEMP=str(root / "temp"), **environment)
+        # A `run` step under `defaults: run: shell: bash`.
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                                cwd=root, env=env, capture_output=True, text=True, timeout=10)
+        calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+        return result, calls, root
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_quick_start_runs_in_its_directory_and_its_failure_fails_the_step(self):
+        result, calls, root = self.run_quickstart_step()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        workdir = str(root / "temp" / "quickstart")
+        programs = [call for call in calls if call[0] == "python3"]
+        self.assertEqual([call[2:4] for call in programs],
+                         [["-B", "scripts/documented_quickstart.py"],
+                          ["-B", "packaging/debian/build-deb.py"]])
+        self.assertEqual(programs[1][programs[1].index("--output") + 1], workdir + "/maki.deb")
+        [run] = [call for call in calls if call[:1] == ["sudo"] and call[2:3] == ["bash"]]
+        self.assertEqual(run[1:], [workdir, "bash", "quickstart.sh"])
+        self.assertLess(calls.index(programs[1]), calls.index(run))
+        self.assertIn("the documented program's output", (Path(workdir) / "quickstart.log").read_text())
+        # Through tee, the program's failure is still the step's, and nothing
+        # after it runs.
+        result, calls, _ = self.run_quickstart_step(QUICKSTART_STATUS="3")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse([call for call in calls if call[0] in ("findmnt", "systemctl")], calls)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_an_attachment_the_quick_start_left_fails_the_step(self):
+        for leftover in ({"RECORD": "1"}, {"MOUNTED": "1"}, {"ACTIVE_STATE": "active"},
+                         {"ACTIVE_STATE": "failed"}, {"BACKEND": "1"}):
+            with self.subTest(leftover=leftover):
+                result, _, _ = self.run_quickstart_step(**leftover)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_failure_prints_the_kernel_log_units_devices_and_helper_output(self):
+        diagnostics = self.step("diagnostics on failure")
+        # Also when a time limit cancels the job, as a hung kernel request would.
+        self.assertIn("if: ${{ failure() || cancelled() }}", diagnostics)
+        self.assertRegex(diagnostics, r"(?m)^        timeout-minutes: \d+$")
+        self.assertEqual(self.names.index("diagnostics on failure"), self.names.index(QUICKSTART_STEP) + 1)
+        for needed in ('latest="$HOME/logs/maki-privileged-validation.latest"', 'cat "$latest/status"',
+                       '"$latest"/*.txt', "sudo dmesg", "journalctl -b", "-u 'maki*'",
+                       "/sys/block/nbd*", "dmsetup", "sudo ls -la /run/maki-attach", "fuser -v /dev/nbd*"):
+            self.assertIn(needed, diagnostics)
+
+    def test_logs_are_kept_without_the_source_build_keys_or_backings(self):
+        collect = self.step("collect logs")
+        upload = self.step("actions/upload-artifact@v4")
+        self.assertIn("if: always()", collect)
+        self.assertIn("if: always()", upload)
+        self.assertIn('> "$out/versions.txt"', collect)
+        self.assertIn("path: ${{ runner.temp }}/kernel-lifecycle-logs\n", upload)
+        self.assertLess(self.names.index("collect logs"), self.names.index("actions/upload-artifact@v4"))
+        self.assertIn("--exclude=./source --exclude=./target --exclude=./build", collect)
+        self.assertIn("--exclude=./maki.deb", collect)
+        for needed in ("journalctl -b --no-pager -o short-monotonic -k",
+                       "journalctl -b --no-pager -o short-monotonic -u 'maki*'"):
+            self.assertIn(needed, collect)
+        # The runner's key lives in its work tree below /var/tmp, the quick
+        # start's in /etc/maki/secrets, the backings below /var/tmp and
+        # /var/lib/maki.
+        for kept_out in ("/var/tmp", "/etc/maki", "/var/lib/maki", "work_dir"):
+            self.assertNotIn(kept_out, collect)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_collected_run_directory_leaves_out_the_snapshot_and_builds(self):
+        with tempfile.TemporaryDirectory(prefix="maki-ci-collect-") as directory:
+            root = Path(directory)
+            run = root / "home/logs/maki-privileged-validation-20261126T000000Z-1"
+            for name in ("source/scripts", "target/release", "build/debug"):
+                (run / name).mkdir(parents=True)
+                (run / name / "file").write_text("large\n")
+            for name in ("run.log", "status", "maki-detach.txt", "detach-opener.txt"):
+                (run / name).write_text("evidence\n")
+            (root / "home/logs/maki-privileged-validation.latest").symlink_to(run.name)
+            binary = root / "bin"
+            binary.mkdir()
+            (binary / "sudo").write_text("#!/bin/sh\necho journal\n")
+            (binary / "sudo").chmod(0o700)
+            env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                       HOME=str(root / "home"), RUNNER_TEMP=str(root / "temp"))
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+                                     step_script("collect logs")], cwd=root, env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = root / "temp/kernel-lifecycle-logs/privileged-run.tar.gz"
+            members = subprocess.run(["tar", "-tzf", str(archive)], capture_output=True, text=True,
+                                     check=True).stdout.split()
+            self.assertEqual(sorted(member.removeprefix("./") for member in members if member != "./"),
+                             ["detach-opener.txt", "maki-detach.txt", "run.log", "status"])
+            for name in ("kernel.log", "maki-units.log", "udev.log"):
+                self.assertEqual((root / "temp/kernel-lifecycle-logs" / name).read_text(), "journal\n")
+            # Each tool's version under the command that printed it, also
+            # where the tool is missing, and in the job's log.
+            versions = (root / "temp/kernel-lifecycle-logs/versions.txt").read_text()
+            for command in ("uname -srvm", "nbdkit --version", "lvm version", "mkfs.xfs -V",
+                            "udevadm --version", "sudo --version"):
+                self.assertIn(f"$ {command}\n", versions)
+            self.assertIn(versions, result.stdout)
 
 
 FAKE_CARGO_FUZZ = r'''#!/usr/bin/env python3
