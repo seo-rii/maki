@@ -1734,9 +1734,9 @@ observable behaviour:
   invocation` each; what the block runs and records is unchanged ([first
   volume](docs/getting-started/first-volume.md#1-provision-and-record-the-layout)).
   The records change corrects the operations guide on where a writable open
-  of a pair whose witness directory cannot be written fails (it creates a
-  missing `rollback.lock` before it fails at the witness) and the comment of
-  `maki-witness`'s `volume_identity`. `v0.1.0-rc.2` was tagged at `92d4dd4`
+  of a pair whose witness directory cannot be written, beside a backing root
+  that can, fails (it creates a missing `rollback.lock` before it fails at the
+  witness) and the comment of `maki-witness`'s `volume_identity`. `v0.1.0-rc.2` was tagged at `92d4dd4`
   on 2026-11-26, before this round.
 
 - **2026-11-25 follow-up round** (AUD-199;
@@ -1769,8 +1769,8 @@ observable behaviour:
   the WebSocket transport does not divide its connect deadline across the
   endpoint host's addresses. When this entry was written, no release
   candidate had been tagged since `v0.1.0-rc.1`, which predates this round
-  and the eighth; `v0.1.0-rc.2`, tagged at `92d4dd4` on 2026-11-26, includes
-  them. *Changed on
+  and the eighth. *`v0.1.0-rc.2`, tagged at `92d4dd4` on 2026-11-26, includes
+  them.* *Changed on
   2026-11-25 (AUD-198, [#400](https://github.com/seo-rii/maki/pull/400)): the
   transport now races the address families and shares its connect deadline
   among the addresses; the status page states what remains.*

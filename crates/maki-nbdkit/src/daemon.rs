@@ -213,16 +213,16 @@ fn check_protected_capacity(
 /// as [`build_backing`]'s open, without its rewrites of the authenticated
 /// state and of the witness anchor (the failed writeback rule, K-01), with
 /// the locks taken shared. The directories decide, as the root does for a
-/// plain backing: in a witness directory it may not write, that open fails
-/// at the witness, when it takes `witness.lock` or publishes the anchor
-/// (after taking the root's `rollback.lock`, which it creates if it is
-/// missing), and a root it may not write is read read-only even where its
-/// files could be rewritten. Where both can be
-/// written it is [`build_backing`], as before. A remote
-/// one always opens as a [`ReadOnlyRollbackBacking`], which sends the
-/// authority only inspections: [`build_backing`] claims a writer at the
-/// authority and copies the current generation into a namespace of its own,
-/// which a command that only reads must never do.
+/// plain backing: beside a root it may write, in a witness directory it may
+/// not write, that open fails at the witness, when it takes `witness.lock`
+/// or publishes the anchor (after taking the root's `rollback.lock`, which
+/// it creates if it is missing), and a root it may not write is read
+/// read-only even where its files could be rewritten. Where both can be
+/// written it is [`build_backing`], as before. A remote one always opens as
+/// a [`ReadOnlyRollbackBacking`], which sends the authority only
+/// inspections: [`build_backing`] claims a writer at the authority and
+/// copies the current generation into a namespace of its own, which a
+/// command that only reads must never do.
 pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
     use maki_backing::configured::BACKING_ROOT;
     let root = Path::new(&config.backing.root);
