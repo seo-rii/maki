@@ -311,6 +311,13 @@ async fn addresses_that_all_fail_within_their_shares_fail_the_request_unsent_bef
     // written: the dispatcher may send it to a peer, retry-safe or not.
     assert!(error.is_retryable(), "{error:?}");
     assert!(error.is_not_sent(), "{error:?}");
+    // A share that ran out is a connect timeout, not the request's.
+    assert!(
+        error
+            .to_string()
+            .starts_with("retryable: connect timeout: "),
+        "{error}"
+    );
     assert!(
         started.elapsed() <= TIMEOUT / 2 + TICK,
         "{:?}",
@@ -343,6 +350,12 @@ async fn addresses_that_never_answer_hold_the_request_until_its_timeout_and_no_l
         .expect("the request outlived its timeout")
         .expect_err("no address answers");
     assert!(error.is_retryable(), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .starts_with("retryable: request timeout: "),
+        "{error}"
+    );
     assert!(
         started.elapsed() <= TIMEOUT + TICK,
         "{:?}",
