@@ -134,15 +134,20 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - An endpoint address that does not answer still costs time on every
   connect. All three remote transports try the other address family 300 ms
   after the first, so a dead IPv6 route before a live IPv4 address costs
-  about 300 ms. Within a family the WebSocket and gRPC transports give each
-  address a share of the timeout, so a dead address before a live one of
-  the same family (two IPv4 addresses, say) costs its share: half the
-  timeout for two. The HTTP transport sets no connect timeout (Maki gives
-  reqwest only the request `timeout`, and reqwest 0.12 then leaves
-  hyper-util's per-address connect timeout unset), so there such an address
-  can take the whole request `timeout`; this is read from the code, not
-  tested. With a WebSocket `timeout` of 300 ms or less, the other family is
-  never tried when the first one does not answer.
+  about 300 ms. Within a family each transport gives each address a share
+  of the timeout, so a dead address before a live one of the same family
+  (two IPv4 addresses, say) costs its share: half the timeout for two. With
+  less than 600 ms of a connect left, the WebSocket transport starts the
+  other family halfway to its deadline instead. The HTTP transport cannot:
+  the 300 ms is hyper-util's and reqwest 0.12 does not expose it, so with an
+  HTTP `timeout` of 300 ms or less the other family is never tried when the
+  first one does not answer, and below 600 ms it has less than half of the
+  time; this is read from the code, not tested. The HTTP shares are fixed,
+  as in the gRPC connector: each of a family's `n` addresses may take
+  `timeout / n`, however soon the one before it failed, so one refused at
+  once does not pass its time on, and a live address slower to accept the
+  connection than its share is given up
+  ([remote HTTP mapping](configuration.md#remote-http-mapping)).
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs
