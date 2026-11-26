@@ -516,6 +516,27 @@ How each response status is classified, and the `maki-crypto-error` header
 that reports an integrity failure or a context refusal, is listed under
 [provider error signals](#provider-error-signals).
 
+An HTTP request's `timeout` covers the connection it opens. Its connector
+(hyper-util's, as for gRPC) resolves the endpoint's host; the family of the
+first address goes first, and the other family starts 300 ms later, or at once
+when the first family has failed. Within a family the addresses are tried one
+at a time, in the resolver's order, and each of the family's `n` addresses may
+take `timeout / n` to connect, so an address that does not answer leaves the
+next one time: half the `timeout` for two. These shares are fixed: one refused
+at once does not leave its time to those after it, and a live address slower to
+accept the connection than its share is given up. When every address has
+failed within its share, the request fails then, before its `timeout`, as a
+connection failure that was not sent. hyper-util reports the family's first
+failure, so the error reads "connect timeout" when the first address's share
+ran out and "transport error" when the first address refused the connection,
+whatever the later ones did. When an address is still connecting at the
+`timeout`, the request fails as a request timeout. Keep `timeout` well above `n` times the time a
+connect is expected to take: with a short `timeout`, a host with many
+addresses can have every live one given up, and on Linux one lost SYN already
+delays a connect by 1 s. reqwest does not expose the 300 ms, so with a
+`timeout` of 300 ms or less the other family is never tried when the first one
+does not answer.
+
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
 `limits.max_active_callbacks` budget. Declaring a larger batch size does not
@@ -581,15 +602,17 @@ completes the handshake is abandoned then and the next request reconnects.
 A WebSocket request's `timeout` covers the connection it opens, including the
 time the request waited for the connection. The endpoint's host is resolved;
 the family of the first address goes first, and the other family starts 300 ms
-later, or at once when the first family has failed, as in the gRPC transport's
-connector. Within a family the addresses are tried one at a time, in the
+later, as in the gRPC transport's connector, or at once when the first family
+has failed. With less than 600 ms of the request left when the addresses are
+dialed, it starts once half of what is left has passed instead, so it always
+has at least half of that time, also with a `timeout` of 300 ms or less. Within
+a family the addresses are tried one at a time, in the
 resolver's order: each but the last may take an equal share of what is left of
 the request's `timeout`, and the last has the rest, so an address that does not
 answer leaves the next one time and one refused at once leaves its share to
 those after it. (The gRPC connector gives every address of a family, the last
 one too, a fixed share of its timeout, and keeps a family's first failure.)
-With a `timeout` of 300 ms or less, the other family is never tried when the
-first one does not answer. The first connection made wins and the other attempt
+The first connection made wins and the other attempt
 is dropped; when none connects, the last failure is reported. The TLS handshake
 and the upgrade then run on that connection, with the certificate verified for
 the URL's host, never for the address it resolved to; their failure is not
