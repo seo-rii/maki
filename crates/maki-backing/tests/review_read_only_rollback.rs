@@ -533,21 +533,32 @@ fn a_witness_that_changes_after_a_read_only_open_stops_the_view() {
     assert!(view.open("data/payload", false).is_err());
 }
 
-/// A backing that records every change asked of it, and lets it happen.
+/// A backing that records every change asked of it, and lets it happen,
+/// and, in `accesses`, every lock, open, lookup, listing and read in order,
+/// each named with `label`.
 struct Recording {
     inner: Arc<dyn Backing>,
     changes: Arc<Mutex<Vec<String>>>,
+    label: &'static str,
+    accesses: Arc<Mutex<Vec<String>>>,
 }
 
 struct RecordingFile {
     inner: Arc<dyn BackingFile>,
     name: String,
     changes: Arc<Mutex<Vec<String>>>,
+    accesses: Arc<Mutex<Vec<String>>>,
 }
 
 impl Recording {
     fn note(&self, change: String) {
         self.changes.lock().unwrap().push(change);
+    }
+    fn access(&self, what: &str, path: &str) {
+        self.accesses
+            .lock()
+            .unwrap()
+            .push(format!("{what} {}:{path}", self.label));
     }
 }
 
@@ -562,6 +573,10 @@ impl RecordingFile {
 
 impl BackingFile for RecordingFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.accesses
+            .lock()
+            .unwrap()
+            .push(format!("read {}", self.name));
         self.inner.read_at(offset, buf)
     }
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -605,13 +620,16 @@ impl Backing for Recording {
         if create {
             self.note(format!("create {path}"));
         }
+        self.access("open", path);
         Ok(Arc::new(RecordingFile {
             inner: self.inner.open(path, create)?,
-            name: path.to_owned(),
+            name: format!("{}:{path}", self.label),
             changes: self.changes.clone(),
+            accesses: self.accesses.clone(),
         }))
     }
     fn exists(&self, path: &str) -> io::Result<bool> {
+        self.access("exists", path);
         self.inner.exists(path)
     }
     fn remove(&self, path: &str) -> io::Result<()> {
@@ -627,6 +645,7 @@ impl Backing for Recording {
         self.inner.create_dir_all(path)
     }
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.access("list", dir);
         self.inner.list(dir)
     }
     fn sync_dir(&self, dir: &str) -> io::Result<()> {
@@ -641,6 +660,7 @@ impl Backing for Recording {
         self.inner.is_read_only()
     }
     fn try_lock_shared_existing(&self, path: &str) -> io::Result<Box<dyn VolumeLock>> {
+        self.access("lock", path);
         self.inner.try_lock_shared_existing(path)
     }
     fn directory_owner(&self, dir: &str) -> io::Result<Option<FileOwner>> {
@@ -656,22 +676,65 @@ fn a_local_read_only_open_asks_for_no_change_even_where_one_is_allowed() {
         return;
     };
     let changes = Arc::new(Mutex::new(Vec::new()));
-    let recording = |path: &Path| -> Arc<dyn Backing> {
+    let accesses = Arc::new(Mutex::new(Vec::new()));
+    let recording = |label, path: &Path| -> Arc<dyn Backing> {
         Arc::new(Recording {
             inner: Arc::new(FileBacking::new(path).unwrap()),
             changes: changes.clone(),
+            label,
+            accesses: accesses.clone(),
         })
     };
-    let view =
-        ReadOnlyRollbackBacking::open_on(recording(local.root()), recording(local.witness()))
-            .unwrap();
+    let view = ReadOnlyRollbackBacking::open_on(
+        recording("root", local.root()),
+        recording("witness", local.witness()),
+    )
+    .unwrap();
+    // Both locks are taken before anything in either directory is opened,
+    // listed or read.
+    let order = accesses.lock().unwrap().clone();
+    assert_eq!(
+        order[..2],
+        ["lock root:rollback.lock", "lock witness:witness.lock"],
+        "{order:?}"
+    );
+    assert!(order.iter().any(|access| access.starts_with("read ")));
     assert_eq!(read_payload(&view), payload());
     view.check_freshness().unwrap();
     drop(view);
     assert_eq!(*changes.lock().unwrap(), Vec::<String>::new());
     // The recording itself is sound: the writable open asks for changes.
-    drop(RollbackBacking::open_on(recording(local.root()), recording(local.witness())).unwrap());
+    drop(
+        RollbackBacking::open_on(
+            recording("root", local.root()),
+            recording("witness", local.witness()),
+        )
+        .unwrap(),
+    );
     assert!(!changes.lock().unwrap().is_empty());
+}
+
+/// A lock file that is missing refuses the open before anything else in
+/// either directory is read: with `witness.lock` missing and the format
+/// marker foreign, the refusal is the lock's.
+#[test]
+fn a_local_read_only_open_refuses_a_missing_lock_before_it_reads_the_marker() {
+    let Some(local) = Local::new() else {
+        return;
+    };
+    std::fs::remove_file(local.witness().join("witness.lock")).unwrap();
+    std::fs::write(
+        local.root().join("rollback.format"),
+        b"MAKI-WITNESS-COW-V0\n",
+    )
+    .unwrap();
+    let error = local.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("witness.lock is missing, and a read-only open cannot create it"),
+        "{error}"
+    );
 }
 
 /// A remote authority over a local state store that records the action of
@@ -922,6 +985,38 @@ fn a_remote_read_only_open_authenticates_the_current_generation() {
         "{error}"
     );
     std::fs::write(&newest_slot, saved).unwrap();
+    // The namespace's lock is taken before anything in the namespace is
+    // read: with the lock and both manifest slots gone, the refusal is the
+    // lock's. A root without the namespace is refused in attach's words.
+    let slots = [0, 1].map(|index| namespace.join(format!("rollback.manifest.{index}")));
+    let saved = slots.clone().map(|slot| std::fs::read(slot).unwrap());
+    let lock = namespace.join("rollback.lock");
+    std::fs::remove_file(&lock).unwrap();
+    for slot in &slots {
+        std::fs::remove_file(slot).unwrap();
+    }
+    let error = remote.open().err().unwrap();
+    assert!(
+        error.to_string().contains(&format!(
+            "{current}/rollback.lock is missing, and a read-only open cannot create it"
+        )),
+        "{error}"
+    );
+    let moved = remote.root().join("elsewhere");
+    std::fs::rename(&namespace, &moved).unwrap();
+    let error = remote.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("this backing root does not hold the remote authority's current generation"),
+        "{error}"
+    );
+    std::fs::rename(&moved, &namespace).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    for (slot, bytes) in slots.iter().zip(saved) {
+        std::fs::write(slot, bytes).unwrap();
+    }
+    remote.open().unwrap();
     // The operation lock and the namespace's lock are taken, never created.
     for lock in [
         "remote.operation.lock".to_string(),
