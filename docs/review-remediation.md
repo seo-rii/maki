@@ -17,6 +17,261 @@ proposed PR fixes from remote-main changes and combined qualification.
 Status values: **Fixed** (regression test landed and passes), **Partial**
 (behaviour improved, remaining gap described), **Open**.
 
+## Second follow-up round (2026-11-26): AUD-201–AUD-204
+
+No audit preceded this round either. After the follow-up round's records
+change ([#404](https://github.com/seo-rii/maki/pull/404), `main` at `92d4dd4`,
+where `v0.1.0-rc.2` is tagged), the owner asked to go on implementing what
+that round had left open ([below](#not-closed-in-the-follow-up-round)). Four
+pull requests were merged into `main` on 2026-11-26:
+[#405](https://github.com/seo-rii/maki/pull/405) at `8be209c`,
+[#407](https://github.com/seo-rii/maki/pull/407) at `1ff1e24`,
+[#406](https://github.com/seo-rii/maki/pull/406) at `35c8e06` and
+[#408](https://github.com/seo-rii/maki/pull/408) at `c3cf27a`. AUD-201 (#405)
+gives each address of an HTTP endpoint's host a share of a connect timeout,
+which the HTTP transport did not set, and lets the WebSocket transport reach
+the other address family when little of its deadline is left. AUD-202 (#407)
+lets `maki check` and `maki volume inspect` read a rollback-protected backing
+read-only, which completes AUD-195. AUD-203 (#406) is a CI job that drives
+whole attachments, with the detach wait of AUD-197, and then the documented
+installation, quick start and first-volume block of AUD-199 through a runner's
+kernel and systemd. AUD-204 (#408) adds fuzz targets for the readers that
+AUD-200 left without one. Notes in the follow-up round's list say what each
+closed or changed. None of these items had lost or corrupted data. Each row's
+**Behaviour change** states what the code did before. Every change landed
+test-first, apart from `maki-backing`'s tests of #407's new view, which use
+its API and came with it (`97d82bb`), and #408's classifier tests
+(`f836a53`), which a review asked for after the classifier's fix, whose two
+seeds had come first (`9f08137`). All four rows are **Fixed**, and AUD-195's
+**Partial** is complete. No change alters a record format or a golden vector.
+The operator-visible changes are listed in the
+[changelog](../CHANGELOG.md#changed).
+
+Every pull request had an independent review before it merged, and three of
+them were blocked at least once: #405 and #407 on false statements, #406 first
+on a check that did not check and then on wording. #408's three recorded
+reviews returned MERGE, the first two with notes. The review of #405 found the
+code right and two sentences of the pull request's text false (which
+`maki-nbdkit` tests build HTTP providers, and which row of a mutated test
+fails), and asked that a connect timeout be reported as one; a delta review
+found the configuration guide's "a share that ran out reads connect timeout"
+false when a refused address comes first, corrected by the coordinator before
+the merge (AUD-201). The review of #407 blocked on three false statements:
+SPEC §27 and the refusal said that nothing is read when a lock file is
+missing, while both opens read part of the backing before they took their last
+lock, which the code was changed to avoid; the reason the documents gave for
+reading an unwritable root read-only was false for a `0500` root holding
+`0600` files; and the remote witness guide said that the check loads no key
+(AUD-202). The first review of #406 found that the runner's "detach waited for
+the opener" check did not check it, and listed nine smaller points; the
+coordinator added a change from the first run's log. Each of its five reviews
+also concerned what the quick start's program writer says it refuses: the
+first found the description wrong, the second found the code narrower and
+coarser than the description, the third and the fourth each found one phrase
+that did not match the code, and the coordinator rewrote those two; the fifth
+returned MERGE with an optional point that was taken (AUD-203). The reviews of
+#408 found that the JSON oracles' skip of serde_json's raw-value key was
+matched by its bytes, so an escaped key failed two targets on serde_json's own
+reading, an ambiguous refusal that no seed covered, and later that nothing
+checked that the oracles run (AUD-204). None of the review findings recorded
+concerns code that was already on `main`. Every pull request's checks passed
+at the head that merged (`3af9f7c`, `d108e37`, `87b4395`, `f836a53`), both
+Windows jobs among them, and #406's included the `kernel-lifecycle` job. The
+`nightly-gates`, `fuzz` and `etcd-qualification` jobs run only on the
+schedule, on dispatch and on `review/integration-*` pull requests, so they ran
+on none of the four. On `main` the push runs passed at `35c8e06` (run
+45775419483, the first push run with the `kernel-lifecycle` job) and at
+`c3cf27a` (run 45778267117). A dispatch of the whole workflow at `c3cf27a`
+(run 45781903832) then passed all eleven jobs, `nightly-gates`,
+`etcd-qualification` and `fuzz` among them. Its `fuzz` job was the first to
+run the seven new targets on GitHub's runner: it built all sixteen targets and
+ran each for 31 seconds from its seeds without a crash, from 66,830 inputs for
+`helper_sysfs` to 13,582,061 for `format_decoders`. The jobs' results are the
+coordinator's records; the `fuzz` job's figures are from its log.
+
+The `kernel-lifecycle` job ran on #406 at least twice, and the logs of two runs
+are kept: run 45759304959, on the merge of `c3d734d` (the first head) into
+`92d4dd4`, and run 45767537362, on the merge of `b9054ed` into `1ff1e24`. Both
+ran on GitHub's `ubuntu-26.04` image, version 20261116.202.1: Ubuntu 26.04.1
+LTS, kernel `7.0.0-1020-azure`, systemd 259, with nbdkit 1.46.2 and lvm2
+2.03.31 from Ubuntu's archive. In both the privileged runner passed, with 33
+checks and then 36 (the review's three attach checks added). The detach with
+the opener exited 0 after 2202 ms and 2193 ms. The opener's read failed with
+`EIO` after three served reads, at 0.152 s and 0.151 s, while the device still
+showed the connection's backend identifier, which stayed until the opener
+closed the device at 2.152 s; then the device showed no connection. The data
+read back after the reattach, nbdkit was killed with `SIGKILL` under the
+mount, `maki-attach cleanup` released the attachment without it in 1104 ms and
+1149 ms, a new nbdkit recovered the volume, the third attach read the data
+back, and the final detach left nothing. In both runs the killed daemon's
+device still showed its connection, so cleanup took its detach path; its
+disconnected-recovery path did not run. The documented program then ran all
+13 steps (the package install, the key, `volume create`, the first-volume
+block on `/dev/nbd0`, the attach unit's start, a planned stop whose deep check
+said `clean`, the restart and the clean-up) and printed "every documented step
+succeeded". In the first run each LVM command of the first-volume block
+printed `File descriptor 9 (/run/maki-attach/attach.lock) leaked on …
+invocation`; the second run's log has no such line. Ubuntu 26.04 is not among
+the platforms of the
+[support matrix](deployment/support-matrix.md#host-platform), which lists
+Ubuntu 22.04 and 24.04 as not qualified, and these runs qualify nothing: one
+local-provider volume at a time, on one image's kernel, with one `SIGKILL` of
+nbdkit while the filesystem is idle after a sync, which is not a power loss.
+
+#405 reports Linux debug runs of `maki-crypto-http` (193 tests),
+`maki-crypto-websocket` (149) and twelve `maki-nbdkit` test binaries that build
+HTTP, WebSocket and gRPC providers (52), the HTTP connect tests 15 times in a
+row and 20 more in four concurrent copies, and the two crates' unit tests as
+uid 65534 with an empty `/run`. #407 reports the `maki-backing`,
+`maki-nbdkit`, `maki` and `maki-check` suites as root with
+`MAKI_TEST_REQUIRE_OTHER_FILESYSTEM=1`, its new and changed test executables as
+uid 65534 with an empty `/run`, and `strace` of `inspect`, `check` and
+`check --deep`, run as uid 65534, on a local volume with both directories
+`0500` and on read-only bind mounts, and on a remote one (a `maki-witness
+serve` authority) on a `0500`, a writable and a read-only bind-mounted root:
+the 15 commands exited 0, their 2,846 trace lines hold no open for writing, no
+truncation, allocation, sync, rename or unlink, one write per command to its
+own stdout and only shared locks, and every entry of the directories and of the
+authority's state was unchanged, while a writable `maki check` of the same
+local volume, the positive control, made 37 opens for writing. #406 changes
+no crate; it reports the Python suites, the two Rust test files that read the
+runner, ShellCheck 0.9.0 and the opener's direct read of a regular file, and
+its host has no `/dev/nbd*`, `modprobe` or KVM, so the job's steps first ran on
+GitHub. #408 reports the suites of the five crates it changes and of the
+harness, `review_fuzz_corpus` as uid 65534, and libFuzzer with
+AddressSanitizer from the committed seeds for 4 minutes per new target (from
+178,474 inputs for `helper_sysfs` to 8,464,077 for `helper_reports`) and 15
+seconds per older one, without a crash; after review, `cargo +nightly fuzz
+build` of all sixteen targets and 60 seconds each of `websocket_response` and
+`http_response`. Each pull request that changes a crate reports strict Clippy
+on 1.94.0 and 1.100.0 for each one (#408 with and without `--features
+fuzzing`; #407 also for `x86_64-pc-windows-msvc` for `maki-backing`), and every
+one fails-before runs of its test commits, mutation checks, `cargo fmt
+--check`, the Python suites and the link checker. Every mutation reported was
+caught by a committed test, some only once the test had been strengthened
+(#406's mutations of one arm of the opener's check and of the program file's
+writing, #407's N2, N11 and N21, #408's `wire_error` and envelope
+mutations). None reports a run of the workspace-wide suite or of the release
+gates, a run on Windows outside CI, on a booted RHEL or Debian host, with a
+remote provider or rollback protection on a kernel device, or through a real
+power loss.
+
+### Remote providers
+
+| ID | Finding | Fix | Regression | PR |
+|---|---|---|---|---|
+| AUD-201 | The HTTP transport built its client with `.timeout(spec.timeout)` alone. reqwest 0.12.28 then builds hyper-util's `HttpConnector` with `connect_timeout` unset (`async_impl/client.rs`: `set_connect_timeout(config.connect_timeout)`, `None` unless the builder sets it), and hyper-util 0.1.20 limits an address's TCP connect only when it is set (`ConnectingTcpRemote::new` divides it by the family's address count). So an address that never answered held the request until its `timeout`, and a live address after it in the same family was never dialed. The pull request reproduced it on `92d4dd4` with a probe it did not commit: a name resolved, through reqwest's `resolve_to_addrs`, to a loopback listener whose full accept queue drops SYNs and then to a live endpoint, with a 10 s `timeout` under paused time, was still pending at 9.999 s with nothing accepted, and failed at 10.001 s as `request timeout: error sending request`, not marked unsent. The WebSocket transport started the other address family a fixed 300 ms after the first attempt (AUD-198), so with 300 ms or less left of its connect deadline (a short `timeout`, or a request that had waited for the connection mutex) a first family that never answered held the connect to its deadline: with a 200 ms `timeout`, a dead IPv6 address and a live IPv4 one, IPv4 had not been dialed at 101 ms. Both were on the follow-up round's open list. | The HTTP provider builds its client with `.connect_timeout(spec.timeout)` as well. hyper-util divides it equally among the addresses of each family and dials them in turn, and reqwest also bounds the whole connect, resolution and TLS included, by it (`with_timeout` in `connect.rs`); since the request's own timer starts first, no connect outlasts its request, and a connect that hyper-util finishes in the background for its pool ends at the same bound (read, not tested). `new` calls a private `with_client(spec, adjust)`, which passes the builder through `adjust` last, so that the tests resolve the name to addresses of their own. reqwest 0.12.28 never calls `set_happy_eyeballs_timeout`, so the HTTP transport keeps hyper-util's 300 ms before the other family. The WebSocket dialer starts the other family after `OTHER_FAMILY_DELAY.min(left / 2)`, `left` measured when the dial begins, so that family always has at least half of what was left; with 600 ms or more left, or without a deadline, nothing changes, and a first family that fails outright still starts it at once. Review found the code right and two sentences of the pull request's text false, and asked that a connect timeout say so: a timeout that is also `is_connect` now reads "connect timeout: …" where it read "request timeout: …", still retryable and marked unsent. A delta review found the configuration guide's "a share that ran out reads connect timeout" false when a refused address comes first, since hyper-util keeps a family's first error; the coordinator corrected it before the merge. The status page, the configuration guide (a paragraph under [remote HTTP mapping](configuration.md#remote-http-mapping), and the WebSocket rule), the architecture page, the testing guide, the module documentation and the development guide's AUD-193 trap (the HTTP seam, the full accept queue, and polling such a test's loopback I/O in a loop that yields under paused time) say so; SPEC says nothing about per-address connects. **Behaviour change:** over HTTP, a host that resolves to several addresses of one family is no longer held by the first that does not answer: each of a family's `n` addresses may take `timeout / n`, so a dead address before a live one costs half the `timeout` for two. When every address fails within its share, the request fails then, before its `timeout`, as a retryable connection failure marked unsent, which the dispatcher may send to another endpoint even for a provider that is not `retry_safe`; it reads "connect timeout: …" when the first address's share ran out and "transport error: …" when the first refused the connection. Before, it failed at `timeout` as "request timeout: …", not marked. The shares are fixed, as in the gRPC connector: an address refused at once does not pass its time on, and a live address slower than its share to accept the connection is given up. A host with one address per family keeps the whole `timeout`, and addresses still connecting at the `timeout` end as a request timeout, as before. Over WebSocket, with less than 600 ms of the connect left when the addresses are dialed, the other family starts halfway to the deadline instead of after 300 ms. | maki-crypto-http `connect_tests.rs` (Linux, paused time; the endpoint's name resolved through reqwest's override; an address that never answers is a loopback listener with a full accept queue, which the fixture first shows to time out rather than refuse): `a_first_address_that_never_answers_leaves_the_next_one_of_its_family_its_share` and `addresses_that_all_fail_within_their_shares_fail_the_request_unsent_before_its_timeout`, which failed before (the second also on the first fix, before the wording change), and the control `addresses_that_never_answer_hold_the_request_until_its_timeout_and_no_longer`; maki-crypto-websocket `connect_address_tests.rs`: `a_short_timeout_starts_the_other_family_at_half_of_what_is_left` and `a_request_with_little_time_left_after_a_wait_starts_the_other_family_at_half_of_it`, which failed before | [#405](https://github.com/seo-rii/maki/pull/405) |
+
+### Offline checks
+
+| ID | Finding | Fix | Regression | PR |
+|---|---|---|---|---|
+| AUD-202 | AUD-195 left rollback-protected backings out. On Linux `maki check`, `maki check --deep` and `maki volume inspect` refused a local protected backing whose backing root or witness directory the user may not write before anything was opened ("… cannot be written by this process, and a rollback-protected backing cannot be checked or inspected read-only: …"): `RollbackBacking::open` re-dirties and syncs every committed page, rewrites the selected manifest and the format marker, reserves storage, publishes the witness anchor again and takes `rollback.lock` and `witness.lock` exclusively. `maki` refused a remote one on every root, writable or not ("read-only remote backing inspection is not supported; use `maki volume witness` …"): `RollbackBacking::open_remote` claims a writer at the authority (`Action::Claim`) and copies the current generation into a namespace of its own, and the remote witness guide said the commands refuse it "until a read-only backing view is implemented". On the test commit (`92d4dd4` with the new tests, run as root without CAP_DAC_OVERRIDE for the commands) 7 of the 9 tests of `bins/maki`'s `review_read_only_backing.rs` failed with the local refusal and 4 of the 18 of `remote_admin.rs` with the remote one. | A new `maki_backing::ReadOnlyRollbackBacking` (`rollback/read_only.rs`) opens both kinds only to read. It makes the writable open's authentication, whose checks moved unchanged out of `open_witnessed` into `open_marker`, `select_manifest`, `open_arena` and `authenticate_pages`, which both opens call: the format marker; the manifest the witness selects, by its digest, canonical encoding, identity, generation and slot size; the arena's size; and every committed page against its digest. The remote open uses the writer's `holds_current`, then `authenticate_pages`. It creates, writes, syncs and removes nothing below the backing root or in the witness directory: it opens both through `FileBacking::read_only`, reads the local anchor under the new `FileWitness::lock_read_only` and `open_read_only` without publishing it, and every change through the view fails with `ReadOnlyFilesystem`; `is_read_only()` is true, so the check adds its `read-only check:` warning and the deep verdict is `unproven`. It takes the locks that keep a writer out shared with `try_lock_shared_existing`, never creating them, and holds them while it is open: `rollback.lock` and `witness.lock` with a local witness, and with a remote one the root's `remote.operation.lock` and the current namespace's `rollback.lock`, before it reads anything in either directory but a remote root's format marker. A lock held exclusively refuses the open ("… is held by another process (…)"), and so does a missing one ("… is missing, and a read-only open cannot create it: …"). It sends the authority only `Action::Inspect`, once after the operation lock and again once both locks are held, and refuses a record that changed in between; nothing claims, creates a namespace, writes an operation guard or sends `Release`. As in a writer's view, every operation then asks the witness first and every read authenticates its pages again, and a mismatch, or a page that is missing, short or does not authenticate, stops the view for good. `build_backing_to_read` opens a local protected backing through `build_backing`, unchanged, only where this process may write both its backing root and its witness directory, and otherwise through the view, after which it refuses an unfinished creation and a capacity that differs from the stored one as `build_backing` does; a remote one always through the view; and `maki` no longer refuses remote backings. Review blocked on three false statements. SPEC §27 said that the open reads nothing when a lock is missing, and the refusal that nothing was read, while the local open read `rollback.format` before it found `witness.lock` missing and the remote open read the selected manifest slot and opened the arena before it took the namespace's lock: the opens now take their locks first (`02007cf`, `d108e37`). The documents said that a root the user may not write is read read-only because a writable open fails there, which is false for a `0500` root holding `0600` files (the review ran `RollbackBacking::open` on one as uid 65534, and it returned Ok); they now say that the root decides, as for a plain backing. The remote witness guide said that the check loads no key, and the operations guide and maki(8) that it loads no credential, while it loads the witness client's TLS private key to ask the authority. SPEC §27, maki(8), maki-check(8), the [operations guide](operations.md#checking-a-backing-that-cannot-be-written), the rollback and remote witness guides and the status page say so. **Behaviour change:** a local protected backing whose backing root or witness directory the user may not write (a read-only mount, a `0500` directory, an immutable one) is checked and inspected read-only, where it was refused; a remote-protected one is, on every root, where `maki` refused it, and its authority receives only inspections. Such a report has a `warning: read-only check:` line and the deep verdict `unproven`; exit statuses are unchanged. To ask a remote authority the commands now load the witness client's TLS identity (`client_key_file` and its certificates), but no volume key or provider credential. Read-only, `inspect` and both checks refuse a protected backing that a daemon or another writer holds and one whose lock file is missing, and a daemon that starts while one of them runs fails to take its lock (with a remote witness, attach fails at the operation lock): unlike on a plain backing, the fast check and `inspect` take a lock here. By the code, a configuration pointed at a snapshot destination is refused, since `maki volume snapshot` creates no `rollback.lock` in the namespace it copies; that was not tested. A remote view sends one inspection per backing operation, each over a connection of its own, as a writer's view does, so a deep check of a large remote volume sends many. Damage, a manifest the witness does not select, a capacity mismatch and an unfinished creation are refused as attach refuses them. Nothing changes for a local pair whose two directories can both be written or for a plain backing, and `maki-check <root>` still refuses protected roots, as its page now says. | `bins/maki` `review_read_only_backing.rs`: `a_protected_backing_it_cannot_write_is_checked_read_only` (root, witness and both `0500`; a writable pair is still `clean`), `a_damaged_page_of_a_protected_backing_it_cannot_write_is_an_error`, `a_protected_backing_whose_witness_selects_no_manifest_in_it_is_an_error`, `a_protected_backing_in_use_or_without_its_lock_is_refused_read_only`, `a_protected_backing_of_another_capacity_is_refused_read_only_too`, `an_unfinished_protected_creation_is_named_read_only_too` and `check_and_inspect_read_a_backing_on_a_read_only_mount` (read-only bind mounts of the root, the witness and both), and `remote_admin.rs`: `diagnostic_commands_read_a_remote_volume_with_inspections_only` (a recording handler on the TLS witness server sees only `inspect`, and the record and the root's bytes, modes and modification times are unchanged), the rewritten `diagnostic_commands_never_claim_or_fork_a_remote_writer`, `resume_enrollment_requires_admin_identity_fence_and_completes_volume_initialization` and `volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness`, all of which failed before; maki-backing `review_read_only_rollback.rs`, 14 tests of the new type, among them `a_local_read_only_open_authenticates_what_a_writable_open_does` (five kinds of damage, each refused with the writable open's error and nothing changed), `a_local_read_only_open_excludes_a_writer_and_admits_a_reader`, `a_remote_read_only_open_sends_only_inspections_and_changes_nothing`, `an_authority_that_changes_while_a_remote_read_only_open_locks_is_refused` and `a_remote_read_only_open_reads_an_active_authority_whose_writer_is_gone`, and from the review `a_local_read_only_open_refuses_a_missing_lock_before_it_reads_the_marker`, which failed on the first fix, as did the access order now recorded in `a_local_read_only_open_asks_for_no_change_even_where_one_is_allowed` and the missing namespace lock of `a_remote_read_only_open_authenticates_the_current_generation`; `scripts/test_docs_accuracy_validation.py` now finds the witness's error kinds in `stops_remote_session` | [#407](https://github.com/seo-rii/maki/pull/407) |
+
+### Tests, CI and fuzzing
+
+| ID | Finding | Fix | Regression | PR |
+|---|---|---|---|---|
+| AUD-203 | The detach and cleanup wait of AUD-197 and the first-volume block of AUD-199 had never run with a real kernel NBD device, udev, device-mapper, LVM, XFS and systemd (the follow-up round's open list). CI's root-only kernel test (`review_nbd_kernel.rs`) reaches the shared wait only through the provisioning disconnect, and no CI job built a whole attachment: on `92d4dd4` `ci.yml` ran neither `scripts/privileged-linux-validation.sh`, nor the quick start, nor the first-volume block, and that runner never ran `maki-attach detach` or killed its nbdkit; it ended its attachment with `maki-attach cleanup`, run twice. | A `kernel-lifecycle` job in `ci.yml` runs on every event of the workflow (pull requests, pushes to `main`, dispatch and the schedule) on the `ubuntu-latest` runner VM itself, with its kernel, udev and systemd. It loads `nbd` with `nbds_max=16 max_part=8`, from `linux-modules-extra` when the kernel keeps the module there, runs `scripts/privileged-linux-validation.sh --install-missing --kill-daemon --device /dev/nbd15 --confirm-wipe /dev/nbd15` as the runner user, then builds the four packaged binaries and the Debian package from the commit and runs, with `sudo bash`, the program that `scripts/documented_quickstart.py` writes: the Debian guide's install blocks, the quick start's blocks and, as its step 4, the first-volume block, in one shell under `set -e -o pipefail`, each block's status checked. It then requires that no attach record, mount at `/srv/demo`, active unit of the volume or NBD connection remains. That step runs also when the runner's has failed; on a failure the job prints the runner's and the components' logs, the kernel log, the units' journal and the devices, mappings and records, and it keeps the logs, without the sources, the builds or a key file, as `kernel-lifecycle-logs`. After its workload, the runner now writes and fsyncs 32 MiB beside the SQLite database and records the SHA-256 of both, and runs `maki-attach detach` while `scripts/privileged_validation_opener.py`, as root, holds the device open: the opener reads the first block with `O_DIRECT` every 50 ms until a read fails, requires `EIO` with the connection still shown, keeps the device open two seconds more, writes, flushed, that it is closing it, closes it and requires that the device shows no connection within 5 s. The runner requires that line in `detach-opener.txt` when the detach returns, so a detach that did not wait for the close fails, and then attaches again with `init_sentinel = false` and compares the hashes. With the new `--kill-daemon` it sends `SIGKILL` to its nbdkit under the mount (status 137), requires `maki-attach cleanup` to release the attachment without the daemon, starts a new nbdkit, which must negotiate, attaches a third time, compares the hashes and detaches. Each attach must show the mount, a backend identifier and the attach record, and each teardown must leave no mount, holder, `backend` or `pid` attribute, size or record; a look for the record that fails stops the run. The program writer refuses a block that Bash cannot read and one with `&&` or `\|\|` text on the lines that the [testing guide](testing.md#automated-ci) names (those that Bash's `declare -f` prints at the block's own level, up to the last such line, before the last line it prints at that level, that ends in `;` or holds a here-document's command), and does not see such lists inside compound commands, brace groups or functions. The first-volume block exports `LVM_SUPPRESS_FD_WARNINGS=1` before it opens the attach lock on descriptor 9, which its LVM commands inherit. The first review found that the runner printed "detach waited for the opener to close" after the release check alone: since the opener closed the device on its own two seconds after the disconnect, a detach that returned at once passed too, which the review reproduced with a helper that returned a second before the close. Its nine smaller points brought, among other things, tests of each arm of the opener's checks, a pin that the job's essential steps are not skipped and that the runner step's status is the runner's, a record check that fails when the look fails, attach checks that make the release check non-vacuous, and a corrected description of the program writer; the coordinator asked for the LVM variable from the first run's log. The four later reviews concerned that description, which now states the rule as the code applies it. The testing guide, the status page, the runbook (with a dated note that no recorded result includes the new checks) and SPEC §55 say so. **Behaviour change:** none in the shipped binaries, units or package. The first-volume block no longer prints LVM's warning about descriptor 9 for each of its LVM commands; what it runs and records is unchanged. The runner detaches with an opener and attaches again in every run, takes `--kill-daemon` and writes more evidence files, which the runbook lists. Every pull request runs the job, which builds in release mode twice. | `scripts/test_privileged_lifecycle_validation.py` (the runner against mocks, the opener on a scripted device and clock): `test_every_run_detaches_with_an_opener_and_attaches_again`, `test_kill_daemon_cleans_up_after_a_killed_nbdkit_and_detaches_at_the_end`, `test_the_cleanup_trap_releases_an_opener_before_any_helper_cleanup`, `test_a_released_attachment_passes_and_each_leftover_fails` and the opener's cases, `test_attributes_gone_while_held_open_are_refused` among them, and from the review `test_a_detach_that_returns_before_the_opener_closed_the_device_fails` (a helper that returns at once), `test_a_record_that_cannot_be_looked_for_fails_both_ways` and `test_an_attachment_shows_what_a_teardown_must_remove`; `scripts/test_documented_quickstart_validation.py`: `test_the_first_failure_stops_the_program_and_names_its_step`, `test_the_bootstrap_is_the_block_the_provisioning_tests_run`, `test_a_list_before_the_last_command_is_refused` and `test_lists_inside_compound_commands_groups_and_functions_are_not_seen` (the known gap); `scripts/test_ci_gate_validation.py`: `test_runs_on_every_change_on_a_runner_vm`, `test_the_privileged_runner_drives_the_whole_lifecycle_as_the_runner_user`, and from the review `test_the_essential_steps_are_not_skipped` and `test_the_runners_status_is_the_steps`; `scripts/test_docs_provisioning_validation.py`: `test_lvm_is_told_not_to_warn_about_the_lock_descriptor`. On the test commit 28 of the 46 tests of the four touched modules failed and 7 errored, and 16 of 65 failed and one class's setup errored on the first head with the review's tests. The job's runs 45759304959 and 45767537362 (above) | [#406](https://github.com/seo-rii/maki/pull/406) |
+| AUD-204 | AUD-200 left these readers of untrusted bytes without a coverage-guided target (the follow-up round's open list): the witness's RPC (a client's reading of a server's answer frame, a server's reading of a request frame and of the operation in it) and its etcd store's reading of etcd's answers; the HTTP, WebSocket and gRPC providers' readers of a crypto endpoint's responses, of which `review_fuzz_transport.rs` covers part of the HTTP path with seeded random responses; and the root helper's readers of the output of the commands it runs as root and of sysfs, beyond the mountinfo and device-name parsers of `probe_parsers`. On `92d4dd4` `fuzz/Cargo.toml` had nine targets, none of which depended on `maki-witness`, a remote provider or `maki_privileged::exec`. The generator added the `nbd_netlink` seeds, a little-endian host's, only under `cfg(all(target_os = "linux", target_endian = "little"))`, so a big-endian host skipped them by name and `netlink_seeds` was unused there. | Seven targets follow #401's design: each `fuzz_targets/*.rs` is one line that calls its entry in `fuzz/harness`, which calls a doc-hidden module of the crate behind a `fuzzing` feature that only the harness enables and that adds no dependency (`maki-privileged` still has no crypto dependency). `witness_rpc` reads a server's answer frame as `Rpc::call` does, and a request frame as the server does, handing its operation to the file authority's own `state_handler` over a `StateStore` on a `MemBacking` in one of four states, with a writer, admin or unlisted certificate; the client must read back what the server answered. `witness_etcd` reads etcd's answers to the store's range read and its two transactions. `http_response`, `websocket_response` and `grpc_response` read a response as each provider does: the HTTP body's bounded accumulation, its JSON mappings of one item and of a batch, a raw body and the status; the WebSocket connection reader's handling of one message and `parse_response`; gRPC's initial headers, the body as tonic polls `BoundedResponseBody`, `map_status` and the message. `helper_reports` (Linux) reads LVM's `fullreport` against a candidate set, `blkid`'s two probes, `dmsetup info`, `blockdev --getsize64` and `blkid -o value`, and `helper_sysfs` (Linux) a `/sys/class/block` tree and a mount table that the input builds in a directory of its own, as detach's observation, allocation, recovery's capture and observations, preflight's discovery and mapping check, the displaced-record check and the connection attributes read them. Readers that were inline are now functions that production calls in the same order (the witness client's `parse_response` and `answer`, the server's `parse_request` and `wire_error`, etcd's `answer`, `created`, `transaction`, `compared` and `snapshot`, the WebSocket reader's `receive`, gRPC's `initial_headers`, `decode_response` and `echoed`, the HTTP provider's `parse_item` and `parse_batch`, the helper's `lv_size_of` and `blkid_value`), and `lvm_preflight`, `recover` and `allocation` gain `fuzzing` modules that forward to their private readers. The JSON oracles hold the HTTP provider's selective parser and the WebSocket reader to `serde_json::Value`, and skip a document with an object whose first key decodes to serde_json's private raw-value token, which `Value` reads as raw JSON under the `raw_value` feature that `maki-witness` enables. `fuzz/Cargo.toml` gains seven `[[bin]]` entries and patches `hyper`, `rustls` and `tungstenite` as the workspace does; 270 seeds are committed, 458 in all. A big-endian host now generates the netlink seeds in its own byte order and replays those under the same names, neither comparing nor writing the committed files. Two readers that use fixed paths are not fuzzed: `wait_nbd_ready`'s read of `/sys/block/nbdN/size` and `nbd_connected`'s check for `/sys/block/nbdN/pid`. No run found a crash. The review, asked to check first that the extractions keep the behaviour, returned MERGE with seven notes. Among them, the JSON oracles matched the raw-value token by its bytes, so the same key with an escaped `$` (`\u0024serde_json::private::RawValue`), which `Value` decodes to the token, made `websocket_response` and `http_response` panic on documents that are serde_json's own reading; two seeds committed first (`9f08137`) made the replay panic until the oracles walked the document with serde_json's deserializer (`707168f`). A narrowed envelope check survived until a seed with an ambiguous `unsupported-context` refusal was added, `helper_sysfs` removes its tree on every exit of the replay, a doc comment went back to its function, and the testing guide no longer claims a size limit that the job's inputs cannot reach. The delta review, also MERGE, found that nothing checked that the oracles run: a classifier that skipped every document still passed the replay. The unit tests that `f836a53` adds for it fail for a classifier that always or never skips, and the confirmation of that commit returned MERGE. The testing guide's fuzzing section and the docs-accuracy pin of the witness's wire-error mapping follow. **Behaviour change:** none for the helper, the daemon, the witness or a provider: the moved code is unchanged and runs in the same order. A release build (`-p maki -p maki-attach -p maki-check -p maki-nbdkit`, or `-p maki-witness-cli`) does not enable the features, while `cargo build --workspace` does, through feature unification, adding the doc-hidden modules. For developers, the default suite replays 270 more seeds (`helper_sysfs`'s create and remove temporary directories), a change to one of these readers may need its seeds written again, and the scheduled `fuzz` job builds a larger graph and runs seven more targets for 30 seconds each. | `fuzz/harness/tests/review_fuzz_corpus.rs`: `every_fuzz_target_has_an_entry_a_binary_and_seeds` (seven targets without an entry and a `[[bin]]`) and `the_manifests_targets_are_read_whatever_its_line_ends` (nine targets for sixteen), which failed before, `every_committed_seed_replays_through_its_target`, which with the review's two seeds failed before the oracles' fix, and `the_committed_seeds_are_what_the_generator_writes`; `scripts/test_ci_gate_validation.py` (`FuzzJob`: at least sixteen targets, the seven by name, every patch of the workspace), whose four checks failed before; from the delta review, `only_a_first_key_that_decodes_to_the_token_skips_the_reference` in the `fuzzing` modules of `maki-crypto-http` and `maki-crypto-websocket`, which fails for a classifier that always or never skips; the libFuzzer runs on #408's host, and the `fuzz` job of run 45781903832 on `c3cf27a`, 31 seconds per target without a crash | [#408](https://github.com/seo-rii/maki/pull/408) |
+
+### Not closed in the second follow-up round
+
+Each item was checked against `main` at `c3cf27a`, with the four pull
+requests merged.
+
+- Every remote transport still loses time to a dead address on every connect:
+  about 300 ms for a dead family, and an address's share within a family
+  (AUD-201). The HTTP transport keeps hyper-util's 300 ms before the other
+  family, which reqwest 0.12 does not expose, so with an HTTP `timeout` of
+  300 ms or less the other family is never tried when the first does not
+  answer, and below 600 ms it has less than half of the time. Its shares are
+  fixed: an address refused at once leaves its time to no other, and a live
+  address slower than `timeout / n` to accept the connection is given up. The
+  gRPC transport's connector, read and not tested, ends its last address at
+  the timeout and then starts the other family in its background connect
+  worker, which can serve a later call. Read from the code and not tested: the
+  HTTP 300 ms and the short-`timeout` limitation, a single-address host
+  keeping the whole `timeout`, the bound on a connect that hyper-util finishes
+  in the background, reqwest's bound over resolution and TLS, and the 1 s SYN
+  retransmission that the configuration guide cites. The HTTP tests run on
+  Linux only; their dead address is a full accept queue on #405's host (Linux
+  6.18), and the WebSocket ones are the test dialer's. No dual-stack host or
+  real route that drops packets was used.
+- The volumes that the CLI tests and the `strace` runs read through the
+  read-only rollback view were made by `volume create` and hold no data slots,
+  so no volume that a daemon wrote through NBD was checked that way; the
+  `maki-backing` tests read a payload of several pages with a hole (AUD-202).
+  That a configuration pointed at a snapshot destination is refused is read
+  from the code, not tested. A writer that died was stood in for by a lost
+  release, not a killed daemon; no etcd-quorum authority was used, and the
+  failover client only for `inspect`. A device mounted read-only, an NFS or
+  other read-only export and `errors=remount-ro` after a real I/O error were
+  not run; the mounts were read-only bind mounts. While a check holds the
+  locks, a daemon that starts fails to take them, and a remote one fails its
+  attach at the operation lock; how many inspections a deep check of a large
+  remote volume sends was not measured. A writable `check` or `inspect` of a
+  local protected pair still rewrites its pages, manifest, marker and witness
+  record. On a plain backing the fast check and `inspect` take no lock and
+  only the root decides, so a writable root whose files cannot be written
+  still fails as before. Only Linux asks: rollback protection is Linux-only,
+  and the new tests run on Linux only.
+- `maki check` compares only what the superblock stores (AUD-194): a different
+  key under the same name, an unavailable credential, a provider that fails
+  its self-test and endpoints that are unreachable or not interchangeable are
+  found only at attach. Attach compares after opening the backing and
+  recovery, so with remote rollback protection it loads the witness client's
+  TLS identity and claims a writer at the authority before it refuses a
+  mismatched configuration; that case was not run, nor a `maki check` of a
+  protected backing read read-only with a mismatched configuration. That
+  attach sends no request to an endpoint before the comparison is tested for
+  the HTTP provider only.
+- CI's `kernel-lifecycle` job runs one local-provider volume at a time on
+  GitHub's `ubuntu-latest` image, whose kernel changes with the image
+  (Ubuntu 26.04.1 and `7.0.0-1020-azure` in the two runs whose logs are kept),
+  not on the Debian 12 primary platform or RHEL 9, and kills nbdkit once while
+  the filesystem is idle after a sync (AUD-203). In both runs the killed
+  daemon's device still showed its connection, so cleanup's disconnected-
+  recovery path has not run on a kernel. The opener is the runner's own and
+  holds the device for two seconds: how often something holds a device open
+  at a detach on a production host, whether it lets go within 15 s, and many
+  volumes stopping together, whose cleanups queue on the attach lock for up
+  to 15 s each and from about the eighth on reach `TimeoutStopSec=120`, remain
+  unmeasured. The quick start's program writer does not see `&&` or `||`
+  lists inside compound commands, brace groups or functions, nor a negated or
+  background command, where a failure lets the program go on, and its check
+  relies on the layout of Bash's `declare -f`, against which it was written
+  with Bash 5.2.21.
+- The first-volume block ran on a kernel only as a run that does not stop
+  (AUD-203). A run that stops, and one that continues from its record, ran
+  only against the suite's mocks (AUD-199). The three mutations that the
+  follow-up round's delta review found equivalent or failing closed (`set -C`
+  dropped when the staged configuration is written, the mountpoint's `! -L`
+  dropped, and `boot_id` dropped from the values a record must hold) each
+  still pass the 27 provisioning tests at `c3cf27a`, rerun for this record.
+- No fuzz run has reached the 24 CPU-hour-per-target qualification (AUD-204):
+  the seven new targets ran 4 minutes each on #408's host, in one process with
+  `-max_len=4096`, before the review changed the JSON oracles, after which
+  `http_response` and `websocket_response` ran 60 seconds each. The `fuzz` job
+  did not run on #408; on GitHub's runner the new targets have run once, 31
+  seconds each from their seeds without a crash, in the dispatch on `main` at
+  `c3cf27a` (run 45781903832). Not fuzzed: the two readers that use fixed paths, and the size limits of etcd's
+  answer (256 KiB) and of the witness state (64 KiB), which lie beyond the
+  job's 4096-byte inputs. The helper's targets read synthetic trees and
+  outputs written to the documented formats, not ones captured from a real
+  LVM, `blkid`, `dmsetup` or kernel. The JSON oracles compare no
+  document whose object's first key decodes to serde_json's raw-value token.
+  No big-endian host was used (its replay and generator paths compile on
+  little-endian hosts through `cfg!`), the new modules were built for Windows
+  only by CI, and under libFuzzer a crashing `helper_sysfs` input leaves its
+  tree in the temporary directory.
+- Nothing in this round ran on a booted RHEL or Debian host or through a real
+  power loss. CI's Windows jobs are the only Windows runs, and CI the only
+  kernel runs: the `kernel-lifecycle` job, and the `pr` job's root-only step,
+  which connects a real `/dev/nbdN` in `review_nbd_kernel.rs`.
+- `v0.1.0-rc.2`, tagged at this round's base `92d4dd4`, predates the round,
+  and no later release candidate had been tagged when this was written.
+
 ## Follow-up round (2026-11-25): AUD-194–AUD-200
 
 No audit preceded this round. After the ninth round's records change
@@ -47,7 +302,9 @@ backing that cannot be written is refused with the reason, since that layer
 has no read-only open. Every other row is **Fixed**. No change alters a record
 format or a golden vector; AUD-199 adds a file that the provisioning block
 writes on the host. The operator-visible changes are listed in the
-[changelog](../CHANGELOG.md#breaking-changes).
+[changelog](../CHANGELOG.md#breaking-changes). *AUD-195 was completed on
+2026-11-26 by AUD-202 ([#407](https://github.com/seo-rii/maki/pull/407)): such
+a backing is now read through a read-only view of that layer.*
 
 Every pull request had an independent review before it merged. #397's was a
 light review and found nothing; each of the other six led to new commits. In
@@ -120,8 +377,8 @@ source.
 
 | ID | Finding | Fix | Regression | PR |
 |---|---|---|---|---|
-| AUD-194 | `maki check <config.toml>` and `maki check <config.toml> --deep` never compared the configuration with the volume they checked. A configuration whose geometry, provider, key name, compatibility id or random prefix length differed from what the superblock stores passed with status 0, and attach then refused it. The ninth audit saw it for the compatibility id, the prefix and the maximum ciphertext size; the pull request reproduced it on `04bbc90` for those, the provider and the key name, and its test shows it for every setting fixed at creation. Attach itself compared only the geometry before it built the provider. For a local provider the engine compared the provider type and key identity, and the self-test the compatibility id, after the provider had been built with its key: with the key file removed, each such change failed with `provider fatal: credential "vol.key" unavailable — failing closed`, not with the setting. For a remote provider the dispatcher (`dispatch_endpoint_set`) refused a changed provider type or compatibility id as `unsupported: remote configuration does not match the locked volume identity/geometry`, which names neither the setting nor the values, and did not compare the key identity. An observation of the ninth audit. | One function, `maki_nbdkit::daemon::configuration_mismatches`, compares the configuration with the superblock alone: the six geometry fields (`volume.device_block_size`, `volume.crypto_unit_size`, `volume.shard_logical_size`, `volume.max_virtual_size`, `backing.slot_alignment`, `crypto.capabilities.max_ciphertext_size`), `nbd.minimum_io` against the stored geometry once that matches, `crypto.provider`, the key identity `crypto.key.name` (a volume an older build created with a `key/.` path still matches the corrected `key`, as attach accepted) and the derived compatibility id, named as `crypto.random_prefix_bytes` or `crypto.crypto_compatibility_id`, whichever part differs. A side without a key identity is named `unset` (the configuration) or `none` (the volume). Attach of an existing volume refuses at the first mismatch before `prepare_provider`, so no provider credential is loaded and no provider transport is built; process hardening, opening the backing and recovery come first, since the superblock compared is the one recovery selects. The dispatcher's own check is replaced by the same function, and the engine's and the self-test's checks stay behind it. `maki check` and `--deep` print one `ERROR: configuration mismatch: <setting> is <value> in the configuration, the volume has <value>; attach refuses this configuration` line per mismatch after their report and fail. The deep verdict still describes the volume only, so a configuration error is not reported as damage to restore from backup. The values printed are sizes, the provider type, the key's name, compatibility ids and the prefix length, none of them secret under SPEC §9. `check` loads no credential and contacts no provider: a different key under the same name, an unavailable credential, a provider that fails its self-test and unreachable endpoints are still found only at attach. `maki-check <root>` reads no configuration, and `maki volume inspect` does not compare the geometry or crypto identity. maki(8), maki-check(8), the operations and configuration guides and SPEC §20 and §27 say so. **Behaviour change:** `check` and `check --deep` exit 1 where they exited 0 for such a configuration, and a matching one prints one more `info:` line. Attach refuses a changed provider, key name, compatibility id or prefix length before it loads any provider credential. For a local provider a compatibility id or prefix mismatch is `crypto identity mismatch: volume was created with compatibility id "…", configuration says "…"` (`AttachError::IdentityMismatch`) where it was `provider fatal: crypto compatibility mismatch: …` after the key was loaded, and a provider change whose key does not fit the new provider reports the provider. For a remote provider, at attach and in `build_provider_with_endpoints`, a changed provider type or compatibility id is `crypto identity mismatch: …` where it was `DaemonError::Unsupported`, and a volume that records a key identity is refused before any probe. The geometry and NBD messages are unchanged. | `bins/maki` `review_check_config_identity.rs`: `every_setting_fixed_at_creation_is_compared_with_the_volume`, `a_prefixed_volume_is_compared_by_prefix_length_and_base_id` and `a_legacy_key_path_suffix_matches_the_corrected_path` (each with and without `--deep`), which failed before, and from the review `a_key_identity_one_side_does_not_have_is_named_as_missing`; maki-nbdkit `review_config_identity_attach.rs`: `a_changed_crypto_identity_is_refused_before_any_credential_is_loaded` and `a_remote_provider_is_not_contacted_for_a_configuration_the_volume_refuses` (no request reaches the HTTP endpoint), which failed before, and from the review `a_remote_configuration_is_compared_by_provider_type_and_key_identity`, which fails with `main`'s `daemon.rs`; five unit tests in `daemon.rs`, `nbd_sizes_are_compared_once_the_geometry_matches` among them | [#399](https://github.com/seo-rii/maki/pull/399) |
-| AUD-195 | `maki volume inspect`, `maki check`, `maki check --deep` and `maki-check` failed on a backing they cannot write: they opened every file read-write, and the deep check took the volume lock exclusively, creating `volume.lock` when it was missing. On `9692e8a`, with a volume's root bind-mounted read-only in a private mount namespace, each ended with `error: Read-only file system (os error 30)` and status 1, and on a tree whose files and directories the user may not write (`0400`/`0500`) with `Permission denied (os error 13)`. An observation of the ninth audit. | **Partial.** On Linux the commands open the backing root as a `FileBacking::read_only` view (AUD-093), which creates, probes and syncs nothing, and ask that view's pinned root descriptor whether this process may write it (`FileBacking::may_write`: `faccessat` with `W_OK` and `AT_EACCESS`; no on a read-only mount, EROFS, for a directory without write permission, EACCES, and for an immutable one, EPERM). Where it may, nothing changes. Where it may not, they read through that view, which opens files `O_RDONLY`. `maki` chooses in one place, `maki_nbdkit::daemon::build_backing_to_read`, which on the read-only path still refuses a `rollback.format` without the configuration's stanza, as `build_backing` does, and `maki-check` asks the same probe. Only the root decides. `Backing` gains `is_read_only` and `try_lock_shared_existing`, which opens an existing lock file read-only, locks it shared without waiting and never creates it. Through a read-only view the fast check adds the warning `read-only check: the backing was opened read-only, so nothing was written, synced or repaired. …` (`READ_ONLY_CHECK`), since what was read may exist only in the page cache (K-01). The deep check takes the lock shared, which excludes a writer for the whole check and admits other read-only checks, does not run without `volume.lock` ("volume lock: volume.lock is missing, and a read-only check cannot create it: …"), reports the records recovery would replay and its journal repairs as warnings, and states the verdict `unproven`, or `unrecoverable` when it finds damage, never `clean` or `recoverable`. `inspect` and the fast check take no lock, as before. A local rollback-protected backing whose root or witness directory cannot be written is refused before anything is opened, with the directory, its setting and the reason ("… cannot be written by this process, and a rollback-protected backing cannot be checked or inspected read-only: opening it re-publishes its authenticated state and the witness anchor before anything is read …"): `RollbackBacking::open` rewrites that state, and no read-only open of that layer exists (the open list). Review found that the first version asked about the root by its path and then opened the path again for the view; the view that answers is now the view that is read. Other platforms, which serve development only, open every root as before. SPEC §27, maki(8), maki-check(8), the [operations guide](operations.md#checking-a-backing-that-cannot-be-written), the rollback guide and the status page say so. **Behaviour change:** on a backing root the user may not write, the four commands work read-only where they failed with EROFS, EACCES or EPERM. Every such report has a `warning: read-only check:` line, and records to replay and journal repairs are warnings where a writable check reports them as `info:`. Exit statuses are unchanged (an `ERROR:` gives 1, otherwise 0), so an `unproven` report exits 0, and a script that needs `clean` reads the verdict line. A root that is not writable while its files are (`0500` with `0600` files), which a writable check used to read, is now checked read-only: its deep verdict is `unproven` where it was `clean`, and a missing `volume.lock` stops the deep check. A protected backing that cannot be written is refused with the reason where it failed with the system's error or whatever its open met first. Nothing changes on a writable backing. | maki-core `review_read_only_check.rs`: `a_deep_check_through_a_read_only_view_changes_nothing_and_is_never_clean`, `a_read_only_deep_check_reports_what_recovery_would_change_as_warnings`, `a_read_only_deep_check_refuses_a_volume_a_writer_holds`, `a_read_only_deep_check_never_creates_the_lock_file_and_does_not_run_without_it` and `the_fast_check_through_a_read_only_view_says_what_it_cannot_prove`, which failed before, and `a_read_only_deep_check_excludes_a_writer_while_it_reads`; `bins/maki` `review_read_only_backing.rs`: `check_and_inspect_read_a_tree_they_may_not_write`, `check_and_inspect_read_a_backing_on_a_read_only_mount` and `a_protected_backing_it_cannot_write_is_refused_with_the_reason`, which failed before, and `a_protected_root_without_its_configuration_is_refused_read_only_too`; `bins/maki-check` `review_read_only_backing.rs`: `maki_check_reads_a_tree_it_may_not_write` and `maki_check_reads_a_root_on_a_read_only_mount`, which failed before, and `maki_check_reads_an_immutable_root`; both binaries' files are listed in `scripts/run_root_tests.py`; maki-backing `file::tests`: `a_shared_lock_of_an_existing_file_creates_nothing_and_excludes_a_writer`, `a_writable_root_may_be_written_and_a_missing_one_is_not_created` and, from the review, `may_write_answers_for_the_root_the_view_holds_not_for_its_path` | [#403](https://github.com/seo-rii/maki/pull/403) |
+| AUD-194 | `maki check <config.toml>` and `maki check <config.toml> --deep` never compared the configuration with the volume they checked. A configuration whose geometry, provider, key name, compatibility id or random prefix length differed from what the superblock stores passed with status 0, and attach then refused it. The ninth audit saw it for the compatibility id, the prefix and the maximum ciphertext size; the pull request reproduced it on `04bbc90` for those, the provider and the key name, and its test shows it for every setting fixed at creation. Attach itself compared only the geometry before it built the provider. For a local provider the engine compared the provider type and key identity, and the self-test the compatibility id, after the provider had been built with its key: with the key file removed, each such change failed with `provider fatal: credential "vol.key" unavailable — failing closed`, not with the setting. For a remote provider the dispatcher (`dispatch_endpoint_set`) refused a changed provider type or compatibility id as `unsupported: remote configuration does not match the locked volume identity/geometry`, which names neither the setting nor the values, and did not compare the key identity. An observation of the ninth audit. | One function, `maki_nbdkit::daemon::configuration_mismatches`, compares the configuration with the superblock alone: the six geometry fields (`volume.device_block_size`, `volume.crypto_unit_size`, `volume.shard_logical_size`, `volume.max_virtual_size`, `backing.slot_alignment`, `crypto.capabilities.max_ciphertext_size`), `nbd.minimum_io` against the stored geometry once that matches, `crypto.provider`, the key identity `crypto.key.name` (a volume an older build created with a `key/.` path still matches the corrected `key`, as attach accepted) and the derived compatibility id, named as `crypto.random_prefix_bytes` or `crypto.crypto_compatibility_id`, whichever part differs. A side without a key identity is named `unset` (the configuration) or `none` (the volume). Attach of an existing volume refuses at the first mismatch before `prepare_provider`, so no provider credential is loaded and no provider transport is built; process hardening, opening the backing and recovery come first, since the superblock compared is the one recovery selects. The dispatcher's own check is replaced by the same function, and the engine's and the self-test's checks stay behind it. `maki check` and `--deep` print one `ERROR: configuration mismatch: <setting> is <value> in the configuration, the volume has <value>; attach refuses this configuration` line per mismatch after their report and fail. The deep verdict still describes the volume only, so a configuration error is not reported as damage to restore from backup. The values printed are sizes, the provider type, the key's name, compatibility ids and the prefix length, none of them secret under SPEC §9. `check` loads no credential and contacts no provider: a different key under the same name, an unavailable credential, a provider that fails its self-test and unreachable endpoints are still found only at attach. *Changed on 2026-11-26 by AUD-202 ([#407](https://github.com/seo-rii/maki/pull/407)): `check` now also reads a remote-protected backing, read-only, and to ask its authority loads the witness client's TLS identity; it still loads no provider credential.* `maki-check <root>` reads no configuration, and `maki volume inspect` does not compare the geometry or crypto identity. maki(8), maki-check(8), the operations and configuration guides and SPEC §20 and §27 say so. **Behaviour change:** `check` and `check --deep` exit 1 where they exited 0 for such a configuration, and a matching one prints one more `info:` line. Attach refuses a changed provider, key name, compatibility id or prefix length before it loads any provider credential. For a local provider a compatibility id or prefix mismatch is `crypto identity mismatch: volume was created with compatibility id "…", configuration says "…"` (`AttachError::IdentityMismatch`) where it was `provider fatal: crypto compatibility mismatch: …` after the key was loaded, and a provider change whose key does not fit the new provider reports the provider. For a remote provider, at attach and in `build_provider_with_endpoints`, a changed provider type or compatibility id is `crypto identity mismatch: …` where it was `DaemonError::Unsupported`, and a volume that records a key identity is refused before any probe. The geometry and NBD messages are unchanged. | `bins/maki` `review_check_config_identity.rs`: `every_setting_fixed_at_creation_is_compared_with_the_volume`, `a_prefixed_volume_is_compared_by_prefix_length_and_base_id` and `a_legacy_key_path_suffix_matches_the_corrected_path` (each with and without `--deep`), which failed before, and from the review `a_key_identity_one_side_does_not_have_is_named_as_missing`; maki-nbdkit `review_config_identity_attach.rs`: `a_changed_crypto_identity_is_refused_before_any_credential_is_loaded` and `a_remote_provider_is_not_contacted_for_a_configuration_the_volume_refuses` (no request reaches the HTTP endpoint), which failed before, and from the review `a_remote_configuration_is_compared_by_provider_type_and_key_identity`, which fails with `main`'s `daemon.rs`; five unit tests in `daemon.rs`, `nbd_sizes_are_compared_once_the_geometry_matches` among them | [#399](https://github.com/seo-rii/maki/pull/399) |
+| AUD-195 | `maki volume inspect`, `maki check`, `maki check --deep` and `maki-check` failed on a backing they cannot write: they opened every file read-write, and the deep check took the volume lock exclusively, creating `volume.lock` when it was missing. On `9692e8a`, with a volume's root bind-mounted read-only in a private mount namespace, each ended with `error: Read-only file system (os error 30)` and status 1, and on a tree whose files and directories the user may not write (`0400`/`0500`) with `Permission denied (os error 13)`. An observation of the ninth audit. | **Partial.** On Linux the commands open the backing root as a `FileBacking::read_only` view (AUD-093), which creates, probes and syncs nothing, and ask that view's pinned root descriptor whether this process may write it (`FileBacking::may_write`: `faccessat` with `W_OK` and `AT_EACCESS`; no on a read-only mount, EROFS, for a directory without write permission, EACCES, and for an immutable one, EPERM). Where it may, nothing changes. Where it may not, they read through that view, which opens files `O_RDONLY`. `maki` chooses in one place, `maki_nbdkit::daemon::build_backing_to_read`, which on the read-only path still refuses a `rollback.format` without the configuration's stanza, as `build_backing` does, and `maki-check` asks the same probe. Only the root decides. `Backing` gains `is_read_only` and `try_lock_shared_existing`, which opens an existing lock file read-only, locks it shared without waiting and never creates it. Through a read-only view the fast check adds the warning `read-only check: the backing was opened read-only, so nothing was written, synced or repaired. …` (`READ_ONLY_CHECK`), since what was read may exist only in the page cache (K-01). The deep check takes the lock shared, which excludes a writer for the whole check and admits other read-only checks, does not run without `volume.lock` ("volume lock: volume.lock is missing, and a read-only check cannot create it: …"), reports the records recovery would replay and its journal repairs as warnings, and states the verdict `unproven`, or `unrecoverable` when it finds damage, never `clean` or `recoverable`. `inspect` and the fast check take no lock, as before. A local rollback-protected backing whose root or witness directory cannot be written is refused before anything is opened, with the directory, its setting and the reason ("… cannot be written by this process, and a rollback-protected backing cannot be checked or inspected read-only: opening it re-publishes its authenticated state and the witness anchor before anything is read …"): `RollbackBacking::open` rewrites that state, and no read-only open of that layer exists (the open list). Review found that the first version asked about the root by its path and then opened the path again for the view; the view that answers is now the view that is read. Other platforms, which serve development only, open every root as before. SPEC §27, maki(8), maki-check(8), the [operations guide](operations.md#checking-a-backing-that-cannot-be-written), the rollback guide and the status page say so. *Completed on 2026-11-26 by AUD-202 ([#407](https://github.com/seo-rii/maki/pull/407)): a local protected backing whose root or witness directory cannot be written, and every remote-protected one, is read through a read-only view that authenticates it as attach does; the refusal is gone, and its test `a_protected_backing_it_cannot_write_is_refused_with_the_reason` is now `a_protected_backing_it_cannot_write_is_checked_read_only`.* **Behaviour change:** on a backing root the user may not write, the four commands work read-only where they failed with EROFS, EACCES or EPERM. Every such report has a `warning: read-only check:` line, and records to replay and journal repairs are warnings where a writable check reports them as `info:`. Exit statuses are unchanged (an `ERROR:` gives 1, otherwise 0), so an `unproven` report exits 0, and a script that needs `clean` reads the verdict line. A root that is not writable while its files are (`0500` with `0600` files), which a writable check used to read, is now checked read-only: its deep verdict is `unproven` where it was `clean`, and a missing `volume.lock` stops the deep check. A protected backing that cannot be written is refused with the reason where it failed with the system's error or whatever its open met first. Nothing changes on a writable backing. | maki-core `review_read_only_check.rs`: `a_deep_check_through_a_read_only_view_changes_nothing_and_is_never_clean`, `a_read_only_deep_check_reports_what_recovery_would_change_as_warnings`, `a_read_only_deep_check_refuses_a_volume_a_writer_holds`, `a_read_only_deep_check_never_creates_the_lock_file_and_does_not_run_without_it` and `the_fast_check_through_a_read_only_view_says_what_it_cannot_prove`, which failed before, and `a_read_only_deep_check_excludes_a_writer_while_it_reads`; `bins/maki` `review_read_only_backing.rs`: `check_and_inspect_read_a_tree_they_may_not_write`, `check_and_inspect_read_a_backing_on_a_read_only_mount` and `a_protected_backing_it_cannot_write_is_refused_with_the_reason`, which failed before, and `a_protected_root_without_its_configuration_is_refused_read_only_too`; `bins/maki-check` `review_read_only_backing.rs`: `maki_check_reads_a_tree_it_may_not_write` and `maki_check_reads_a_root_on_a_read_only_mount`, which failed before, and `maki_check_reads_an_immutable_root`; both binaries' files are listed in `scripts/run_root_tests.py`; maki-backing `file::tests`: `a_shared_lock_of_an_existing_file_creates_nothing_and_excludes_a_writer`, `a_writable_root_may_be_written_and_a_missing_one_is_not_created` and, from the review, `may_write_answers_for_the_root_the_view_holds_not_for_its_path` | [#403](https://github.com/seo-rii/maki/pull/403) |
 | AUD-196 | `maki-witness init <dir> <nil-uuid>` and `maki-witness init-etcd <config> <nil-uuid>` exited 1, the status of a failed command, where `maki volume resume-enrollment` refuses a nil identity as misuse with status 2 and the binaries refuse a bad argument with 2 before anything is read or created (AUD-137, AUD-190). The nil UUID parses as a UUID: `init` handed it to the state store, which refused it ("nil remote witness identity") before it created anything, and `init-etcd` read its configuration first. The eighth audit noted it as cosmetic. | `volume_identity`, which these two commands use and no other does, refuses the nil identity with `maki-witness: volume identity must be nonzero` and status 2 before anything is read or created, as it already refused a word that is not a UUID. A command whose arguments are well formed and that then fails still exits 1. **Behaviour change:** status 2 and that message where the commands exited 1. | `a_nil_volume_identity_exits_2_before_anything_is_created` (`bins/maki-witness` `review_misuse_status.rs`: both commands, nothing on stdout, no state directory created), which failed before with status 1 | [#397](https://github.com/seo-rii/maki/pull/397) |
 
 ### Privileged helper
@@ -161,6 +418,12 @@ requests merged.
   (`async_impl/client.rs`) and not tested: the transport has no seam to model
   an address that never answers, and setting `connect_timeout` would also cut
   a slow but live first address at its share. The status page states it.
+  *Closed by AUD-201 ([#405](https://github.com/seo-rii/maki/pull/405)): the
+  client is built with `connect_timeout(timeout)`, which hyper-util divides
+  among a family's addresses, so a dead address before a live one of its
+  family costs its share, half the `timeout` for two; tested on Linux with an
+  address whose full accept queue drops SYNs. What remains is in the second
+  follow-up round's open list.*
 - A dead endpoint address still costs time on every connect: about 300 ms for
   a dead family, and its share of what is left of the timeout within a family
   (AUD-198). With a WebSocket `timeout` of 300 ms or less, the other family is
@@ -170,6 +433,11 @@ requests merged.
   call. No dual-stack host or real route that drops packets was used: the
   addresses that never answer are the test dialer's, and `localhost` resolving
   to `::1` first on Windows comes from AUD-193's record.
+  *Changed by AUD-201 ([#405](https://github.com/seo-rii/maki/pull/405)): with
+  less than 600 ms of a connect left, the WebSocket transport starts the other
+  family halfway to its deadline, so a `timeout` of 300 ms or less still
+  reaches it. The HTTP transport keeps the limitation (reqwest 0.12 does not
+  expose hyper-util's 300 ms), and the gRPC connector is unchanged.*
 - The detach wait (AUD-197): what keeps a disconnected connection showing is
   read from the CentOS Stream 9 driver, and nothing has shown how often
   something holds a device open at a detach's disconnect, or whether it lets
@@ -179,6 +447,18 @@ requests merged.
   all held open and the volumes stop together, their cleanups queue on the
   attach lock for 15 s each and, from about the eighth on, reach
   `TimeoutStopSec=120`; the operations guide says what that leaves.
+  *Changed by AUD-203 ([#406](https://github.com/seo-rii/maki/pull/406)): CI's
+  `kernel-lifecycle` job detaches a whole attachment while another process
+  holds the device open. In its two runs whose logs are kept (Ubuntu 26.04.1,
+  kernel `7.0.0-1020-azure`), the opener's read failed with `EIO` while the
+  device still showed the connection's backend identifier, which stayed until
+  the opener closed the device two seconds later, as read from the driver;
+  in both runs detach waited for the close (2202 ms and 2193 ms) and succeeded
+  in a single invocation.
+  The cleanup after nbdkit was killed found the device still connected and
+  took its detach path both times, so its disconnected-recovery path has not
+  run on a kernel. How often a real opener holds a device, and many volumes
+  stopping together, remain unmeasured.*
 - `maki check` compares only what the superblock stores (AUD-194): a different
   key under the same name, an unavailable credential, a provider that fails
   its self-test and endpoints that are unreachable or not interchangeable are
@@ -188,6 +468,11 @@ requests merged.
   refuses a mismatched configuration; that case was not run. That attach sends
   no request to an endpoint before the comparison is tested for the HTTP
   provider only; WebSocket and gRPC go through the same functions.
+  *Changed by AUD-202 ([#407](https://github.com/seo-rii/maki/pull/407)):
+  `maki check` now also reads a remote-protected backing, read-only, and
+  compares the configuration with it; to ask the authority it loads the
+  witness client's TLS identity, and it sends only inspections. Attach is
+  unchanged.*
 - A rollback-protected backing whose root or witness directory cannot be
   written is refused, not checked, since that layer has no read-only open, and
   a writable `check` or `inspect` of a protected backing still rewrites its
@@ -197,7 +482,15 @@ requests merged.
   other platforms every root opens as before, and CI's Windows jobs are the
   only Windows runs of the new in-process tests. A device mounted read-only,
   an NFS or other read-only export, and `errors=remount-ro` after a real I/O
-  error were not run; the mount tested is a read-only bind mount.
+  error were not run; the mount tested is a read-only bind mount. *Changed by
+  AUD-202 ([#407](https://github.com/seo-rii/maki/pull/407)): a local
+  protected backing whose root or witness directory cannot be written, and
+  every remote one, is read through a read-only view that authenticates it as
+  attach does, writes nothing and asks a remote authority only to inspect, and
+  through that view the fast check and `inspect` take the writer's locks
+  shared. A local pair whose two directories can both be written is still
+  opened to write, which takes those locks exclusively, and rewritten; the rest
+  of the item stands.*
 - The first-volume block (AUD-199) ran only against the suite's mocks: no real
   `maki-attach`, kernel NBD device, LVM, device-mapper, udev, XFS or systemd
   was used, and the holder check relies on two layouts read from documentation
@@ -206,6 +499,18 @@ requests merged.
   closed: `set -C` dropped when the staged configuration is written, the
   mountpoint's symlink test (`! -L`) dropped, and `boot_id` dropped from the
   required values.
+  *Changed by AUD-203 ([#406](https://github.com/seo-rii/maki/pull/406)): CI's
+  `kernel-lifecycle` job runs the block as written, after the Debian guide's
+  install of a package built from the commit, under systemd with the installed
+  units. In its two runs whose logs are kept (Ubuntu 26.04.1, kernel
+  `7.0.0-1020-azure`, LVM 2.03.31) a run that did not stop connected
+  `/dev/nbd0` with the real `maki-attach`, created the PV, VG, LV and XFS,
+  passed the device-mapper UUID and holder checks, deactivated the VG,
+  disconnected and wrote the attach configuration, which the quick start then
+  attached. A run that stops, and one that continues from its record, still
+  ran only against the mocks, and the three mutations still pass the tests.
+  The block now exports `LVM_SUPPRESS_FD_WARNINGS=1`, so its LVM commands no
+  longer warn about the lock's descriptor.*
 - No fuzz run has reached the 24 CPU-hour-per-target qualification: the new
   targets ran 12 minutes each on #401's host, the others less (AUD-200). Not
   fuzzed: `maki-witness`'s RPC and the witness's decoding of requests, the
@@ -215,12 +520,27 @@ requests merged.
   The `nbd_netlink` seeds are in little-endian byte order: on a big-endian
   host the replay skips them by name, which was checked by reading, and the
   generator's `netlink_seeds` is unused there.
+  *Changed by AUD-204 ([#408](https://github.com/seo-rii/maki/pull/408)):
+  seven targets read the witness's RPC, its etcd store's reading of etcd's
+  answers, the three providers' response readers and the helper's readers of
+  command output and sysfs, and a big-endian host now replays netlink seeds
+  that its generator makes in its own byte order (checked by reading). The new
+  targets ran 4 minutes each on #408's host; the qualification is still
+  outstanding.*
 - Nothing in this round ran on a real kernel NBD device outside CI's root-only
   tests, with udev, device-mapper or LVM, under systemd with these units, on a
   booted RHEL or Debian host or through a real power loss. CI's Windows jobs
   are the only Windows runs.
+  *Changed on 2026-11-26 by AUD-203
+  ([#406](https://github.com/seo-rii/maki/pull/406)): CI's `kernel-lifecycle`
+  job runs whole attachments through a runner's kernel NBD, udev,
+  device-mapper, LVM and XFS, and the quick start under systemd with the
+  installed units, on GitHub's Ubuntu runner; nothing has run on a booted RHEL
+  or Debian host or through a real power loss.*
 - `v0.1.0-rc.1` predates the eighth, the ninth and this round, and no later
-  release candidate had been tagged when this was written.
+  release candidate had been tagged when this was written. *`v0.1.0-rc.2` was
+  tagged at `92d4dd4` on 2026-11-26, after this round's records change, so it
+  includes this round.*
 
 ## Ninth round (2026-11-25): AUD-181–AUD-193
 
@@ -475,7 +795,9 @@ requests merged.
   compare those settings and fail on a difference; the third in part by
   AUD-195 ([#403](https://github.com/seo-rii/maki/pull/403)), with which a
   plain backing whose root cannot be written is checked read-only, while a
-  rollback-protected one is refused with the reason.*
+  rollback-protected one is refused with the reason.* *AUD-202
+  ([#407](https://github.com/seo-rii/maki/pull/407)) closed the rest of the
+  third on 2026-11-26: a rollback-protected backing is read read-only too.*
   Two things recorded before were seen again: WebSocket
   and gRPC keep plaintext copies of the last units in transport buffers
   after the volume goes idle (MAKI-015, the [status
