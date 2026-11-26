@@ -38,6 +38,11 @@ use maki_format::config::{decode_pointer_token, HttpFieldSource, HttpPayloadEnco
 mod request;
 mod response;
 
+// A loopback address that never answers needs Linux: a listener whose
+// accept queue is full drops the SYNs sent to it.
+#[cfg(all(test, target_os = "linux"))]
+mod connect_tests;
+
 #[cfg(test)]
 mod request_tests;
 
@@ -934,6 +939,16 @@ fn classify_status(
 
 impl HttpCryptoProvider {
     pub fn new(spec: HttpProviderSpec) -> Result<Self, CryptoError> {
+        Self::with_client(spec, std::convert::identity)
+    }
+
+    /// `new`, with the client's builder passed through `adjust` last, so a
+    /// test can resolve the endpoint's host to addresses of its own
+    /// (`connect_tests.rs`).
+    fn with_client(
+        spec: HttpProviderSpec,
+        adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, CryptoError> {
         for op in [&spec.encrypt, &spec.decrypt] {
             maki_format::config::check_http_header_names(
                 op.headers.iter().map(|(k, _)| k.as_str()),
@@ -965,7 +980,8 @@ impl HttpCryptoProvider {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
-            .use_preconfigured_tls(tls)
+            .use_preconfigured_tls(tls);
+        let client = adjust(client)
             .build()
             .map_err(|e| fatal(format!("http client build failed: {e}")))?;
         Ok(Self { client, spec })
