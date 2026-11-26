@@ -11,13 +11,21 @@ block is the volume configuration that its step 2 installs from `demo.toml`.
 
 writes DIRECTORY/demo.toml and DIRECTORY/quickstart.sh. Run the program as
 root in DIRECTORY, beside the package as `maki.deb`, on a disposable host:
-`sudo bash quickstart.sh`. It stops at the first command that fails, also
-inside an `&&` list, and says which step it was in.
+`sudo bash quickstart.sh`. It runs under `set -e -o pipefail` and checks
+each block's status after it, so it stops at a failed command that `set -e`
+stops at (a pipeline included, whichever of its commands failed) and at a
+block whose last command failed, an `&&` list that ends the block included,
+and says which step it was in. `set -e` does not stop at a failure inside an
+`&&` or `||` list before a block's last command, so the writer refuses a
+block in which Bash reads such a list, or which Bash cannot read.
 """
 import argparse
+import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 
 
@@ -33,7 +41,7 @@ BOOTSTRAP_SECTION = "1. Provision and record the layout"
 PRELUDE = """\
 # Written by scripts/documented_quickstart.py from the guides. Run it as root
 # in the directory that holds maki.deb and demo.toml, on a disposable host.
-set -e
+set -e -o pipefail
 step=''
 documented_stop() {
     documented_status=$?
@@ -93,11 +101,67 @@ def configuration():
     return blocks[0]
 
 
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def without_heredoc_bodies(block):
+    """The block without the bodies of its here-documents, which Bash prints
+    as they are written and which are no commands of the block."""
+    lines, terminator = [], None
+    for line in block.splitlines():
+        if terminator is not None:
+            if line.lstrip("\t") == terminator:
+                lines.append(line)
+                terminator = None
+            continue
+        lines.append(line)
+        found = HEREDOC.search(line)
+        if found and "<<<" not in line:
+            terminator = found.group(2)
+    return "\n".join(lines) + "\n"
+
+
+def has_unguarded_list(label, block):
+    """Whether Bash reads an `&&` or `||` list in `block` before its last
+    command, at the block's own level or in a subshell there.
+
+    Bash prints a function's body one command to a line, four spaces in at
+    its own level, each command but the last ended by `;` (a here-document's
+    command line by its body). The block is first only read (`bash -n`): a
+    block that Bash reads alone cannot close the function it is put in, so
+    defining that function runs none of it."""
+    bash = shutil.which("bash")
+    if bash is None:
+        raise ValueError("Bash is needed to read the guides' blocks")
+    body = without_heredoc_bodies(block)
+    environment = {"PATH": os.defpath, "LC_ALL": "C"}
+    read = subprocess.run([bash, "--noprofile", "--norc", "-n"], input=body, env=environment,
+                          capture_output=True, text=True, timeout=10)
+    if read.returncode:
+        raise ValueError(f"Bash cannot read {label}: {read.stderr.strip()}")
+    printed = subprocess.run(
+        [bash, "--noprofile", "--norc", "-c",
+         'eval "documented_block() {\n$1\n}" && declare -f documented_block', "bash", body],
+        env=environment, capture_output=True, text=True, timeout=10, check=True).stdout
+    level = [line[4:] for line in printed.splitlines()
+             if line.startswith("    ") and not line.startswith("     ")]
+    ends = [index for index, line in enumerate(level[:-1])
+            if line.endswith(";") or HEREDOC.search(line)]
+    return bool(ends) and any("&&" in line or "||" in line for line in level[:ends[-1] + 1])
+
+
 def program(found):
     """One Bash program that runs each (label, block) in order in one shell.
 
-    `set -e` stops at a failed command; a failed command inside an `&&` list
-    does not trigger it, so each block's own status is checked as well."""
+    `set -e -o pipefail` stops at a failed command or pipeline; one inside an
+    `&&` or `||` list does not trigger it, so each block's own status is
+    checked after it, and a block with such a list before its last command,
+    whose failure nothing would see, is refused."""
+    for label, block in found:
+        if has_unguarded_list(label, block):
+            raise ValueError(f"{label} has an && or || list before its last command: set -e "
+                             "does not stop at a failure there, and the block's status is its "
+                             "last command's")
     lines = [PRELUDE]
     for number, (label, block) in enumerate(found, 1):
         lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")

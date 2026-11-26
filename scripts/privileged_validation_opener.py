@@ -11,7 +11,7 @@ notes what the device shows, holds it open for two seconds more, closes it and
 requires the attributes to go once it has. Its output says what it saw, with
 times from its start.
 
-Exit status 0 only if reads were served while it held the device, a read then
+Exit status 0 only if whole blocks were read while it held the device, a read then
 failed with EIO, the device still showed the connection it had shown at the
 start both then and just before the close, and showed none within five
 seconds after it. Any other outcome, a stop requested with the stop file and
@@ -53,7 +53,8 @@ class Device:
         self.buffer = mmap.mmap(-1, BLOCK)
 
     def read(self):
-        os.preadv(self.descriptor, [self.buffer], 0)
+        """The number of bytes the read returned."""
+        return os.preadv(self.descriptor, [self.buffer], 0)
 
     def close(self):
         os.close(self.descriptor)
@@ -77,10 +78,15 @@ def hold(device, shown, stop_requested, *, clock=time.monotonic, sleep=time.slee
             device.close()
             return 3
         try:
-            device.read()
+            count = device.read()
         except OSError as error:
             failure = error
             break
+        if count != BLOCK:
+            # Not a served block, and not the kernel's answer to a disconnect.
+            note(f"refused: a read returned {count} bytes, not {BLOCK}, after {served} served reads")
+            device.close()
+            return 9
         served += 1
         if clock() - started > deadline:
             note(f"no read failed within {deadline:.0f} s: no disconnect was seen")

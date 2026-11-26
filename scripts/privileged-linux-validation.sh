@@ -1090,6 +1090,34 @@ run_helper() {
     return "$status"
 }
 
+# Look for the helper's attach record as root. record_state is "present" or
+# "absent"; a look that fails stops the run, since it shows neither.
+attach_record_state() {
+    local record="/run/maki-attach/$volume_name.nbd" state
+    state="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then echo present; else echo absent; fi' \
+        sh "$record")" || state=""
+    case "$state" in
+        present|absent) record_state="$state" ;;
+        *) die "could not look for the attach record $record" ;;
+    esac
+}
+
+# What an attach ($1) must show, which require_released then looks for: the
+# mount, the attachment's backend identifier on the device and its record.
+require_attached() {
+    local backend=""
+    findmnt -rn -M "$mountpoint" >/dev/null 2>&1 || die "$1 left $mountpoint unmounted"
+    if [[ -r "/sys/block/$nbd_target/backend" ]]; then
+        backend="$(<"/sys/block/$nbd_target/backend")"
+    fi
+    [[ "$backend" == maki-* ]] ||
+        die "$1 left $device without the attachment's backend identifier (${backend:-none})"
+    attach_record_state
+    [[ "$record_state" == present ]] ||
+        die "$1 left no attach record at /run/maki-attach/$volume_name.nbd"
+    pass "$1 shows the mount, the connection $backend and the attach record"
+}
+
 # What a detach or cleanup ($1) must leave: no mount at the mountpoint, no
 # holder of the device, no connection, a size of 0 and no attach record.
 require_released() {
@@ -1107,9 +1135,9 @@ require_released() {
     fi
     size="$(sudo -n blockdev --getsize64 "$device")"
     [[ "$size" == 0 ]] || die "$1 left $device exposing $size bytes"
-    if sudo -n test -e "/run/maki-attach/$volume_name.nbd"; then
+    attach_record_state
+    [[ "$record_state" == absent ]] ||
         die "$1 left the attach record /run/maki-attach/$volume_name.nbd"
-    fi
     pass "$1 left no mount, holder, connection or attach record"
 }
 
@@ -1153,6 +1181,8 @@ check_lifecycle_data() {
     pass "data written and fsynced before the first detach reads back unchanged after the $1"
 }
 
+require_attached "the first attach"
+
 log "writing and fsyncing 32 MiB beside the SQLite database"
 dd if=/dev/urandom of="$mountpoint/work/lifecycle.dat" bs=1M count=32 conv=fsync status=none
 sync -f "$mountpoint/work"
@@ -1165,6 +1195,13 @@ hold_device_open
 run_helper detach maki-detach || die "maki-attach detach failed; see maki-detach.txt above"
 mount_active=false
 helper_cleanup_needed=false
+# The opener writes this line, flushed, just before it closes the device,
+# and the device shows the connection until that close: a detach that
+# waited for the connection to go cannot have returned before the line.
+if ! grep -q ' closing after holding it ' "$run_dir/detach-opener.txt"; then
+    cat "$run_dir/detach-opener.txt" >&2
+    die "maki-attach detach returned while the opener still held $device: it did not wait for the connection to go"
+fi
 finish_opener
 require_released "detach with an opener of $device"
 pass "detach waited for the opener to close $device and completed in one run"
@@ -1180,6 +1217,7 @@ sudo -n install -m 0600 -o root -g root "$run_dir/attach-reattach.toml" "$attach
 helper_cleanup_needed=true
 run_helper attach maki-reattach || die "the second maki-attach attach failed; see maki-reattach.txt above"
 mount_active=true
+require_attached "the second attach"
 run_helper verify maki-verify-reattach || die "maki-attach verify failed after the second attach"
 check_lifecycle_data reattach
 
@@ -1224,6 +1262,7 @@ if [[ "$kill_daemon" == true ]]; then
     run_helper attach maki-attach-after-kill ||
         die "maki-attach attach failed after nbdkit was killed; see maki-attach-after-kill.txt above"
     mount_active=true
+    require_attached "the attach after nbdkit was killed"
     run_helper verify maki-verify-after-kill || die "maki-attach verify failed after nbdkit was killed"
     check_lifecycle_data restart
 

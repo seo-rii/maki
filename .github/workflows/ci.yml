@@ -529,8 +529,11 @@ jobs:
           sudo journalctl -b --no-pager -o short-monotonic -k > "$out/kernel.log"
           sudo journalctl -b --no-pager -o short-monotonic -u 'maki*' > "$out/maki-units.log"
           sudo journalctl -b --no-pager -o short-monotonic -u systemd-udevd > "$out/udev.log"
-          for command in 'uname -srvm' 'nbdkit --version' 'nbdinfo --version' 'lvm version' \
-            'mkfs.xfs -V' 'udevadm --version' 'systemctl --version' 'sudo --version' 'python3 --version'; do
+          # LVM prints its driver's version only as root, and warns about the
+          # descriptors this shell passes on unless told not to.
+          for command in 'uname -srvm' 'nbdkit --version' 'nbdinfo --version' \
+            'sudo env LVM_SUPPRESS_FD_WARNINGS=1 lvm version' 'mkfs.xfs -V' 'udevadm --version' \
+            'systemctl --version' 'sudo --version' 'python3 --version'; do
             echo "\$ $command"
             $command 2>&1 | head -n 3
           done > "$out/versions.txt"
