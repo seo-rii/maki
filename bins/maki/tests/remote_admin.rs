@@ -7,7 +7,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use maki_backing::remote_witness::{
     namespace, Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
@@ -34,6 +35,20 @@ struct Fixture {
     writer_config: PathBuf,
     admin_config: PathBuf,
     writer: Arc<dyn Rpc>,
+    /// The action of every request the authority was sent, in order.
+    actions: Arc<Mutex<Vec<&'static str>>>,
+}
+fn action_name(action: &Action) -> &'static str {
+    match action {
+        Action::Inspect => "inspect",
+        Action::Claim => "claim",
+        Action::Takeover => "takeover",
+        Action::RecoverEnrollment => "recover-enrollment",
+        Action::ClaimRestore { .. } => "claim-restore",
+        Action::Activate { .. } => "activate",
+        Action::Advance { .. } => "advance",
+        Action::Release => "release",
+    }
 }
 fn inspect(rpc: &dyn Rpc) -> Record {
     rpc.call(&Request {
@@ -130,9 +145,17 @@ impl Fixture {
             ],
         })
         .unwrap();
-        let handler = maki_witness::state_handler(
+        let state = maki_witness::state_handler(
             StateStore::create(&dir.path().join("authority"), [1; 16]).unwrap(),
         );
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let sent = actions.clone();
+        let handler: Arc<maki_witness::Handler> = Arc::new(move |role, request: &[u8]| {
+            if let Ok(request) = serde_json::from_slice::<Request>(request) {
+                sent.lock().unwrap().push(action_name(&request.action));
+            }
+            state(role, request)
+        });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -214,6 +237,7 @@ client_key_file={key:?}
             writer_config,
             admin_config,
             writer: client(writer_files),
+            actions,
         }
     }
     fn create(&self) -> RollbackBacking {
@@ -504,8 +528,10 @@ fn restore_requires_approved_snapshot_root_and_advances_epoch_without_lowering_g
     assert_eq!(read(&reopened), b"ciphertext-old");
 }
 
-/// Every entry below `root` with its mode and, for a file, its bytes.
-fn tree(root: &std::path::Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>)> {
+/// Every entry below `root` with its mode, its bytes if it is a file, and
+/// its modification time, which a rewrite of identical bytes and a created
+/// or removed entry (in its directory) change.
+fn tree(root: &std::path::Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>, SystemTime)> {
     use std::os::unix::fs::PermissionsExt;
     let mut entries = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -519,7 +545,12 @@ fn tree(root: &std::path::Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>)> {
         } else {
             Some(std::fs::read(&path).unwrap())
         };
-        entries.push((path, metadata.permissions().mode(), bytes));
+        entries.push((
+            path,
+            metadata.permissions().mode(),
+            bytes,
+            metadata.modified().unwrap(),
+        ));
     }
     entries.sort();
     entries
@@ -527,7 +558,7 @@ fn tree(root: &std::path::Path) -> Vec<(PathBuf, u32, Option<Vec<u8>>)> {
 
 fn set_modes(root: &std::path::Path, file: u32, directory: u32) {
     use std::os::unix::fs::PermissionsExt;
-    for (path, mode, _) in tree(root) {
+    for (path, mode, _, _) in tree(root) {
         let mode = if mode & 0o040000 != 0 {
             directory
         } else {
@@ -975,10 +1006,8 @@ fn resume_enrollment_requires_admin_identity_fence_and_completes_volume_initiali
         assert_eq!(after.fence, before.fence + 1);
         assert_eq!(after.phase, Phase::Released);
         assert!(after.current.is_some());
-        failure(
-            &["volume", "inspect", f.path(false)],
-            "read-only remote backing inspection is not supported",
-        );
+        let inspected = success(&["volume", "inspect", f.path(false)]);
+        assert!(String::from_utf8_lossy(&inspected.stdout).contains("uuid:"));
         assert_eq!(inspect(f.writer.as_ref()), after);
         // This fixture explicitly acquires a writer to verify initialization.
         // The diagnostic CLI must never acquire that writer implicitly.
@@ -1150,10 +1179,8 @@ fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
     assert_eq!(before.identity, [1; 16]);
     assert_eq!(before.phase, Phase::Released);
     assert!(before.current.is_some());
-    failure(
-        &["volume", "inspect", path],
-        "read-only remote backing inspection is not supported",
-    );
+    let inspected = success(&["volume", "inspect", path]);
+    assert!(String::from_utf8_lossy(&inspected.stdout).contains("uuid:"));
     assert_eq!(inspect(f.writer.as_ref()), before);
     volume_config::write(
         &config,
@@ -1197,9 +1224,27 @@ fn diagnostic_commands_never_claim_or_fork_a_remote_writer() {
             vec!["check", fixture.path(false)],
             vec!["check", fixture.path(false), "--deep"],
         ] {
-            failure(
-                &args,
-                "read-only remote backing inspection is not supported",
+            fixture.actions.lock().unwrap().clear();
+            let output = run(&args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{args:?}");
+            if active {
+                // The writer holds its namespace's lock, which the
+                // read-only view takes shared.
+                assert!(
+                    stderr.contains("rollback.lock is held by another process"),
+                    "{args:?}: {stderr}"
+                );
+            } else {
+                // The backing holds no volume: the commands read it and
+                // say so.
+                let output = format!("{stderr}{}", String::from_utf8_lossy(&output.stdout));
+                assert!(output.contains("superblock"), "{args:?}: {output}");
+            }
+            let actions = fixture.actions.lock().unwrap().clone();
+            assert!(
+                !actions.is_empty() && actions.iter().all(|action| *action == "inspect"),
+                "{args:?}: {actions:?}"
             );
             assert_eq!(inspect(fixture.writer.as_ref()), before);
             assert_eq!(names(), namespaces, "diagnostic created a writer namespace");
@@ -1207,5 +1252,52 @@ fn diagnostic_commands_never_claim_or_fork_a_remote_writer() {
         if active {
             drop(backing.take());
         }
+    }
+}
+
+/// `volume inspect`, `check` and `check --deep` read a remote-protected
+/// volume through a view that only reads, whether its root can be written
+/// or not: the authority is sent nothing but inspections, and nothing in the
+/// root changes. Opening the backing to write claims a writer and copies
+/// the current state into a namespace of its own, so they refused it.
+#[test]
+fn diagnostic_commands_read_a_remote_volume_with_inspections_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    success(&["volume", "create", fixture.path(false)]);
+    let before = inspect(fixture.writer.as_ref());
+    assert_eq!(before.phase, Phase::Released);
+    let path = fixture.path(false);
+    for mode in [0o700, 0o500] {
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let unchanged = tree(&fixture.root);
+        fixture.actions.lock().unwrap().clear();
+        let inspected = success(&["volume", "inspect", path]);
+        assert!(String::from_utf8_lossy(&inspected.stdout).contains("uuid:"));
+        let check = success(&["check", path]);
+        let report = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            report.contains("warning: read-only check: ") && report.ends_with("check passed\n"),
+            "{report}"
+        );
+        let deep = success(&["check", path, "--deep"]);
+        let report = String::from_utf8_lossy(&deep.stdout);
+        assert!(
+            report.contains("info: deep check verdict: unproven\n")
+                && report.ends_with("check passed\n"),
+            "{report}"
+        );
+        let actions = fixture.actions.lock().unwrap().clone();
+        assert!(
+            !actions.is_empty() && actions.iter().all(|action| *action == "inspect"),
+            "{actions:?}"
+        );
+        assert_eq!(inspect(fixture.writer.as_ref()), before);
+        assert_eq!(
+            tree(&fixture.root),
+            unchanged,
+            "a read-only command changed the root"
+        );
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

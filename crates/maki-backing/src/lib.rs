@@ -27,7 +27,7 @@ pub mod remote_witness;
 mod rollback;
 pub mod witness;
 pub use rollback::gc as remote_gc;
-pub use rollback::RollbackBacking;
+pub use rollback::{ReadOnlyRollbackBacking, RollbackBacking};
 
 pub use file::FileBacking;
 pub use mem::MemBacking;

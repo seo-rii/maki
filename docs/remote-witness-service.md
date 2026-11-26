@@ -708,9 +708,25 @@ independent-host, persistent-disk or disruptive campaign qualification.
 ## Diagnostic commands and writer ownership
 
 `maki volume witness <config.toml>` inspects the authority without claiming a
-writer. `maki volume inspect`, `maki check`, and `maki check --deep` refuse remote
-rollback backing until a read-only backing view is implemented. Opening the
-normal remote backing claims a writer and creates a new namespace; diagnostic
-commands must not do that implicitly, including when they fail or are killed.
-This refusal applies to both active and released authority states. It does not
-validate the stored ciphertext or replace an offline data-integrity check.
+writer. Opening the normal remote backing claims a writer and creates a new
+namespace; diagnostic commands must not do that implicitly, including when
+they fail or are killed. So `maki volume inspect`, `maki check`, and `maki
+check --deep` read a remote rollback backing through a read-only view, on a
+root that can be written or not
+([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+The view sends the authority nothing but inspections. It reads the authority's
+current generation where it is, in the namespace the current descriptor names,
+after authenticating it as attach does (the manifest the descriptor selects,
+exact and canonical, the sizes of its slot and of the arena, and every committed
+page), and creates, writes, syncs and removes nothing in the root. It takes the
+root's `remote.operation.lock` and the current namespace's `rollback.lock`
+shared, and never creates either, before it reads anything in the root but its
+format marker: it refuses a volume whose writer is still running (an attached
+volume), reads one whose active writer has gone without releasing it (after a
+crash, before a takeover), and while it runs an attach, takeover, restore,
+snapshot or GC of that root fails to take the operation lock. It reads the
+authority's record again once it holds both locks and refuses one that changed
+in between, and every later operation inspects the authority again, as a
+writer's operations do. Its deep verdict is `unproven`. It loads the witness
+client's TLS identity to ask the authority, but no volume key, and decrypts
+nothing, so it does not replace an offline data-integrity check.

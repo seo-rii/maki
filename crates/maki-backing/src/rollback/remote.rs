@@ -48,14 +48,7 @@ impl Witness {
     pub(super) fn stops_session(&self, error: &io::Error) -> bool {
         match self {
             Self::Local(witness) => witness.is_poisoned(),
-            Self::Remote(_) => matches!(
-                error.kind(),
-                io::ErrorKind::InvalidData
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::NotFound
-            ),
+            Self::Remote(_) => stops_remote_session(error),
         }
     }
     pub(super) fn advance(&mut self, root: [u8; 32]) -> io::Result<()> {
@@ -97,6 +90,19 @@ impl Witness {
     }
 }
 
+/// Whether a failed remote freshness check stops a session for good
+/// ([`Witness::stops_session`]): a mismatch, an invalid or denied answer.
+pub(super) fn stops_remote_session(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::NotFound
+    )
+}
+
 pub(super) struct RemoteSession {
     root: Arc<FileBacking>,
     rpc: Arc<dyn Rpc>,
@@ -118,7 +124,7 @@ impl Drop for RemoteSession {
     }
 }
 
-fn inspect(rpc: &dyn Rpc) -> io::Result<Record> {
+pub(super) fn inspect(rpc: &dyn Rpc) -> io::Result<Record> {
     let record = rpc.call(&Request {
         operation_id: *uuid::Uuid::new_v4().as_bytes(),
         expected: None,
@@ -205,6 +211,12 @@ impl Backing for Scope {
     fn try_lock(&self, name: &str) -> io::Result<Box<dyn VolumeLock>> {
         self.root.try_lock(&self.path(name)?)
     }
+    fn is_read_only(&self) -> bool {
+        self.root.is_read_only()
+    }
+    fn try_lock_shared_existing(&self, name: &str) -> io::Result<Box<dyn VolumeLock>> {
+        self.root.try_lock_shared_existing(&self.path(name)?)
+    }
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         self.root.free_bytes()
     }
@@ -216,7 +228,8 @@ fn remote_root(root: &Path, create: bool) -> io::Result<Arc<FileBacking>> {
 
 /// The snapshot root a restore copies from, through a read-only view: a
 /// restore only reads it, so it may be kept where nothing can change it.
-fn backup_root(root: &Path) -> io::Result<Arc<FileBacking>> {
+/// [`ReadOnlyRollbackBacking::open_remote`] reads a volume's root so too.
+pub(super) fn backup_root(root: &Path) -> io::Result<Arc<FileBacking>> {
     open_root(root, false, true)
 }
 
@@ -646,7 +659,7 @@ pub(super) fn scope(root: Arc<dyn Backing>, name: &str) -> io::Result<Arc<dyn Ba
 /// another volume's witness would otherwise raise that volume's fence (or
 /// revoke its live writer) and only then fail to find the data (BUG-107).
 /// GC applies the same check before trusting an authority.
-fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<Manifest> {
+pub(super) fn holds_current(disk: &Arc<FileBacking>, record: &Record) -> io::Result<Manifest> {
     let current = record
         .current
         .as_ref()
