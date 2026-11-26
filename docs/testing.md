@@ -303,7 +303,7 @@ the workspace):
 | `nbd_netlink` (Linux) | The helper's reading of the kernel's netlink answer to the family lookup, `NBD_CMD_CONNECT` and `NBD_CMD_DISCONNECT` |
 | `backing_records` | `maki-backing`'s own records: the witness anchor, the remote enrollment binding, the remote witness state, the rollback manifest, a manifest slot as the check of an interrupted creation reads it, and remote namespace names |
 | `witness_rpc` | The witness's RPC after TLS: a client reading the server's answer frame (`read_frame`, the response envelope, the record's validation), and a server reading a request frame and handing its operation to the file authority's own handler over a state store in memory, whose answer the client must read back as sent |
-| `witness_etcd` | The witness's etcd store reading etcd's answers: the body's size limit, JSON and pinned cluster, the range answer's exact key, lease, base64 value, revision and state, and the transaction's verdict and comparison range |
+| `witness_etcd` | The witness's etcd store reading etcd's answers: the body's JSON and pinned cluster, the range answer's exact key, lease, base64 value, revision and state, and the transaction's verdict and comparison range |
 | `http_response` | The HTTP provider's reading of a response: the body's bounded accumulation, single-item and batch JSON mappings (JSON pointers, payload encodings, unit echoes and batch item matching), a raw body, and the status and `maki-crypto-error` header |
 | `websocket_response` | The WebSocket provider's connection reader on one message (type, JSON, id, probe envelope) and its reading of a response's error class and items |
 | `grpc_response` | The gRPC provider's reading of a response's initial headers, of its body as tonic polls it (framing, trailers, the status tonic reads from them) and of its message (decoding and unit echoes) |
@@ -327,7 +327,11 @@ status classified from anything but its code and allowlisted metadata, an
 identity preflight verifies that recovery refuses, a recovery proof that
 does not authorize the state it was captured from), and otherwise returns
 whether the code accepted the input. `helper_sysfs` builds each input's tree
-in a directory of its own below the temporary directory and removes it.
+in a directory of its own below the temporary directory and removes it,
+also when an assertion fails in the replay (under libFuzzer a failed
+assertion aborts the process, and the crashing input's tree stays). The
+size limits of etcd's answer (256 KiB) and of the witness state it holds
+(64 KiB) lie beyond the job's 4096-byte inputs and are not exercised.
 
 Each target's seeds are committed in `fuzz/seeds/<target>/`: the code's own
 encodings, or where the bytes come from another program, that program's
@@ -357,8 +361,9 @@ and `cargo-fuzz`, copies the workspace's `Cargo.lock` to `fuzz/Cargo.lock`
 workspace pins, and runs every target `cargo fuzz list` names for 30 seconds
 from its seeds; a list that cannot be read or is empty fails the job. Its
 token may only read the repository. `fuzz/Cargo.toml` patches the vendored
-`serde_json` and `bytes` as the workspace does, so the fuzzed JSON decoder
-is the one production uses, and pins `libfuzzer-sys` and `arbitrary`
+`serde_json`, `bytes`, `hyper`, `rustls` and `tungstenite` as the workspace
+does, so the fuzzed JSON decoder, HTTP client, TLS and WebSocket code are
+the ones production uses, and pins `libfuzzer-sys` and `arbitrary`
 exactly, which that lockfile does not list. New inputs stay in `fuzz/corpus/<target>`, which is not
 committed either; a crash fails the job and its input is uploaded as
 `fuzz-artifacts`. The same, locally:
