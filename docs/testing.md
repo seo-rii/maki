@@ -193,7 +193,7 @@ whose last command failed, an `&&` list that ends the block included. `set
 last command. The writer refuses a block that Bash cannot read, and one with
 `&&` or `||`, matched as text, on any line that Bash's `declare -f`
 prints at the block's own level (a subshell's commands print there too) up to
-the last such line, before the block's final printed line, that ends in `;` or
+the last such line, before the last line it prints at that level, that ends in `;` or
 holds a here-document's command; so a condition, a test expression or quoted
 text there is refused too. It does not
 see lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or

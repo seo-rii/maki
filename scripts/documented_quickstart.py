@@ -19,7 +19,7 @@ and says which step it was in. `set -e` does not stop at a failure inside an
 `&&` or `||` list before a block's last command. The writer refuses a block
 that Bash cannot read, and one with `&&` or `||`, matched as text, on any line that Bash's `declare -f`
 prints at the block's own level (a subshell's commands print there too) up to
-the last such line, before the block's final printed line, that ends in `;` or
+the last such line, before the last line it prints at that level, that ends in `;` or
 holds a here-document's command; so a condition, a test expression, quoted
 text or a command substitution there is refused too. It does not see
 lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
@@ -133,7 +133,7 @@ def has_unguarded_list(label, block):
     """Whether `block` has `&&` or `||`, matched as text, on a line that
     `declare -f` prints at the block's own level (four spaces in; a
     subshell's commands print there too) up to the last such line, before
-    the block's final printed line, that ends in `;` or holds a
+    the last line it prints at that level, that ends in `;` or holds a
     here-document's command. Lines printed deeper (the bodies of compound
     commands, brace groups and functions) and the block-level lines after
     that one are not read.
