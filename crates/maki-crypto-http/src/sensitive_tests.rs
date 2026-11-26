@@ -523,10 +523,9 @@ fn http_json_malformed_response_erases_completed_strings_and_keys() {
     ];
     for (data_path, wire) in &values {
         let op = json_op(data_path);
-        let provider = test_provider(&op);
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body, 0);
+        let result = HttpCryptoProvider::parse_single(&op, body, 0);
         let failed = result.is_err();
         drop(result);
         let inspection = finish_inspection();
@@ -544,11 +543,10 @@ fn http_json_malformed_response_erases_completed_strings_and_keys() {
         assert_sensitive_allocations_wiped(inspection, 1);
     }
     let op = json_op("/data");
-    let provider = test_provider(&op);
     for wire in values.iter().map(|(_, wire)| wire).chain(&keys) {
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body, 0);
+        let result = HttpCryptoProvider::parse_single(&op, body, 0);
         let failed = result.is_err();
         drop(result);
         let inspection = finish_inspection();
@@ -561,7 +559,6 @@ fn http_json_malformed_response_erases_completed_strings_and_keys() {
 fn http_json_duplicate_values_are_erased_before_replacement() {
     let secret = sensitive_string();
     let op = json_op("/data");
-    let provider = test_provider(&op);
     for (wire, minimum) in [
         // The replaced value is read by the mapping, so it was owned.
         (format!(r#"{{"data":"{secret}","data":"YQ=="}}"#), 1),
@@ -572,7 +569,7 @@ fn http_json_duplicate_values_are_erased_before_replacement() {
     ] {
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body, 0).unwrap();
+        let result = HttpCryptoProvider::parse_single(&op, body, 0).unwrap();
         let inspection = finish_inspection();
         assert_eq!(result.expose(), b"a");
         if minimum == 0 {
@@ -593,10 +590,9 @@ fn http_json_duplicate_keys_are_erased_before_discarding() {
     assert_sensitive_allocations_wiped(inspection, 2);
 
     let op = json_op("/data");
-    let provider = test_provider(&op);
     let body = SecretBuffer::from_slice(wire.as_bytes());
     begin_inspection();
-    let result = provider.parse_single(&op, body, 0).unwrap();
+    let result = HttpCryptoProvider::parse_single(&op, body, 0).unwrap();
     let inspection = finish_inspection();
     assert_eq!(result.expose(), b"a");
     assert_never_copied(inspection);
@@ -609,7 +605,6 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
     let invalid = sensitive_string();
     let mut op = json_op("/data");
     op.response.item_index_path = Some("/unit".into());
-    let provider = test_provider(&op);
     for (wire, succeeds) in [
         (format!(r#"{{"unit":0,"data":"{valid}"}}"#), true),
         (format!(r#"{{"unit":0,"data":"{invalid}"}}"#), false),
@@ -617,7 +612,7 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
     ] {
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body, 0);
+        let result = HttpCryptoProvider::parse_single(&op, body, 0);
         let succeeded = result.is_ok();
         drop(result);
         let inspection = finish_inspection();
@@ -629,7 +624,7 @@ fn http_json_complete_response_erases_strings_on_success_and_contract_errors() {
         let wire = format!(r#"{{"{secret}":["{secret}"],"unit":0,"data":{data}}}"#);
         let body = SecretBuffer::from_slice(wire.as_bytes());
         begin_inspection();
-        let result = provider.parse_single(&op, body, 0);
+        let result = HttpCryptoProvider::parse_single(&op, body, 0);
         let succeeded = result.is_ok();
         drop(result);
         let inspection = finish_inspection();

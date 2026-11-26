@@ -100,16 +100,71 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "witness_rpc"
+path = "fuzz_targets/witness_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "witness_etcd"
+path = "fuzz_targets/witness_etcd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket_response"
+path = "fuzz_targets/websocket_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc_response"
+path = "fuzz_targets/grpc_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_reports"
+path = "fuzz_targets/helper_reports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_sysfs"
+path = "fuzz_targets/helper_sysfs.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 
 # The workspace's patches of the crates the fuzzed code uses, so that it is
 # built as the workspace builds it: the vendored serde_json (which decodes
-# the rollback manifest and the remote witness state) and bytes, not their
-# crates.io releases.
+# the rollback manifest, the remote witness state, the witness's RPC frames,
+# etcd's answers and the providers' JSON responses), bytes, hyper (the HTTP
+# provider's client and the gRPC provider's transport), rustls (the
+# witness's and the providers' TLS) and tungstenite (the WebSocket
+# provider's frames), not their crates.io releases.
 [patch.crates-io]
 bytes = { path = "../vendor/bytes" }
+hyper = { path = "../vendor/hyper" }
+rustls = { path = "../vendor/rustls" }
 serde_json = { path = "../vendor/serde_json" }
+tungstenite = { path = "../vendor/tungstenite" }
 
 # Detach from the parent workspace. The harness below this directory is a
 # member of that one.

@@ -35,6 +35,9 @@ use maki_crypto::{
 // token decoder, so a validated mapping is exactly the one sent.
 use maki_format::config::{decode_pointer_token, HttpFieldSource, HttpPayloadEncoding};
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod request;
 mod response;
 
@@ -1063,8 +1066,34 @@ impl HttpCryptoProvider {
         Ok(out)
     }
 
+    /// One unit's ciphertext or plaintext from the response to its own
+    /// request.
+    fn parse_item(
+        op: &OpSpec,
+        direction: Direction,
+        response: SecretBuffer,
+        unit_index: u64,
+        payload_len: usize,
+    ) -> Result<SecretBuffer, CryptoError> {
+        // The whole raw body becomes the unit's ciphertext, and nothing
+        // else in it distinguishes ciphertext from, say, a proxy's error
+        // page, so it must be at least as long as its plaintext. This
+        // belongs to the raw mapping, not to CheckedProvider: compact
+        // provider encodings are valid in general (BUG-049, BUG-053).
+        if direction == Direction::Encrypt
+            && op.response.kind == RespKind::Raw
+            && response.len() < payload_len
+        {
+            return Err(CryptoError::Contract(format!(
+                "raw encrypt response for unit {unit_index} is {} bytes, shorter than its \
+                 {payload_len}-byte plaintext",
+                response.len(),
+            )));
+        }
+        Self::parse_single(op, response, unit_index)
+    }
+
     fn parse_single(
-        &self,
         op: &OpSpec,
         body: SecretBuffer,
         unit_index: u64,
@@ -1177,23 +1206,13 @@ impl HttpCryptoProvider {
                     error
                 }
             })?;
-            // The whole raw body becomes the unit's ciphertext, and nothing
-            // else in it distinguishes ciphertext from, say, a proxy's error
-            // page, so it must be at least as long as its plaintext. This
-            // belongs to the raw mapping, not to CheckedProvider: compact
-            // provider encodings are valid in general (BUG-049, BUG-053).
-            if direction == Direction::Encrypt
-                && op.response.kind == RespKind::Raw
-                && response.len() < payload.len()
-            {
-                return Err(CryptoError::Contract(format!(
-                    "raw encrypt response for unit {unit_index} is {} bytes, shorter than its \
-                     {}-byte plaintext",
-                    response.len(),
-                    payload.len()
-                )));
-            }
-            out.push(self.parse_single(op, response, *unit_index)?);
+            out.push(Self::parse_item(
+                op,
+                direction,
+                response,
+                *unit_index,
+                payload.len(),
+            )?);
         }
         Ok(out)
     }
@@ -1210,6 +1229,15 @@ impl HttpCryptoProvider {
     ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let encoded = request::encode_batch(fields, items_path, item_fields, context, items)?;
         let response = self.send(op, body_from(encoded), true).await?;
+        Self::parse_batch(op, response, items)
+    }
+
+    /// Every unit's result from the response to a batch request.
+    fn parse_batch(
+        op: &OpSpec,
+        response: SecretBuffer,
+        items: &[(u64, SecretBuffer)],
+    ) -> Result<Vec<SecretBuffer>, CryptoError> {
         let selection = op.response.batch_selection(items.len());
         let value = response::parse(response.expose(), &selection)
             .map_err(|e| CryptoError::Contract(format!("invalid JSON response: {e}")))?;

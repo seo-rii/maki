@@ -422,7 +422,7 @@ class HelperAndWitnessStatements(DocumentTest):
                         "io::Error::new(io::ErrorKind::InvalidData, message) }", "remote_witness.rs")
         self.has(store, 'invalid("remote witness changed while locked")', "remote_witness.rs")
         wire = flat("crates/maki-witness/src/lib.rs")
-        self.has(wire, "io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => { "
+        self.has(wire, "io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => "
                        "WireError::InvalidRequest", "maki-witness lib.rs")
         self.has(wire, 'WireError::InvalidRequest => invalid("witness request rejected")',
                  "maki-witness lib.rs")

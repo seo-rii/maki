@@ -58,7 +58,9 @@ impl Expect {
 
 /// Targets whose committed seeds are in a little-endian host's byte order:
 /// the kernel's netlink answers are in the host's. On a big-endian host the
-/// generator writes none of them and the replay skips them.
+/// generator writes none of them, the committed files are not compared with
+/// its output, and the replay runs its own seeds, in that host's byte
+/// order, instead.
 pub const LITTLE_ENDIAN: [&str; 1] = ["nbd_netlink"];
 
 /// Every seed, in a fixed order.
@@ -77,13 +79,26 @@ pub fn all() -> Vec<Seed> {
     add("config_parse", config_parse());
     add("endpoint_url", endpoint_url());
     add("probe_parsers", probe_parsers());
-    // The helper's code is Linux's, and the netlink seeds are
-    // little-endian (`LITTLE_ENDIAN`).
+    // The helper's code is Linux's. The netlink seeds are in the host's
+    // byte order: only a little-endian host's are committed
+    // (`LITTLE_ENDIAN`).
     #[cfg(target_os = "linux")]
     add("nbd_handshake", crate::nbd::handshake_seeds());
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[cfg(target_os = "linux")]
     add("nbd_netlink", crate::nbd::netlink_seeds());
     add("backing_records", maki_backing::fuzzing::seeds());
+    add("witness_rpc", maki_witness::fuzzing::rpc_seeds());
+    add("witness_etcd", maki_witness::fuzzing::etcd_seeds());
+    add("http_response", maki_crypto_http::fuzzing::seeds());
+    add(
+        "websocket_response",
+        maki_crypto_websocket::fuzzing::seeds(),
+    );
+    add("grpc_response", maki_crypto_grpc::fuzzing::seeds());
+    #[cfg(target_os = "linux")]
+    add("helper_reports", crate::nbd::report_seeds());
+    #[cfg(target_os = "linux")]
+    add("helper_sysfs", crate::nbd::sysfs_seeds());
     seeds
 }
 

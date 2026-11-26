@@ -64,6 +64,9 @@ use maki_crypto::{
     SecretBuffer,
 };
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod request;
 mod response;
 
@@ -422,6 +425,67 @@ pub struct WsCryptoProvider {
     dead_generation: Arc<AtomicU64>,
 }
 
+/// What the reader takes from one message of the peer.
+enum Received {
+    /// A ping or a pong, which tungstenite answers itself.
+    Control,
+    /// A response for the request `id`, or why its frame is refused.
+    Response(u64, Result<Value, CryptoError>),
+}
+
+/// The reader's reading of one message. `items` gives how many response
+/// items to keep: as many as the largest request registered on the
+/// connection carries. An error ends the connection's generation.
+fn receive(msg: Message, items: impl FnOnce() -> usize) -> Result<Received, CryptoError> {
+    // Responses are JSON text frames with a numeric correlation id; only an
+    // unknown or stale id is discarded. Anything else breaks the receive
+    // contract and fails this generation at once, instead of leaving every
+    // request to time out and be resent or retried under `stall` (BUG-117).
+    // Payloads are still taken into guarded buffers before they drop.
+    let text = matches!(msg, Message::Text(_));
+    let control = matches!(msg, Message::Ping(_) | Message::Pong(_));
+    let closing = matches!(msg, Message::Close(_));
+    let frame = response::own_message(msg);
+    if control {
+        return Ok(Received::Control);
+    }
+    if closing {
+        return Err(retryable("connection lost: closed"));
+    }
+    let violation = |what: &str| {
+        CryptoError::Contract(format!(
+            "websocket peer sent {what}; responses are JSON text frames with a numeric id"
+        ))
+    };
+    let Some(frame) = frame.filter(|_| text) else {
+        return Err(violation("a non-text frame"));
+    };
+    // Later items are only counted, so a frame of many small items costs no
+    // more than the items it may carry (`max_frame_bytes` bounds only wire
+    // bytes).
+    let Ok(value) = frame.parse(items()) else {
+        return Err(violation("a text frame that is not a JSON response"));
+    };
+    let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
+        return Err(violation("a response without a numeric id"));
+    };
+    let frame = if matches!(
+        value
+            .get("error")
+            .and_then(|error| error.get("class"))
+            .and_then(Value::as_str),
+        Some("integrity" | "unsupported-context")
+    ) && !value.valid_probe_envelope()
+    {
+        Err(CryptoError::Contract(
+            "remote crypto provider returned an invalid probe error envelope".into(),
+        ))
+    } else {
+        Ok(value)
+    };
+    Ok(Received::Response(id, frame))
+}
+
 #[cfg(test)]
 fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -723,62 +787,17 @@ impl WsCryptoProvider {
             loop {
                 match source.next().await {
                     Some(Ok(msg)) => {
-                        use tokio_tungstenite::tungstenite::Message;
-                        // Responses are JSON text frames with a numeric
-                        // correlation id; only an unknown or stale id is
-                        // discarded. Anything else breaks the receive
-                        // contract and fails this generation at once, instead
-                        // of leaving every request to time out and be resent
-                        // or retried under `stall` (BUG-117). Payloads are
-                        // still taken into guarded buffers before they drop.
-                        let text = matches!(msg, Message::Text(_));
-                        let control = matches!(msg, Message::Ping(_) | Message::Pong(_));
-                        let closing = matches!(msg, Message::Close(_));
-                        let frame = response::own_message(msg);
-                        if control {
-                            // tungstenite answers pings itself.
-                            continue;
-                        }
-                        if closing {
-                            return retryable("connection lost: closed");
-                        }
-                        let violation = |what: &str| {
-                            CryptoError::Contract(format!(
-                                "websocket peer sent {what}; responses are JSON text frames \
-                                 with a numeric id"
-                            ))
-                        };
-                        let Some(frame) = frame.filter(|_| text) else {
-                            return violation("a non-text frame");
-                        };
                         // A request registers before it is sent, so a frame
                         // answering it can only reach a request registered on
                         // this generation already: keeping as many items as
                         // the largest of those loses none it could deliver.
-                        // Later items are only counted, so a frame of many
-                        // small items costs no more than the items it may
-                        // carry (`max_frame_bytes` bounds only wire bytes).
-                        let items = reader_pending.lock().max_items();
-                        let Ok(value) = frame.parse(items) else {
-                            return violation("a text frame that is not a JSON response");
+                        let received = match receive(msg, || reader_pending.lock().max_items()) {
+                            Ok(received) => received,
+                            Err(failure) => return failure,
                         };
-                        let Some(id) = value.get("id").and_then(|v| v.as_u64()) else {
-                            return violation("a response without a numeric id");
-                        };
-                        let frame = if matches!(
-                            value
-                                .get("error")
-                                .and_then(|error| error.get("class"))
-                                .and_then(Value::as_str),
-                            Some("integrity" | "unsupported-context")
-                        ) && !value.valid_probe_envelope()
-                        {
-                            Err(CryptoError::Contract(
-                                "remote crypto provider returned an invalid probe error envelope"
-                                    .into(),
-                            ))
-                        } else {
-                            Ok(value)
+                        let Received::Response(id, frame) = received else {
+                            // tungstenite answers pings itself.
+                            continue;
                         };
                         let response = reader_pending.lock().remove(id);
                         match response {

@@ -1,7 +1,11 @@
-//! The root helper's NBD handshake and its reading of the kernel's netlink
-//! answer (`maki_privileged::nbd_kernel`, Linux only). Both run in a root
+//! The root helper's code, which is built on Linux only: its NBD handshake
+//! and its reading of the kernel's netlink answer
+//! (`maki_privileged::nbd_kernel`), and the executor's readers of command
+//! output and of sysfs (`maki_privileged::exec`). All of them run in a root
 //! process on bytes it does not control: the volume daemon, an unprivileged
-//! user, sends the handshake, and the netlink socket the answer.
+//! user, sends the handshake, the netlink socket the answer, and the
+//! commands and the kernel report what LVM metadata, partition tables,
+//! filesystems and device-mapper tables on the volume's device say.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -319,4 +323,32 @@ pub(crate) fn handshake_seeds() -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|(name, bytes)| (name.to_string(), bytes))
         .collect()
+}
+
+/// The root helper's readers of the output of the commands it runs as root:
+/// LVM's report, `blkid`, `dmsetup info` and `blockdev`
+/// (`maki_privileged::exec::fuzzing::reports`, which describes the input).
+/// An input is accepted when the reader accepts the output.
+pub fn helper_reports(data: &[u8]) -> bool {
+    maki_privileged::exec::fuzzing::reports(data)
+}
+
+/// The root helper's readers of the kernel's block topology in sysfs and of
+/// the mount table: detach's observation, device allocation, recovery's
+/// proof and observations, LVM preflight's candidates and mapping check,
+/// the displaced-record check and the connection attributes
+/// (`maki_privileged::exec::fuzzing::sysfs`, which describes the input).
+/// An input is accepted when the reader accepts what it observed.
+pub fn helper_sysfs(data: &[u8]) -> bool {
+    maki_privileged::exec::fuzzing::sysfs(data)
+}
+
+/// The committed seeds of `helper_reports`.
+pub(crate) fn report_seeds() -> Vec<(String, Vec<u8>)> {
+    maki_privileged::exec::fuzzing::report_seeds()
+}
+
+/// The committed seeds of `helper_sysfs`.
+pub(crate) fn sysfs_seeds() -> Vec<(String, Vec<u8>)> {
+    maki_privileged::exec::fuzzing::sysfs_seeds()
 }

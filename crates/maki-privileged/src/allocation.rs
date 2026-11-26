@@ -112,6 +112,21 @@ fn choose(
     Err(ExecError::NoFreeDevice)
 }
 
+/// Allocation's choice over a sysfs and a mount table, for the fuzz harness
+/// ([`crate::exec::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(super) mod fuzzing {
+    use super::*;
+
+    pub(crate) fn choose(
+        sysfs: &Path,
+        mountinfo: &[u8],
+        reserved: &BTreeSet<String>,
+    ) -> Result<String, ExecError> {
+        super::choose(sysfs, mountinfo, reserved)
+    }
+}
+
 #[cfg(test)]
 #[path = "allocation_tests.rs"]
 mod tests;

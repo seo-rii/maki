@@ -30,6 +30,11 @@ mod allocation;
 #[path = "displaced.rs"]
 mod displaced;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+#[path = "exec_fuzzing.rs"]
+pub mod fuzzing;
+
 use crate::detach::DetachObservation;
 use crate::nbd_kernel::NbdError;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
@@ -313,6 +318,11 @@ fn blkid_uuid_command(device: &str) -> Option<std::process::Command> {
 
 fn blkid_uuid(device: &str) -> Option<String> {
     let out = command::capture(&mut blkid_uuid_command(device)?, command::Policy::PROBE).ok()?;
+    blkid_value(&out)
+}
+
+/// The value `blkid -o value` printed, if it succeeded with one.
+fn blkid_value(out: &std::process::Output) -> Option<String> {
     if !out.status.success() {
         return None;
     }
@@ -1252,14 +1262,7 @@ impl System for LinuxSystem {
             command::controlled("blockdev").args(["--getsize64", &format!("/dev/{vg}/{lv}")]),
             command::Policy::PROBE,
         )?;
-        if !out.status.success() {
-            return Err(identity_error("logical volume size probe failed"));
-        }
-        std::str::from_utf8(&out.stdout)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .filter(|size| *size > 0)
-            .ok_or_else(|| identity_error("logical volume size probe returned invalid bytes"))
+        lv_size_of(&out)
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
         run_step(step, identifier)
@@ -1314,6 +1317,18 @@ impl System for LinuxSystem {
 /// The refusal of a verb that finds the recorded device connected under an
 /// identity other than the recorded one. Nothing is changed and the record
 /// is kept.
+/// The size `blockdev --getsize64` printed.
+fn lv_size_of(out: &std::process::Output) -> Result<u64, ExecError> {
+    if !out.status.success() {
+        return Err(identity_error("logical volume size probe failed"));
+    }
+    std::str::from_utf8(&out.stdout)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|size| *size > 0)
+        .ok_or_else(|| identity_error("logical volume size probe returned invalid bytes"))
+}
+
 fn other_identity_message(record: &BoundDeviceRecord, refused: &str) -> String {
     format!(
         "{device} is recorded for volume {volume} but is connected under another identity; \

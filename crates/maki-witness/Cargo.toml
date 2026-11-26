@@ -10,6 +10,12 @@ default = []
 # MAKI_ETCD_BIN and refuses to skip without it, so it is excluded from the
 # unfiltered nightly `-- --ignored` run (see docs/testing.md).
 etcd-qualification = []
+# `fuzzing` builds `maki_witness::fuzzing`, the fuzz harness's way into the
+# readers of what a peer sends: the RPC client's reading of an answer, the
+# server's reading of a request and the etcd store's reading of etcd's
+# answers (fuzz/harness, targets witness_rpc and witness_etcd). Only the
+# harness enables it; it adds no dependency.
+fuzzing = []
 
 [dependencies]
 maki-backing.workspace = true

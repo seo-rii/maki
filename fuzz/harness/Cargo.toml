@@ -16,10 +16,15 @@ workspace = "../.."
 
 [dependencies]
 crc32fast.workspace = true
-# `fuzzing` exposes the decoders of maki-backing's own records and the
-# root helper's reading of the kernel's netlink answer; nothing else
-# enables it.
+# `fuzzing` exposes the decoders of maki-backing's own records, the root
+# helper's readers of the kernel's netlink answer, of command output and of
+# sysfs, the witness's readers of RPC frames and of etcd's answers, and the
+# remote crypto providers' readers of responses; nothing else enables it.
 maki-backing = { workspace = true, features = ["fuzzing"] }
+maki-crypto-grpc = { workspace = true, features = ["fuzzing"] }
+maki-crypto-http = { workspace = true, features = ["fuzzing"] }
+maki-crypto-websocket = { workspace = true, features = ["fuzzing"] }
 maki-format.workspace = true
 maki-privileged = { workspace = true, features = ["fuzzing"] }
+maki-witness = { workspace = true, features = ["fuzzing"] }
 uuid.workspace = true
