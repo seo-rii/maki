@@ -1020,6 +1020,25 @@ pub(super) fn deactivate_recovery(
     Ok(())
 }
 
+/// The preflight's private readers, for the fuzz harness
+/// ([`crate::exec::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(super) mod fuzzing {
+    use super::*;
+
+    pub(crate) fn probe_label(output: &Output) -> io::Result<Option<String>> {
+        super::probe_label(output)
+    }
+
+    pub(crate) fn discover_at(
+        sysfs: &Path,
+        device: &str,
+        dev_number: impl FnMut(&Path) -> io::Result<(u32, u32)>,
+    ) -> io::Result<Vec<Device>> {
+        super::discover_at(sysfs, device, dev_number)
+    }
+}
+
 #[cfg(test)]
 #[path = "lvm_preflight_tests.rs"]
 mod tests;

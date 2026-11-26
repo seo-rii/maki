@@ -48,6 +48,9 @@ use maki_crypto::{
 use maki_format::config::{check_grpc_metadata_keys, grpc_request_path};
 
 mod connection;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod protected;
 use connection::ConnectionCache;
 use protected::{ResponseDecodeError, WireItem, WireRequest, WireResponse};
@@ -411,32 +414,8 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
         let limit = self.limit;
         Box::pin(async move {
             let mut response = response.await?;
-            // Tonic reads a trailers-only status from these headers.
-            discard_remote_status_text(response.headers_mut());
-            // A successful unary response needs a message followed by OK
-            // trailers. Initial status belongs to a trailers-only error.
-            // Tonic treats initial OK as an empty response and skips later
-            // status checks, accepting data even after an error trailer.
-            // Reject before its decoder sees the headers, including an
-            // already-ended body that would never reach our framing checks.
-            let initial_status =
-                response_status(response.headers()).map_err(receive_contract_status)?;
-            if initial_status == Some(true) {
-                return Err(receive_contract_status(
-                    "grpc unary response reported success in initial headers",
-                )
-                .into());
-            }
-            // A non-200 response without a gRPC status comes from an
-            // intermediary (a proxy's 502 page during an upstream restart),
-            // not from the gRPC peer: its body is not gRPC framing, and
-            // framing it would turn a transient outage into a contract
-            // violation (BUG-175). Map the HTTP status instead.
-            if response.status() != tonic::codegen::http::StatusCode::OK
-                && !response.headers().contains_key("grpc-status")
-            {
-                return Err(status_from_http(response.status()).into());
-            }
+            let status = response.status();
+            initial_headers(status, response.headers_mut())?;
             Ok(response.map(|inner| BoundedResponseBody {
                 inner,
                 framing: ResponseFraming::new(limit),
@@ -444,6 +423,38 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
             }))
         })
     }
+}
+
+/// The initial headers of a response, before its body is read: refused, or
+/// mapped to the status of an intermediary's answer, or the body may follow.
+#[allow(clippy::result_large_err)] // the status tonic's service and codec traits return
+fn initial_headers(
+    status: tonic::codegen::http::StatusCode,
+    headers: &mut tonic::codegen::http::HeaderMap,
+) -> Result<(), tonic::Status> {
+    // Tonic reads a trailers-only status from these headers.
+    discard_remote_status_text(headers);
+    // A successful unary response needs a message followed by OK
+    // trailers. Initial status belongs to a trailers-only error.
+    // Tonic treats initial OK as an empty response and skips later
+    // status checks, accepting data even after an error trailer.
+    // Reject before its decoder sees the headers, including an
+    // already-ended body that would never reach our framing checks.
+    let initial_status = response_status(headers).map_err(receive_contract_status)?;
+    if initial_status == Some(true) {
+        return Err(receive_contract_status(
+            "grpc unary response reported success in initial headers",
+        ));
+    }
+    // A non-200 response without a gRPC status comes from an
+    // intermediary (a proxy's 502 page during an upstream restart),
+    // not from the gRPC peer: its body is not gRPC framing, and
+    // framing it would turn a transient outage into a contract
+    // violation (BUG-175). Map the HTTP status instead.
+    if status != tonic::codegen::http::StatusCode::OK && !headers.contains_key("grpc-status") {
+        return Err(status_from_http(status));
+    }
+    Ok(())
 }
 
 struct ResponseCodec {
@@ -484,21 +495,26 @@ impl tonic::codec::Decoder for ResponseDecoder {
         &mut self,
         source: &mut tonic::codec::DecodeBuf<'_>,
     ) -> Result<Option<Self::Item>, Self::Error> {
-        WireResponse::decode_bounded(source, self.requested)
-            .map(Some)
-            .map_err(|error| {
-                receive_contract_status(match error {
-                    ResponseDecodeError::ExtraItem => {
-                        "grpc response has more items than the request"
-                    }
-                    ResponseDecodeError::Malformed => "grpc response protobuf decoding failed",
-                })
-            })
+        decode_response(source, self.requested).map(Some)
     }
 
     fn buffer_settings(&self) -> tonic::codec::BufferSettings {
         self.inner.buffer_settings()
     }
+}
+
+/// The response message to a request of `requested` items.
+#[allow(clippy::result_large_err)] // the status tonic's service and codec traits return
+fn decode_response(
+    source: impl prost::bytes::Buf,
+    requested: usize,
+) -> Result<WireResponse, tonic::Status> {
+    WireResponse::decode_bounded(source, requested).map_err(|error| {
+        receive_contract_status(match error {
+            ResponseDecodeError::ExtraItem => "grpc response has more items than the request",
+            ResponseDecodeError::Malformed => "grpc response protobuf decoding failed",
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1010,24 +1026,30 @@ impl GrpcCryptoProvider {
             }
         };
 
-        // The decoder already refused any item beyond the request's count.
-        if response.items.len() != expected.len() {
+        echoed(response.items, &expected)
+    }
+}
+
+/// The items of a response, each of which must echo the unit of the request
+/// item in its position.
+fn echoed(items: Vec<WireItem>, expected: &[u64]) -> Result<Vec<WireItem>, CryptoError> {
+    // The decoder already refused any item beyond the request's count.
+    if items.len() != expected.len() {
+        return Err(CryptoError::Contract(format!(
+            "grpc response has {} item(s), expected {}",
+            items.len(),
+            expected.len()
+        )));
+    }
+    for (i, (item, want)) in items.iter().zip(expected.iter()).enumerate() {
+        if item.unit_index != *want {
             return Err(CryptoError::Contract(format!(
-                "grpc response has {} item(s), expected {}",
-                response.items.len(),
-                expected.len()
+                "grpc response item {i} echoes unit {}, expected {want}",
+                item.unit_index
             )));
         }
-        for (i, (item, want)) in response.items.iter().zip(expected.iter()).enumerate() {
-            if item.unit_index != *want {
-                return Err(CryptoError::Contract(format!(
-                    "grpc response item {i} echoes unit {}, expected {want}",
-                    item.unit_index
-                )));
-            }
-        }
-        Ok(response.items)
     }
+    Ok(items)
 }
 
 #[async_trait]

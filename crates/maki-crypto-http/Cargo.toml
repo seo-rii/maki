@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# `fuzzing` builds `maki_crypto_http::fuzzing`, the fuzz harness's way into
+# the provider's reading of a response: the body's bounded accumulation, the
+# JSON mappings of one item and of a batch, a raw body and the status
+# (fuzz/harness, target http_response). Only the harness enables it; it adds
+# no dependency.
+[features]
+fuzzing = []
+
 [dependencies]
 # `tls-trust`: the roots every remote transport trusts.
 maki-crypto = { workspace = true, features = ["tls-trust"] }

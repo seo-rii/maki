@@ -12,6 +12,10 @@ pub mod failover;
 
 pub mod etcd;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -360,28 +364,38 @@ impl Client {
         let frame = write_frame(&mut tls, bytes.expose())
             .and_then(|()| read_frame(&mut tls))
             .map_err(|error| refusal(&mut tls, error))?;
-        let response: WireResponse<R> = serde_json::from_slice(frame.expose())
-            .map_err(|_| corrupt("invalid witness response"))?;
+        let response: WireResponse<R> = parse_response(frame.expose())?;
         remaining(deadline)?;
-        if response.version != WIRE_VERSION || response.id != id {
-            return Err(corrupt("witness response version or request id mismatch"));
-        }
-        match (response.response, response.error) {
-            (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(match error {
-                WireError::Conflict => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "witness predecessor conflict")
-                }
-                WireError::PermissionDenied => {
-                    io::Error::new(io::ErrorKind::PermissionDenied, "witness operation denied")
-                }
-                WireError::InvalidRequest => invalid("witness request rejected"),
-                WireError::Unavailable => {
-                    io::Error::other("witness request failed; durable outcome may be unknown")
-                }
-            }),
-            _ => Err(corrupt("ambiguous witness response")),
-        }
+        answer(response, id)
+    }
+}
+
+/// The client's reading of the server's answer frame.
+fn parse_response<R: DeserializeOwned>(frame: &[u8]) -> io::Result<WireResponse<R>> {
+    serde_json::from_slice(frame).map_err(|_| corrupt("invalid witness response"))
+}
+
+/// What an answer to the request `id` says: its result, or the server's
+/// refusal as the kind the caller acts on.
+fn answer<R>(response: WireResponse<R>, id: Uuid) -> io::Result<R> {
+    if response.version != WIRE_VERSION || response.id != id {
+        return Err(corrupt("witness response version or request id mismatch"));
+    }
+    match (response.response, response.error) {
+        (Some(value), None) => Ok(value),
+        (None, Some(error)) => Err(match error {
+            WireError::Conflict => {
+                io::Error::new(io::ErrorKind::WouldBlock, "witness predecessor conflict")
+            }
+            WireError::PermissionDenied => {
+                io::Error::new(io::ErrorKind::PermissionDenied, "witness operation denied")
+            }
+            WireError::InvalidRequest => invalid("witness request rejected"),
+            WireError::Unavailable => {
+                io::Error::other("witness request failed; durable outcome may be unknown")
+            }
+        }),
+        _ => Err(corrupt("ambiguous witness response")),
     }
 }
 
@@ -398,14 +412,18 @@ impl Rpc for Client {
 pub fn state_handler(store: StateStore) -> Arc<Handler> {
     let store = Mutex::new(store);
     Arc::new(move |role, request| {
-        let request: Request =
-            serde_json::from_slice(request).map_err(|_| invalid("invalid witness operation"))?;
+        let request = operation(request)?;
         let mut store = store
             .lock()
             .map_err(|_| io::Error::other("witness store poisoned"))?;
         let record = store.handle(role, &request)?;
         serde_json::to_value(record).map_err(|_| corrupt("invalid witness state"))
     })
+}
+
+/// A state handler's reading of the operation a request carries.
+fn operation(request: &[u8]) -> io::Result<Request> {
+    serde_json::from_slice(request).map_err(|_| invalid("invalid witness operation"))
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -835,11 +853,7 @@ impl Server {
         handler: &Handler,
     ) -> io::Result<()> {
         let frame = read_frame(&mut tls)?;
-        let request: IncomingRequest<'_> = serde_json::from_slice(frame.expose())
-            .map_err(|_| corrupt("invalid witness request"))?;
-        if request.version != WIRE_VERSION {
-            return Err(corrupt("unsupported witness wire version"));
-        }
+        let request = parse_request(&frame)?;
         remaining(deadline)?;
         let outcome = match role {
             Some(role) => handler(role, request.request.get().as_bytes()),
@@ -847,17 +861,7 @@ impl Server {
         };
         let (response, error) = match outcome {
             Ok(response) => (Some(response), None),
-            Err(error) => (
-                None,
-                Some(match error.kind() {
-                    io::ErrorKind::WouldBlock => WireError::Conflict,
-                    io::ErrorKind::PermissionDenied => WireError::PermissionDenied,
-                    io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
-                        WireError::InvalidRequest
-                    }
-                    _ => WireError::Unavailable,
-                }),
-            ),
+            Err(error) => (None, Some(wire_error(&error))),
         };
         remaining(deadline)?;
         let bytes = serialize_frame(&WireResponse {
@@ -965,6 +969,27 @@ impl Server {
             }
             std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
+    }
+}
+
+/// The server's reading of a request frame: the envelope, which must be of
+/// this wire version, around the operation the handler reads.
+fn parse_request(frame: &SecretBuffer) -> io::Result<IncomingRequest<'_>> {
+    let request: IncomingRequest<'_> =
+        serde_json::from_slice(frame.expose()).map_err(|_| corrupt("invalid witness request"))?;
+    if request.version != WIRE_VERSION {
+        return Err(corrupt("unsupported witness wire version"));
+    }
+    Ok(request)
+}
+
+/// The refusal a handler's error is answered with.
+fn wire_error(error: &io::Error) -> WireError {
+    match error.kind() {
+        io::ErrorKind::WouldBlock => WireError::Conflict,
+        io::ErrorKind::PermissionDenied => WireError::PermissionDenied,
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => WireError::InvalidRequest,
+        _ => WireError::Unavailable,
     }
 }
 

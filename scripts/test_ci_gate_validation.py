@@ -795,22 +795,29 @@ class FuzzJob(unittest.TestCase):
         self.assertRegex(self.job, r"(?m)^    permissions:\n      contents: read\n    [a-z]")
 
     def test_the_fuzzed_code_uses_the_workspace_patches(self):
-        # Without them the fuzzed serde_json and bytes would be the
-        # crates.io releases, not the vendored copies production uses.
+        # Without them the fuzzed serde_json, bytes, hyper, rustls and
+        # tungstenite would be the crates.io releases, not the vendored
+        # copies production uses. The witness's and the remote providers'
+        # targets put every patched crate in the fuzz crate's graph.
         root = re.search(r"(?ms)^\[patch\.crates-io\]\n(.*?)(?=^\[|\Z)", (ROOT / "Cargo.toml").read_text())
         fuzz = re.search(r"(?ms)^\[patch\.crates-io\]\n(.*?)(?=^\[|\Z)", FUZZ_MANIFEST.read_text())
         self.assertIsNotNone(fuzz, "fuzz/Cargo.toml patches nothing")
         patches = dict(re.findall(r'(?m)^(\w+) = \{ path = "([^"]+)" \}$', root.group(1)))
         for name, path in re.findall(r'(?m)^(\w+) = \{ path = "([^"]+)" \}$', fuzz.group(1)):
             self.assertEqual("../" + patches[name], path, name)
-        for name in ("serde_json", "bytes"):
-            self.assertRegex(fuzz.group(1), rf"(?m)^{name} = ")
+        self.assertGreaterEqual(set(patches), {"serde_json", "bytes", "hyper", "rustls", "tungstenite"})
+        for name in patches:
+            with self.subTest(name=name):
+                self.assertRegex(fuzz.group(1), rf"(?m)^{name} = ")
 
     @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
     def test_every_target_runs_briefly_from_its_seeds_and_a_crash_fails_the_job(self):
         self.assertIn("shell: bash", self.step(FUZZ_STEP))
         targets = fuzz_targets()
-        self.assertGreaterEqual(len(targets), 9)
+        self.assertGreaterEqual(len(targets), 16)
+        for target in ("witness_rpc", "witness_etcd", "http_response", "websocket_response",
+                       "grpc_response", "helper_reports", "helper_sysfs"):
+            self.assertIn(target, targets)
         for failing in ("", targets[len(targets) // 2]):
             with self.subTest(failing=failing), tempfile.TemporaryDirectory(prefix="maki-ci-fuzz-") as directory:
                 root = Path(directory)

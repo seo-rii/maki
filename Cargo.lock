@@ -1115,8 +1115,12 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "maki-backing",
+ "maki-crypto-grpc",
+ "maki-crypto-http",
+ "maki-crypto-websocket",
  "maki-format",
  "maki-privileged",
+ "maki-witness",
  "uuid",
 ]
 

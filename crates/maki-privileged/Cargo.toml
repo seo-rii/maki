@@ -9,10 +9,11 @@ authors.workspace = true
 # the privileged helper is a storage control-plane component with zero
 # access to key material (SPEC §6, PRIV-010).
 
-# `fuzzing` builds `nbd_kernel::fuzzing`, the fuzz harness's way into the
-# reading of the kernel's netlink answer (fuzz/harness, target nbd_netlink).
-# Only the harness enables it; it adds no dependency and nothing the helper
-# runs.
+# `fuzzing` builds `nbd_kernel::fuzzing` and `exec::fuzzing`, the fuzz
+# harness's way into the reading of the kernel's netlink answer, of the
+# output of the commands the helper runs and of sysfs (fuzz/harness,
+# targets nbd_netlink, helper_reports and helper_sysfs). Only the harness
+# enables it; it adds no dependency and nothing the helper runs.
 [features]
 fuzzing = []
 

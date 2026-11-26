@@ -669,6 +669,50 @@ pub(super) fn execute(
     ))
 }
 
+/// Recovery's private readers, for the fuzz harness
+/// ([`crate::exec::fuzzing`]).
+#[cfg(feature = "fuzzing")]
+pub(super) mod fuzzing {
+    use super::*;
+
+    /// Whether `dmsetup info` reports exactly the closed mapping `name`
+    /// (`uuid`, device `device`).
+    pub(crate) fn removal_info(
+        name: &str,
+        uuid: &str,
+        device: (u32, u32),
+        output: &Output,
+    ) -> io::Result<()> {
+        verify_removal_info(
+            &BlockIdentity {
+                name: "dm-3".into(),
+                device,
+                dm_name: Some(name.into()),
+                dm_uuid: Some(uuid.into()),
+                slaves: vec!["nbd3".into()],
+            },
+            output,
+        )
+    }
+
+    /// The recorded block devices `record`'s sysfs shows, as their names.
+    pub(crate) fn inventory(record: &BoundDeviceRecord, sysfs: &Path) -> io::Result<Vec<String>> {
+        Ok(super::inventory(record, sysfs)?
+            .into_iter()
+            .map(|node| node.name)
+            .collect())
+    }
+
+    /// The direct deactivation target `record`'s proof and sysfs show.
+    pub(crate) fn force_deactivation_target(
+        record: &BoundDeviceRecord,
+        mounts: &[u8],
+        sysfs: &Path,
+    ) -> io::Result<Option<String>> {
+        Ok(force_deactivation_target_at(record, mounts, sysfs)?.map(|node| node.name))
+    }
+}
+
 #[cfg(test)]
 mod force_deactivation_tests {
     use super::*;

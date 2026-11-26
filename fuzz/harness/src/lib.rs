@@ -13,7 +13,7 @@ mod nbd;
 pub mod seeds;
 
 #[cfg(target_os = "linux")]
-pub use nbd::{nbd_handshake, nbd_netlink};
+pub use nbd::{helper_reports, helper_sysfs, nbd_handshake, nbd_netlink};
 
 use maki_format::ab::AbRecord;
 use maki_format::allocation::AllocationMap;
@@ -79,17 +79,54 @@ pub const TARGETS: &[Target] = &[
         name: "backing_records",
         entry: Some(backing_records),
     },
+    Target {
+        name: "witness_rpc",
+        entry: Some(witness_rpc),
+    },
+    Target {
+        name: "witness_etcd",
+        entry: Some(witness_etcd),
+    },
+    Target {
+        name: "http_response",
+        entry: Some(http_response),
+    },
+    Target {
+        name: "websocket_response",
+        entry: Some(websocket_response),
+    },
+    Target {
+        name: "grpc_response",
+        entry: Some(grpc_response),
+    },
+    Target {
+        name: "helper_reports",
+        entry: HELPER_REPORTS,
+    },
+    Target {
+        name: "helper_sysfs",
+        entry: HELPER_SYSFS,
+    },
 ];
 
-// The root helper's kernel NBD code is built on Linux only.
+// The root helper's kernel NBD code and its executor are built on Linux
+// only.
 #[cfg(target_os = "linux")]
 const NBD_HANDSHAKE: Option<Entry> = Some(nbd_handshake);
 #[cfg(target_os = "linux")]
 const NBD_NETLINK: Option<Entry> = Some(nbd_netlink);
+#[cfg(target_os = "linux")]
+const HELPER_REPORTS: Option<Entry> = Some(helper_reports);
+#[cfg(target_os = "linux")]
+const HELPER_SYSFS: Option<Entry> = Some(helper_sysfs);
 #[cfg(not(target_os = "linux"))]
 const NBD_HANDSHAKE: Option<Entry> = None;
 #[cfg(not(target_os = "linux"))]
 const NBD_NETLINK: Option<Entry> = None;
+#[cfg(not(target_os = "linux"))]
+const HELPER_REPORTS: Option<Entry> = None;
+#[cfg(not(target_os = "linux"))]
+const HELPER_SYSFS: Option<Entry> = None;
 
 /// Every on-disk decoder of `maki-format`, on raw bytes. A decoder must
 /// reject any corrupt image with an error — never panic, over-allocate, or
@@ -345,4 +382,46 @@ pub fn probe_parsers(data: &[u8]) -> bool {
         .collect();
     let _ = choose_free_nbd(&devices);
     mounted
+}
+
+/// The witness's RPC over one connection: a client reading the server's
+/// answer, and a server reading a request, handing it to the file
+/// authority's handler and writing the answer the client must read back as
+/// sent (`maki_witness::fuzzing::rpc`, which describes the input). An input
+/// is accepted when the side that reads it accepts a record.
+pub fn witness_rpc(data: &[u8]) -> bool {
+    maki_witness::fuzzing::rpc(data)
+}
+
+/// The witness's etcd store reading etcd's answers to its range and
+/// transaction requests (`maki_witness::fuzzing::etcd`, which describes the
+/// input). An input is accepted when the store accepts the answer.
+pub fn witness_etcd(data: &[u8]) -> bool {
+    maki_witness::fuzzing::etcd(data)
+}
+
+/// The HTTP provider's reading of a response: the body's bounded
+/// accumulation, the JSON mappings of one item and of a batch, a raw body,
+/// and the status (`maki_crypto_http::fuzzing::response`, which describes
+/// the input). The selective JSON parser must agree with serde_json. An
+/// input is accepted when the provider accepts the response.
+pub fn http_response(data: &[u8]) -> bool {
+    maki_crypto_http::fuzzing::response(data)
+}
+
+/// The WebSocket provider's reading of a message and of the response it
+/// carries (`maki_crypto_websocket::fuzzing::message`, which describes the
+/// input). The frame parser must agree with serde_json. An input is
+/// accepted when the provider accepts the response as the request's
+/// results.
+pub fn websocket_response(data: &[u8]) -> bool {
+    maki_crypto_websocket::fuzzing::message(data)
+}
+
+/// The gRPC provider's reading of a response's initial headers, of its body
+/// as tonic polls it and of its message (`maki_crypto_grpc::fuzzing::response`,
+/// which describes the input). An input is accepted when the provider
+/// accepts what it read.
+pub fn grpc_response(data: &[u8]) -> bool {
+    maki_crypto_grpc::fuzzing::response(data)
 }

@@ -376,24 +376,54 @@ the workspace):
 | `nbd_handshake` (Linux) | The helper's NBD handshake client, which runs as root, against a server that sends the input |
 | `nbd_netlink` (Linux) | The helper's reading of the kernel's netlink answer to the family lookup, `NBD_CMD_CONNECT` and `NBD_CMD_DISCONNECT` |
 | `backing_records` | `maki-backing`'s own records: the witness anchor, the remote enrollment binding, the remote witness state, the rollback manifest, a manifest slot as the check of an interrupted creation reads it, and remote namespace names |
+| `witness_rpc` | The witness's RPC after TLS: a client reading the server's answer frame (`read_frame`, the response envelope, the record's validation), and a server reading a request frame and handing its operation to the file authority's own handler over a state store in memory, whose answer the client must read back as sent |
+| `witness_etcd` | The witness's etcd store reading etcd's answers: the body's JSON and pinned cluster, the range answer's exact key, lease, base64 value, revision and state, and the transaction's verdict and comparison range |
+| `http_response` | The HTTP provider's reading of a response: the body's bounded accumulation, single-item and batch JSON mappings (JSON pointers, payload encodings, unit echoes and batch item matching), a raw body, and the status and `maki-crypto-error` header |
+| `websocket_response` | The WebSocket provider's connection reader on one message (type, JSON, id, probe envelope) and its reading of a response's error class and items |
+| `grpc_response` | The gRPC provider's reading of a response's initial headers, of its body as tonic polls it (framing, trailers, the status tonic reads from them) and of its message (decoding and unit echoes) |
+| `helper_reports` (Linux) | The helper's readers of the output of the commands it runs as root: LVM's `fullreport`, `blkid`'s label and filesystem probes, `dmsetup info`, `blockdev --getsize64` and `blkid -o value` |
+| `helper_sysfs` (Linux) | The helper's readers of a `/sys/class/block` tree and a mount table that the input builds: detach's observation, device allocation, recovery's mapping proof and observations, LVM preflight's candidates and mapping check, the displaced-record check and the connection attributes |
 
-`maki-privileged` and `maki-backing` expose what the last two need behind a
-`fuzzing` feature that only the harness enables; it adds no dependency. A
+`maki-privileged`, `maki-backing`, `maki-witness` and the three remote
+providers expose what their targets need behind a `fuzzing` feature that
+only the harness enables; it adds no dependency, and `maki-privileged` still
+has none on a crypto crate. Each target calls the production reader itself;
+where a reader was inline (the witness client's and server's frame
+handling, etcd's answer, the WebSocket connection's message handling, the
+gRPC initial headers, a provider's item checks, two command outputs of the
+helper) it is now a function of its own that production calls too. A
 target's function panics where the code broke a rule the target checks (an
 export the kernel may not use, a handshake client that reads beyond the
-handshake, a verdict the kernel does not send, an accepted record that is not its own encoding), and
-otherwise returns whether the code accepted the input.
+handshake, a verdict the kernel does not send, an accepted record that is
+not its own encoding, a selective JSON parser that disagrees with
+serde_json, a client that does not read back what the server sent, a
+status classified from anything but its code and allowlisted metadata, an
+identity preflight verifies that recovery refuses, a recovery proof that
+does not authorize the state it was captured from), and otherwise returns
+whether the code accepted the input. `helper_sysfs` builds each input's tree
+in a directory of its own below the temporary directory and removes it,
+also when an assertion fails in the replay (under libFuzzer a failed
+assertion aborts the process, and the crashing input's tree stays). The
+size limits of etcd's answer (256 KiB) and of the witness state it holds
+(64 KiB) lie beyond the job's 4096-byte inputs and are not exercised.
 
 Each target's seeds are committed in `fuzz/seeds/<target>/`: the code's own
-encodings, or for the handshake and the netlink answer the bytes nbdkit and
-the kernel send, with copies cut short or changed. A seed's name says what
+encodings, or where the bytes come from another program, that program's
+output in the form it documents (nbdkit's handshake, the kernel's netlink
+answers and sysfs, etcd's JSON gateway, a provider speaking each documented
+mapping, LVM's JSON report, `blkid` and `dmsetup`), with copies cut short or
+changed. A seed's name says what
 the target must do with it: accept a `valid-` seed, refuse a `refused-` one,
 and only not crash on `noise-`. `fuzz/harness/tests/review_fuzz_corpus.rs`,
 in the default suite, feeds every committed seed through its target's
 function on the stable toolchain, requires an entry function, a `[[bin]]`
 and seeds for every target, and checks that the committed seeds are what
-the generator (`fuzz/harness/src/seeds.rs`) writes. After changing an
-encoding, write them again:
+the generator (`fuzz/harness/src/seeds.rs`) writes. The kernel answers
+netlink in the host's byte order, and the committed `nbd_netlink` seeds are
+a little-endian host's: a big-endian host replays the seeds its generator
+makes in its own byte order instead, under the same names, and neither
+compares nor writes the committed files. After changing an encoding, write
+them again:
 
 ```bash
 MAKI_FUZZ_WRITE_SEEDS=1 cargo test -p maki-fuzz-harness --test review_fuzz_corpus
@@ -405,8 +435,9 @@ and `cargo-fuzz`, copies the workspace's `Cargo.lock` to `fuzz/Cargo.lock`
 workspace pins, and runs every target `cargo fuzz list` names for 30 seconds
 from its seeds; a list that cannot be read or is empty fails the job. Its
 token may only read the repository. `fuzz/Cargo.toml` patches the vendored
-`serde_json` and `bytes` as the workspace does, so the fuzzed JSON decoder
-is the one production uses, and pins `libfuzzer-sys` and `arbitrary`
+`serde_json`, `bytes`, `hyper`, `rustls` and `tungstenite` as the workspace
+does, so the fuzzed JSON decoder, HTTP client, TLS and WebSocket code are
+the ones production uses, and pins `libfuzzer-sys` and `arbitrary`
 exactly, which that lockfile does not list. New inputs stay in `fuzz/corpus/<target>`, which is not
 committed either; a crash fails the job and its input is uploaded as
 `fuzz-artifacts`. The same, locally:
@@ -736,7 +767,7 @@ Disk power-loss campaign.
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); nine coverage-guided `cargo-fuzz` targets in `fuzz/`: `format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`, the root helper's `nbd_handshake` and `nbd_netlink`, and `maki-backing`'s `backing_records`. Their committed seeds are replayed by the default suite, and the scheduled `fuzz` job runs each target for 30 seconds from them ([Fuzzing](#fuzzing)). Only short runs have been made, all with libFuzzer and AddressSanitizer on one core and none with a crash. On 2026-11-24, from an empty corpus: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M). Every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reached almost no image that passes one (256 covered edges); `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). On 2026-11-25, from the committed seeds: `nbd_netlink`, `backing_records` and `nbd_handshake` 12 minutes each (37M, 29M and 1.3M inputs; 357, 4,318 and 333 edges), and 150 seconds each of `format_decoders` (34M, 378 edges), `format_records` (16M, 948), `journal_scan` (32M, 169), `config_parse` (3.0M, 4,291), `endpoint_url` (1.6M, 2,312) and `probe_parsers` (2.1M, 1,024). A 24 CPU-hour-per-target run remains outstanding |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); sixteen coverage-guided `cargo-fuzz` targets in `fuzz/`: `format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`, the root helper's `nbd_handshake`, `nbd_netlink`, `helper_reports` and `helper_sysfs`, `maki-backing`'s `backing_records`, the witness's `witness_rpc` and `witness_etcd`, and the remote providers' `http_response`, `websocket_response` and `grpc_response`. Their committed seeds are replayed by the default suite, and the scheduled `fuzz` job runs each target for 30 seconds from them ([Fuzzing](#fuzzing)). Only short runs have been made, all with libFuzzer and AddressSanitizer on one core and none with a crash. On 2026-11-24, from an empty corpus: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M). Every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reached almost no image that passes one (256 covered edges); `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). On 2026-11-25, from the committed seeds: `nbd_netlink`, `backing_records` and `nbd_handshake` 12 minutes each (37M, 29M and 1.3M inputs; 357, 4,318 and 333 edges), and 150 seconds each of `format_decoders` (34M, 378 edges), `format_records` (16M, 948), `journal_scan` (32M, 169), `config_parse` (3.0M, 4,291), `endpoint_url` (1.6M, 2,312) and `probe_parsers` (2.1M, 1,024). On 2026-11-26, from the committed seeds, 4 minutes each on a shared host: `witness_rpc` (1.4M inputs, 5,133 edges), `witness_etcd` (8.2M, 2,627), `http_response` (3.8M, 3,480), `websocket_response` (8.2M, 2,302), `grpc_response` (5.3M, 2,056), `helper_reports` (8.5M, 3,750) and `helper_sysfs` (0.18M, 3,465; each input builds and removes a directory tree). A 24 CPU-hour-per-target run remains outstanding |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
