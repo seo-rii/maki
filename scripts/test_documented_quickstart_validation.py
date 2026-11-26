@@ -127,8 +127,9 @@ class DocumentedSteps(unittest.TestCase):
 class UnguardedLists(unittest.TestCase):
     """set -e does not stop at a failed command in an && or || list that is
     not the last of its block, and the block's status is its last command's:
-    the program would go on. The writer refuses such a block, read as Bash
-    reads it."""
+    the program would go on. The writer refuses && or || text at a block's
+    own level before its last command, read from Bash's printing of the
+    block (declare -f); a change of that layout shows here."""
 
     @classmethod
     def setUpClass(cls):
@@ -142,7 +143,7 @@ class UnguardedLists(unittest.TestCase):
             with self.subTest(block=block):
                 with self.assertRaises(ValueError) as raised:
                     self.driver.program([("block one", "true"), ("block two", block)])
-                self.assertIn("block two has an && or || list before its last command",
+                self.assertIn("block two has && or || at its own level before its last command",
                               str(raised.exception))
 
     def test_a_block_bash_cannot_read_is_refused_before_anything_runs(self):
@@ -162,6 +163,61 @@ class UnguardedLists(unittest.TestCase):
                       "if a; then\n  b\nfi\nc"):
             with self.subTest(block=block):
                 self.driver.program([("block", block)])
+
+    def test_any_list_text_at_the_blocks_level_before_its_last_command_is_refused(self):
+        # The check matches && and || as text on the lines Bash prints at
+        # the block's level: a condition, a test expression, quoted text or
+        # a command substitution there is refused too, though set -e would
+        # see its failure or there is none.
+        for block in ("if a && b; then\n  c\nfi\nd", "while a || b; do\n  c\ndone\nd",
+                      "[[ -n $x && -n $y ]] || exit 1\nd", "echo 'a && b'\nd", "x=$(a || b)\nd",
+                      "false | cat && true\ntouch after"):
+            with self.subTest(block=block):
+                with self.assertRaises(ValueError):
+                    self.driver.program([("block", block)])
+
+    def test_lists_inside_compound_commands_groups_and_functions_are_not_seen(self):
+        # A known gap: Bash prints these bodies deeper than the block's
+        # level, which the check does not read, so it accepts them although
+        # set -e does not stop at their failure and the program goes on. Nor
+        # does it refuse set -e's other exemptions, a negated or a background
+        # command. What the guides hold there is pinned below.
+        for block in ("{\n  false && true\n  echo inner\n}\ntouch after",
+                      "if true; then\n  false && true\n  echo inner\nfi\ntouch after",
+                      "for i in 1; do\n  false && true\n  echo inner\ndone\ntouch after",
+                      "f() {\n  false && true\n  echo inner\n}\nf\ntouch after",
+                      "case x in\n x) false && true\n echo inner;;\nesac\ntouch after",
+                      "! true\ntouch after", "false && true &\ntouch after"):
+            with self.subTest(block=block), tempfile.TemporaryDirectory() as directory:
+                program = self.driver.program([("block", block)])
+                result = subprocess.run(["bash", "-c", program], cwd=directory, capture_output=True,
+                                        text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((Path(directory) / "after").exists())
+                self.assertIn("every documented step succeeded", result.stdout)
+
+    def test_the_guides_lists_below_the_block_level_are_their_own_handling(self):
+        # The gap above, for the guides as they are: below a block's level
+        # (here-document bodies, which run in a shell of their own under
+        # `set -euo pipefail`, left out) the only lists are wait_stopped's
+        # returns and the unmount check's alternative. A new one must be
+        # read and added here, or the block reworded.
+        bash = shutil.which("bash")
+        deeper = []
+        for label, block in self.driver.steps():
+            printed = subprocess.run(
+                [bash, "--noprofile", "--norc", "-c",
+                 'eval "documented_block() {\n$1\n}" && declare -f documented_block', "bash",
+                 self.driver.without_heredoc_bodies(block)],
+                capture_output=True, text=True, check=True, timeout=10).stdout
+            deeper += [(label.split(",")[1].strip(), line.strip()) for line in printed.splitlines()
+                       if line.startswith("     ") and ("&&" in line or "||" in line)]
+        self.assertEqual(deeper, [
+            ("7. Planned stop with a durability acknowledgement",
+             'state=$(systemctl show -P ActiveState "$unit") || return 1;'),
+            ("7. Planned stop with a durability acknowledgement", '[ -n "$pending" ] || return 0;'),
+            ("7. Planned stop with a durability acknowledgement", 'findmnt /srv/demo || echo "unmounted"'),
+        ])
 
     def test_the_guides_have_no_unguarded_list(self):
         # The program CI runs is written from them, so this is what CI runs.

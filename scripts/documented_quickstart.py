@@ -16,8 +16,15 @@ each block's status after it, so it stops at a failed command that `set -e`
 stops at (a pipeline included, whichever of its commands failed) and at a
 block whose last command failed, an `&&` list that ends the block included,
 and says which step it was in. `set -e` does not stop at a failure inside an
-`&&` or `||` list before a block's last command, so the writer refuses a
-block in which Bash reads such a list, or which Bash cannot read.
+`&&` or `||` list before a block's last command. The writer refuses a block
+that Bash cannot read, and one with `&&` or `||` on a line that Bash prints
+at the block's own level, or in a subshell there, before the line that ends
+its last command; it matches them as text, so a condition, a test expression,
+quoted text or a command substitution there is refused too. It does not see
+lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
+functions, nor `set -e`'s other exemptions (a negated or a background
+command): a failure there lets the program go on. The check relies on the
+layout of `declare -f`.
 """
 import argparse
 import os
@@ -122,8 +129,10 @@ def without_heredoc_bodies(block):
 
 
 def has_unguarded_list(label, block):
-    """Whether Bash reads an `&&` or `||` list in `block` before its last
-    command, at the block's own level or in a subshell there.
+    """Whether `block` has `&&` or `||`, matched as text, on a line that Bash
+    prints at the block's own level or in a subshell there, before the line
+    that ends its last command. Lists deeper down (in compound-command bodies,
+    brace groups and functions) are not read.
 
     Bash prints a function's body one command to a line, four spaces in at
     its own level, each command but the last ended by `;` (a here-document's
@@ -155,13 +164,14 @@ def program(found):
 
     `set -e -o pipefail` stops at a failed command or pipeline; one inside an
     `&&` or `||` list does not trigger it, so each block's own status is
-    checked after it, and a block with such a list before its last command,
-    whose failure nothing would see, is refused."""
+    checked after it, and a block that `has_unguarded_list` finds with `&&`
+    or `||` at its own level before its last command is refused (lists in
+    compound-command bodies, brace groups and functions are not seen)."""
     for label, block in found:
         if has_unguarded_list(label, block):
-            raise ValueError(f"{label} has an && or || list before its last command: set -e "
-                             "does not stop at a failure there, and the block's status is its "
-                             "last command's")
+            raise ValueError(f"{label} has && or || at its own level before its last command: "
+                             "set -e does not stop at a failed list there, and the block's status "
+                             "is its last command's")
     lines = [PRELUDE]
     for number, (label, block) in enumerate(found, 1):
         lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")
