@@ -376,6 +376,177 @@ jobs:
           if rpm -q maki; then exit 1; fi
           test ! -e /etc/dnf/protected.d/maki.conf
 
+  kernel-lifecycle:
+    # A whole attachment on the runner's own kernel. GitHub's Ubuntu runners
+    # are VMs with systemd as PID 1, udev and passwordless sudo, and load the
+    # nbd module. The privileged runner (scripts/privileged-linux-validation.sh,
+    # its runbook in docs/qualification) builds maki, maki-attach and Maki's
+    # nbdkit plugin from this commit and drives them through kernel NBD, LVM,
+    # device-mapper and XFS: attach, data written and fsynced, a detach whose
+    # disconnect finds the device still held open (the wait of AUD-197), a
+    # second attach that reads the data back, a cleanup after nbdkit is
+    # killed under the mount, a third attach and a final detach. The package
+    # built from the same commit then runs the Debian guide's install steps,
+    # the quick start and its first-volume bootstrap (AUD-199) as written,
+    # under systemd with the installed units. The runner is Ubuntu, not the
+    # Debian 12 primary platform.
+    runs-on: ubuntu-latest
+    # Above the sum of the step limits and the build, so that a hung step
+    # fails by its own limit and the diagnostics still run.
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kernel-lifecycle
+      - name: runner host
+        run: |
+          uname -a
+          cat /etc/os-release
+          systemctl --version | head -n 1
+          echo "system state: $(systemctl is-system-running || true)"
+          systemctl --failed --no-pager || true
+          sudo --version | head -n 1
+          nproc
+          free -m
+          df -h / /var/tmp /var/lib "$RUNNER_TEMP"
+          id
+      # With the parameters the privileged runner asks for, so that its own
+      # modprobe finds the module loaded as it wants it. The kernel may ship
+      # the module only in linux-modules-extra; if neither loads, this fails.
+      - name: load the NBD module
+        run: |
+          if ! sudo modprobe nbd nbds_max=16 max_part=8; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
+            sudo modprobe nbd nbds_max=16 max_part=8
+          fi
+          test -d /sys/module/nbd
+          test -b /dev/nbd0
+          test -b /dev/nbd15
+          echo "nbds_max=$(cat /sys/module/nbd/parameters/nbds_max) max_part=$(cat /sys/module/nbd/parameters/max_part)"
+      # As the runner user, which has passwordless sudo: the script refuses
+      # root and calls sudo only where it needs it. It installs its tools
+      # with apt, builds from a snapshot of this commit, and prints each
+      # check; its logs stay in ~/logs/maki-privileged-validation.latest.
+      - name: attach lifecycle through the privileged runner
+        timeout-minutes: 45
+        run: |
+          scripts/privileged-linux-validation.sh --install-missing --kill-daemon \
+            --device /dev/nbd15 --confirm-wipe /dev/nbd15
+      # The package's tmpfiles make /run/maki root:maki 0750, which the
+      # runner's own nbdkit could not pass, so it is installed only now.
+      - name: packaged binaries
+        if: ${{ !cancelled() }}
+        run: cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+      - name: documented quick start on the installed package
+        if: ${{ !cancelled() }}
+        timeout-minutes: 25
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dpkg-dev psmisc
+          workdir="$RUNNER_TEMP/quickstart"
+          python3 -B scripts/documented_quickstart.py "$workdir"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 -B packaging/debian/build-deb.py --release-dir target/release \
+            --version 0.0.0~ci --architecture "$(dpkg --print-architecture)" \
+            --output "$workdir/maki.deb"
+          dpkg-deb --field "$workdir/maki.deb" Depends
+          cd "$workdir"
+          # The guides' blocks, in order, in one root shell: it stops at the
+          # first failed command and names the step.
+          sudo bash quickstart.sh 2>&1 | tee quickstart.log
+          # The quick start's clean-up leaves no attachment behind.
+          sudo test ! -e /run/maki-attach/demo.nbd
+          if findmnt /srv/demo; then exit 1; fi
+          for unit in maki@demo.service maki-attach@demo.service maki-recover@demo.service \
+            maki-workload@demo.target; do
+            test "$(systemctl show -P ActiveState "$unit")" = inactive
+          done
+          for attribute in /sys/block/nbd*/backend; do
+            if [ -e "$attribute" ] && [ -n "$(cat "$attribute")" ]; then
+              echo "$attribute shows a connection: $(cat "$attribute")" >&2
+              exit 1
+            fi
+          done
+      - name: diagnostics on failure
+        if: ${{ failure() || cancelled() }}
+        timeout-minutes: 5
+        run: |
+          set +e
+          latest="$HOME/logs/maki-privileged-validation.latest"
+          echo "::group::privileged runner status and component logs"
+          cat "$latest/status"
+          for file in "$latest"/*.txt "$latest"/*.log; do
+            [ -f "$file" ] || continue
+            echo "===== ${file##*/} (last 80 lines)"
+            tail -n 80 "$file"
+          done
+          echo "::endgroup::"
+          echo "::group::kernel log (last 300 lines)"
+          sudo dmesg | tail -n 300
+          echo "::endgroup::"
+          echo "::group::maki units"
+          systemctl --no-pager --all list-units 'maki*'
+          sudo journalctl -b --no-pager -o short-monotonic -u 'maki*' | tail -n 300
+          echo "::endgroup::"
+          echo "::group::NBD devices, mappings, mounts and attach records"
+          lsblk -o NAME,MAJ:MIN,SIZE,TYPE,MOUNTPOINTS
+          for device in /sys/block/nbd*; do
+            echo "${device##*/} pid=$(cat "$device/pid" 2>/dev/null) backend=$(cat "$device/backend" 2>/dev/null) holders=$(ls "$device/holders" 2>/dev/null | tr '\n' ' ')"
+          done
+          sudo timeout 30 dmsetup info -c
+          sudo timeout 30 vgs
+          sudo timeout 30 lvs
+          findmnt -t xfs
+          sudo ls -la /run/maki-attach
+          sudo sh -c 'for record in /run/maki-attach/*.nbd; do [ -e "$record" ] && { echo "== $record"; cat "$record"; echo; }; done'
+          sudo fuser -v /dev/nbd* 2>&1
+          ps -eo pid,user,stat,wchan:32,args | grep -E 'nbdkit|maki|umount|vgchange|dmsetup|udev' | grep -v grep
+          echo "::endgroup::"
+      # The run directory without its source snapshot and build trees, the
+      # quick start's program and output without the package, and the
+      # journal. The key files (the runner's in its work tree, the quick
+      # start's in /etc/maki/secrets) are never collected.
+      - name: collect logs
+        if: always()
+        run: |
+          set +e
+          out="$RUNNER_TEMP/kernel-lifecycle-logs"
+          mkdir -p "$out"
+          latest="$HOME/logs/maki-privileged-validation.latest"
+          if [ -d "$latest" ]; then
+            tar -C "$latest/" --exclude=./source --exclude=./target --exclude=./build \
+              -czf "$out/privileged-run.tar.gz" .
+          fi
+          if [ -d "$RUNNER_TEMP/quickstart" ]; then
+            tar -C "$RUNNER_TEMP/quickstart" --exclude=./maki.deb -czf "$out/quickstart.tar.gz" .
+          fi
+          sudo journalctl -b --no-pager -o short-monotonic -k > "$out/kernel.log"
+          sudo journalctl -b --no-pager -o short-monotonic -u 'maki*' > "$out/maki-units.log"
+          sudo journalctl -b --no-pager -o short-monotonic -u systemd-udevd > "$out/udev.log"
+          # LVM prints its driver's version only as root, and warns about the
+          # descriptors this shell passes on unless told not to.
+          for command in 'uname -srvm' 'nbdkit --version' 'nbdinfo --version' \
+            'sudo env LVM_SUPPRESS_FD_WARNINGS=1 lvm version' 'mkfs.xfs -V' 'udevadm --version' \
+            'systemctl --version' 'sudo --version' 'python3 --version'; do
+            echo "\$ $command"
+            $command 2>&1 | head -n 3
+          done > "$out/versions.txt"
+          cat "$out/versions.txt"
+          ls -l "$out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-lifecycle-logs
+          path: ${{ runner.temp }}/kernel-lifecycle-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))
     runs-on: ubuntu-latest

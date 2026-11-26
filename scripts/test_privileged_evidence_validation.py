@@ -92,6 +92,7 @@ device=/dev/nbd0
 confirmed_device="$device"
 install_missing=false
 discard=false
+kill_daemon=false
 work_root=""
 sudo() { echo later-edit > "$REPO_ROOT/version"; }
 """

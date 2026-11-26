@@ -38,13 +38,40 @@ The automated run checks:
 - the real `maki-attach` attach, read-only verify, and convergent cleanup paths,
   including a second idempotent cleanup;
 - root-owned mode-`0600` attach configuration and exact PV/VG/LV UUID pins;
-- unprivileged fio through the mounted XFS filesystem; and
-- a SQLite WAL checkpoint with `synchronous=FULL` and `integrity_check`.
+- unprivileged fio through the mounted XFS filesystem;
+- a SQLite WAL checkpoint with `synchronous=FULL` and `integrity_check`;
+- 32 MiB written with `fsync` beside the database, and the SHA-256 of both;
+- a `maki-attach detach` while `scripts/privileged_validation_opener.py`
+  holds the device open: the opener reads whole blocks until a read fails
+  with `EIO` (the kernel acknowledged the disconnect), keeps the device open
+  two seconds more, writes that it is closing it, closes it, and requires
+  that the device showed the connection until then and shows none after.
+  The run requires that line to be there when the detach returns, so the
+  detach must have waited for the close (AUD-197), and must succeed in one
+  run; and
+- a second attach with `init_sentinel = false`, the workload gate and the
+  same hashes.
 
-The run does **not** force a daemon crash, send `SIGKILL`/`SIGSEGV`, induce an
-OOM, interrupt power, test a real disk, or modify installed Maki systemd
-units. Those scenarios need an isolated destructive-test host and are outside
-this safe runner.
+Each attach must show the mount, the attachment's backend identifier on the
+device and the helper's attach record. After each detach, and after each
+cleanup that ends an attachment, the mountpoint must be unmounted, the device
+must have no holders, no `backend` or `pid` attribute and size 0, and the
+attach record must be gone. The record is looked for as root, and a look that
+fails stops the run. Without `--kill-daemon` the run then
+ends the attachment with `maki-attach cleanup`. With `--kill-daemon` it
+instead sends `SIGKILL` to its nbdkit under the mounted attachment (exit
+status 137 required), requires `maki-attach cleanup` to release the
+attachment without the daemon, removes the dead daemon's socket, starts a new
+nbdkit on the same backing and configuration, which must negotiate, attaches
+a third time, compares the hashes and ends with `maki-attach detach`. Either
+way a second cleanup must then succeed without a record.
+
+The run does **not** induce an OOM, interrupt power, test a real disk, or
+modify installed Maki systemd units, and without `--kill-daemon` it forces no
+daemon crash and sends no `SIGKILL`/`SIGSEGV`. Those scenarios need an
+isolated destructive-test host; `--kill-daemon` kills only the run's own
+nbdkit, once, while the filesystem is idle after a sync, and is meant for
+disposable hosts such as CI's runner.
 
 The duplicate-attach check uses the same backing, volume and crypto settings
 with separate NBD and control socket paths. Its NBD path matches the second
@@ -92,6 +119,15 @@ For a read-only dependency preview, run:
 ./scripts/privileged-linux-validation.sh --preflight --device /dev/nbd15
 ```
 
+CI's `kernel-lifecycle` job runs the runner on every change, in the
+foreground on GitHub's Ubuntu runner, as the runner user (which has
+passwordless sudo), with `--install-missing --kill-daemon --device /dev/nbd15
+--confirm-wipe /dev/nbd15`, after loading the `nbd` module with the
+parameters the runner asks for; see
+[testing](../testing.md#automated-ci). It keeps the run directory, without
+`source/`, `target/` and `build/`, in the job's `kernel-lifecycle-logs`
+artifact.
+
 ## Logs and completion
 
 Every run creates a mode-`0700` directory below `~/logs` and mode-`0600`
@@ -113,10 +149,28 @@ filesystem. A stable symlink points to the newest run:
 ├── maki-attach-plan.txt
 ├── maki-verify-before-workload.txt
 ├── maki-verify-after-workload.txt
-├── maki-cleanup.txt
+├── lifecycle.sha256
+├── detach-opener.txt
+├── maki-detach.txt
+├── maki-reattach.txt
+├── maki-verify-reattach.txt
+├── lifecycle-check-reattach.txt
+├── maki-cleanup.txt                 (without --kill-daemon)
+├── maki-cleanup-dead-daemon.txt     (--kill-daemon: this, the next five)
+├── nbdinfo-after-kill.txt
+├── maki-attach-after-kill.txt
+├── maki-verify-after-kill.txt
+├── lifecycle-check-restart.txt
+├── maki-detach-final.txt
 ├── maki-cleanup-idempotent.txt
 └── maki-check.txt
 ```
+
+`nbdkit.log` holds the output of both nbdkit processes of a `--kill-daemon`
+run, the second after a `--- a new nbdkit after SIGKILL ---` line. The
+lifecycle's helper output also goes to `run.log`, with each command's exit
+status and duration, and a command that stops the run is named there with
+its line number.
 
 `status` is finalized at the logical end of the run. `state=passed` and
 `exit_code=0` mean every check and cleanup step succeeded. If it reports
@@ -131,7 +185,9 @@ The latest log path on this host is:
 
 ## Cleanup guarantees
 
-The exit trap attempts, in order, to unmount the test filesystem, deactivate
+The exit trap first asks an opener of the device that is still holding it
+to close it (`stop-opener` in the run directory) and waits for it, then
+attempts, in order, to unmount the test filesystem, deactivate
 the uniquely named test VG, disconnect only the NBD connection created by the
 run, terminate nbdkit normally with `SIGTERM`, remove the unique `/run/maki`
 child directory, and delete only the `mktemp` work tree.
@@ -186,6 +242,15 @@ the helper reports the kernel's `Operation not permitted` for
 is kept as `unprivileged-nbd-disconnect.txt`. Every result below attached
 through nbd-client, 3.27.1 (3.24 in the 2026-09-02 result); no campaign has
 been run with the helper's own connect yet.
+
+## Attach lifecycle and CI — 2026-11-26
+
+The runner now detaches with an opener of the device and attaches again in
+every run, `--kill-daemon` adds the cleanup after a killed nbdkit, a third
+attach and a final detach, and CI's `kernel-lifecycle` job runs it with
+`--kill-daemon` on GitHub's Ubuntu runner on every change. No result below
+includes these checks, and none had been run on a host outside CI when this
+was written.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 

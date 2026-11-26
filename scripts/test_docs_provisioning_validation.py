@@ -55,6 +55,10 @@ if name == "maki-attach":
     else:
         sys.exit("maki-attach inherited the attach lock's descriptor")
 entry = [name, *args]
+if name in ("vgs", "lvs", "pvs", "pvcreate", "vgcreate", "lvcreate", "vgchange"):
+    # Whether LVM was told not to warn about the descriptors it inherits.
+    with (root / "lvm-environment.jsonl").open("a") as log:
+        log.write(json.dumps([name, os.environ.get("LVM_SUPPRESS_FD_WARNINGS")]) + "\n")
 if name == "sync":
     # Whether the record still exists when something is made durable.
     entry.append("record" if (root / "etc/maki/attach/demo.bootstrap").exists() else "no record")
@@ -247,6 +251,8 @@ class ProvisioningContract(unittest.TestCase):
                    BOOTSTRAP_FIXTURE=directory, BOOTSTRAP_SCENARIO=scenario,
                    BOOTSTRAP_UUID=UUID, BOOTSTRAP_PV=PV, BOOTSTRAP_VG=VG, BOOTSTRAP_LV=LV,
                    BOOTSTRAP_OTHER_VG=OTHER_VG, BOOTSTRAP_OTHER_DISK_VG=OTHER_DISK_VG)
+        # Only the block may tell LVM what to suppress.
+        env.pop("LVM_SUPPRESS_FD_WARNINGS", None)
         log = root / "commands.jsonl"
         before = len(log.read_text().splitlines()) if log.exists() else 0
         result = subprocess.run(["bash", "-c", program], env=env, capture_output=True,
@@ -304,6 +310,22 @@ class ProvisioningContract(unittest.TestCase):
                 "staged": sorted(entry.name for entry in (root / "etc/maki/attach").iterdir()
                                  if entry.name.endswith(".next")),
             }
+
+    def test_lvm_is_told_not_to_warn_about_the_lock_descriptor(self):
+        # Every LVM command inherits the attach lock's descriptor 9; LVM
+        # closes its own copy, which leaves the lock held, and warns that it
+        # "leaked" unless LVM_SUPPRESS_FD_WARNINGS is set (lvm(8)).
+        self.assertLess(self.program.index("\nexport LVM_SUPPRESS_FD_WARNINGS=1\n"),
+                        self.program.index("\nexec 9>>/run/maki-attach/attach.lock\n"))
+        for runs in (("success",), ("fail-mkfs.xfs", "success")):
+            with self.subTest(runs=runs), tempfile.TemporaryDirectory(prefix="maki-bootstrap-") as directory:
+                self.make_fixture(directory, runs[0])
+                for scenario in runs:
+                    self.run_block(directory, scenario)
+                log = Path(directory) / "lvm-environment.jsonl"
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertIn("vgchange", [name for name, _ in calls])
+                self.assertEqual({value for _, value in calls}, {"1"}, calls)
 
     def test_success_pins_created_layout_and_formats_without_force(self):
         result, calls, content, mode = self.run_case("success")

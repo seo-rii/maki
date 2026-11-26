@@ -2936,6 +2936,11 @@ ledger; it does not run SQLite, PostgreSQL or a kernel XFS stack. The broader
 tiers below are qualification targets. Continued fuzzing, systemd sandbox,
 real DB/XFS, weekly and release qualification require separate runners and
 recorded results; a green push or nightly run does not certify those targets.
+Every change also drives whole attachments through a disposable runner VM's
+kernel NBD, device-mapper, LVM, XFS and systemd (the privileged validation
+runner, then the documented installation, quick start and first-volume
+bootstrap on the built package); that is one Ubuntu host and the local
+provider, not the qualification of a target platform.
 See [the testing guide](docs/testing.md) for the implemented commands and limits.
 
 ## Pull Request

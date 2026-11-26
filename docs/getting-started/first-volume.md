@@ -116,6 +116,9 @@ done
 [[ -b "$dev" ]] || die "NBD device is missing"
 # Coordinate with maki-attach; the packaged runtime directory is root-only.
 [[ ! -L /run/maki-attach/attach.lock ]] || die "Unexpected lock symlink"
+# The LVM commands below inherit the lock's descriptor. Each closes its copy,
+# which leaves the lock held, and says so unless told not to (lvm(8)).
+export LVM_SUPPRESS_FD_WARNINGS=1
 exec 9>>/run/maki-attach/attach.lock
 flock -n 9 || die "Another bootstrap or a maki-attach command holds the attach lock;" \
     "run this block again once it has finished."
