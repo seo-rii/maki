@@ -6,7 +6,8 @@
 //! below are never dialed for real. One test keeps the system resolver.
 //! When the host has addresses of both families, the other family's
 //! attempts start 300 ms after the first one, as the gRPC transport's
-//! connector does, and the attempt that loses is dropped.
+//! connector does, or halfway to the deadline if that is sooner, and the
+//! attempt that loses is dropped.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
