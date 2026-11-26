@@ -118,8 +118,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
   example) is checked and inspected read-only; on other platforms every root
   opens as before. A read-only check cannot show that what it reads is on
   disk, or make the rewrites and repairs recovery makes, so its deep verdict
-  is `unproven`, never `clean`. A rollback-protected backing there is
-  refused: opening one rewrites its authenticated state
+  is `unproven`, never `clean`. A rollback-protected backing whose root or
+  witness directory the user may not write, and every one with a remote
+  witness, is read through a read-only view that
+  authenticates it as attach does, writes nothing and asks a remote
+  authority only to inspect; it takes the writer's locks shared, so these
+  commands refuse such a backing while a daemon holds it
   ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
 - `local-aes-xts` returns garbage rather than an error for a wrong key once
   the canary check is bypassed by an empty volume; use `local-aes-gcm-siv`.

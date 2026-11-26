@@ -18,6 +18,10 @@ by volume configuration, which also reports each setting fixed at creation
 whose configured value differs from the volume's (attach refuses each one),
 use
 .BR "maki check" .
+Without a configuration it cannot open a rollback-protected backing either,
+whose witness only the configuration names: it refuses such a root, and
+.B maki check
+checks it, read-only where it cannot be written.
 On Linux, a root the user running
 .B maki-check
 may not write (a read-only mount, a read-only bind mount, a directory without

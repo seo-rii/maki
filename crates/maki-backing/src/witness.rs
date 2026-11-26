@@ -133,30 +133,44 @@ impl FileWitness {
 
     pub(crate) fn open_backing(backing: Arc<dyn Backing>) -> io::Result<Self> {
         let lock = backing.try_lock(LOCK_FILE)?;
-        // A witness without its anchor is what a creation leaves that
-        // stopped before it published one, and also what a witness mount
-        // that is not mounted, or one that lost its state, looks like. Name
-        // the causes and the way out of each, with the same error kind.
-        let anchor = read_anchor(backing.as_ref()).map_err(|error| {
-            if error.kind() != io::ErrorKind::NotFound {
-                return error;
-            }
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "the witness directory holds no anchor: either the creation of this volume did \
-                 not complete, or the witness is not mounted or lost its state. First make sure \
-                 this directory is the mounted witness, because volume create enrolls a pair \
-                 that committed nothing into whatever directory is configured, an empty mount \
-                 point included. Then running volume create again continues an interrupted \
-                 creation and refuses a backing that holds committed data; if the witness lost \
-                 its state, restore the witness directory",
-            )
-        })?;
+        let anchor = read_anchor(backing.as_ref()).map_err(no_anchor)?;
         // A prior process may have observed rename success and directory-sync
         // failure. Re-publish the exact validated record before returning so
         // callers never reclaim data based only on page-cache-visible state.
         // The new file keeps the replaced record's owner (`replaced_owner`).
         publish_anchor(backing.as_ref(), &anchor)?;
+        Ok(Self {
+            backing,
+            anchor,
+            poisoned: Cell::new(false),
+            _lock: lock,
+        })
+    }
+
+    /// Open the witness in `backing` for a reader that changes nothing, as
+    /// a read-only view of the backing it protects does
+    /// (`ReadOnlyRollbackBacking`): its lock is taken shared and never
+    /// created ([`Backing::try_lock_shared_existing`]), which keeps out a
+    /// writer, who holds it exclusively, while admitting other readers, and
+    /// the anchor is read and validated, never published again. `refusal`
+    /// words a lock that cannot be taken; a witness that holds neither the
+    /// lock nor the anchor is refused as one without its anchor.
+    /// [`Self::verify_current`] then reads the anchor as it does for a
+    /// writer. Only a writer advances a witness.
+    pub(crate) fn open_read_only(
+        backing: Arc<dyn Backing>,
+        refusal: impl FnOnce(io::Error) -> io::Error,
+    ) -> io::Result<Self> {
+        let lock = match backing.try_lock_shared_existing(LOCK_FILE) {
+            Ok(lock) => lock,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && !backing.exists(ANCHOR_FILE)? =>
+            {
+                return Err(no_anchor(error))
+            }
+            Err(error) => return Err(refusal(error)),
+        };
+        let anchor = read_anchor(backing.as_ref()).map_err(no_anchor)?;
         Ok(Self {
             backing,
             anchor,
@@ -236,6 +250,27 @@ impl FileWitness {
             Ok(())
         }
     }
+}
+
+/// A witness without its anchor is what a creation leaves that stopped
+/// before it published one, and also what a witness mount that is not
+/// mounted, or one that lost its state, looks like. Name the causes and the
+/// way out of each, with the same error kind. Any other `error` is returned
+/// as it is.
+fn no_anchor(error: io::Error) -> io::Error {
+    if error.kind() != io::ErrorKind::NotFound {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "the witness directory holds no anchor: either the creation of this volume did \
+         not complete, or the witness is not mounted or lost its state. First make sure \
+         this directory is the mounted witness, because volume create enrolls a pair \
+         that committed nothing into whatever directory is configured, an empty mount \
+         point included. Then running volume create again continues an interrupted \
+         creation and refuses a backing that holds committed data; if the witness lost \
+         its state, restore the witness directory",
+    )
 }
 
 fn write_temporary(

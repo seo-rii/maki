@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-use maki_backing::RollbackBacking;
 use maki_backing::{Backing, FileBacking};
+#[cfg(target_os = "linux")]
+use maki_backing::{ReadOnlyRollbackBacking, RollbackBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
 use maki_core::volume::{Volume, VolumeOptions};
 use maki_crypto::endpoint::EndpointSet;
@@ -133,27 +133,10 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
                     Path::new(&rollback.witness_root),
                 )?,
             };
-            // A local creation that stopped after its witness anchor left
-            // a pair that opens and holds no volume. Say so, and what
-            // continues it, in place of a bare "no valid superblock", and
-            // before the capacity is compared: there is no volume yet whose
-            // capacity a configuration could contradict, and `create`
-            // names both values when it continues the pair.
-            if rollback.remote.is_none() && init::unfinished_creation(&backing)? {
-                return Err(DaemonError::Format(FormatError::Invalid(
-                    "no valid superblock: this volume's creation did not complete (its \
-                     rollback-protected backing holds only an unfinished creation); run `maki \
-                     volume create` again, which continues it"
-                        .to_string(),
-                )));
+            if rollback.remote.is_none() {
+                refuse_unfinished_creation(&backing)?;
             }
-            let stored = backing.capacity()?;
-            if rollback.capacity.0 != stored {
-                return Err(DaemonError::Unsupported(format!(
-                    "protected backing capacity mismatch: configuration {}, stored {stored}; migration is required",
-                    rollback.capacity.0
-                )));
-            }
+            check_protected_capacity(rollback, backing.capacity()?)?;
             return Ok(Arc::new(backing));
         }
         #[cfg(not(target_os = "linux"))]
@@ -178,6 +161,39 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
     Ok(Arc::new(FileBacking::new(&config.backing.root)?))
 }
 
+/// A local creation that stopped after its witness anchor left a pair that
+/// opens and holds no volume. Say so, and what continues it, in place of a
+/// bare "no valid superblock", and before the capacity is compared: there
+/// is no volume yet whose capacity a configuration could contradict, and
+/// `create` names both values when it continues the pair.
+#[cfg(target_os = "linux")]
+fn refuse_unfinished_creation(backing: &dyn Backing) -> Result<(), DaemonError> {
+    if init::unfinished_creation(backing)? {
+        return Err(DaemonError::Format(FormatError::Invalid(
+            "no valid superblock: this volume's creation did not complete (its \
+             rollback-protected backing holds only an unfinished creation); run `maki \
+             volume create` again, which continues it"
+                .to_string(),
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a configured capacity that differs from the `stored` one.
+#[cfg(target_os = "linux")]
+fn check_protected_capacity(
+    rollback: &maki_format::config::RollbackProtectionSection,
+    stored: u64,
+) -> Result<(), DaemonError> {
+    if rollback.capacity.0 != stored {
+        return Err(DaemonError::Unsupported(format!(
+            "protected backing capacity mismatch: configuration {}, stored {stored}; migration is required",
+            rollback.capacity.0
+        )));
+    }
+    Ok(())
+}
+
 /// The backing of an existing volume for a command that only reads it
 /// (`maki check`, `maki check --deep`, `maki volume inspect`).
 ///
@@ -191,34 +207,48 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
 /// cannot work through a writable backing there: every file would be opened
 /// read-write, which such a root refuses.
 ///
-/// A rollback-protected backing has no read-only open: opening it
-/// authenticates its state against the witness and then re-publishes that
-/// state and the witness anchor before anything is read (the failed
-/// writeback rule, K-01). A local one whose root or witness directory this
-/// process may not write is refused with the reason, before anything is
-/// opened. A remote one is opened as [`build_backing`] opens it; `maki`
-/// refuses it before calling this.
+/// A local rollback-protected backing whose root or witness directory this
+/// process may not write, either of them, opens as a
+/// [`ReadOnlyRollbackBacking`]: the same authentication against the witness
+/// as [`build_backing`]'s open, without its rewrites of the authenticated
+/// state and of the witness anchor (the failed writeback rule, K-01), which
+/// it could not make in both directories, with the locks taken shared.
+/// Where both can be written it is [`build_backing`], as before. A remote
+/// one always opens as a [`ReadOnlyRollbackBacking`], which sends the
+/// authority only inspections: [`build_backing`] claims a writer at the
+/// authority and copies the current generation into a namespace of its own,
+/// which a command that only reads must never do.
 pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
-    use maki_backing::configured::{BACKING_ROOT, WITNESS_ROOT};
+    use maki_backing::configured::BACKING_ROOT;
     let root = Path::new(&config.backing.root);
     if let Some(rollback) = &config.backing.rollback_protection {
-        if rollback.remote.is_none() {
-            let witness = Path::new(&rollback.witness_root);
-            WITNESS_ROOT.reachable(witness)?;
-            for (directory, path) in [(&BACKING_ROOT, root), (&WITNESS_ROOT, witness)] {
-                if !directory.may_write(path)? {
-                    return Err(DaemonError::Unsupported(format!(
-                        "{} cannot be written by this process, and a rollback-protected \
-                         backing cannot be checked or inspected read-only: opening it \
-                         re-publishes its authenticated state and the witness anchor before \
-                         anything is read. Run the command where the backing root and the \
-                         witness directory can both be written",
-                        directory.named(path)
-                    )));
+        #[cfg(target_os = "linux")]
+        {
+            use maki_backing::configured::WITNESS_ROOT;
+            let backing = match &rollback.remote {
+                Some(remote) => {
+                    ReadOnlyRollbackBacking::open_remote(root, remote_witness_client(remote)?)?
                 }
-            }
+                None => {
+                    let witness = Path::new(&rollback.witness_root);
+                    BACKING_ROOT.reachable(root)?;
+                    WITNESS_ROOT.reachable(witness)?;
+                    if BACKING_ROOT.may_write(root)? && WITNESS_ROOT.may_write(witness)? {
+                        return build_backing(config);
+                    }
+                    let backing = ReadOnlyRollbackBacking::open(root, witness)?;
+                    refuse_unfinished_creation(&backing)?;
+                    backing
+                }
+            };
+            check_protected_capacity(rollback, backing.capacity()?)?;
+            return Ok(Arc::new(backing));
         }
-        return build_backing(config);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = rollback;
+            return build_backing(config);
+        }
     }
     // Ask about the view that is then read, through its pinned descriptor:
     // the directory found unwritable is the one checked. A root that becomes
