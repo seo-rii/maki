@@ -1,0 +1,25 @@
+€  {
+      "report": [
+          {
+              "vg": [
+                  {"vg_name":"maki-vg", "vg_uuid":"Zy8xW6-vU4t-sR2q-pO0n-mL8k-jI6h-gF4eD2", "vg_seqno":"3", "pv_count":"1", "vg_missing_pv_count":"0", "vg_partial":"0", "vg_exported":"0", "vg_systemid":"", "vg_lock_type":""}
+              ]
+              ,
+              "pv": [
+                  {"pv_name":"/dev/nbd3p1", "pv_uuid":"aB3dE5-fG7h-iJ9k-lM1n-oP3q-rS5t-uV7wX9", "vg_uuid":"Zy8xW6-vU4t-sR2q-pO0n-mL8k-jI6h-gF4eD2", "pv_missing":"0", "pv_duplicate":"0"}
+              ]
+              ,
+              "lv": [
+                  {"lv_name":"data", "lv_uuid":"Ab1cD2-eF3g-hI4j-kL5m-nO6p-qR7s-tU8vW9", "vg_uuid":"Zy8xW6-vU4t-sR2q-pO0n-mL8k-jI6h-gF4eD2", "lv_layout":"linear"}
+              ]
+              ,
+              "pvseg": [
+                  {"pv_uuid":"aB3dE5-fG7h-iJ9k-lM1n-oP3q-rS5t-uV7wX9"}
+              ]
+              ,
+              "seg": [
+                  {"lv_uuid":"Ab1cD2-eF3g-hI4j-kL5m-nO6p-qR7s-tU8vW9"}
+              ]
+          }
+      ]
+  }

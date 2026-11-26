@@ -8,7 +8,12 @@
 //! longer accepts or an invalid one it accepts. The targets of the root
 //! helper's NBD handshake and netlink answer reader and of maki-backing's
 //! own records are required here: before them, no fuzzer read the bytes a
-//! root process takes from the volume daemon and from a netlink socket.
+//! root process takes from the volume daemon and from a netlink socket. So
+//! are the targets of the witness's RPC and etcd readers, of the remote
+//! crypto providers' response readers and of the helper's readers of
+//! command output and of sysfs: before them, no fuzzer read what a witness
+//! peer, etcd, a crypto endpoint, LVM, blkid, dmsetup or the kernel's block
+//! topology hands those readers.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,7 @@ use maki_fuzz_harness::seeds::{self, Expect};
 use maki_fuzz_harness::TARGETS;
 
 /// Every fuzz target there must be.
-const REQUIRED: [&str; 9] = [
+const REQUIRED: [&str; 16] = [
     "format_decoders",
     "format_records",
     "journal_scan",
@@ -27,11 +32,23 @@ const REQUIRED: [&str; 9] = [
     "nbd_handshake",
     "nbd_netlink",
     "backing_records",
+    "witness_rpc",
+    "witness_etcd",
+    "http_response",
+    "websocket_response",
+    "grpc_response",
+    "helper_reports",
+    "helper_sysfs",
 ];
 
 /// Targets whose code is built on Linux only: the root helper's kernel NBD
-/// connection.
-const LINUX_ONLY: [&str; 2] = ["nbd_handshake", "nbd_netlink"];
+/// connection and its executor.
+const LINUX_ONLY: [&str; 4] = [
+    "nbd_handshake",
+    "nbd_netlink",
+    "helper_reports",
+    "helper_sysfs",
+];
 
 /// The largest seed file: one handshake seed is longer than the client's
 /// 64 KiB byte limit.
@@ -165,22 +182,34 @@ fn every_fuzz_target_has_an_entry_a_binary_and_seeds() {
     }
 }
 
+/// Whether the committed seeds of `target` are in another byte order than
+/// this host's, which reads them differently.
+fn foreign_byte_order(target: &str) -> bool {
+    cfg!(target_endian = "big") && seeds::LITTLE_ENDIAN.contains(&target)
+}
+
 #[test]
 fn every_committed_seed_replays_through_its_target() {
     let mut replayed = 0;
     let mut skipped = Vec::new();
+    let mut own_byte_order = Vec::new();
     for target in TARGETS {
-        let files = committed(target.name);
         let Some(entry) = target.entry else {
             skipped.push(target.name);
             continue;
         };
-        // The generator writes these only where they are in the host's byte
-        // order; a big-endian host reads the committed ones differently.
-        if cfg!(target_endian = "big") && seeds::LITTLE_ENDIAN.contains(&target.name) {
-            skipped.push(target.name);
-            continue;
-        }
+        // A big-endian host replays the seeds its generator writes in its
+        // own byte order, with the same names and so the same expectations.
+        let files = if foreign_byte_order(target.name) {
+            own_byte_order.push(target.name);
+            seeds::all()
+                .into_iter()
+                .filter(|seed| seed.target == target.name)
+                .map(|seed| (seed.name, seed.bytes))
+                .collect()
+        } else {
+            committed(target.name)
+        };
         for (name, bytes) in files {
             assert!(
                 bytes.len() <= MAX_SEED_BYTES,
@@ -199,9 +228,15 @@ fn every_committed_seed_replays_through_its_target() {
     }
     assert_eq!(
         skipped,
-        if !cfg!(target_os = "linux") {
+        if cfg!(target_os = "linux") {
+            Vec::new()
+        } else {
             LINUX_ONLY.to_vec()
-        } else if cfg!(target_endian = "big") {
+        }
+    );
+    assert_eq!(
+        own_byte_order,
+        if cfg!(all(target_os = "linux", target_endian = "big")) {
             seeds::LITTLE_ENDIAN.to_vec()
         } else {
             Vec::new()
@@ -216,7 +251,11 @@ fn every_committed_seed_replays_through_its_target() {
 fn the_committed_seeds_are_what_the_generator_writes() {
     let generated = seeds::all();
     if std::env::var_os("MAKI_FUZZ_WRITE_SEEDS").is_some_and(|value| value == "1") {
-        for seed in &generated {
+        // A big-endian host's netlink seeds are not the committed ones.
+        for seed in generated
+            .iter()
+            .filter(|seed| !foreign_byte_order(seed.target))
+        {
             let directory = seed_dir().join(seed.target);
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join(&seed.name), &seed.bytes).unwrap();
@@ -236,6 +275,9 @@ fn the_committed_seeds_are_what_the_generator_writes() {
             seed.target,
             seed.name
         );
+        if foreign_byte_order(seed.target) {
+            continue;
+        }
         let path = seed_dir().join(seed.target).join(&seed.name);
         let found = std::fs::read(&path).unwrap_or_default();
         assert!(
