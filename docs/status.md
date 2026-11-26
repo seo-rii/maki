@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-11-25. External campaign evidence below runs through
+Last updated: 2026-11-26. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -114,11 +114,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Default v2/v3 backings cannot detect restoration of an older, internally
   valid volume image (historical rollback). Only the experimental
   rollback-protected backing addresses this, and it is not qualified.
-- A backing root the user may not write (a read-only mount, for example) is
-  checked and inspected read-only. Such a check cannot show that what it
-  reads is on disk, or make the rewrites and repairs recovery makes, so its
-  deep verdict is `unproven`, never `clean`. A rollback-protected backing
-  there is refused: opening one rewrites its authenticated state
+- On Linux, a backing root the user may not write (a read-only mount, for
+  example) is checked and inspected read-only; on other platforms every root
+  opens as before. A read-only check cannot show that what it reads is on
+  disk, or make the rewrites and repairs recovery makes, so its deep verdict
+  is `unproven`, never `clean`. A rollback-protected backing there is
+  refused: opening one rewrites its authenticated state
   ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
 - `local-aes-xts` returns garbage rather than an error for a wrong key once
   the canary check is bypassed by an empty volume; use `local-aes-gcm-siv`.
