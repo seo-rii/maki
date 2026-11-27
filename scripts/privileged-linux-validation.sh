@@ -1185,6 +1185,18 @@ require_released() {
     pass "$1 left no mount, holder, connection or attach record"
 }
 
+# Whether process $1 still runs, read from /proc: a zombie the shell has not
+# reaped yet has gone. Unlike kill -0 this needs no permission to signal it.
+# sudo checks its policy with real, effective and saved uid 0 (sudoers'
+# PERM_ROOT), so for that moment the invoking user's kill -0 on its PID fails
+# with EPERM although it runs: in the Debian 12 guest the wait for the opener
+# stopped so at its first look.
+process_running() {
+    local stat
+    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+    [[ "${stat##*) }" != Z* ]]
+}
+
 # Start an opener of the device (privileged_validation_opener.py) and wait
 # until it holds the device.
 hold_device_open() {
@@ -1198,7 +1210,7 @@ hold_device_open() {
     opener_pid=$!
     for _ in $(seq 1 200); do
         grep -q ' holding the device open' "$run_dir/detach-opener.txt" && return 0
-        kill -0 "$opener_pid" 2>/dev/null || break
+        process_running "$opener_pid" || break
         sleep 0.05
     done
     cat "$run_dir/detach-opener.txt" >&2
