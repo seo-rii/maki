@@ -529,13 +529,7 @@ fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError
         }
         // tokio-tungstenite's rustls connector carries handshake errors in
         // io::Error, so matching only Error::Tls misses certificate failures.
-        Error::Io(error)
-            if error
-                .get_ref()
-                .is_some_and(|source| source.is::<rustls::Error>()) =>
-        {
-            CryptoError::EndpointFatal("websocket TLS authentication or protocol failure".into())
-        }
+        Error::Io(error) if holds_tls_error(&error) => tls_failure(),
         Error::Tls(_) => CryptoError::EndpointFatal(
             "websocket TLS authentication or configuration failure".into(),
         ),
@@ -547,6 +541,31 @@ fn classify_connect(error: tokio_tungstenite::tungstenite::Error) -> CryptoError
         }
         _ => CryptoError::EndpointFatal("invalid websocket upgrade or configuration".into()),
     }
+}
+
+/// A TLS authentication or protocol failure of the connection: an endpoint
+/// failure, in the connection attempt and on an established connection.
+fn tls_failure() -> CryptoError {
+    CryptoError::EndpointFatal("websocket TLS authentication or protocol failure".into())
+}
+
+/// Whether a rustls error is in `error`'s chain. The TLS stream reports one
+/// inside an `io::Error`, whose `source()` skips it (it forwards to the
+/// inner error's own source), so each I/O error's inner error is inspected
+/// too. An error's text never decides.
+fn holds_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error.is::<rustls::Error>() {
+            return true;
+        }
+        cause = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
+    }
+    false
 }
 
 /// The roots this transport trusts: the host's trust store, the compiled-in
@@ -836,6 +855,14 @@ impl WsCryptoProvider {
                             Error::Protocol(_) => CryptoError::Contract(
                                 "websocket peer violated the receive framing contract".into(),
                             ),
+                            // A TLS protocol failure under the connection (a
+                            // record that does not decrypt, a fatal alert)
+                            // is an endpoint failure, as in the connection
+                            // attempt. A request it reaches was handed to the
+                            // connection and may have been sent: `request`
+                            // does not mark it unsent, and does not send it
+                            // again on a new connection.
+                            Error::Io(error) if holds_tls_error(&error) => tls_failure(),
                             _ => retryable("connection lost: closed"),
                         };
                     }

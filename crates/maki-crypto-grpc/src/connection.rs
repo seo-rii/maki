@@ -3,7 +3,10 @@
 //! Preserve payload-free unfinished connection attempts: their separate bound
 //! allows a slow successful handshake to outlive one RPC deadline. A channel
 //! with no completed RPC is still retired after that initial progress window,
-//! covering a completed handshake followed by a silent first RPC.
+//! covering a completed handshake followed by a silent first RPC. A TLS
+//! failure inside a call retires the channel at once, inside that window
+//! too: kept, it would hand the next call to tonic's own reconnect, with the
+//! request queued while the handshake fails again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -162,6 +165,7 @@ impl ConnectionCache {
             cache: self,
             channel,
             finished: false,
+            retired: false,
         }
     }
 }
@@ -170,6 +174,8 @@ pub(super) struct Exchange<'a> {
     cache: &'a ConnectionCache,
     channel: Arc<CachedChannel>,
     finished: bool,
+    /// Retire the channel whatever its progress (see `Exchange::retire`).
+    retired: bool,
 }
 
 impl Exchange<'_> {
@@ -201,12 +207,25 @@ impl Exchange<'_> {
         // failures must not receive the unfinished-handshake grace period.
         self.succeeded();
     }
+
+    /// A TLS failure ended the call: tonic's reconnect inside the channel
+    /// failed its handshake, so no connection is left under it, and the next
+    /// call would reconnect the same way with its request queued in tonic.
+    /// Retire the channel also when no RPC has completed on it and its
+    /// initial progress window is still open, so the next call opens a
+    /// connection through the payload-free attempt, whose failure proves its
+    /// request unsent. As for any other failure, only the cached channel
+    /// this exchange used is retired, never a replacement (see `Drop`).
+    pub(super) fn retire(&mut self) {
+        self.retired = true;
+    }
 }
 
 impl Drop for Exchange<'_> {
     fn drop(&mut self) {
         if self.finished
-            || (!matches!(*self.channel.state.borrow(), ConnectionState::Failed(_))
+            || (!self.retired
+                && !matches!(*self.channel.state.borrow(), ConnectionState::Failed(_))
                 && !self.channel.established.load(Ordering::Acquire)
                 && self.channel.started.elapsed() < self.cache.initial_progress_timeout)
         {
@@ -318,6 +337,34 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await;
         drop(first);
         assert!(!Arc::ptr_eq(&cache.exchange().channel, &old));
+    }
+
+    #[tokio::test]
+    async fn a_retired_exchange_retires_a_channel_inside_its_progress_window() {
+        let cache = cache();
+        let mut failed = cache.exchange();
+        let old = failed.channel.clone();
+        failed.retire();
+        drop(failed);
+        assert!(!Arc::ptr_eq(&cache.exchange().channel, &old));
+    }
+
+    #[tokio::test]
+    async fn a_late_retired_exchange_cannot_evict_a_replacement() {
+        let cache = cache();
+        // Two calls on a channel no RPC has completed on; the first one's
+        // TLS failure retires it, and the next call opens a replacement.
+        let mut late = cache.exchange();
+        let mut first = cache.exchange();
+        first.retire();
+        drop(first);
+        let replacement = cache.exchange();
+        let new_channel = replacement.channel.clone();
+        assert!(!Arc::ptr_eq(&late.channel, &new_channel));
+        // The second call's TLS failure on the old channel arrives later.
+        late.retire();
+        drop(late);
+        assert!(Arc::ptr_eq(&cache.exchange().channel, &new_channel));
     }
 
     #[tokio::test]
