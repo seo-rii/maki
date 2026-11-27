@@ -838,8 +838,28 @@ class Merge(Fixture):
              "why": "the merge was interrupted before it unpacked it"} for shard in (1, 2)])
         self.assertFalse(self.unpacked(1).exists())
 
-        # Interrupted between two members of an archive: what it unpacked of
-        # it is removed.
+        # Interrupted once it has begun to unpack the first archive: what it
+        # unpacked is not merged, and is left where it is, since removing a
+        # tree of 400,000 inputs could outlast the runner's kill.
+        unpacked = self.root / "shards" / "fuzz-shard-witness_etcd-1" / "shard"
+
+        class Begun:
+            def is_set(self):
+                return unpacked.exists()
+
+        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 2,
+                                                        Begun())
+        self.assertEqual(sources, [])
+        self.assertEqual([entry["why"] for entry in unmerged],
+                         ["the merge was interrupted while it unpacked it",
+                          "the merge was interrupted before it unpacked it"])
+        self.assertTrue(unpacked.is_dir())
+
+    def test_an_interrupt_is_answered_while_an_archive_is_listed(self):
+        # Listing an archive of 405,755 members took 9.8 s here, and the
+        # runner kills the step 10 s after its interrupt: the merge stops
+        # reading the archive at the interrupt, before it reaches the member
+        # at its end that it would refuse.
         class InterruptedAfter:
             def __init__(self, answers):
                 self.answers = answers
@@ -848,13 +868,13 @@ class Merge(Fixture):
                 self.answers -= 1
                 return self.answers < 0
 
-        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 2,
-                                                        InterruptedAfter(3))
-        self.assertEqual(sources, [])
-        self.assertEqual([entry["why"] for entry in unmerged],
-                         ["the merge was interrupted while it unpacked it",
-                          "the merge was interrupted before it unpacked it"])
-        self.assertFalse((self.root / "shards" / "fuzz-shard-witness_etcd-1" / "shard").exists())
+        link = tarfile.TarInfo("shard/corpus/link")
+        link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+        self.shard(1, b"one", extra=[(link, None)])
+        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 1,
+                                                        InterruptedAfter(2))
+        self.assertEqual((sources, [entry["why"] for entry in unmerged]),
+                         ([], ["the merge was interrupted while it unpacked it"]))
 
     def test_an_interrupt_while_the_archives_are_unpacked_is_recorded(self):
         # The merge's handlers are in place before it unpacks: the runner's
