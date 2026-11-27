@@ -461,8 +461,10 @@ class Run(Fixture):
         out = self.root / "shard"
         runner = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "run", "--binary", str(self.binary),
                                    "--target", "journal_scan", "--shard", "1", "--cpu-seconds", "3600",
-                                   "--wall-seconds", "3600", "--workers", "2", "--seeds", str(self.seeds), "--out", str(out)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                   "--wall-seconds", "3600", "--workers", "2", "--seeds", str(self.seeds), "--out", str(out),
+                                   "--temp", str(self.root)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  start_new_session=True)
         try:
             # Both processes started and wait for their interrupt.
             for _ in range(400):
@@ -474,8 +476,12 @@ class Run(Fixture):
             runner.send_signal(signal.SIGTERM)
             stdout, stderr = runner.communicate(timeout=30)
         finally:
-            if runner.poll() is None:
-                runner.kill()
+            # The runner and, should it have left them, its processes.
+            try:
+                os.killpg(runner.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            runner.wait()
         self.assertEqual(runner.returncode, 1, stdout + stderr)
         record = json.loads((out / "shard.json").read_text())
         self.assertEqual([(worker["exit"], worker["stopped"]) for worker in record["workers"]],

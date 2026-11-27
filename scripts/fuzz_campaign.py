@@ -693,6 +693,9 @@ def main(arguments=None):
     running.add_argument("--workers", required=True, type=int)
     running.add_argument("--seeds", required=True, type=Path)
     running.add_argument("--out", required=True, type=Path)
+    running.add_argument("--temp", type=Path,
+                         help="where the shard's temporary directory goes (default: /dev/shm "
+                              "where it can be written)")
     merging = commands.add_parser("merge", help="merge a target's shard corpora")
     merging.add_argument("--binary", required=True, type=Path)
     merging.add_argument("--target", required=True)
@@ -722,7 +725,8 @@ def main(arguments=None):
         return 0
     if options.command == "run":
         record = run(options.binary, options.target, options.shard, options.cpu_seconds,
-                     options.wall_seconds, options.workers, options.seeds, options.out)
+                     options.wall_seconds, options.workers, options.seeds, options.out,
+                     temp=options.temp)
         for worker in record["workers"]:
             print(f"process {worker['worker']}: {worker['cpu_seconds']} CPU s in "
                   f"{worker['wall_seconds']} s over {worker['rounds_run']} round(s), "
