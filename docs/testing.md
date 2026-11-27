@@ -164,8 +164,9 @@ helper's readers parse, for the `helper_reports` and `helper_sysfs` fuzz
 seeds: `scripts/privileged_validation_capture.py` runs LVM's `fullreport`,
 the `blkid` label and filesystem probes, `dmsetup info`, the LV's size probe
 and the mount source's UUID probe with the helper's own arguments,
-environment and limits (the tests read them from the helper's sources), and
-writes their output with the device's nodes below `/sys/class/block`, in the
+environment and 15 s limit (the tests read them from the helper's sources),
+and writes their output (the first 64 KiB of each stream, marked truncated
+if longer, after reading it whole) with the device's nodes below `/sys/class/block`, in the
 `helper_sysfs` input's line format, and the mount table into
 `helper-outputs.json`.
 
@@ -196,11 +197,12 @@ it started. Read from the kernel's NBD driver, the device keeps a
 connection's attributes while anything holds it open, a mount or a mapping
 above all, so a device that shows no connection has neither left, and the
 disconnected recovery that a kernel can reach only retires the record. The
-job's first run with these steps (2026-11-27, Linux `7.0.0-1020-azure`)
-showed it: after `NBD_CMD_DISCONNECT` the device still showed the connection
-with XFS mounted and again after the unmount, and showed none once the
-mapping was removed; cleanup then logged disconnected recovery, ran no step
-and left nothing. Each attach must show the mount, the attachment's backend identifier
+job's runs with these steps (2026-11-27, Linux `7.0.0-1020-azure`) showed it
+for the mapping: after `NBD_CMD_DISCONNECT` the device still showed the
+connection with XFS mounted on the LV and again after the unmount, and
+showed none once the mapping was removed (the mount sits on the mapping,
+so its own effect is not told apart); cleanup then logged disconnected
+recovery, ran no step and left nothing. Each attach must show the mount, the attachment's backend identifier
 and the attach record; after each detach, and after each cleanup that ends
 an attachment, the mount, the device's holders, its connection and size and
 the attach record must be gone, and a look for the record that fails stops
@@ -262,9 +264,10 @@ quick start's start block. With every target started, the opener holds each
 volume's device and keeps it 10 seconds after its disconnect, and one
 `systemctl stop` stops the three targets (AUD-197). Each attach unit's stop
 runs `maki-attach cleanup`, which waits for its opener without the global
-attach lock, so the three waits are expected to overlap, each stop taking
-about the hold; the job's runs before that change queued them, about 10.2,
-20.3 and 30.5 s. `systemctl stop` returns once the targets' own jobs are done, before
+attach lock. With that, the job's run at 31b7ef8 measured the three stops
+overlapping, 10.183, 10.246 and 10.310 s, about the hold each; its runs
+before the change measured them queued on the lock, about 10.2, 20.3 and
+30.5 s. The driver requires neither. `systemctl stop` returns once the targets' own jobs are done, before
 the attach units they are ordered after have stopped, so the driver looks at
 each attach unit until it is inactive or failed, for up to 300 s. systemd
 then garbage-collects an inactive unit, and `systemctl show` loads a fresh

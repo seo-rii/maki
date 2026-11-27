@@ -294,12 +294,15 @@ device closes it, and a mounted filesystem or an LV mapping is such an
 opener, so a device that shows no connection has no mount or mapping of it
 left, and cleanup's disconnected recovery then has nothing to unmount or
 deactivate and retires the record. The run logs what the device shows after
-each step of the release by hand. CI's first run with these checks
-(2026-11-27, GitHub's Ubuntu runner, Linux `7.0.0-1020-azure`) passed them:
-the device still showed the connection after the disconnect with XFS
-mounted and after the unmount, showed none once the mapping was removed, and
-cleanup logged disconnected recovery and left nothing. No run outside CI has
-these checks yet.
+each step of the release by hand. CI's runs with these checks (2026-11-27,
+GitHub's Ubuntu runner, Linux `7.0.0-1020-azure`, at commits a6c2006,
+f933c7c, 8b9ef4d and 31b7ef8 of #413) passed them. In the three whose logs
+are kept the device still showed the connection after the disconnect with
+XFS mounted on the LV and after the unmount, showed none once the LV's
+mapping was removed, and cleanup logged disconnected recovery and left
+nothing. That shows the mapping keeping the
+connection's attributes; the mount sits on the mapping, so its own effect is
+not told apart. No run outside CI has these checks yet.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 

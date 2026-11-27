@@ -6,9 +6,12 @@ The fuzz targets `helper_reports` and `helper_sysfs` feed the readers of
 code expects. This runs, as root and read-only, the commands those readers
 are handed, as the helper runs them: the same arguments, an environment of
 only `PATH` (systemd's default) and `LC_ALL=C`, no standard input and no
-inherited descriptors, a probe's 15 seconds and 64 KiB. The label probe reads
-the device through a descriptor this process holds (`/proc/<pid>/fd/<n>`),
-as the helper's does.
+inherited descriptors, and a probe's 15 seconds. The helper also refuses
+output beyond 64 KiB as it reads it; this reads each command's whole output
+and keeps the first 64 KiB of each stream, marking a longer one truncated.
+The mount table and the sysfs attributes are read whole (an attribute is at
+most a page). The label probe reads the device through a descriptor this
+process holds (`/proc/<pid>/fd/<n>`), as the helper's does.
 It prints one JSON document: each command's argument vector, exit status,
 standard output and standard error; the device's nodes below
 /sys/class/block (the device, its partitions and every mapping above them)
