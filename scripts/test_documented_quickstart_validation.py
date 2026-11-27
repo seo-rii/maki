@@ -328,14 +328,17 @@ else
     printf 'pv_uuid=1\n' > "$record"
     echo maki-bootstrap-1 > @ROOT@/sys/block/nbd0/backend
     pvcreate
+    [[ -z ${RECORD_FS_EARLY:-} ]] || printf 'fs_uuid=2\n' >> "$record"
     if ! mkfs.xfs; then
         [[ -z ${NO_RECORD:-} ]] || rm "$record"
+        [[ -z ${DROP_BACKEND:-} ]] || rm @ROOT@/sys/block/nbd0/backend
         [[ -n ${NO_STOP:-} ]] || exit 1
     fi
-    printf 'fs_uuid=2\n' >> "$record"
+    [[ -n ${NO_FS:-} ]] || printf 'fs_uuid=2\n' >> "$record"
 fi
 vgs
 if ! vgchange; then
+    [[ -z ${DROP_BACKEND:-} ]] || rm @ROOT@/sys/block/nbd0/backend
     [[ -n ${NO_STOP:-} ]] || exit 1
 fi
 rm -f "$record" @ROOT@/sys/block/nbd0/backend
@@ -343,10 +346,17 @@ echo created >> @ROOT@/log
 BASH
 """
 # A stand-in for a command the bootstrap runs; the one FAIL_ONCE names fails
-# the first time, on its own.
+# the first time, on its own. `systemctl` shows SYSTEMCTL_STATE, and
+# RESET_STATE from its second look on (the reset's, after the release's).
 FAKE_TOOL = """#!/bin/sh
 echo "${0##*/} $*" >> "$FIXTURE/log"
-if [ "${0##*/}" = systemctl ]; then echo "${SYSTEMCTL_STATE:-inactive}"; fi
+if [ "${0##*/}" = systemctl ]; then
+    if [ -n "${RESET_STATE:-}" ] && [ "$(grep -c '^systemctl ' "$FIXTURE/log")" -ge 2 ]; then
+        echo "$RESET_STATE"
+    else
+        echo "${SYSTEMCTL_STATE:-inactive}"
+    fi
+fi
 if [ "${0##*/}" = "${FAIL_ONCE:-}" ] && [ ! -e "$FIXTURE/failed-once" ]; then
     : > "$FIXTURE/failed-once"
     echo "${0##*/}: failed on its own" >&2
@@ -470,11 +480,24 @@ class StoppedBootstrap(unittest.TestCase):
             ("mkfs.xfs", "KEEP_RECORD"): "kept its record",
             ("mkfs.xfs", "KEEP_BACKEND"): "still shows the connection maki-bootstrap-1",
             ("mkfs.xfs", "SYSTEMCTL_STATE"): "maki@demo.service is active, not stopped",
+            # The record of the stop says whether the run formatted.
+            ("mkfs.xfs", "RECORD_FS_EARLY"):
+                "the record of a bootstrap stopped at mkfs.xfs must not name a filesystem",
+            ("vgchange", "NO_FS"): "the record of a bootstrap stopped at vgchange must name a filesystem",
+            # The device must show the stopped run's connection.
+            ("mkfs.xfs", "DROP_BACKEND"):
+                "/dev/nbd0 does not show the stopped bootstrap's connection (none)",
+            ("vgchange", "DROP_BACKEND"):
+                "/dev/nbd0 does not show the stopped bootstrap's connection (none)",
+            # The backing directory goes only while the daemon is stopped.
+            ("mkfs.xfs", "RESET_STATE"):
+                "maki@demo.service is active: the volume is reset only while it is stopped",
         }
         for (command, knob), message in cases.items():
             with self.subTest(command=command, knob=knob):
                 result, log, root = self.run_stopped(
-                    command, **{knob: "active" if knob == "SYSTEMCTL_STATE" else "1"})
+                    command, **{knob: "active" if knob in ("SYSTEMCTL_STATE", "RESET_STATE")
+                                else "1"})
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(message, result.stderr)
                 self.assertIn("stopped in [", result.stderr)
