@@ -499,8 +499,15 @@ mod tests {
         tracing::warn!("logged after the discard");
         {
             let _held = super::hold().unwrap();
-            tracing::warn!("held, then written by the drop");
+            tracing::warn!("held, then let go without a release");
         }
+        // A panic while lines are held lets them go unreleased too.
+        let unwound = std::panic::catch_unwind(|| {
+            let _held = super::hold().unwrap();
+            tracing::warn!("held across a panic");
+            panic!("the holder panicked");
+        });
+        assert!(unwound.is_err());
         let held = super::hold().unwrap();
         tracing::warn!("held and kept before the bound");
         tracing::warn!("{}", "x".repeat(super::HELD_BYTES));
@@ -515,9 +522,14 @@ mod tests {
 
     /// Held lines are written at the release, after every line logged
     /// before the hold and before every line logged after it, from any
-    /// thread; discarded ones are not written and are counted. At most
+    /// thread; discarded ones are not written and are counted. Lines that
+    /// nothing released (the guard dropped without a release, or unwound
+    /// by a panic) are dropped too, and how many is said. At most
     /// `HELD_BYTES` of text is kept, and what is not kept is counted and
     /// said, never dropped unsaid.
+    /// What the sink says of held lines that nothing released.
+    const UNRELEASED: &str = "log lines held back were dropped unwritten: nothing released them";
+
     #[test]
     fn held_lines_are_written_in_order_at_the_release_and_counted_when_discarded() {
         let stderr = child_stderr_of("logging::tests::child_holds_lines", None);
@@ -531,7 +543,7 @@ mod tests {
             "held, then released",
             "logged after the release",
             "logged after the discard",
-            "held, then written by the drop",
+            UNRELEASED,
             "held and kept before the bound",
             "lines=2",
             "logged last",
@@ -540,9 +552,20 @@ mod tests {
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{stderr}");
         assert!(at("held from another thread") > order[1], "{stderr}");
         assert!(at("held from another thread") < order[2], "{stderr}");
+        let unreleased: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.contains(UNRELEASED))
+            .collect();
+        assert_eq!(unreleased.len(), 2, "{stderr}");
+        assert!(
+            unreleased.iter().all(|line| line.contains("lines=1")),
+            "{stderr}"
+        );
         for unwritten in [
             "held, then discarded",
             "with a second line",
+            "held, then let go without a release",
+            "held across a panic",
             "held after the bound",
             &"x".repeat(64),
             &"y".repeat(64),

@@ -1290,4 +1290,59 @@ root = "/nonexistent/maki-ownership-hint"
         );
         assert_eq!(ownership_hint(false, &cfg), None);
     }
+
+    /// Only a command reading a volume with a remote witness holds its log:
+    /// a local witness is read before every operation, and a plain backing
+    /// has none to ask.
+    #[test]
+    fn only_a_volume_with_a_remote_witness_holds_its_log_while_it_is_read() {
+        let config = |protection: &str| {
+            maki_format::config::parse_config(&format!(
+                r#"
+config_schema_version = 1
+[volume]
+name = "demo"
+max_virtual_size = "1MiB"
+shard_logical_size = "64KiB"
+[crypto]
+provider = "local-aes-gcm-siv"
+crypto_compatibility_id = "local-aes-gcm-siv-v1"
+key = {{ source = "credential", name = "crypto-token" }}
+[crypto.capabilities]
+supported_plaintext_sizes = [4096]
+max_ciphertext_size = 4384
+[backing]
+root = "/nonexistent/maki-reading"
+{protection}"#
+            ))
+            .unwrap()
+        };
+        let local = r#"[backing.rollback_protection]
+witness_root = "/nonexistent/maki-witness"
+capacity = "1MiB"
+"#;
+        let remote = r#"[backing.rollback_protection]
+capacity = "1MiB"
+[backing.rollback_protection.remote]
+address = "127.0.0.1:1"
+server_name = "localhost"
+timeout_ms = 1000
+ca_file = "/nonexistent/ca"
+client_cert_file = "/nonexistent/cert"
+client_key_file = "/nonexistent/key"
+"#;
+        for (protection, holds) in [("", false), (local, false), (remote, true)] {
+            let cfg = config(protection);
+            assert_eq!(
+                cfg.backing
+                    .rollback_protection
+                    .as_ref()
+                    .map(|rollback| rollback.remote.is_some()),
+                (!protection.is_empty()).then_some(holds),
+                "{protection}"
+            );
+            let reading = Reading::start(&cfg);
+            assert_eq!(reading.0.is_some(), holds, "{protection}");
+        }
+    }
 }
