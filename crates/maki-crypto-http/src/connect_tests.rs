@@ -654,8 +654,10 @@ const DROPPED: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// live address: in a private network namespace a packet filter drops every
 /// SYN sent to one loopback address, so a connect to it is neither answered
 /// nor refused, and the next address serves once the first one's share has
-/// run out. It needs root, for the namespace and the rule, and `nft` or
-/// `iptables`; without them it says why it skips.
+/// run out. It needs root, for the namespace and the rule: without root, or
+/// where root cannot create a network namespace, it says why it skips. As
+/// root it fails when neither `nft` nor `iptables` installs the rule, and
+/// when a rule program reports success but the connect is refused.
 #[test]
 fn a_route_that_drops_packets_leaves_the_next_address_its_share() {
     // SAFETY: geteuid has no preconditions.
@@ -674,10 +676,7 @@ fn a_route_that_drops_packets_leaves_the_next_address_its_share() {
             return;
         }
         loopback_up();
-        if !drop_syns_to(DROPPED) {
-            eprintln!("skipping: neither nft nor iptables can be run");
-            return;
-        }
+        drop_syns_to(DROPPED);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -725,9 +724,9 @@ fn loopback_up() {
 }
 
 /// Make this thread's network namespace drop every TCP SYN it sends to
-/// `address`, with `nft`, or `iptables` where `nft` cannot be run. False
-/// when neither can be run.
-fn drop_syns_to(address: Ipv4Addr) -> bool {
+/// `address`, with `nft`, or with `iptables` where `nft` is missing or
+/// fails. Panics, with what each said, when neither installs the rule.
+fn drop_syns_to(address: Ipv4Addr) {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
     let rules = format!(
@@ -738,34 +737,36 @@ fn drop_syns_to(address: Ipv4Addr) -> bool {
          \t}}\n\
          }}\n"
     );
-    match Command::new("nft")
+    let nft = Command::new("nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-    {
-        Ok(mut nft) => {
-            nft.stdin
-                .take()
-                .unwrap()
-                .write_all(rules.as_bytes())
-                .unwrap();
-            let status = nft.wait().unwrap();
-            assert!(status.success(), "nft refused the rule: {status}");
-            return true;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("nft: {error}"),
-    }
+        .and_then(|mut nft| {
+            nft.stdin.take().unwrap().write_all(rules.as_bytes())?;
+            nft.wait_with_output()
+        });
+    let nft = match nft {
+        Ok(output) if output.status.success() => return,
+        Ok(output) => format!(
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => error.to_string(),
+    };
     let address = address.to_string();
     let arguments = [
         "-w", "-A", "OUTPUT", "-d", &address, "-p", "tcp", "--syn", "-j", "DROP",
     ];
-    match Command::new("iptables").args(arguments).status() {
-        Ok(status) => {
-            assert!(status.success(), "iptables refused the rule: {status}");
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => panic!("iptables: {error}"),
-    }
+    let iptables = match Command::new("iptables").args(arguments).output() {
+        Ok(output) if output.status.success() => return,
+        Ok(output) => format!(
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => error.to_string(),
+    };
+    panic!("neither nft ({nft}) nor iptables ({iptables}) installed the rule");
 }
