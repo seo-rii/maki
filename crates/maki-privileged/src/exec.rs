@@ -39,7 +39,7 @@ use crate::detach::DetachObservation;
 use crate::nbd_kernel::NbdError;
 use crate::plan::{Plan, PlannedStep, MOUNT_OPTIONS, SENTINEL_FILE};
 use crate::probe::{nbd_device_of, nbd_index, parse_mountinfo, resolve_leaf_devices};
-use crate::state::{BoundDeviceRecord, StateLock, TrustedState};
+use crate::state::{BoundDeviceRecord, TrustedState};
 use crate::verify::{
     verify_filesystem_identity, verify_mount_device, verify_mount_identity, MountExpectation,
     MountObservation,
@@ -210,19 +210,6 @@ pub fn load_trusted_config(path: impl AsRef<Path>) -> Result<crate::config::Atta
         )
     })?;
     crate::config::parse(&text).map_err(|error| error.to_string())
-}
-
-/// Held for the whole attach so two helpers cannot pick the same device;
-/// the file lock is released when this is dropped.
-pub struct AttachLock {
-    _lock: StateLock,
-    state: TrustedState,
-}
-
-pub fn lock_attach() -> io::Result<AttachLock> {
-    let state = TrustedState::open()?;
-    let lock = state.lock()?;
-    Ok(AttachLock { _lock: lock, state })
 }
 
 fn nbd_connected(device: &str) -> bool {
@@ -1800,16 +1787,24 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
                 | PlannedStep::XfsGrowfs { .. }
         )
     });
-    let lock = if needs_lock {
-        Some(lock_attach()?)
+    let state = if needs_lock {
+        Some(TrustedState::open()?)
     } else {
         None
     };
-    execute_with(
-        plan,
-        lock.as_ref().map(|lock| &lock.state),
-        &mut LinuxSystem,
-    )
+    execute_on(plan, state.as_ref(), &mut LinuxSystem)
+}
+
+/// [`execute`] on the attach state `state`, given when the plan needs it:
+/// the run takes its attach lock, so that two helpers cannot pick the same
+/// device or act on one record at once, before it reads any record.
+fn execute_on(
+    plan: &Plan,
+    state: Option<&TrustedState>,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let _lock = state.map(TrustedState::lock).transpose()?;
+    execute_with(plan, state, system)
 }
 
 fn execute_with(
@@ -2234,8 +2229,9 @@ mod command_tests;
 /// Recover only disconnected storage, under the same root-controlled lock as attach.
 /// Callers must stop workloads first; this command never starts or repairs a database.
 pub fn recover(plan: &Plan) -> Result<(), ExecError> {
-    let lock = lock_attach()?;
-    recover_with(plan, &lock.state, &mut LinuxSystem)
+    let state = TrustedState::open()?;
+    let _lock = state.lock()?;
+    recover_with(plan, &state, &mut LinuxSystem)
 }
 
 /// Converge trusted storage state under the attach lock.
@@ -2245,8 +2241,18 @@ pub fn recover(plan: &Plan) -> Result<(), ExecError> {
 /// backend follows disconnected recovery. Foreign and unreadable backends
 /// fail closed before either path can mutate storage.
 pub fn cleanup(plan: &Plan) -> Result<(), ExecError> {
-    let lock = lock_attach()?;
-    cleanup_with(plan, &lock.state, &mut LinuxSystem)
+    cleanup_on(plan, &TrustedState::open()?, &mut LinuxSystem)
+}
+
+/// [`cleanup`] on the attach state `state`, whose attach lock the run takes
+/// before it reads the record.
+fn cleanup_on(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let _lock = state.lock()?;
+    cleanup_with(plan, state, system)
 }
 
 /// Check the current caller namespace's complete attachment before starting
