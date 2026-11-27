@@ -227,9 +227,11 @@ fn not_retry_safe(peers: Vec<(&str, Arc<dyn CryptoProvider>)>) -> EndpointSet {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_connection_fails_a_non_retry_safe_request_over_to_a_peer() {
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Bound and never listening, for the whole test: the connect is refused,
+    // and a test beside this one cannot be given the port for its server.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let down = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
     let (good, served) = server(Mode::Serve).await;
     let set = not_retry_safe(vec![
         ("down", provider(&down, Duration::from_secs(5))),

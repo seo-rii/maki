@@ -228,11 +228,24 @@ fn not_retry_safe(peers: Vec<(&str, Arc<dyn CryptoProvider>)>) -> EndpointSet {
     .with_plaintext_size(UNIT as u32)
 }
 
-async fn closed_port_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
-    drop(listener);
-    url
+/// An endpoint that refuses every connection for as long as it lives: its
+/// socket is bound and never listens. The bound socket also keeps the port;
+/// a listener dropped once its address was taken frees it, and the kernel
+/// may give it to the next `127.0.0.1:0` bind of any test.
+struct ClosedPort {
+    url: String,
+    _socket: tokio::net::TcpSocket,
+}
+
+impl ClosedPort {
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        Self {
+            url: format!("ws://{}", socket.local_addr().unwrap()),
+            _socket: socket,
+        }
+    }
 }
 
 /// The tests of this file run side by side in one process, and each binds
@@ -241,8 +254,8 @@ async fn closed_port_url() -> String {
 /// is given is no longer refused, and its request is served there.
 #[tokio::test]
 async fn the_refused_endpoint_keeps_its_port_while_a_test_uses_it() {
-    let down = closed_port_url().await;
-    let address: std::net::SocketAddr = down.strip_prefix("ws://").unwrap().parse().unwrap();
+    let down = ClosedPort::new();
+    let address: std::net::SocketAddr = down.url.strip_prefix("ws://").unwrap().parse().unwrap();
     // The kernel gives a listener only a port that it could bind like this.
     let taken = TcpListener::bind(address).await;
     assert!(
@@ -258,10 +271,10 @@ async fn the_refused_endpoint_keeps_its_port_while_a_test_uses_it() {
 
 #[tokio::test]
 async fn a_refused_connection_fails_a_non_retry_safe_request_over_to_a_peer() {
-    let down = closed_port_url().await;
+    let down = ClosedPort::new();
     let good = Peer::start(|_| Connection::Serve).await;
     let set = not_retry_safe(vec![
-        ("down", provider(&down, false)),
+        ("down", provider(&down.url, false)),
         ("good", good.provider(false)),
     ]);
     let output = set
