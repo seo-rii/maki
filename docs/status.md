@@ -122,9 +122,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
   witness directory the user may not write, and every one with a remote
   witness, is read through a read-only view that
   authenticates it as attach does, writes nothing and asks a remote
-  authority only to inspect; it takes the writer's locks shared, so these
-  commands refuse such a backing while a daemon holds it
+  authority only to inspect, three times per command (four for `check
+  --deep`) however large the volume; it takes the writer's locks shared, so
+  these commands refuse such a backing while a daemon holds it
   ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+  With a remote witness, attach refuses a configuration that does not match
+  the volume before it claims a writer at the authority.
 - `local-aes-xts` returns garbage rather than an error for a wrong key once
   the canary check is bypassed by an empty volume; use `local-aes-gcm-siv`.
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,

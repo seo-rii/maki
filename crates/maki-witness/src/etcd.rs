@@ -764,6 +764,35 @@ pub(crate) mod fuzzing {
             "refused-range-not-json",
             input_bytes(RANGE, &body[..body.len() - 1]),
         );
+        // The size limits. An answer as long as the store reads (white
+        // space after the document, which JSON allows) and one byte longer.
+        let padded = |length: usize| {
+            let mut padded = body.clone();
+            padded.resize(length, b' ');
+            input_bytes(RANGE, &padded)
+        };
+        add("valid-range-answer-at-the-limit", padded(MAX_JSON_BYTES));
+        add(
+            "refused-range-answer-beyond-the-limit",
+            padded(MAX_JSON_BYTES + 1),
+        );
+        // A value of as many bytes as a state may have (refused only as no
+        // canonical state), of one byte more (refused once decoded), and
+        // one whose base64 is longer than such a state's (refused before).
+        let long = |length: usize| {
+            let mut state = claimed.clone();
+            state.resize(length, 0);
+            input(RANGE, &one(&state))
+        };
+        add("refused-range-state-at-the-limit", long(MAX_STATE_BYTES));
+        add(
+            "refused-range-state-beyond-the-limit",
+            long(MAX_STATE_BYTES + 1),
+        );
+        add(
+            "refused-range-value-beyond-the-limit",
+            long(MAX_STATE_BYTES + 3),
+        );
         let mut noise = body.clone();
         noise[body.len() / 2] ^= 0x04;
         add("noise-range-claimed", input_bytes(RANGE, &noise));

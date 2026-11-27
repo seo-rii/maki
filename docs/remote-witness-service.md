@@ -726,7 +726,33 @@ volume), reads one whose active writer has gone without releasing it (after a
 crash, before a takeover), and while it runs an attach, takeover, restore,
 snapshot or GC of that root fails to take the operation lock. It reads the
 authority's record again once it holds both locks and refuses one that changed
-in between, and every later operation inspects the authority again, as a
-writer's operations do. Its deep verdict is `unproven`. It loads the witness
-client's TLS identity to ask the authority, but no volume key, and decrypts
-nothing, so it does not replace an offline data-integrity check.
+in between. Every later read is authenticated against the manifest it read,
+and the authority is asked again once the command has read everything, before
+it reports (`check --deep` asks once more, before its verdict): `volume
+inspect` and `check` send three inspections and `check --deep` four, however
+large the volume, where the view used to send one before every backing
+operation as a writer's operations do. A command that fails once the view
+has read the record asks the authority again before it reports the failure,
+also when the failure stopped the view (a page that no longer
+authenticates).
+A record that changed since the open fails the command and is reported
+instead of what it read or of the failure; because a record never
+takes an earlier value again, one that is the same at the end was the same
+throughout
+([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+Its deep verdict is `unproven`. It loads the witness client's TLS identity to
+ask the authority, but no volume key, and decrypts nothing, so it does not
+replace an offline data-integrity check. A configuration whose root is a
+snapshot destination is refused: while the authority still names the
+namespace the snapshot copied, because that namespace holds no
+`rollback.lock` (`… is missing, and a read-only open cannot create it`), and
+once the volume has been opened to write again, because the snapshot does
+not hold the namespace the authority names (`this backing root does not hold
+the remote authority's current generation …`).
+
+Attach, which claims a writer, compares the configuration with the volume
+before its claim: with the root's operation lock held and the authority's
+current generation authenticated in the root, it reads that generation's
+superblock copies and refuses a configuration whose immutable settings or
+`backing.rollback_protection.capacity` differ, so a mismatched configuration
+raises no fence and creates no namespace (SPEC §20).

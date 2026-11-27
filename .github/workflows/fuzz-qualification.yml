@@ -1,0 +1,295 @@
+# The parser fuzz qualification of SPEC §56 (docs/testing.md, "Fuzz
+# qualification"): every fuzz target, or a chosen list, for a given number
+# of CPU-hours on GitHub's hosted runners. Run by hand; nothing here runs on
+# a push, a pull request or a schedule. A hosted runner has 4 vCPUs and a
+# job may run 6 hours, so scripts/fuzz_campaign.py splits each target's
+# CPU-hours into shards: jobs of one libFuzzer process per vCPU on one
+# shared corpus, each fuzzing until the kernel has charged it its share of
+# CPU time. The targets are built once and every shard fuzzes that
+# build; then each target's shard corpora are merged, and the last job
+# records each target's CPU time, executions, coverage and failing inputs
+# and fails unless every target qualified.
+
+name: fuzz-qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Targets (fuzz/Cargo.toml), separated by spaces or commas, or all"
+        required: true
+        default: all
+        type: string
+      cpu_hours:
+        description: "CPU-hours per target; SPEC §56 asks 24"
+        required: true
+        default: "24"
+        type: string
+      shard_hours:
+        description: "Longest fuzzing time of one job, in hours (at most 5)"
+        required: true
+        default: "5"
+        type: string
+      max_parallel:
+        description: "Fuzzing jobs at once (at most 20, the account's limit; leave some for other CI)"
+        required: true
+        default: "16"
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# One campaign at a time: two would share the account's 20 runners.
+concurrency:
+  group: fuzz-qualification
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      targets: ${{ steps.plan.outputs.targets }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
+    steps:
+      - uses: actions/checkout@v4
+      # The inputs reach the script through the environment only.
+      - name: plan the shards
+        id: plan
+        env:
+          TARGETS: ${{ inputs.targets }}
+          CPU_HOURS: ${{ inputs.cpu_hours }}
+          SHARD_HOURS: ${{ inputs.shard_hours }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/fuzz_campaign.py plan --targets "$TARGETS" --cpu-hours "$CPU_HOURS" \
+            --shard-hours "$SHARD_HOURS" --max-parallel "$MAX_PARALLEL" > "$RUNNER_TEMP/plan.txt"
+          cat "$RUNNER_TEMP/plan.txt"
+          cat "$RUNNER_TEMP/plan.txt" >> "$GITHUB_OUTPUT"
+
+  build:
+    # The build of the fuzz job of ci.yml: the same pinned nightly and
+    # cargo-fuzz, from the workspace's lockfile. Tarred, because an
+    # artifact does not keep the executable bit.
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-24
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-qualification
+          workspaces: fuzz
+      - name: install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # fuzz/Cargo.lock is not committed: starting it from the workspace's
+      # builds the fuzzed code with the versions the workspace pins.
+      - name: build every fuzz target
+        run: |
+          cp Cargo.lock fuzz/Cargo.lock
+          cargo fuzz build
+      - name: package the planned targets
+        env:
+          TARGETS: ${{ needs.plan.outputs.targets }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/binaries"
+          mkdir -p "$out"
+          for target in $(python3 -B -c 'import json, sys; print(" ".join(json.loads(sys.argv[1])))' "$TARGETS"); do
+            cp "fuzz/target/x86_64-unknown-linux-gnu/release/$target" "$out/$target"
+          done
+          (cd "$out" && sha256sum -- * > SHA256SUMS)
+          {
+            echo "revision $GITHUB_SHA"
+            rustc --version --verbose
+            cargo fuzz --version
+            echo "runner ${ImageOS:-unknown} ${ImageVersion:-unknown}, $(nproc) vCPUs, kernel $(uname -r)"
+          } > "$out/versions.txt"
+          cat "$out/versions.txt" "$out/SHA256SUMS"
+          ls -l "$out"
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/fuzz-binaries.tar" binaries
+          mkdir -p "$RUNNER_TEMP/build-record"
+          cp "$out/SHA256SUMS" "$out/versions.txt" "$RUNNER_TEMP/build-record/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-binaries
+          path: ${{ runner.temp }}/fuzz-binaries.tar
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-build
+          path: ${{ runner.temp }}/build-record
+          if-no-files-found: error
+          retention-days: 90
+
+  fuzz:
+    needs: [plan, build]
+    name: fuzz ${{ matrix.target }} ${{ matrix.shard }}/${{ matrix.shards }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fuzz-binaries
+          path: ${{ runner.temp }}
+      - name: unpack the build
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/fuzz-binaries.tar"
+          (cd "$RUNNER_TEMP/binaries" && sha256sum --check --strict SHA256SUMS)
+          nproc
+          free -m
+      # One process per vCPU on one corpus, each in rounds until the kernel
+      # has charged it its share of CPU time, within the shard's wall
+      # time; the script stops a process that outlives its round. When
+      # GitHub interrupts the step (its time limit, a cancelled run), the
+      # runner signals the step's own process only (SIGINT, SIGTERM 7.5 s
+      # later, a kill 2.5 s after that), and bash does not hand a signal on
+      # to a command it waits for: `exec` makes the script that process.
+      # It then interrupts its fuzzers, kills one still running 2 s later
+      # and writes shard.json before the SIGTERM. A kill alone (SIGKILL)
+      # leaves no record.
+      - name: fuzz the shard
+        timeout-minutes: ${{ matrix.minutes }}
+        env:
+          TARGET: ${{ matrix.target }}
+          SHARD: ${{ matrix.shard }}
+          CPU_SECONDS: ${{ matrix.cpu_seconds }}
+          WALL_SECONDS: ${{ matrix.wall_seconds }}
+          WORKERS: ${{ matrix.workers }}
+        run: |
+          exec python3 -B scripts/fuzz_campaign.py run --binary "$RUNNER_TEMP/binaries/$TARGET" \
+            --target "$TARGET" --shard "$SHARD" --cpu-seconds "$CPU_SECONDS" \
+            --wall-seconds "$WALL_SECONDS" --workers "$WORKERS" \
+            --seeds "fuzz/seeds/$TARGET" --out "$RUNNER_TEMP/shard"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-shard-${{ matrix.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard
+          if-no-files-found: warn
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-stats-${{ matrix.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard/shard.json
+          if-no-files-found: warn
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard/artifacts
+          if-no-files-found: ignore
+          retention-days: 90
+
+  merge:
+    # Also after a shard failed: its corpus is still evidence.
+    needs: [plan, build, fuzz]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    name: merge ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fuzz-binaries
+          path: ${{ runner.temp }}
+      - name: unpack the build
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/fuzz-binaries.tar"
+          (cd "$RUNNER_TEMP/binaries" && sha256sum --check --strict SHA256SUMS)
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fuzz-shard-${{ matrix.target }}-*
+          path: ${{ runner.temp }}/shards
+      # `exec`, as for a shard: an interrupted merge stops libFuzzer's
+      # processes and writes coverage.json, marked interrupted.
+      - name: merge the seeds and the shard corpora
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          exec python3 -B scripts/fuzz_campaign.py merge --binary "$RUNNER_TEMP/binaries/$TARGET" \
+            --target "$TARGET" --seeds "fuzz/seeds/$TARGET" --shards "$RUNNER_TEMP/shards" \
+            --out "$RUNNER_TEMP/merged"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: ${{ runner.temp }}/merged
+          if-no-files-found: warn
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-coverage-${{ matrix.target }}
+          path: ${{ runner.temp }}/merged/coverage.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  summary:
+    # Whatever the other jobs did: a missing record is a target that did
+    # not qualify.
+    needs: [plan, build, fuzz, merge]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fuzz-build
+          path: ${{ runner.temp }}/build
+      - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          pattern: fuzz-stats-*
+          path: ${{ runner.temp }}/stats
+      - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          pattern: fuzz-coverage-*
+          path: ${{ runner.temp }}/coverage
+      - name: summarize the campaign
+        if: ${{ !cancelled() }}
+        env:
+          PLAN: ${{ needs.plan.outputs.plan }}
+        run: |
+          set -euo pipefail
+          status=0
+          python3 -B scripts/fuzz_campaign.py summary --plan "$PLAN" --stats "$RUNNER_TEMP/stats" \
+            --coverage "$RUNNER_TEMP/coverage" --build "$RUNNER_TEMP/build" \
+            --out "$RUNNER_TEMP/summary" || status=$?
+          cat "$RUNNER_TEMP/summary/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-qualification-summary
+          path: ${{ runner.temp }}/summary
+          if-no-files-found: warn
+          retention-days: 90

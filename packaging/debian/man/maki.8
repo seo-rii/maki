@@ -72,7 +72,10 @@ witness directory cannot be written, and every one with a remote witness, is
 read the same way, through a view that authenticates it against its witness
 as attach does and writes nothing below its root or in its witness
 directory; it asks a remote witness only to inspect, and never claims a
-writer there. That view takes the locks a writer holds shared, so there
+writer there. It asks a remote witness twice while it opens and once more
+before the command reports what it read or a failure, and the deep check
+once more before its verdict, however much it reads; an authority whose
+record changed meanwhile fails the command, and the change is reported. That view takes the locks a writer holds shared, so there
 .B "volume inspect"
 and both checks refuse a backing that a daemon holds, and one whose lock file
 is missing.

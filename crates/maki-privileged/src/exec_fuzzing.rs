@@ -26,15 +26,33 @@
 //! symbolic link to `target`, both relative to the tree's root. Paths are
 //! up to six components of up to 64 bytes, any bytes but `/` and NUL, and
 //! neither `.` nor `..`; other lines are skipped.
+//!
+//! The trees are built below the temporary directory, in a directory of the
+//! process's own (`maki-fuzz-sysfs-trees-<pid>-<nanoseconds>-<n>`), which it
+//! holds an exclusive `flock` on until it ends. Each input's tree is removed
+//! when the reader is done with it, also when the reader's frame unwinds,
+//! and, under libFuzzer, whose panic hook aborts the process on a failed
+//! assertion, by a hook of this module that runs first. The directory goes
+//! when the process exits normally (libFuzzer at its time limit). A process
+//! that ends otherwise (a timeout or the memory limit, which libFuzzer ends
+//! with `_exit`, an abort, a kill) leaves its directory, with at most the
+//! tree of the input it was reading; the next process that builds a tree
+//! removes every such directory nobody holds the lock on before it makes
+//! its own.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::lvm_preflight::{self, Device, VerifiedLvm};
 use super::{allocation, blkid_value, displaced, lv_size_of, recover, verify_filesystem_probe};
@@ -291,14 +309,121 @@ pub fn reports(data: &[u8]) -> bool {
     }
 }
 
-/// Where the trees of this process are built; one per call.
-fn scratch() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "maki-fuzz-sysfs-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+/// The start of the name of a directory that holds one process's trees.
+pub const TREES: &str = "maki-fuzz-sysfs-trees-";
+
+/// This process's directory of trees, and the lock that says it runs.
+struct Trees {
+    path: PathBuf,
+    _lock: File,
+}
+
+static PROCESS_TREES: OnceLock<Trees> = OnceLock::new();
+
+thread_local! {
+    /// The tree of the input this thread reads.
+    static CURRENT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// This process's directory of trees, made on first use (see the module's
+/// documentation).
+fn trees() -> &'static Path {
+    &PROCESS_TREES
+        .get_or_init(|| {
+            let temp = std::env::temp_dir();
+            remove_ended(&temp);
+            let trees = claim(&temp);
+            // libfuzzer-sys's hook aborts: remove the tree of the input
+            // whose reader panicked before it runs.
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = CURRENT.try_with(|current| {
+                    if let Some(tree) = current
+                        .try_borrow()
+                        .ok()
+                        .as_deref()
+                        .and_then(Option::as_ref)
+                    {
+                        let _ = std::fs::remove_dir_all(tree);
+                    }
+                });
+                previous(info);
+            }));
+            // SAFETY: `atexit` only records a function, which takes no
+            // arguments and touches nothing but this module's directory.
+            unsafe { libc::atexit(remove_at_exit) };
+            trees
+        })
+        .path
+}
+
+/// Open a directory itself, never what a link of that name points to.
+fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Remove the directories of trees below `temp` whose processes have
+/// ended: a running process holds the lock on its own.
+fn remove_ended(temp: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().as_bytes().starts_with(TREES.as_bytes()) {
+            continue;
+        }
+        let Ok(directory) = open_directory(&entry.path()) else {
+            continue;
+        };
+        if directory.try_lock().is_ok() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Make and lock this process's directory below `temp`. Another process's
+/// [`remove_ended`] may take the lock of a directory made a moment ago and
+/// remove it; then the next name is tried.
+fn claim(temp: &Path) -> Trees {
+    for attempt in 0..64 {
+        let nanoseconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let path = temp.join(format!(
+            "{TREES}{}-{nanoseconds}-{attempt}",
+            std::process::id()
+        ));
+        match DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot make {}: {error}", path.display()),
+        }
+        let Ok(lock) = open_directory(&path) else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        // Still the directory just made, not removed before the lock.
+        if let (Ok(named), Ok(held)) = (std::fs::symlink_metadata(&path), lock.metadata()) {
+            if (named.dev(), named.ino()) == (held.dev(), held.ino()) {
+                return Trees { path, _lock: lock };
+            }
+        }
+    }
+    panic!(
+        "no directory of this process's own below {}",
+        temp.display()
+    );
+}
+
+extern "C" fn remove_at_exit() {
+    if let Some(trees) = PROCESS_TREES.get() {
+        let _ = std::fs::remove_dir_all(&trees.path);
+    }
 }
 
 /// A path of the tree, if `bytes` is one.
@@ -349,6 +474,14 @@ fn build(root: &Path, spec: &[u8]) {
 /// observed. Panics where an accepted observation contradicts itself or
 /// what a later reader of the same state must accept.
 pub fn sysfs(data: &[u8]) -> bool {
+    sysfs_with(data, read)
+}
+
+/// [`sysfs`] with the reader `read` (the selector modulo 8, the mount
+/// table and the tree): the harness's tests read a tree with one that fails
+/// an assertion, as a crashing input's reader does.
+#[doc(hidden)]
+pub fn sysfs_with(data: &[u8], read: impl FnOnce(u8, &[u8], &Path) -> bool) -> bool {
     let Some((&selector, rest)) = data.split_first() else {
         return false;
     };
@@ -356,21 +489,30 @@ pub fn sysfs(data: &[u8]) -> bool {
         Some(at) => (&rest[..at], &rest[at + 1..]),
         None => (rest, &[][..]),
     };
-    let root = scratch();
-    if std::fs::create_dir(&root).is_err() {
-        return false;
-    }
-    let root = Tree(root);
-    build(&root.0, spec);
-    read(selector % 8, mounts, &root.0)
+    let tree = Tree::new();
+    build(&tree.0, spec);
+    read(selector % 8, mounts, &tree.0)
 }
 
-/// A tree this process made, removed when the reader is done with it, also
+/// The tree of one input, removed when the reader is done with it, also
 /// when one of the target's assertions fails.
 struct Tree(PathBuf);
 
+impl Tree {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = trees().join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+        if let Err(error) = std::fs::create_dir(&path) {
+            panic!("cannot make the tree {}: {error}", path.display());
+        }
+        CURRENT.with(|current| *current.borrow_mut() = Some(path.clone()));
+        Self(path)
+    }
+}
+
 impl Drop for Tree {
     fn drop(&mut self) {
+        let _ = CURRENT.try_with(|current| current.borrow_mut().take());
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
