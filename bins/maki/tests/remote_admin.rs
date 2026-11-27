@@ -46,9 +46,10 @@ struct Fixture {
     /// Set to `n`, an administrator takes the authority over, elsewhere,
     /// right after the `n`th inspection from now is answered.
     takeover_after: Arc<Mutex<Option<usize>>>,
-    /// Set to `n`, the `n`th inspection from now is answered as unavailable
-    /// (the client's "witness request failed"), and changes nothing.
-    unavailable_at: Arc<Mutex<Option<usize>>>,
+    /// Set to `[n, …]`, the `n`th inspection from now, and each other one
+    /// listed, is answered as unavailable (the client's "witness request
+    /// failed"), which changes nothing.
+    unavailable_at: Arc<Mutex<Vec<usize>>>,
     /// Where a data configuration's control socket is bound.
     sockets: tempfile::TempDir,
 }
@@ -164,7 +165,7 @@ impl Fixture {
         );
         let actions = Arc::new(Mutex::new(Vec::new()));
         let takeover_after = Arc::new(Mutex::new(None::<usize>));
-        let unavailable_at = Arc::new(Mutex::new(None::<usize>));
+        let unavailable_at = Arc::new(Mutex::new(Vec::<usize>::new()));
         let sent = actions.clone();
         let countdown = takeover_after.clone();
         let outage = unavailable_at.clone();
@@ -178,13 +179,14 @@ impl Fixture {
                 .is_some_and(|request| request.action == Action::Inspect)
             {
                 let mut outage = outage.lock().unwrap();
-                if let Some(remaining) = outage.as_mut() {
+                let due = outage.contains(&1);
+                outage.retain_mut(|remaining| {
                     *remaining -= 1;
-                    if *remaining == 0 {
-                        *outage = None;
-                        // Answered as unavailable, which stops no session.
-                        return Err(std::io::Error::other("unavailable for the test"));
-                    }
+                    *remaining > 0
+                });
+                if due {
+                    // Answered as unavailable, which stops no session.
+                    return Err(std::io::Error::other("unavailable for the test"));
                 }
             }
             let answer = state(role, request)?;
@@ -1960,7 +1962,7 @@ fn a_read_only_command_writes_its_log_once_the_authority_still_selects_what_it_r
     // The deep check's inspection before its verdict is unanswered: the
     // check fails, and its failure is reported once the authority has been
     // asked again and still selects what was read, with the log.
-    *fixture.unavailable_at.lock().unwrap() = Some(3);
+    *fixture.unavailable_at.lock().unwrap() = vec![3];
     fixture.clear();
     let failed = run(&["check", path, "--deep"]);
     let log = stderr(&failed);
@@ -1976,8 +1978,9 @@ fn a_read_only_command_writes_its_log_once_the_authority_still_selects_what_it_r
 /// dropped, and a warning says how many, when the authority does not
 /// confirm that it still selects what was read: when it changed after the
 /// open (a takeover made elsewhere right after the open's second
-/// inspection) and when its last inspection before the report could not be
-/// answered. The deep check's warning about the shard it adopts described a
+/// inspection), when its last inspection before the report could not be
+/// answered, and when a failure was met and the inspection asked before it is
+/// reported could not be answered either. The deep check's warning about the shard it adopts described a
 /// state that may no longer be the volume's, and is not written beside the
 /// error. The fast check logs nothing while it reads; what it drops is the
 /// view's own warning that it stopped, which the error repeats.
@@ -1987,7 +1990,7 @@ fn a_read_only_command_drops_its_log_when_the_authority_does_not_confirm_what_it
     let config = volume_with_an_orphan_shard(&fixture);
     let path = config.to_str().unwrap();
     // Unanswered at the last inspection before the report.
-    *fixture.unavailable_at.lock().unwrap() = Some(4);
+    *fixture.unavailable_at.lock().unwrap() = vec![4];
     fixture.clear();
     let unanswered = run(&["check", path, "--deep"]);
     let log = stderr(&unanswered);
@@ -1996,6 +1999,21 @@ fn a_read_only_command_drops_its_log_when_the_authority_does_not_confirm_what_it
     assert!(!log.contains(ADOPTING), "{log}");
     assert!(log.contains(DROPPED), "{log}");
     assert!(!String::from_utf8_lossy(&unanswered.stdout).contains("check "));
+    assert_eq!(fixture.sent(), ["inspect"; 4]);
+
+    // Unanswered before the deep verdict, which fails the check, and again
+    // when the authority is asked before that failure is reported.
+    *fixture.unavailable_at.lock().unwrap() = vec![3, 4];
+    fixture.clear();
+    let twice = run(&["check", path, "--deep"]);
+    let log = stderr(&twice);
+    assert!(!twice.status.success(), "{log}");
+    assert!(
+        log.contains("the witness could not be asked again whether it still selects what was read"),
+        "{log}"
+    );
+    assert!(!log.contains(ADOPTING), "{log}");
+    assert!(log.contains(DROPPED), "{log}");
     assert_eq!(fixture.sent(), ["inspect"; 4]);
 
     // Changed after the open.
