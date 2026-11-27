@@ -2082,8 +2082,9 @@ witness MUST be read again before every operation, and one that no longer
 selects what was read MUST stop the view. A remote authority MUST be asked
 again before the command reports anything it read, and before it reports a
 failure it met once the open had read the record twice (the open's own
-included), and a record that differs from the one the open read MUST stop the
-view and be reported instead of what was read or of the failure; it is not
+included, and one that stopped the view, such as a page that no longer
+authenticates), and a record that differs from the one the open read MUST stop
+the view and be reported instead of what was read or of the failure; it is not
 asked before every operation, as a writer's view asks it. That proves what an
 inspection before every operation proves: while the view is open its locks keep
 out every operation that changes the root, every read is authenticated against

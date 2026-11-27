@@ -34,6 +34,7 @@ use std::fmt;
 
 use super::*;
 use crate::remote_witness::{Record, Rpc};
+use crate::WitnessAnswer;
 
 use super::gc::OPERATION_LOCK;
 
@@ -49,6 +50,10 @@ struct View {
     witness: Mutex<Freshness>,
     /// Why the view stopped, recorded once.
     stopped: OnceLock<String>,
+    /// The witness's answer that stopped the view, or that it gave when it
+    /// was asked again after a stop of another kind; reported in preference
+    /// to [`Self::stopped`].
+    answered: OnceLock<String>,
     /// The shared locks that keep a writer out while the view is open.
     _locks: Vec<Box<dyn VolumeLock>>,
     /// Whether a stop is logged as a read-only session's: not for the view a
@@ -341,6 +346,7 @@ impl ReadOnlyRollbackBacking {
                 logs_stop: !matches!(witness, Freshness::BeforeClaim),
                 witness: Mutex::new(witness),
                 stopped: OnceLock::new(),
+                answered: OnceLock::new(),
                 _locks: locks,
             }),
         }
@@ -375,20 +381,65 @@ impl View {
         }
         if let Err(error) = witness.verify_current() {
             if witness.stops_view(&error) {
-                self.stop(&error);
+                self.answer(&error);
             }
             return Err(error);
         }
         Ok(())
     }
 
+    /// Ask the witness again for a caller that is about to report a failure
+    /// ([`Backing::ask_witness_again`]). A view that stopped on what it read
+    /// (a page that is missing, short or does not authenticate) asks too: its
+    /// stop says nothing about whether the witness still selects what was
+    /// read, and a witness that no longer does, or that answers so that a
+    /// session stops, becomes the view's stop reason. A view that its
+    /// witness stopped asks nothing: that answer is given already. Asking
+    /// changes nothing, and the view still holds its locks.
+    fn ask_again(&self) -> WitnessAnswer {
+        if let Some(answer) = self.answered.get() {
+            return WitnessAnswer::Stopped(answer.clone());
+        }
+        let witness = self.witness.lock();
+        match witness.verify_current() {
+            Ok(()) => WitnessAnswer::Selects,
+            Err(error) if witness.stops_view(&error) => {
+                self.answer(&error);
+                WitnessAnswer::Stopped(self.reason().unwrap_or_default())
+            }
+            Err(error) => WitnessAnswer::Unanswered(error),
+        }
+    }
+
+    /// Why the view stopped: the witness's answer if it gave one, otherwise
+    /// what stopped it.
+    fn reason(&self) -> Option<String> {
+        self.answered.get().or(self.stopped.get()).cloned()
+    }
+
+    /// Stop the view on what it read.
     fn stop(&self, cause: &dyn fmt::Display) {
         if self
             .stopped
             .set(format!("rollback session stopped: {cause}"))
             .is_ok()
-            && self.logs_stop
         {
+            self.log(cause);
+        }
+    }
+
+    /// Stop the view on its witness's answer, `cause`, which from then on is
+    /// its stop reason, also when it had stopped on what it read before.
+    fn answer(&self, cause: &dyn fmt::Display) {
+        let reason = format!("rollback session stopped: {cause}");
+        if self.answered.set(reason.clone()).is_ok() {
+            let _ = self.stopped.set(reason);
+            self.log(cause);
+        }
+    }
+
+    fn log(&self, cause: &dyn fmt::Display) {
+        if self.logs_stop {
             tracing::warn!(
                 "read-only rollback session stopped: {cause}; every operation fails until the \
                  volume is opened again against the witness"
@@ -518,8 +569,14 @@ impl Backing for ReadOnlyRollbackBacking {
     fn check_freshness(&self) -> io::Result<()> {
         self.view.ask(true)
     }
+    /// The witness's answer if it stopped the view or answered so when it
+    /// was asked again ([`Backing::ask_witness_again`]), otherwise what the
+    /// view stopped on.
     fn session_stopped(&self) -> Option<String> {
-        self.view.stopped.get().cloned()
+        self.view.reason()
+    }
+    fn ask_witness_again(&self) -> WitnessAnswer {
+        self.view.ask_again()
     }
     fn open(&self, name: &str, create: bool) -> io::Result<Arc<dyn BackingFile>> {
         validate_name(name, false)?;

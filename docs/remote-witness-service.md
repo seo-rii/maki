@@ -732,7 +732,9 @@ it reports (`check --deep` asks once more, before its verdict): `volume
 inspect` and `check` send three inspections and `check --deep` four, however
 large the volume, where the view used to send one before every backing
 operation as a writer's operations do. A command that fails once the view
-has read the record asks the authority again before it reports the failure.
+has read the record asks the authority again before it reports the failure,
+also when the failure stopped the view (a page that no longer
+authenticates).
 A record that changed since the open fails the command and is reported
 instead of what it read or of the failure; because a record never
 takes an earlier value again, one that is the same at the end was the same

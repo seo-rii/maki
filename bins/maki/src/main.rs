@@ -968,18 +968,12 @@ fn existing_backing(
 }
 
 /// Ask the witness, once everything a command reports has been read,
-/// whether it still selects what was read. A remote rollback view asks its
+/// whether it still selects what was read
+/// ([`maki_nbdkit::daemon::still_current`]): a remote rollback view asks its
 /// authority only here (one inspection, however much the command read), and
-/// a record that changed since the view was opened fails the command: what
-/// it read is then no longer the volume's current state. Any other backing
-/// answers as it answers before each of its operations. A view that has
-/// stopped is reported with the reason it stopped.
+/// a record that changed since the view was opened fails the command.
 fn still_current(backing: &dyn maki_backing::Backing) -> Result<(), String> {
-    backing.check_freshness().map_err(|error| {
-        backing
-            .session_stopped()
-            .unwrap_or_else(|| error.to_string())
-    })
+    maki_nbdkit::daemon::still_current(backing)
 }
 
 /// `error`, met after the backing was opened, as the command reports it:

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use maki_backing::{Backing, FileBacking};
+use maki_backing::{Backing, FileBacking, WitnessAnswer};
 #[cfg(target_os = "linux")]
 use maki_backing::{ReadOnlyRollbackBacking, RollbackBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
@@ -336,60 +336,64 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
     Ok(Arc::new(view))
 }
 
-/// What asking the witness of a backing that a command only reads once more
-/// says, before the command reports a failure it met after the open.
-enum AskedAgain {
-    /// Report the failure: the witness still selects what was read, or the
-    /// view had stopped already, for the reason the failure gives.
-    Failure,
-    /// The witness no longer selects what was read (the view's stop
-    /// reason): report this instead of the failure, which may describe a
-    /// state that is no longer the volume's.
-    Changed(String),
-    /// The witness could not be asked (this error).
-    Unanswered(String),
-}
-
-fn ask_again(backing: &dyn Backing) -> AskedAgain {
-    if backing.session_stopped().is_some() {
-        return AskedAgain::Failure;
-    }
-    match backing.check_freshness() {
-        Ok(()) => AskedAgain::Failure,
-        Err(error) => match backing.session_stopped() {
-            Some(stopped) => AskedAgain::Changed(stopped),
-            None => AskedAgain::Unanswered(error.to_string()),
-        },
-    }
-}
-
 /// How a command that reads a backing through [`build_backing_to_read`]
 /// reports `failure`, met after the backing was opened. A remote view asks
 /// its authority only while it opens and when asked, and a command asks it
 /// before it reports what it read (SPEC §27); it asks before it reports a
-/// failure too. If the witness no longer selects what was read, that is
-/// reported instead of the failure; if it cannot be asked, the failure is,
-/// saying so. Any other backing answers as it answers before each of its
-/// operations, and the failure is reported as it is.
+/// failure too ([`Backing::ask_witness_again`]), also when the failure
+/// stopped the view (a page that no longer authenticates). If the witness no
+/// longer selects what was read, or answered so that the view stopped (a
+/// denial, an invalid answer), that answer is reported instead of the
+/// failure; if it cannot be asked, the failure is, saying so. A view that
+/// stopped on what it read is reported by its stop reason, which names
+/// that. Any other backing answers as it answers before each of its
+/// operations.
 pub fn read_failure(backing: &dyn Backing, failure: String) -> String {
-    match ask_again(backing) {
-        AskedAgain::Failure => failure,
-        AskedAgain::Changed(change) => change,
-        AskedAgain::Unanswered(error) => unanswered(&failure, &error),
+    match backing.ask_witness_again() {
+        WitnessAnswer::Selects => backing.session_stopped().unwrap_or(failure),
+        WitnessAnswer::Stopped(reason) => reason,
+        WitnessAnswer::Unanswered(error) => unanswered(
+            &backing.session_stopped().unwrap_or(failure),
+            &error.to_string(),
+        ),
+    }
+}
+
+/// Whether the witness still selects what a command read through a backing
+/// that [`build_backing_to_read`] opened, asked once the command has read
+/// everything it reports, before it reports (SPEC §27): one inspection of a
+/// remote authority, however much was read. A record that changed since the
+/// view was opened fails the command, and so does a view that stopped, after
+/// its witness has been asked again as for any failure ([`read_failure`]).
+pub fn still_current(backing: &dyn Backing) -> Result<(), String> {
+    match backing.check_freshness() {
+        Ok(()) => Ok(()),
+        Err(error) => Err(match backing.session_stopped() {
+            None => error.to_string(),
+            Some(_) => read_failure(backing, error.to_string()),
+        }),
     }
 }
 
 /// [`read_failure`] for a refusal of [`build_backing_to_read`] itself.
 #[cfg(target_os = "linux")]
 fn refused_after_reading(backing: &dyn Backing, refusal: DaemonError) -> DaemonError {
-    match ask_again(backing) {
-        AskedAgain::Failure => refusal,
-        AskedAgain::Changed(change) => {
-            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, change))
+    match backing.ask_witness_again() {
+        WitnessAnswer::Selects => match backing.session_stopped() {
+            Some(reason) => {
+                DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+            }
+            None => refusal,
+        },
+        WitnessAnswer::Stopped(reason) => {
+            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
         }
-        AskedAgain::Unanswered(error) => {
-            DaemonError::Io(std::io::Error::other(unanswered(&refusal, &error)))
-        }
+        WitnessAnswer::Unanswered(error) => DaemonError::Io(std::io::Error::other(unanswered(
+            &backing
+                .session_stopped()
+                .unwrap_or_else(|| refusal.to_string()),
+            &error.to_string(),
+        ))),
     }
 }
 

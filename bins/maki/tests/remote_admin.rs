@@ -1780,8 +1780,9 @@ fn an_authority_that_changes_before_a_command_fails_is_reported_instead() {
 /// authority before the failure is reported, as every other failure is
 /// reported: an authority that changed meanwhile (a takeover made elsewhere
 /// right after the open's second inspection) is reported instead of the
-/// page's error, and one that did not leaves the page's error. Each answer
-/// costs one inspection. The view answered from its stop alone and sent
+/// page's error, and one that did not leaves the page's error, both after a
+/// failure (`read_failure`) and at the last inspection before a report
+/// (`still_current`). Each answer costs one inspection. The view answered from its stop alone and sent
 /// nothing, where a view that asked before every operation reported the
 /// change first.
 #[test]
@@ -1808,7 +1809,9 @@ fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_repor
         file.read_exact_at(&mut byte, slot * 4096).unwrap();
         file.write_all_at(&[byte[0] ^ 1], slot * 4096).unwrap();
     };
-    for changed in [true, false] {
+    // `read_failure`, as after a failure, then `still_current`, as before a
+    // report: both must ask once.
+    for (changed, last) in [(true, false), (false, false), (true, true), (false, true)] {
         if changed {
             *fixture.takeover_after.lock().unwrap() = Some(2);
         }
@@ -1827,13 +1830,29 @@ fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_repor
         );
         assert!(view.session_stopped().is_some());
         fixture.clear();
-        let reported = maki_nbdkit::daemon::read_failure(&view, error.to_string());
+        let reported = if last {
+            maki_nbdkit::daemon::still_current(&view).unwrap_err()
+        } else {
+            maki_nbdkit::daemon::read_failure(&view, error.to_string())
+        };
         let expected = if changed {
             "the remote authority changed after the backing was opened read-only"
         } else {
             "rollback arena page authentication failed"
         };
-        assert!(reported.contains(expected), "changed {changed}: {reported}");
-        assert_eq!(fixture.sent(), ["inspect"], "changed {changed}");
+        assert!(
+            reported.contains(expected),
+            "changed {changed}, last {last}: {reported}"
+        );
+        assert_eq!(
+            fixture.sent(),
+            ["inspect"],
+            "changed {changed}, last {last}"
+        );
+        // A later operation's error says only that the view stopped: the
+        // stop's reason, or the authority's answer, is reported for it.
+        let generic = "rollback session stopped; reopen against the independent witness";
+        let reported = maki_nbdkit::daemon::read_failure(&view, generic.into());
+        assert!(reported.contains(expected), "{reported}");
     }
 }

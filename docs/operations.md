@@ -425,7 +425,8 @@ everything, before it reports (and by `check --deep` once more, before its
 verdict), not before every operation: `volume inspect` and `check` send it
 three inspections and `check --deep` four, however large the volume. A
 command that fails once the view has read the record asks it again before it
-reports the failure, too. An authority that changed since the view was
+reports the failure, too, also when the failure stopped the view (a page that
+no longer authenticates). An authority that changed since the view was
 opened fails the command (`the remote authority changed after the backing
 was opened read-only`, or `… while the backing was opened read-only: run the
 command again` when the open itself failed), and that is reported instead of
