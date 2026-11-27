@@ -598,6 +598,20 @@ class Run(Fixture):
         self.assertEqual(record["failures"], [
             "process 1 ended 3 rounds in a row before half of their time"])
 
+    def test_a_round_that_ends_early_is_no_failure_once_a_later_one_makes_up_the_time(self):
+        # docs/testing.md: a round may end before its time limit; only three
+        # such rounds in a row, short of the share, fail the process.
+        os.environ.update(FAKE_MODES=json.dumps(["ok"] + ["burn"] * 12), FAKE_BURN="0.6")
+        out, record = self.run_shard(workers=1, cpu_seconds=0.5, wall_seconds=30, min_round=1)
+        worker, = record["workers"]
+        first, *later = worker["rounds"]
+        self.assertLess(first["wall_seconds"], first["seconds"] / 2)
+        self.assertLess(first["cpu_seconds"], 0.5)
+        self.assertTrue(later)
+        self.assertEqual((worker["exit"], worker["stopped"], worker["ended_early"]), (0, False, False))
+        self.assertGreaterEqual(worker["cpu_seconds"], 0.5)
+        self.assertEqual(record["failures"], [])
+
     def test_a_shard_without_seeds_is_refused(self):
         empty = self.root / "empty"
         empty.mkdir()

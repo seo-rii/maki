@@ -663,8 +663,11 @@ it, in five jobs:
    target qualified.
 
 A target qualifies when every planned shard reported, every round of
-every process ran to its time limit and exited 0, every process was charged
-its share, no process wrote a crash, timeout, out-of-memory or leak input,
+every process exited 0 and was neither stopped at its deadline nor
+interrupted, no process ended three rounds in a row before half of their
+time while it still lacked CPU time (a round may end early: the next one
+runs for the CPU time still missing), every process was charged its share,
+no process wrote a crash, timeout, out-of-memory or leak input,
 the CPU time charged to its processes reaches the requested CPU-hours, the
 merge exited 0 after one attempt without writing such an input, its
 coverage run exited 0 and printed its `INITED` line, and the shards and the
