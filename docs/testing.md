@@ -52,6 +52,9 @@ default suite, not only the release gates, after touching those structures.
 ## Automated CI
 
 The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+The parser fuzz qualification is a workflow of its own,
+[`.github/workflows/fuzz-qualification.yml`](../.github/workflows/fuzz-qualification.yml),
+which runs only when dispatched by hand ([Fuzz qualification](#fuzz-qualification)).
 
 | Tier | Trigger | Platform | Enforcement |
 |---|---|---|---|
@@ -62,7 +65,9 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 | etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
+| Big-endian seeds | Pull requests and pushes | Ubuntu, Rust 1.94.0, `s390x-unknown-linux-gnu` under `qemu-user` | The replay of every committed [fuzz seed](#fuzzing), cross-built for s390x and run under user-mode emulation, blocks |
 | Fuzzing | Scheduled run | Ubuntu, pinned nightly `nightly-2026-11-24`, `cargo-fuzz` 0.13.2 | Every [fuzz target](#fuzzing) runs for 30 seconds from its committed seeds under libFuzzer and AddressSanitizer; a crash blocks |
+| Fuzz qualification | Manual dispatch of `fuzz-qualification.yml` | Ubuntu hosted runners (4 vCPUs), the fuzzing tier's nightly and `cargo-fuzz` | Every [fuzz target](#fuzz-qualification), or a chosen list, for a given number of CPU-hours (24 by default) over several jobs; the summary fails unless every target qualified |
 
 Both platform matrices set `fail-fast: false`, so a Linux failure cannot
 cancel the Windows evidence. The pinned baseline is reproducible; latest stable
@@ -405,19 +410,31 @@ serde_json, a client that does not read back what the server sent, a
 status classified from anything but its code and allowlisted metadata, an
 identity preflight verifies that recovery refuses, a recovery proof that
 does not authorize the state it was captured from), and otherwise returns
-whether the code accepted the input. `helper_sysfs` builds each input's tree
-in a directory of its own below the temporary directory and removes it,
-also when an assertion fails in the replay (under libFuzzer a failed
-assertion aborts the process, and the crashing input's tree stays). The
-size limits of etcd's answer (256 KiB) and of the witness state it holds
-(64 KiB) lie beyond the job's 4096-byte inputs and are not exercised.
+whether the code accepted the input.
+
+`helper_sysfs` builds each input's tree in a directory of the process's
+own below the temporary directory (`maki-fuzz-sysfs-trees-<pid>-…`), on
+which the process holds an exclusive `flock` while it runs, and removes the
+tree when the reader is done with it: when the reader's frame unwinds (the
+replay) and, under libFuzzer, whose panic hook aborts the process on a
+failed assertion, in a panic hook of the target's own that runs first. A
+normal exit (libFuzzer's at its time limit) removes the directory. A
+process that ends otherwise (libFuzzer ends one at a timeout or the memory
+limit with `_exit`; an abort; a kill) leaves its directory, with at most
+the tree of the input it was reading, and the next process that builds a
+tree removes every such directory whose lock nobody holds before it makes
+its own (`fuzz/harness/tests/review_sysfs_trees.rs`). Directories named as
+before this scheme (`maki-fuzz-sysfs-<pid>-<n>`) are left alone.
 
 Each target's seeds are committed in `fuzz/seeds/<target>/`: the code's own
 encodings, or where the bytes come from another program, that program's
 output in the form it documents (nbdkit's handshake, the kernel's netlink
 answers and sysfs, etcd's JSON gateway, a provider speaking each documented
 mapping, LVM's JSON report, `blkid` and `dmsetup`), with copies cut short or
-changed. A seed's name says what
+changed. The `witness_etcd` seeds include etcd's answer at the store's
+256 KiB limit and one byte beyond it, and witness states at the 64 KiB a
+state may have, one byte beyond it and three bytes beyond it, the last a
+value whose base64 is longer than a state's can be. A seed's name says what
 the target must do with it: accept a `valid-` seed, refuse a `refused-` one,
 and only not crash on `noise-`. `fuzz/harness/tests/review_fuzz_corpus.rs`,
 in the default suite, feeds every committed seed through its target's
@@ -427,8 +444,10 @@ the generator (`fuzz/harness/src/seeds.rs`) writes. The kernel answers
 netlink in the host's byte order, and the committed `nbd_netlink` seeds are
 a little-endian host's: a big-endian host replays the seeds its generator
 makes in its own byte order instead, under the same names, and neither
-compares nor writes the committed files. After changing an encoding, write
-them again:
+compares nor writes the committed files. The `big-endian-seeds` job runs
+this replay on every change, cross-built for `s390x-unknown-linux-gnu` and
+run under `qemu-user`: user-mode emulation of s390x on the x86 runner, not
+an s390x machine or kernel. After changing an encoding, write them again:
 
 ```bash
 MAKI_FUZZ_WRITE_SEEDS=1 cargo test -p maki-fuzz-harness --test review_fuzz_corpus
@@ -438,7 +457,8 @@ The `fuzz` job runs where `nightly-gates` runs: it installs the pinned nightly
 and `cargo-fuzz`, copies the workspace's `Cargo.lock` to `fuzz/Cargo.lock`
 (which is not committed) so the fuzzed code is built with the versions the
 workspace pins, and runs every target `cargo fuzz list` names for 30 seconds
-from its seeds; a list that cannot be read or is empty fails the job. Its
+from its seeds, with the target's `-max_len` (below); a list that cannot be
+read or is empty fails the job. Its
 token may only read the repository. `fuzz/Cargo.toml` patches the vendored
 `serde_json`, `bytes`, `hyper`, `rustls` and `tungstenite` as the workspace
 does, so the fuzzed JSON decoder, HTTP client, TLS and WebSocket code are
@@ -453,12 +473,131 @@ cargo +nightly fuzz run nbd_handshake fuzz/corpus/nbd_handshake fuzz/seeds/nbd_h
   -max_len=70000 -max_total_time=600
 ```
 
-The two format targets need `-max_len=8192` (a superblock is a 4096-byte
-frame after the selector byte) and `nbd_handshake` `-max_len=70000`, beyond
-the client's 64 KiB limit. A crash's input reproduces it with
-`cargo +nightly fuzz run <target> <input>`; once the cause is fixed, commit
-it under `fuzz/seeds/<target>/` with a `valid-` or `refused-` name so the
-replay keeps it fixed.
+A target's `-max_len` is what `python3 -B scripts/fuzz_campaign.py max-len
+<target>` prints: libFuzzer's default of 4096 bytes, unless the target's
+readers check a bound on a longer input. libFuzzer neither generates an
+input longer than `-max_len` nor reads more than that of a longer seed, so
+each length lies beyond the bound and is at least the target's longest
+seed; `scripts/test_fuzz_qualification_validation.py` reads each bound from
+the Rust source and checks every committed seed against its length:
+
+| Target | `-max_len` | Bound beyond it |
+|---|---:|---|
+| `format_decoders`, `format_records` | 8,192 | A superblock: a 4096-byte frame after the selector byte |
+| `config_parse` | 70,000 | A gRPC method path of at most 65,534 bytes |
+| `nbd_handshake` | 70,000 | The client reads at most 64 KiB |
+| `nbd_netlink` | 140,000 | Up to eight datagrams of up to 16 KiB each |
+| `backing_records` | 70,000 | The remote witness state, at most 64 KiB |
+| `witness_rpc` | 70,000 | A frame of at most 64 KiB |
+| `witness_etcd` | 270,000 | etcd's answer, at most 256 KiB, with a witness state of at most 64 KiB |
+| `helper_reports` | 70,000 | LVM's report (`MAX_REPORT`), and the output of the filesystem probe and of `dmsetup info`, at most 64 KiB each |
+
+A length only lets a run get there: a run keeps a longer input only when it
+reaches code no shorter one did. Seeds reach the format targets' bound (a
+whole superblock) and cross those of `nbd_handshake`, `nbd_netlink` (a
+datagram longer than the buffer), `witness_rpc` (a frame header beyond
+64 KiB) and `witness_etcd`; no seed of `config_parse`, `backing_records` or
+`helper_reports` is as long as its bound.
+
+A crash's input reproduces it with `cargo +nightly fuzz run <target>
+<input>`; once the cause is fixed, commit it under `fuzz/seeds/<target>/`
+with a `valid-` or `refused-` name so the replay keeps it fixed.
+
+### Fuzz qualification
+
+SPEC §56 asks for 24 CPU-hours of fuzzing per parser target.
+[`.github/workflows/fuzz-qualification.yml`](../.github/workflows/fuzz-qualification.yml)
+runs such a campaign on GitHub's hosted runners when it is dispatched by
+hand, with every target or a chosen list (`targets`), the CPU-hours per
+target (`cpu_hours`, 24 by default), the longest fuzzing time of one job
+(`shard_hours`, at most 5, as a job may run 6 hours) and the number of
+fuzzing jobs at once (`max_parallel`, at most 20, the account's limit):
+
+```bash
+gh workflow run fuzz-qualification.yml --ref main \
+  -f targets=all -f cpu_hours=24 -f shard_hours=5 -f max_parallel=16
+```
+
+[`scripts/fuzz_campaign.py`](../scripts/fuzz_campaign.py) plans and records
+it, in five jobs:
+
+1. `plan` splits each target's CPU-hours into equal shares for the
+   processes of equal shards: 4 libFuzzer processes a shard, one per vCPU
+   of a hosted runner, each to be charged its share of CPU time within
+   `shard_hours` of wall time, which is at least half again the share. 24
+   CPU-hours are 2 shards of 4 processes, each charged 10,800 CPU seconds
+   (3 hours) within 18,000 seconds (5 hours).
+2. `build` builds every target once as the `fuzz` job does (the pinned
+   nightly, `cargo-fuzz` 0.13.2, AddressSanitizer, the workspace's lockfile)
+   and keeps the planned targets' binaries with their SHA-256 digests and
+   the toolchain's versions.
+3. Each `fuzz` job checks the build's digests and runs one shard: 4
+   processes of the target's binary on one corpus, from the target's seeds,
+   with the target's `-max_len`, `-timeout=25`, `-rss_limit_mb=2048` and
+   `-print_final_stats=1`, `ASAN_OPTIONS` as `cargo fuzz run` sets it and a
+   temporary directory of the shard's own on `/dev/shm`. `helper_sysfs`
+   builds a tree for every input: in a run on the host this guide was
+   written on, it was charged 36 % of its wall time with its trees on the
+   disk and 91 % on `/dev/shm`; a runner's disk was not measured. Each
+   process fuzzes in rounds on
+   the shard's corpus: the first with `-max_total_time` its share, each
+   further one as long as the CPU time it still lacks and at least a
+   minute, until the kernel has charged it its share (user and system time,
+   from `wait4`) or no round fits the wall time left. A process charged less
+   than its wall time (a target that waits for a thread of its own or for
+   the filesystem) so takes longer, not less CPU time; a process whose
+   rounds exit 0 before half of their time three times in a row is not
+   started again. A process still running 10 minutes after its round's time
+   is interrupted, and killed a minute later. When GitHub interrupts the
+   step (its time limit, a cancelled run), the runner sends the step's own
+   process SIGINT, SIGTERM 7.5 seconds later and kills it 2.5 seconds after
+   that; bash, which runs the step's script, does not hand a signal on to a
+   command it waits for, so the step `exec`s the script. The script then
+   interrupts every process at once, kills one still running 2 seconds
+   later, and writes its record, marked interrupted, before the SIGTERM; a
+   kill alone leaves no record. The job records, for each process and each round, its
+   exit, the CPU time the kernel charged it, its wall time, its seed, its
+   executions and its last coverage line; every input libFuzzer wrote (a
+   crash, a timeout, an input beyond the memory limit or a leak fails the
+   shard, and a slow unit is only listed); and what the processes left in
+   their temporary directory. A process that stopped on an input, was
+   interrupted, ended its rounds early or was charged less than its share
+   fails the shard. Its corpus and logs are
+   kept for 30 days, its record (`fuzz-stats-*`) and failing inputs
+   (`fuzz-crashes-*`) for 90.
+4. `merge` merges each target's seeds and shard corpora with `-merge=1` and
+   runs the merged corpus once (`-runs=0`), whose `INITED` line gives the
+   edges and features it covers. The corpus (`fuzz-corpus-<target>`) is
+   kept for 90 days, also after a shard failed. Interrupted like a shard's,
+   the step stops libFuzzer's processes (the merge runs one of its own) and
+   writes `coverage.json`, marked interrupted.
+5. `summary` writes a table to the run's summary and to
+   `fuzz-qualification-summary` (`summary.md`, `summary.json`), kept for 90
+   days: per target, the CPU-hours charged to its processes, their
+   process-hours, executions, the merged corpus's edges, features and size,
+   the inputs a process stopped on, and the verdict; with the revision, the
+   run, the toolchain and the runners. It fails unless every target
+   qualified.
+
+A target qualifies when every planned shard reported, every round of
+every process ran to its time limit and exited 0, every process was charged
+its share, no process wrote a crash, timeout, out-of-memory or leak input,
+the CPU time charged to its processes reaches the requested CPU-hours, the
+merge and its coverage run succeeded, and the shards and the merge ran the
+build's binary. A CPU-hour is an hour of CPU time the kernel charged to the
+target's fuzzing processes; their wall time is reported beside it. A hosted
+runner is a virtual machine on GitHub's hardware, and its vCPUs may be
+hardware threads that share cores.
+
+A campaign of all 16 targets at 24 CPU-hours is 32 shards. A process that
+is charged nearly all of its wall time is done after about 3 hours, one
+charged three quarters of it after 4; with the job's setup and uploads, a
+shard takes about 3¼ to 4¼ hours. At 16 or 20 jobs at once the shards run
+in two rounds, about 6½ to 8½ hours, and the build before them and the
+merges and the summary after them add about 45 minutes. A dispatch with
+`cpu_hours=0.1` checks the whole workflow in under an hour. No campaign has
+been run yet: [Current qualification status](#current-qualification-status)
+lists what has.
 
 ## Test model
 
@@ -775,7 +914,7 @@ Disk power-loss campaign.
 | Crash/recovery cycles | 10,000+ | Partial | 10,000 in-process seeded runs plus native FLUSH/FUA SIGKILL regressions; not 10,000 OS process crashes |
 | Endpoint failure cycles | 10,000+ | Pass in simulation | Deterministic dispatcher cycles with no failed requests or permit leaks |
 | Circuit-breaker cycles | 10,000+ | Pass in simulation | Complete open, half-open, close, and failed-probe reopen cycles |
-| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); sixteen coverage-guided `cargo-fuzz` targets in `fuzz/`: `format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`, the root helper's `nbd_handshake`, `nbd_netlink`, `helper_reports` and `helper_sysfs`, `maki-backing`'s `backing_records`, the witness's `witness_rpc` and `witness_etcd`, and the remote providers' `http_response`, `websocket_response` and `grpc_response`. Their committed seeds are replayed by the default suite, and the scheduled `fuzz` job runs each target for 30 seconds from them ([Fuzzing](#fuzzing)). Only short runs have been made, all with libFuzzer and AddressSanitizer on one core and none with a crash. On 2026-11-24, from an empty corpus: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M). Every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reached almost no image that passes one (256 covered edges); `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). On 2026-11-25, from the committed seeds: `nbd_netlink`, `backing_records` and `nbd_handshake` 12 minutes each (37M, 29M and 1.3M inputs; 357, 4,318 and 333 edges), and 150 seconds each of `format_decoders` (34M, 378 edges), `format_records` (16M, 948), `journal_scan` (32M, 169), `config_parse` (3.0M, 4,291), `endpoint_url` (1.6M, 2,312) and `probe_parsers` (2.1M, 1,024). On 2026-11-26, from the committed seeds, 4 minutes each on a shared host: `witness_rpc` (1.4M inputs, 5,133 edges), `witness_etcd` (8.2M, 2,627), `http_response` (3.8M, 3,480), `websocket_response` (8.2M, 2,302), `grpc_response` (5.3M, 2,056), `helper_reports` (8.5M, 3,750) and `helper_sysfs` (0.18M, 3,465; each input builds and removes a directory tree). A 24 CPU-hour-per-target run remains outstanding |
+| Parser fuzzing | 24 CPU-hours per target | Partial | `review_fuzz.rs` (exhaustive single-bit-flip sweep of every on-disk decoder, ~30,000 seeded mutations, config and URL fuzz) and `review_fuzz_transport.rs` (random provider responses through the HTTP parse path); sixteen coverage-guided `cargo-fuzz` targets in `fuzz/`: `format_decoders`, `format_records`, `journal_scan`, `config_parse`, `endpoint_url`, `probe_parsers`, the root helper's `nbd_handshake`, `nbd_netlink`, `helper_reports` and `helper_sysfs`, `maki-backing`'s `backing_records`, the witness's `witness_rpc` and `witness_etcd`, and the remote providers' `http_response`, `websocket_response` and `grpc_response`. Their committed seeds are replayed by the default suite, and the scheduled `fuzz` job runs each target for 30 seconds from them ([Fuzzing](#fuzzing)). Only short runs have been made, all with libFuzzer and AddressSanitizer on one core and none with a crash. On 2026-11-24, from an empty corpus: `format_decoders` 5 minutes (36M inputs), `format_records` 10 minutes (47M), `journal_scan` 5 minutes (14M) and `config_parse` 30 minutes (1.9M). Every decoder checks a CRC-32 before it reads a field, and from an empty corpus `format_decoders` reached almost no image that passes one (256 covered edges); `format_records` repairs the checksum first and requires an accepted record to survive a round trip (712 edges). On 2026-11-25, from the committed seeds: `nbd_netlink`, `backing_records` and `nbd_handshake` 12 minutes each (37M, 29M and 1.3M inputs; 357, 4,318 and 333 edges), and 150 seconds each of `format_decoders` (34M, 378 edges), `format_records` (16M, 948), `journal_scan` (32M, 169), `config_parse` (3.0M, 4,291), `endpoint_url` (1.6M, 2,312) and `probe_parsers` (2.1M, 1,024). On 2026-11-26, from the committed seeds, 4 minutes each on a shared host: `witness_rpc` (1.4M inputs, 5,133 edges), `witness_etcd` (8.2M, 2,627), `http_response` (3.8M, 3,480), `websocket_response` (8.2M, 2,302), `grpc_response` (5.3M, 2,056), `helper_reports` (8.5M, 3,750) and `helper_sysfs` (0.18M, 3,465; each input builds and removes a directory tree). A 24 CPU-hour-per-target run remains outstanding; the [fuzz qualification](#fuzz-qualification) workflow runs one on GitHub's hosted runners when dispatched |
 | Userspace nbdkit/libnbd/fio | Functional smoke | Pass on Debian 12/KVM | ABI probe, byte-identical copy, and CRC32C fio verification |
 | Kernel NBD, LVM, XFS, and fio | Functional smoke and repeated server crash | Pass on Debian 12 GCE | `448c0b2` ran two automatic nbdkit SIGKILL recoveries and one open-target cleanup failure/retry through `/dev/nbd15` and pinned single-PV/LV storage |
 | Packaged systemd lifecycle | Functional ordering and failure gates | Pass for scoped Debian 12 and 13 GCE profiles | Debian 12's installed templates recreated the daemon, attachment, workload and Docker container, withheld restart on open-LV cleanup failure, and recovered on retry; Debian 13 passed the PostgreSQL 17 crash and packaged LVM stop/start scenario |
@@ -1070,9 +1209,11 @@ Before production approval, complete its remaining coverage:
 - If using experimental rollback-protected backing, qualify its independent
   persistent witness as described [above](#experimental-rollback-backing).
 - Long-duration (24 CPU-hour-per-target) `cargo-fuzz` corpus runs (the
-  targets and their seeds are in `fuzz/`, and CI runs each for 30 seconds in
-  the scheduled tier; only short runs have been done) and long-duration
-  provider and 72-hour mixed-I/O soaks.
+  targets and their seeds are in `fuzz/`, CI runs each for 30 seconds in
+  the scheduled tier, and the [fuzz qualification](#fuzz-qualification)
+  workflow runs the campaign on hosted runners when dispatched; only short
+  runs have been done) and long-duration provider and 72-hour mixed-I/O
+  soaks.
 
 These checks are privileged, destructive, externally credentialed, or
 long-running. Run them only in explicitly authorized environments.

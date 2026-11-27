@@ -2,15 +2,18 @@
 pull-request job every script test module, the RHEL 9 job the packaged
 build, the native suites and the RPM in a RHEL 9 userspace, the kernel
 lifecycle job a whole attachment and the documented quick start on the
-runner's kernel, and the fuzz job every fuzz target from its committed
-seeds."""
+runner's kernel, the fuzz job every fuzz target from its committed seeds,
+the big-endian job the replay of those seeds on s390x, and the fuzz
+qualification workflow the CPU-hours of SPEC §56 per target, recorded."""
 
 import fnmatch
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +24,8 @@ ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 FUZZ_MANIFEST = ROOT / "fuzz" / "Cargo.toml"
 FUZZ_STEP = "run every fuzz target from its seeds"
+QUALIFICATION = ROOT / ".github" / "workflows" / "fuzz-qualification.yml"
+CAMPAIGN = ROOT / "scripts" / "fuzz_campaign.py"
 WITNESS_MANIFEST = ROOT / "crates" / "maki-witness" / "Cargo.toml"
 ETCD_GATE = ROOT / "crates" / "maki-witness" / "tests" / "etcd_ha.rs"
 ETCD_CFG = '#[cfg(all(unix, feature = "etcd-qualification"))]'
@@ -78,9 +83,17 @@ sys.exit(1)
 '''
 
 
-def step_script(name):
+def campaign():
+    """scripts/fuzz_campaign.py, which plans and records the fuzz qualification."""
+    spec = importlib.util.spec_from_file_location("fuzz_campaign", CAMPAIGN)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def step_script(name, workflow=WORKFLOW):
     """The `run` block of a workflow step, as the runner's shell receives it."""
-    step = WORKFLOW.read_text().split(f"      - name: {name}\n", 1)[1]
+    step = workflow.read_text().split(f"      - name: {name}\n", 1)[1]
     run = re.search(r"(?m)^        run: \|\n((?:          .*\n)+)", step)
     assert run is not None, f"{name} must have an executable shell block"
     return "".join(line[10:] + "\n" for line in run.group(1).splitlines())
@@ -818,6 +831,7 @@ class FuzzJob(unittest.TestCase):
         for target in ("witness_rpc", "witness_etcd", "http_response", "websocket_response",
                        "grpc_response", "helper_reports", "helper_sysfs"):
             self.assertIn(target, targets)
+        lengths = campaign()
         for failing in ("", targets[len(targets) // 2]):
             with self.subTest(failing=failing), tempfile.TemporaryDirectory(prefix="maki-ci-fuzz-") as directory:
                 root = Path(directory)
@@ -826,6 +840,8 @@ class FuzzJob(unittest.TestCase):
                 cargo = binary / "cargo"
                 cargo.write_text(FAKE_CARGO_FUZZ)
                 cargo.chmod(0o700)
+                (root / "scripts").mkdir()
+                shutil.copy(CAMPAIGN, root / "scripts" / "fuzz_campaign.py")
                 calls = root / "calls.jsonl"
                 environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
                                    FUZZ_TARGETS=json.dumps(targets), FUZZ_CALLS=str(calls),
@@ -850,6 +866,10 @@ class FuzzJob(unittest.TestCase):
                     self.assertTrue(any(re.fullmatch(r"-timeout=\d+", option) for option in options), options)
                     length = [option for option in options if option.startswith("-max_len=")]
                     self.assertEqual(len(length), 1, options)
+                    # The qualification's length: beyond the bounds the
+                    # target's readers check, and no committed seed is cut
+                    # to it (scripts/test_fuzz_qualification_validation.py).
+                    self.assertEqual(int(length[0].split("=")[1]), lengths.max_len(target), target)
                     if target in ("format_decoders", "format_records"):
                         # A superblock frame is 4096 bytes after the selector.
                         self.assertGreater(int(length[0].split("=")[1]), 4097)
@@ -880,6 +900,325 @@ class FuzzJob(unittest.TestCase):
         upload = self.step("actions/upload-artifact@v4")
         self.assertIn("if: failure()", upload)
         self.assertIn("path: fuzz/artifacts", upload)
+
+
+
+class BigEndianSeedReplay(unittest.TestCase):
+    """Every committed fuzz seed replayed on a big-endian host, s390x under
+    qemu-user, on every change: the netlink seeds are a little-endian
+    host's, and the replay of a big-endian host takes another path."""
+
+    def setUp(self):
+        self.job = jobs().get("big-endian-seeds")
+        self.assertIsNotNone(self.job, "ci.yml has no big-endian-seeds job")
+        self.steps = steps(self.job)
+        self.names = [name for name, _ in self.steps]
+
+    def step(self, name):
+        return dict(self.steps)[name]
+
+    def test_runs_on_every_change_on_the_baseline_toolchain(self):
+        self.assertNotRegex(self.job, r"(?m)^    if:")
+        self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + self.job)
+        self.assertRegex(self.job, r"(?m)^    timeout-minutes: \d+$")
+        self.assertNotIn("continue-on-error", self.job)
+        self.assertIn("          targets: s390x-unknown-linux-gnu\n",
+                      self.step("dtolnay/rust-toolchain@1.94.0"))
+        self.assertIn("key: big-endian-seeds", self.step("Swatinem/rust-cache@v2"))
+
+    def test_the_replay_is_cross_built_and_run_under_qemu(self):
+        tools = self.step("s390x cross compiler and qemu-user")
+        for package in ("gcc-s390x-linux-gnu", "libc6-dev-s390x-cross", "qemu-user"):
+            self.assertRegex(tools, rf"apt-get install [^\n]*\b{package}\b")
+        replay = self.step("replay every committed seed on s390x")
+        for line in ("CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc\n",
+                     "CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER: qemu-s390x -L /usr/s390x-linux-gnu\n",
+                     "CC_s390x_unknown_linux_gnu: s390x-linux-gnu-gcc\n"):
+            self.assertIn(line, replay)
+        self.assertIn("cargo test --locked -p maki-fuzz-harness --target s390x-unknown-linux-gnu "
+                      "--test review_fuzz_corpus", replay)
+        self.assertLess(self.names.index("s390x cross compiler and qemu-user"),
+                        self.names.index("the target is big-endian"))
+        self.assertLess(self.names.index("the target is big-endian"),
+                        self.names.index("replay every committed seed on s390x"))
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_a_target_that_is_not_big_endian_fails_the_job(self):
+        for endian, passes in (("big", True), ("little", False)):
+            with self.subTest(endian=endian), tempfile.TemporaryDirectory(prefix="maki-ci-be-") as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                for tool, text in (("rustc", f'target_arch="s390x"\ntarget_endian="{endian}"\n'),
+                                   ("qemu-s390x", "qemu-s390x version 8.2.2\n")):
+                    (binary / tool).write_text(f"#!/bin/sh\nprintf '%s' '{text}'\n")
+                    (binary / tool).chmod(0o700)
+                environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"])
+                result = subprocess.run(["bash", "-e", "-c", step_script("the target is big-endian")],
+                                        cwd=root, env=environment, capture_output=True, text=True,
+                                        timeout=10)
+                self.assertEqual(result.returncode == 0, passes, result.stdout + result.stderr)
+
+
+def qualification_jobs():
+    """Each job of the qualification workflow, by name, in order."""
+    text = QUALIFICATION.read_text().split("\njobs:\n", 1)[1]
+    return dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", text))
+
+
+def job_step_script(job, name):
+    """The `run` block of the step `name` of a job's body."""
+    step = job.split(f"      - name: {name}\n", 1)[1]
+    run = re.search(r"(?m)^        run: \|\n((?:          .*\n)+)", step)
+    assert run is not None, f"{name} must have an executable shell block"
+    return "".join(line[10:] + "\n" for line in run.group(1).splitlines())
+
+
+def run_bash(script, root, environment):
+    # The workflow's default shell: bash with -e and pipefail.
+    return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                          cwd=root, env=dict(os.environ, **environment), capture_output=True,
+                          text=True, timeout=60)
+
+
+class FuzzQualificationWorkflow(unittest.TestCase):
+    """SPEC §56's 24 CPU-hours per fuzz target, on hosted runners, dispatched
+    by hand: shards of one build, merged corpora and a recorded verdict."""
+
+    def setUp(self):
+        self.assertTrue(QUALIFICATION.is_file(), "there is no .github/workflows/fuzz-qualification.yml")
+        self.text = QUALIFICATION.read_text()
+        self.jobs = qualification_jobs()
+
+    def step(self, job, name):
+        return dict(steps(self.jobs[job]))[name]
+
+    def names(self, job):
+        return [name for name, _ in steps(self.jobs[job])]
+
+    def test_it_runs_only_when_dispatched_with_the_campaigns_inputs(self):
+        on = self.text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual(re.findall(r"(?m)^  (\w+):", on), ["workflow_dispatch"])
+        inputs = dict(re.findall(r'(?ms)^      (\w+):\n(?:        [^\n]*\n)*?        default: "?([^"\n]+)"?\n', on))
+        self.assertEqual(inputs, {"targets": "all", "cpu_hours": "24", "shard_hours": "5",
+                                  "max_parallel": "16"})
+        self.assertRegex((ROOT / "SPEC.md").read_text(), r"\nparser fuzz +24 CPU-hours / target\n")
+
+    def test_it_reads_the_repository_and_writes_nothing(self):
+        self.assertIn("\npermissions:\n  contents: read\n\n", self.text)
+        self.assertNotRegex(self.text, r"(?m)^    permissions:")
+        self.assertNotIn("secrets.", self.text)
+        self.assertIn("\ndefaults:\n  run:\n    shell: bash\n", self.text)
+        self.assertIn("\nconcurrency:\n  group: fuzz-qualification\n  cancel-in-progress: false\n",
+                      self.text)
+
+    def test_inputs_and_matrix_values_reach_the_shell_only_through_the_environment(self):
+        for job, body in self.jobs.items():
+            for name, step in steps(body):
+                run = re.search(r"(?ms)^        run: (.*?)(?=^        [\w-]+:|\Z)", step)
+                if run:
+                    with self.subTest(job=job, step=name):
+                        self.assertNotIn("${{", run.group(1))
+
+    def test_every_job_has_a_time_limit_a_hosted_runner_allows(self):
+        self.assertEqual(list(self.jobs), ["plan", "build", "fuzz", "merge", "summary"])
+        for job, body in self.jobs.items():
+            with self.subTest(job=job):
+                limit = re.search(r"(?m)^    timeout-minutes: (\d+)$", body)
+                self.assertIsNotNone(limit)
+                self.assertLessEqual(int(limit.group(1)), 360)
+                self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + body)
+                self.assertNotIn("continue-on-error", body)
+
+    def test_the_jobs_run_plan_build_fuzz_merge_summary(self):
+        needs = {job: re.search(r"(?m)^    needs: (.+)$", body) for job, body in self.jobs.items()}
+        self.assertIsNone(needs["plan"])
+        self.assertEqual({job: match.group(1) for job, match in needs.items() if match}, {
+            "build": "plan", "fuzz": "[plan, build]", "merge": "[plan, build, fuzz]",
+            "summary": "[plan, build, fuzz, merge]"})
+        # A failed shard's corpus is still merged; the summary runs whatever
+        # the other jobs did, and reports what is missing.
+        self.assertIn("    if: ${{ !cancelled() && needs.build.result == 'success' }}\n", self.jobs["merge"])
+        self.assertIn("    if: ${{ always() && needs.plan.result == 'success' }}\n", self.jobs["summary"])
+        self.assertRegex(self.jobs["plan"], r"(?m)^      (plan|matrix|targets|max_parallel): "
+                                            r"\$\{\{ steps\.plan\.outputs\.\1 \}\}$")
+        self.assertEqual(len(re.findall(r"(?m)^      (\w+): \$\{\{ steps\.plan\.outputs\.\1 \}\}$",
+                                        self.jobs["plan"])), 4)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_plan_step_hands_the_dispatched_inputs_to_the_script(self):
+        with tempfile.TemporaryDirectory(prefix="maki-ci-qualification-") as directory:
+            temp = Path(directory)
+            output = temp / "output"
+            environment = {"TARGETS": "all", "CPU_HOURS": "24", "SHARD_HOURS": "5",
+                           "MAX_PARALLEL": "16", "RUNNER_TEMP": str(temp), "GITHUB_OUTPUT": str(output)}
+            result = run_bash(job_step_script(self.jobs["plan"], "plan the shards"), ROOT, environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            plan = json.loads(outputs["plan"])
+            self.assertEqual(plan["targets"], fuzz_targets())
+            self.assertEqual(json.loads(outputs["matrix"]), plan["matrix"])
+            self.assertEqual(len(plan["matrix"]), 2 * len(fuzz_targets()))
+            self.assertEqual(outputs["max_parallel"], "16")
+            output.unlink()
+            environment["CPU_HOURS"] = "0"
+            result = run_bash(job_step_script(self.jobs["plan"], "plan the shards"), ROOT, environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists() and output.read_text(), "a refused plan wrote outputs")
+
+    def test_the_build_is_the_fuzz_jobs(self):
+        ci = dict(steps(jobs()["fuzz"]))
+        for name in ("dtolnay/rust-toolchain@master", "install pinned cargo-fuzz"):
+            with self.subTest(step=name):
+                self.assertEqual(self.step("build", name), ci[name])
+        build = self.step("build", "build every fuzz target")
+        self.assertLess(build.index("cp Cargo.lock fuzz/Cargo.lock\n"), build.index("cargo fuzz build\n"))
+        self.assertEqual(self.names("build")[-2:], ["actions/upload-artifact@v4"] * 2)
+        uploads = [step for name, step in steps(self.jobs["build"]) if name == "actions/upload-artifact@v4"]
+        self.assertIn("name: fuzz-binaries\n", uploads[0])
+        self.assertIn("name: fuzz-build\n", uploads[1])
+
+    @unittest.skipUnless(os.name == "posix", "the steps run in bash on Linux runners")
+    def test_the_planned_binaries_are_packed_with_their_digests_and_checked_unpacked(self):
+        with tempfile.TemporaryDirectory(prefix="maki-ci-qualification-") as directory:
+            root = Path(directory)
+            release = root / "fuzz/target/x86_64-unknown-linux-gnu/release"
+            release.mkdir(parents=True)
+            for target in ("format_decoders", "witness_etcd", "helper_sysfs"):
+                (release / target).write_text(f"#!/bin/sh\necho {target}\n")
+                (release / target).chmod(0o755)
+            binary = root / "bin"
+            binary.mkdir()
+            for tool, text in (("rustc", "rustc 1.102.0-nightly"), ("cargo", "cargo-fuzz 0.13.2")):
+                (binary / tool).write_text(f"#!/bin/sh\necho '{text}'\n")
+                (binary / tool).chmod(0o700)
+            temp = root / "temp"
+            temp.mkdir()
+            environment = {"PATH": str(binary) + os.pathsep + os.environ["PATH"],
+                           "TARGETS": json.dumps(["format_decoders", "witness_etcd"]),
+                           "RUNNER_TEMP": str(temp), "GITHUB_SHA": "f" * 40}
+            result = run_bash(job_step_script(self.jobs["build"], "package the planned targets"),
+                              root, environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            members = subprocess.run(["tar", "-tvf", str(temp / "fuzz-binaries.tar")],
+                                     capture_output=True, text=True, check=True).stdout
+            self.assertRegex(members, r"(?m)^-rwxr-xr-x .* binaries/witness_etcd$")
+            self.assertNotIn("helper_sysfs", members)
+            sums = (temp / "build-record" / "SHA256SUMS").read_text()
+            self.assertEqual([line.split()[1] for line in sums.splitlines()],
+                             ["format_decoders", "witness_etcd"])
+            self.assertIn("revision " + "f" * 40, (temp / "build-record" / "versions.txt").read_text())
+            # Each shard and merge unpacks and checks that build.
+            unpack = job_step_script(self.jobs["fuzz"], "unpack the build")
+            self.assertEqual(job_step_script(self.jobs["merge"], "unpack the build"),
+                             "\n".join(unpack.splitlines()[:3]) + "\n")
+            shutil.rmtree(temp / "binaries")
+            result = run_bash(unpack, root, environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(os.access(temp / "binaries" / "witness_etcd", os.X_OK))
+            (temp / "binaries" / "witness_etcd").write_text("#!/bin/sh\necho changed\n")
+            subprocess.run(["tar", "-C", str(temp), "-cf", str(temp / "fuzz-binaries.tar"), "binaries"],
+                           check=True)
+            result = run_bash(unpack, root, environment)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_each_shard_fuzzes_the_build_on_its_matrix_entry(self):
+        fuzz = self.jobs["fuzz"]
+        self.assertIn("    strategy:\n      fail-fast: false\n"
+                      "      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}\n"
+                      "      matrix:\n        include: ${{ fromJSON(needs.plan.outputs.matrix) }}\n", fuzz)
+        self.assertEqual(self.names("fuzz")[:4], ["actions/checkout@v4", "actions/download-artifact@v4",
+                                                  "unpack the build", "fuzz the shard"])
+        shard = self.step("fuzz", "fuzz the shard")
+        self.assertIn("        timeout-minutes: ${{ matrix.minutes }}\n", shard)
+        for variable, value in (("TARGET", "matrix.target"), ("SHARD", "matrix.shard"),
+                                ("CPU_SECONDS", "matrix.cpu_seconds"),
+                                ("WALL_SECONDS", "matrix.wall_seconds"), ("WORKERS", "matrix.workers")):
+            self.assertIn(f"          {variable}: ${{{{ {value} }}}}\n", shard)
+        script = job_step_script(fuzz, "fuzz the shard")
+        # The script itself is the step's process, which alone the runner
+        # signals when it interrupts the step (StepCancellation in
+        # scripts/test_fuzz_qualification_validation.py).
+        self.assertEqual(shlex.split(script.replace("\\\n", " ")), [
+            "exec", "python3", "-B", "scripts/fuzz_campaign.py", "run", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
+            "--target", "$TARGET", "--shard", "$SHARD", "--cpu-seconds", "$CPU_SECONDS",
+            "--wall-seconds", "$WALL_SECONDS", "--workers", "$WORKERS", "--seeds", "fuzz/seeds/$TARGET",
+            "--out", "$RUNNER_TEMP/shard"])
+        # Every key the step reads is in the plan's matrix entries.
+        entry = campaign().plan("journal_scan", "1", "5", "4")["matrix"][0]
+        for key in re.findall(r"\$\{\{ matrix\.(\w+) \}\}", fuzz):
+            self.assertIn(key, entry)
+        uploads = [step for name, step in steps(fuzz) if name == "actions/upload-artifact@v4"]
+        self.assertEqual(len(uploads), 3)
+        for upload, condition, name, path in (
+                (uploads[0], "always()", "fuzz-shard-${{ matrix.target }}-${{ matrix.shard }}",
+                 "${{ runner.temp }}/shard"),
+                (uploads[1], "always()", "fuzz-stats-${{ matrix.target }}-${{ matrix.shard }}",
+                 "${{ runner.temp }}/shard/shard.json"),
+                (uploads[2], "failure()", "fuzz-crashes-${{ matrix.target }}-${{ matrix.shard }}",
+                 "${{ runner.temp }}/shard/artifacts")):
+            with self.subTest(name=name):
+                self.assertIn(f"        if: {condition}\n", upload)
+                self.assertIn(f"          name: {name}\n", upload)
+                self.assertIn(f"          path: {path}\n", upload)
+
+    def test_each_targets_shard_corpora_are_merged_with_its_seeds(self):
+        merge = self.jobs["merge"]
+        self.assertIn("      matrix:\n        target: ${{ fromJSON(needs.plan.outputs.targets) }}\n", merge)
+        self.assertIn("          pattern: fuzz-shard-${{ matrix.target }}-*\n", merge)
+        script = job_step_script(merge, "merge the seeds and the shard corpora")
+        self.assertEqual(shlex.split(script.replace("\\\n", " ")), [
+            "exec", "python3", "-B", "scripts/fuzz_campaign.py", "merge", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
+            "--target", "$TARGET", "--seeds", "fuzz/seeds/$TARGET", "--shards", "$RUNNER_TEMP/shards",
+            "--out", "$RUNNER_TEMP/merged"])
+        uploads = [step for name, step in steps(merge) if name == "actions/upload-artifact@v4"]
+        self.assertEqual(len(uploads), 2)
+        for upload, name, path in ((uploads[0], "fuzz-corpus-${{ matrix.target }}", "${{ runner.temp }}/merged"),
+                                   (uploads[1], "fuzz-coverage-${{ matrix.target }}",
+                                    "${{ runner.temp }}/merged/coverage.json")):
+            self.assertIn("        if: always()\n", upload)
+            self.assertIn(f"          name: {name}\n", upload)
+            self.assertIn(f"          path: {path}\n", upload)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_summary_is_kept_and_its_status_is_the_verdict(self):
+        summary = self.jobs["summary"]
+        for pattern in ("fuzz-stats-*", "fuzz-coverage-*"):
+            self.assertIn(f"          pattern: {pattern}\n", summary)
+        self.assertIn("          name: fuzz-build\n", summary)
+        self.assertIn("        if: ${{ !cancelled() }}\n", self.step("summary", "summarize the campaign"))
+        upload = self.step("summary", "actions/upload-artifact@v4")
+        self.assertIn("        if: always()\n", upload)
+        self.assertIn("          name: fuzz-qualification-summary\n", upload)
+        plan = campaign().plan("journal_scan", "0.001", "5", "4")
+        with tempfile.TemporaryDirectory(prefix="maki-ci-qualification-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            shutil.copy(CAMPAIGN, root / "scripts" / "fuzz_campaign.py")
+            temp = root / "temp"
+            digest = "ab" * 32
+            (temp / "build").mkdir(parents=True)
+            (temp / "build" / "SHA256SUMS").write_text(f"{digest}  journal_scan\n")
+            (temp / "stats" / "fuzz-stats-journal_scan-1").mkdir(parents=True)
+            (temp / "coverage" / "fuzz-coverage-journal_scan").mkdir(parents=True)
+            (temp / "coverage" / "fuzz-coverage-journal_scan" / "coverage.json").write_text(json.dumps({
+                "target": "journal_scan", "binary_sha256": digest, "merge_exit": 0, "coverage_exit": 0,
+                "cov": 169, "ft": 300, "inputs": 9, "bytes": 900, "seeds": 7}))
+            step_summary = temp / "step-summary.md"
+            for cpu, status in ((plan["cpu_seconds"], 0), (0.5, 1)):
+                with self.subTest(cpu=cpu):
+                    (temp / "stats" / "fuzz-stats-journal_scan-1" / "shard.json").write_text(json.dumps({
+                        "target": "journal_scan", "shard": 1, "binary_sha256": digest, "artifacts": [],
+                        "cpu_seconds": plan["cpu_seconds"], "wall_seconds": plan["wall_seconds"],
+                        "workers": [{"worker": worker, "exit": 0, "stopped": False, "cpu_seconds": cpu,
+                                     "wall_seconds": cpu, "executions": 10} for worker in range(1, 5)]}))
+                    step_summary.write_text("")
+                    result = run_bash(job_step_script(summary, "summarize the campaign"), root, {
+                        "PLAN": json.dumps(plan), "RUNNER_TEMP": str(temp),
+                        "GITHUB_STEP_SUMMARY": str(step_summary)})
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertIn("| `journal_scan` | 4,096 |", step_summary.read_text())
+                    self.assertTrue((temp / "summary" / "summary.json").is_file())
 
 
 if __name__ == "__main__":
