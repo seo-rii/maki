@@ -48,7 +48,7 @@ fn data() -> Vec<u8> {
 }
 
 fn tools_available(test: &str) -> bool {
-    for program in ["nbdkit", "nbdcopy"] {
+    for program in ["nbdkit", "nbdcopy", "timeout"] {
         let reason = match Command::new(program).arg("--version").output() {
             Ok(output) if output.status.success() => continue,
             Ok(output) => format!("`{program} --version` exited with {}", output.status),
@@ -95,14 +95,18 @@ socket = {}
 
 /// Create the volume of `raw`, then serve it with nbdkit and the plugin
 /// while `nbdcopy` writes [`data`] at its start and flushes; nbdkit exits
-/// when the copy has finished, which detaches the volume.
+/// when the copy has finished, which detaches the volume. A plugin that fails
+/// to start leaves `nbdcopy` waiting on a server that has gone, so the whole
+/// run is bounded and then killed (coreutils `timeout`), as the drain test
+/// bounds its own.
 fn write_through_nbd(directory: &Path, raw: &str) {
     maki_nbdkit::daemon::create_volume_from_config_str(raw).unwrap();
     let config = directory.join("volume.toml");
     volume_config::write(&config, raw).unwrap();
     let source = directory.join("data");
     std::fs::write(&source, data()).unwrap();
-    let output = Command::new("nbdkit")
+    let output = Command::new("timeout")
+        .args(["--kill-after=5s", "120s", "nbdkit"])
         .args(["--foreground", "--exit-with-parent", "-U", "-"])
         .arg(native_plugin::path())
         .arg(format!("config={}", config.display()))
