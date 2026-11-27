@@ -378,8 +378,9 @@ read the volume's trusted record again under it: only the record they
 disconnected may be retired, once observations under the lock show that
 nothing of its attachment remains and the device no connection (§8). A
 record that another helper retired meanwhile, which it does only when nothing
-of the attachment remains, ends the command as a success, whatever the device
-shows; one that another helper replaced (the volume attached again, possibly
+of the attachment remains, ends the command as a success, whatever connection
+the device then shows (a backend that cannot be read fails the command first,
+as above); one that another helper replaced (the volume attached again, possibly
 on the same device, whose connection under the new identifier then ends the
 wait) is kept with the attachment it names, and the command fails saying so,
 never as a disconnect that a later cleanup should finish, which would tear
