@@ -411,14 +411,22 @@ URLs from transport errors before classification and formatting, keeping query
 credentials out of those error messages. Its connector, hyper-util's as for
 gRPC, gives each address of a family a fixed share of the request `timeout`
 (reqwest's `connect_timeout`, which hyper-util divides among them), so an
-address that does not answer leaves the next one time. The WebSocket transport
-resolves the endpoint's host itself and connects straight to its addresses. As
-in the gRPC and HTTP transports' connector, the other address family starts
-300 ms after the first; unlike it, that is halfway to the deadline when less
-than 600 ms are left, each family's addresses but the last share out what is
-left of the request's attempt deadline and the last has the rest, where the
-connector gives every address a fixed share, and the last failure is reported,
-where the connector keeps a family's first. TLS (verified for the URL's host)
+address that does not answer leaves the next one time. reqwest builds that
+connector and keeps hyper-util's 300 ms before the other family, which the
+provider cannot change without a connector of its own
+([remote HTTP mapping](configuration.md#remote-http-mapping)); a `timeout`
+under 600 ms is accepted with a warning. The gRPC provider builds the same
+connector itself and sets that delay to `min(300 ms, timeout / 2)`. The
+WebSocket transport resolves the endpoint's host itself and connects straight
+to its addresses. Its other address family starts 300 ms after the first, or
+halfway to the deadline when less than 600 ms are left when the dial begins
+(the gRPC connector's delay is half of its whole `timeout` when that is under
+600 ms, fixed when the provider is built, and the HTTP one's stays at
+300 ms). Each family's
+addresses but the last share out what is left of the request's attempt
+deadline and the last has the rest, where the connector gives every address a
+fixed share, and the last failure is reported, where the connector keeps a
+family's first. TLS (verified for the URL's host)
 and the upgrade run on the first connection made, and the other attempt is
 dropped. Each WebSocket connection generation
 owns both reader and writer futures in one task. Timeout, request cancellation,

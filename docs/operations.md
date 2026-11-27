@@ -256,9 +256,12 @@ both values. The check loads no provider credential and contacts no provider
 authority), so attach alone finds a different key under the same name (the key
 canary), a credential that is unavailable or does not fit the provider, a
 provider that fails its self-test, endpoints that are unreachable or not
-interchangeable, and the memory and swap checks. `maki-check <root>` reads no
-configuration and compares none. `maki volume inspect` reports what the volume
-stores and does not compare the geometry or crypto identity with the
+interchangeable, and the memory and swap checks. A valid configuration that
+serves badly passes with a `warning:` line, which `maki volume create` prints
+too and attach logs: an HTTP provider `timeout` under 600 ms, named in the line
+([remote HTTP mapping](configuration.md#remote-http-mapping)).
+`maki-check <root>` reads no configuration and compares none. `maki volume
+inspect` reports what the volume stores and does not compare the geometry or crypto identity with the
 configuration; like the check, it stops on a protected backing whose
 `backing.rollback_protection.capacity` differs.
 

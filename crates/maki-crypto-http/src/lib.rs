@@ -997,7 +997,11 @@ impl HttpCryptoProvider {
         // never lets a connect outlast its request; a connect that hyper-
         // util finishes in the background for its pool ends at this bound
         // as well. The other family still starts after hyper-util's fixed
-        // 300 ms, which reqwest 0.12 does not expose.
+        // 300 ms, which reqwest (0.12.28, and 0.13.5 too) does not expose
+        // and neither a resolver nor a connector layer can shorten; a
+        // shorter connect timeout would, but would also cut a host's only
+        // address and the TLS handshake (docs/configuration.md, remote HTTP
+        // mapping).
         let tls = client_tls_config(spec.tls.as_ref())?;
         let client = reqwest::Client::builder()
             .timeout(spec.timeout)
