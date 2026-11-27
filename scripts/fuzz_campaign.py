@@ -94,16 +94,26 @@ MAX_JOBS = 256
 # minute later.
 GRACE_SECONDS = 600
 KILL_AFTER_SECONDS = 60
+# When GitHub interrupts the step (its time limit, a cancelled run), the
+# runner sends the step's process SIGINT, then SIGTERM 7.5 s later and kills
+# it 2.5 s after that (actions/runner, ProcessInvoker.cs). The workflow
+# execs this script as the step's process. It then interrupts every
+# libFuzzer process at once, kills one still running this long after, and
+# writes its record well before the SIGTERM.
+INTERRUPT_KILL_AFTER_SECONDS = 2
+# A round that exits 0 before half of its time (libFuzzer runs to
+# -max_total_time) is not followed by more than this many such rounds.
+MAX_EARLY_ROUNDS = 3
 # The prefixes of the inputs libFuzzer writes when it stops on one: a crash
 # (a panic, an abort or a sanitizer report), an input that ran longer than
 # -timeout, one that took more memory than -rss_limit_mb, a leak.
 # `slow-unit-` inputs are only reported.
 FAILING_ARTIFACTS = ("crash", "timeout", "oom", "leak")
 # The processes' temporary directory goes on this memory filesystem where
-# there is one: helper_sysfs builds a directory tree for every input, which
-# on the runner's disk leaves a process waiting on the filesystem for most
-# of its time (a local run: 36 % of its wall time on the CPU on disk, 91 %
-# on /dev/shm, with twelve times the executions).
+# there is one: helper_sysfs builds a directory tree for every input. In a
+# run on the host this was written on, a process was charged 36 % of its
+# wall time with its trees on the disk and 91 % on /dev/shm, with twelve
+# times the executions; a runner's disk was not measured.
 MEMORY_TEMP = Path("/dev/shm")
 TARGET_NAME = re.compile(r"[a-z0-9_]+")
 
@@ -320,10 +330,12 @@ def run(binary, target, shard, cpu_seconds, wall_seconds, workers, seeds, out,
     # Held until every process is reaped here: a Popen object collected
     # while its process runs is reaped by the next Popen's cleanup.
     processes = {}
-    finished, interrupted = threading.Event(), threading.Event()
+    # `wake` wakes the watchdog at once when the step is interrupted.
+    finished, interrupted, wake = threading.Event(), threading.Event(), threading.Event()
     began = time.monotonic()
-    workers_records = {worker: {"worker": worker, "rounds": []}
+    workers_records = {worker: {"worker": worker, "rounds": [], "ended_early": False}
                        for worker in range(1, workers + 1)}
+    early = dict.fromkeys(workers_records, 0)
 
     def start(worker, seconds):
         rounds = workers_records[worker]["rounds"]
@@ -349,35 +361,52 @@ def run(binary, target, shard, cpu_seconds, wall_seconds, workers, seeds, out,
         if interrupted.is_set() or record["stopped"] or record["exit"] != 0:
             return None
         missing = cpu_seconds - charged(worker)
+        if missing <= 0:
+            return None
+        early[worker] = early[worker] + 1 if record["wall_seconds"] < record["seconds"] / 2 else 0
+        if early[worker] >= MAX_EARLY_ROUNDS:
+            workers_records[worker]["ended_early"] = True
+            return None
         left = math.floor(wall_seconds - (time.monotonic() - began))
         seconds = min(max(math.ceil(missing), min_round), left)
-        return seconds if missing > 0 and seconds >= min_round else None
+        return seconds if seconds >= min_round else None
 
     def watchdog():
-        # Interrupt a process past its deadline, or every process when the
-        # step is interrupted, and kill one that outlives that by kill_after.
-        while not finished.wait(poll):
+        # Interrupt a process past its deadline, and kill one that outlives
+        # that by kill_after; when the step is interrupted, interrupt every
+        # process at once and kill one that outlives that by
+        # INTERRUPT_KILL_AFTER_SECONDS.
+        hurried = set()
+        while not finished.is_set():
+            if interrupted.is_set():
+                finished.wait(0.05)
+            else:
+                wake.wait(poll)
             now = time.monotonic()
             with lock:
                 for pid, entry in live.items():
                     if not entry[3] and (interrupted.is_set() or now >= entry[2]):
                         entry[1]["stopped"] = True
-                        entry[2], entry[3] = now + kill_after, True
+                        entry[1]["stop"] = "interrupted" if interrupted.is_set() else "deadline"
+                        entry[2] = now + (INTERRUPT_KILL_AFTER_SECONDS if interrupted.is_set()
+                                          else kill_after)
+                        entry[3] = True
                         os.kill(pid, signal.SIGINT)
                     elif entry[3] and now >= entry[2]:
                         os.kill(pid, signal.SIGKILL)
+                    if interrupted.is_set() and pid not in hurried:
+                        hurried.add(pid)
+                        entry[2] = min(entry[2], now + INTERRUPT_KILL_AFTER_SECONDS)
 
-    for worker in workers_records:
-        start(worker, max(1, min(math.ceil(cpu_seconds), wall_seconds)))
-    guard = threading.Thread(target=watchdog, daemon=True)
-    guard.start()
-    previous = {sig: signal.signal(sig, lambda *_: interrupted.set())
-                for sig in (signal.SIGINT, signal.SIGTERM)}
-    try:
+    def interrupt(*_):
+        interrupted.set()
+        wake.set()
+
+    def reap():
         while True:
             with lock:
                 if not live:
-                    break
+                    return
             # Wait without reaping, so a process the watchdog signals is
             # still ours; reap it once it is no longer in `live`.
             ended = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOWAIT)
@@ -402,66 +431,92 @@ def run(binary, target, shard, cpu_seconds, wall_seconds, workers, seeds, out,
             seconds = next_round(worker, record)
             if seconds is not None:
                 start(worker, seconds)
+
+    def write():
+        for record in workers_records.values():
+            rounds = record["rounds"]
+            last = rounds[-1]
+            record.update({
+                "rounds_run": len(rounds),
+                "cpu_seconds": round(sum(entry["cpu_seconds"] for entry in rounds), 3),
+                "user_seconds": round(sum(entry["user_seconds"] for entry in rounds), 3),
+                "system_seconds": round(sum(entry["system_seconds"] for entry in rounds), 3),
+                "wall_seconds": round(sum(entry["wall_seconds"] for entry in rounds), 3),
+                "executions": sum(entry["executions"] or 0 for entry in rounds),
+                "exit": last["exit"], "signal": last["signal"],
+                "stopped": any(entry["stopped"] for entry in rounds),
+                "stop": last.get("stop"),
+                "error": next((entry["error"] for entry in rounds if entry["error"]), None),
+                "seeds": [entry["seed"] for entry in rounds],
+                "cov": last["cov"], "ft": last["ft"],
+            })
+        found = []
+        for entry in sorted(artifacts.iterdir()):
+            if entry.is_file():
+                kind = entry.name.split("-", 1)[0] if "-" in entry.name else entry.name
+                if entry.name.startswith("slow-unit-"):
+                    kind = "slow-unit"
+                found.append({"name": entry.name, "kind": kind, "bytes": entry.stat().st_size})
+        # What the processes left in their temporary directory, two levels
+        # deep: helper_sysfs removes its trees (docs/testing.md, "Fuzzing"),
+        # but a process interrupted or killed leaves its directory and the
+        # tree of the input it was reading.
+        everything = list(shard_temp.rglob("*"))
+        left = sorted(str(path.relative_to(shard_temp)) for path in everything
+                      if len(path.relative_to(shard_temp).parts) <= 2)
+        shutil.rmtree(shard_temp, ignore_errors=True)
+        inputs, size = files_in(corpus)
+        seed_inputs, seed_bytes = files_in(seeds)
+        record = {"target": target, "shard": shard, "cpu_seconds": cpu_seconds,
+                  "wall_seconds": wall_seconds, "max_len": length,
+                  "temporary_directory": str(shard_temp), "left_in_temporary_directory": left,
+                  "paths_left_in_temporary_directory": len(everything),
+                  "timeout_seconds": TIMEOUT_SECONDS, "rss_limit_mb": RSS_LIMIT_MB,
+                  "command": [Path(binary).name, "-max_total_time=<round>", *options,
+                              "corpus/", "seeds/"],
+                  "binary_sha256": sha256(binary),
+                  "seeds": {"inputs": seed_inputs, "bytes": seed_bytes},
+                  "corpus": {"inputs": inputs, "bytes": size}, "artifacts": found,
+                  "interrupted": interrupted.is_set(),
+                  "workers": list(workers_records.values()), "host": host()}
+        record["failures"] = shard_failures(record)
+        (out / "shard.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        return record
+
+    # Kept until the record is written: the runner's SIGTERM follows its
+    # SIGINT and must not end this process before then.
+    previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for worker in workers_records:
+            start(worker, max(1, min(math.ceil(cpu_seconds), wall_seconds)))
+        guard = threading.Thread(target=watchdog, daemon=True)
+        guard.start()
+        try:
+            reap()
+        finally:
+            finished.set()
+        return write()
     finally:
-        finished.set()
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    for worker, record in workers_records.items():
-        rounds = record["rounds"]
-        last = rounds[-1]
-        record.update({
-            "rounds_run": len(rounds),
-            "cpu_seconds": round(sum(entry["cpu_seconds"] for entry in rounds), 3),
-            "user_seconds": round(sum(entry["user_seconds"] for entry in rounds), 3),
-            "system_seconds": round(sum(entry["system_seconds"] for entry in rounds), 3),
-            "wall_seconds": round(sum(entry["wall_seconds"] for entry in rounds), 3),
-            "executions": sum(entry["executions"] or 0 for entry in rounds),
-            "exit": last["exit"], "signal": last["signal"],
-            "stopped": any(entry["stopped"] for entry in rounds),
-            "error": next((entry["error"] for entry in rounds if entry["error"]), None),
-            "seeds": [entry["seed"] for entry in rounds],
-            "cov": last["cov"], "ft": last["ft"],
-        })
-    found = []
-    for entry in sorted(artifacts.iterdir()):
-        if entry.is_file():
-            kind = entry.name.split("-", 1)[0] if "-" in entry.name else entry.name
-            if entry.name.startswith("slow-unit-"):
-                kind = "slow-unit"
-            found.append({"name": entry.name, "kind": kind, "bytes": entry.stat().st_size})
-    # What the processes left in their temporary directory (helper_sysfs
-    # removes its trees: docs/testing.md, "Fuzzing").
-    left = sorted(str(path.relative_to(shard_temp)) for path in shard_temp.rglob("*"))
-    shutil.rmtree(shard_temp, ignore_errors=True)
-    inputs, size = files_in(corpus)
-    seed_inputs, seed_bytes = files_in(seeds)
-    record = {"target": target, "shard": shard, "cpu_seconds": cpu_seconds,
-              "wall_seconds": wall_seconds, "max_len": length,
-              "temporary_directory": str(shard_temp), "left_in_temporary_directory": left,
-              "timeout_seconds": TIMEOUT_SECONDS, "rss_limit_mb": RSS_LIMIT_MB,
-              "command": [Path(binary).name, "-max_total_time=<round>", *options,
-                          "corpus/", "seeds/"],
-              "binary_sha256": sha256(binary), "seeds": {"inputs": seed_inputs, "bytes": seed_bytes},
-              "corpus": {"inputs": inputs, "bytes": size}, "artifacts": found,
-              "interrupted": interrupted.is_set(),
-              "workers": list(workers_records.values()), "host": host()}
-    record["failures"] = shard_failures(record)
-    (out / "shard.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-    return record
-
 
 def shard_failures(record):
     """Why a shard's processes were not all charged their share, each round
     run to its time limit, without finding an input to stop on."""
-    reasons = []
+    reasons = ["the step was interrupted"] if record.get("interrupted") else []
     for worker in record["workers"]:
-        if worker.get("stopped"):
+        if worker.get("stopped") and worker.get("stop") == "interrupted":
+            reasons.append(f"process {worker['worker']} was interrupted with the step")
+        elif worker.get("stopped"):
             reasons.append(f"process {worker['worker']} was stopped at its deadline")
         elif worker.get("exit") != 0:
             how = (f"signal {worker['signal']}" if worker.get("signal") is not None
                    else f"status {worker.get('exit')}")
             reasons.append(f"process {worker['worker']} ended with {how}"
                            + (f": {worker['error']}" if worker.get("error") else ""))
+        elif worker.get("ended_early"):
+            reasons.append(f"process {worker['worker']} ended {MAX_EARLY_ROUNDS} rounds in a row "
+                           "before half of their time")
         elif (worker.get("cpu_seconds") or 0) < record.get("cpu_seconds", 0):
             reasons.append(f"process {worker['worker']} was charged {worker['cpu_seconds']:.0f} "
                            f"of its {record['cpu_seconds']:g} CPU seconds "
@@ -470,6 +525,37 @@ def shard_failures(record):
         if artifact["kind"] in FAILING_ARTIFACTS:
             reasons.append(f"{artifact['kind']} input {artifact['name']}")
     return reasons
+
+
+def run_group(command, log_path, environment, interrupted):
+    """Run `command` in a process group of its own (libFuzzer's merge runs
+    an inner process), and when `interrupted` is set, interrupt the group
+    and kill it INTERRUPT_KILL_AFTER_SECONDS later. Returns its status."""
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, env=environment,
+                                   start_new_session=True)
+    signalled = None
+    while True:
+        try:
+            status = process.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if interrupted.is_set():
+            now = time.monotonic()
+            if signalled is None:
+                signalled = now
+                os.killpg(process.pid, signal.SIGINT)
+            elif now - signalled >= INTERRUPT_KILL_AFTER_SECONDS:
+                os.killpg(process.pid, signal.SIGKILL)
+    if interrupted.is_set():
+        # What the group's leader left of it.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return status
 
 
 def merge(binary, target, seeds, shards, out, temp=None):
@@ -487,16 +573,30 @@ def merge(binary, target, seeds, shards, out, temp=None):
     merge_temp = Path(tempfile.mkdtemp(prefix=f"maki-fuzz-merge-{target}-",
                                        dir=temp if temp is not None else temporary_root()))
     environment["TMPDIR"] = str(merge_temp)
-    with open(out / "merge.log", "wb") as log:
-        merged = subprocess.run([str(binary), "-merge=1", *limits,
-                                 f"-artifact_prefix={out / 'artifacts'}/", str(corpus),
-                                 str(seeds), *map(str, sources)],
-                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                env=environment).returncode
-    with open(out / "coverage.log", "wb") as log:
-        measured = subprocess.run([str(binary), "-runs=0", *limits, str(corpus)],
-                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                  env=environment).returncode
+    # As for a shard: the runner's SIGINT interrupts the merge, whose record
+    # is written before its SIGTERM.
+    interrupted = threading.Event()
+    previous = {sig: signal.signal(sig, lambda *_: interrupted.set())
+                for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        return merge_and_record(binary, target, seeds, out, corpus, sources, limits,
+                                environment, merge_temp, interrupted)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def merge_and_record(binary, target, seeds, out, corpus, sources, limits, environment,
+                     merge_temp, interrupted):
+    length = max_len(target)
+    merged = run_group([str(binary), "-merge=1", *limits, f"-artifact_prefix={out / 'artifacts'}/",
+                        str(corpus), str(seeds), *map(str, sources)],
+                       out / "merge.log", environment, interrupted)
+    measured = None
+    (out / "coverage.log").write_bytes(b"")
+    if not interrupted.is_set():
+        measured = run_group([str(binary), "-runs=0", *limits, str(corpus)],
+                             out / "coverage.log", environment, interrupted)
     shutil.rmtree(merge_temp, ignore_errors=True)
     found = parse_log((out / "coverage.log").read_text(errors="replace"))
     inputs, size = files_in(corpus)
@@ -506,7 +606,8 @@ def merge(binary, target, seeds, shards, out, temp=None):
               "sources": [{"shard": path.parent.name, "inputs": files_in(path)[0]}
                           for path in sources],
               "merge_exit": merged, "coverage_exit": measured, "inputs": inputs, "bytes": size,
-              "cov": found["inited_cov"], "ft": None, "error": found["error"]}
+              "cov": found["inited_cov"], "ft": None, "error": found["error"],
+              "interrupted": interrupted.is_set()}
     inited = [status for status in STATUS.findall((out / "coverage.log").read_text(errors="replace"))
               if status[1] == "INITED"]
     if inited:
@@ -517,6 +618,8 @@ def merge(binary, target, seeds, shards, out, temp=None):
 
 
 def merge_failures(record):
+    if record.get("interrupted"):
+        return ["the merge was interrupted"]
     reasons = []
     if record["merge_exit"] != 0:
         reasons.append(f"the merge ended with status {record['merge_exit']}")

@@ -158,8 +158,14 @@ jobs:
           free -m
       # One process per vCPU on one corpus, each in rounds until the kernel
       # has charged it its share of CPU time, within the shard's wall
-      # time; the script stops a process that outlives its round and
-      # writes shard.json whatever the outcome.
+      # time; the script stops a process that outlives its round. When
+      # GitHub interrupts the step (its time limit, a cancelled run), the
+      # runner signals the step's own process only (SIGINT, SIGTERM 7.5 s
+      # later, a kill 2.5 s after that), and bash does not hand a signal on
+      # to a command it waits for: `exec` makes the script that process.
+      # It then interrupts its fuzzers, kills one still running 2 s later
+      # and writes shard.json before the SIGTERM. A kill alone (SIGKILL)
+      # leaves no record.
       - name: fuzz the shard
         timeout-minutes: ${{ matrix.minutes }}
         env:
@@ -169,7 +175,7 @@ jobs:
           WALL_SECONDS: ${{ matrix.wall_seconds }}
           WORKERS: ${{ matrix.workers }}
         run: |
-          python3 -B scripts/fuzz_campaign.py run --binary "$RUNNER_TEMP/binaries/$TARGET" \
+          exec python3 -B scripts/fuzz_campaign.py run --binary "$RUNNER_TEMP/binaries/$TARGET" \
             --target "$TARGET" --shard "$SHARD" --cpu-seconds "$CPU_SECONDS" \
             --wall-seconds "$WALL_SECONDS" --workers "$WORKERS" \
             --seeds "fuzz/seeds/$TARGET" --out "$RUNNER_TEMP/shard"
@@ -221,11 +227,13 @@ jobs:
         with:
           pattern: fuzz-shard-${{ matrix.target }}-*
           path: ${{ runner.temp }}/shards
+      # `exec`, as for a shard: an interrupted merge stops libFuzzer's
+      # processes and writes coverage.json, marked interrupted.
       - name: merge the seeds and the shard corpora
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          python3 -B scripts/fuzz_campaign.py merge --binary "$RUNNER_TEMP/binaries/$TARGET" \
+          exec python3 -B scripts/fuzz_campaign.py merge --binary "$RUNNER_TEMP/binaries/$TARGET" \
             --target "$TARGET" --seeds "fuzz/seeds/$TARGET" --shards "$RUNNER_TEMP/shards" \
             --out "$RUNNER_TEMP/merged"
       - uses: actions/upload-artifact@v4
