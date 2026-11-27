@@ -10,6 +10,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use maki_privileged::nbd_kernel::fuzzing;
@@ -37,18 +38,15 @@ const GREETING: usize = 18;
 /// exactly the handshake: what follows the acknowledgement is the
 /// transmission phase, the kernel's to read. An input is accepted when the
 /// client returns an export.
+///
+/// The server is the calling thread's [`SERVER`], which it starts on its
+/// first input, not a thread per input.
 pub fn nbd_handshake(data: &[u8]) -> bool {
-    let (client, mut server) = UnixStream::pair().expect("a socket pair");
-    let sent_by_server = data.to_vec();
-    let writer = std::thread::spawn(move || {
-        // The client stops reading at its first error; the bytes it left
-        // are drained below, so this write always ends.
-        let _ = server.write_all(&sent_by_server);
-        let _ = server.shutdown(Shutdown::Write);
-        let mut request = Vec::new();
-        let _ = server.read_to_end(&mut request);
-        request
-    });
+    let (client, server) = UnixStream::pair().expect("a socket pair");
+    let (done, request) = mpsc::channel();
+    SERVER
+        .with(|inputs| inputs.send((server, data.to_vec(), done)))
+        .expect("the server thread");
     let result = negotiate(&client, Instant::now() + DEADLINE);
     let mut left = 0;
     let mut reader = &client;
@@ -62,7 +60,7 @@ pub fn nbd_handshake(data: &[u8]) -> bool {
         }
     }
     drop(client);
-    let request = writer.join().expect("the server thread");
+    let request = request.recv().expect("the server thread");
     let consumed = data.len() - left;
     assert!(
         consumed <= MAX_HANDSHAKE_BYTES,
@@ -98,6 +96,48 @@ pub fn nbd_handshake(data: &[u8]) -> bool {
         "the client did not read exactly the handshake"
     );
     true
+}
+
+/// One input for the server: its side of the socket pair, the bytes it
+/// sends, and where it hands what the client sent.
+type Input = (UnixStream, Vec<u8>, mpsc::Sender<Vec<u8>>);
+
+thread_local! {
+    /// The server side of every input this thread hands
+    /// [`nbd_handshake`]: one thread, started on the first. libFuzzer runs
+    /// millions of inputs in one process, and under AddressSanitizer the
+    /// process's memory grows with every thread it has started, also once
+    /// the thread has ended: a thread per input took all eight processes of
+    /// the target's 24 CPU-hour qualification past `-rss_limit_mb=2048`
+    /// (`tests/review_fuzz_entry_threads.rs`). A server of its own per
+    /// calling thread never makes one caller's client wait for another
+    /// caller's input. It ends once this thread has ended and dropped its
+    /// sender.
+    static SERVER: mpsc::Sender<Input> = serve();
+}
+
+/// Start a server thread: for each input, send its bytes, close the
+/// sending side, and read what the client sent until the client closes its
+/// socket.
+fn serve() -> mpsc::Sender<Input> {
+    let (inputs, received) = mpsc::channel::<Input>();
+    std::thread::Builder::new()
+        .name("nbd-handshake-server".to_string())
+        .spawn(move || {
+            for (mut server, sent_by_server, done) in received {
+                // The client stops reading at its first error; the bytes it
+                // left are drained by `nbd_handshake`, so this write always
+                // ends.
+                let _ = server.write_all(&sent_by_server);
+                let _ = server.shutdown(Shutdown::Write);
+                let mut request = Vec::new();
+                let _ = server.read_to_end(&mut request);
+                // Nobody receives it only when the caller unwound.
+                let _ = done.send(request);
+            }
+        })
+        .expect("the server thread");
+    inputs
 }
 
 /// The server's handshake flags, if `data` starts with a greeting that

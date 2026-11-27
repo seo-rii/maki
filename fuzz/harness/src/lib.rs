@@ -7,6 +7,11 @@
 //! default suite. A function panics where the code under test broke a rule
 //! (libFuzzer reports that as a crash), and otherwise returns whether the
 //! code accepted the input. [`seeds`] writes the committed seeds.
+//!
+//! A function starts no thread per input
+//! (`tests/review_fuzz_entry_threads.rs`): libFuzzer runs millions of
+//! inputs in one process, and under AddressSanitizer the process's memory
+//! grows with every thread it has started.
 
 #[cfg(target_os = "linux")]
 mod nbd;
