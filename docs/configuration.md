@@ -541,9 +541,9 @@ or less the other family is never tried when the first one does not answer,
 and below 600 ms it has `timeout` minus 300 ms, less than half. Such a
 `timeout` is accepted with a warning that names it, which `maki volume
 create` and `maki check` print and attach logs: "[crypto.http] timeout is
-300ms: under 600 ms the other address family of an endpoint's host gets less
-than half of it, and at 300 ms or less it is never tried, so a host whose
-first address family does not answer can fail every connect".
+300ms: while the first address family of an endpoint's host does not answer,
+the other family gets less than half of a timeout under 600 ms and is never
+tried at 300 ms or less, so such a host can fail every connect".
 
 Maki cannot shorten those 300 ms over HTTP. reqwest builds hyper-util's
 connector itself and never sets its other-family delay
@@ -553,8 +553,11 @@ order: the connector still splits them by family, and the first family's
 addresses together keep the whole connect timeout. A connect timeout shorter
 than `timeout` would end the first family, and so start the other, sooner,
 but it is also the bound over a host's only address and over the whole
-connect, TLS handshake included. A connector layer sees no URI and cannot make
-the connection type reqwest uses, so it can only wrap reqwest's own connect.
+connect, TLS handshake included. A connector layer can read the URI only
+through the `Debug` output of the value it is handed (`Unnameable`), cannot
+build the connection type reqwest uses (`Conn`), and cannot copy that value,
+which is not `Clone`, so all it can do is call reqwest's own connect once and
+pass its result on.
 Two clients, one for each family, raced by Maki would keep a pool each and
 could both send a request that is not retry-safe. Shortening the delay needs
 a change to reqwest, or an HTTP client built on hyper-util with a connector of

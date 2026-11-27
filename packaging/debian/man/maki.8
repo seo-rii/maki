@@ -46,8 +46,9 @@ line, which
 .B "volume create"
 prints too: an HTTP provider
 .B timeout
-under 600 ms, which leaves the other address family of an endpoint's host
-less than half of it and, at 300 ms or less, none.
+under 600 ms: while the first address family of an endpoint's host does not
+answer, that leaves the other family less than half of the timeout and, at
+300 ms or less, none.
 .PP
 .BR "volume inspect" " and " check
 first ask, on Linux, whether the user running them may write the backing
