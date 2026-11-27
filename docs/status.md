@@ -139,7 +139,9 @@ See [cache reload](operations.md#growth-and-cache-reload).
   retryable status (`grpc status Unknown`, `Cancelled` or `Unavailable`)
   counted as sent, not as a TLS authentication or protocol failure: the
   HTTP/2 library does not keep the TLS error. HTTP and WebSocket report the
-  same failures as endpoint failures
+  same failures as endpoint failures when they read the bad record or the
+  server's alert before the connection is lost; a connection reset first
+  leaves a retryable lost connection on every transport
   ([provider error signals](configuration.md#provider-error-signals)).
 - An endpoint address that does not answer still costs time on every
   connect. All three remote transports try the other address family 300 ms
