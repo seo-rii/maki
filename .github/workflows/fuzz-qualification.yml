@@ -182,8 +182,9 @@ jobs:
       # The shard's output (corpus, logs, inputs, record) as one archive:
       # upload-artifact@v4 lists a directory's files with @actions/glob,
       # which fails with "Maximum call stack size exceeded" on a directory
-      # of more than about 123,000 entries, and a 24 CPU-hour shard's corpus
-      # held up to 405,750 inputs. The upload compresses the archive. tar
+      # of more than about 123,000 entries (measured on Node 22; the action
+      # declares node20), and a 24 CPU-hour shard's corpus held up to
+      # 405,750 inputs. The upload compresses the archive. tar
       # writes an archive also when it fails (empty without the directory,
       # without a file it could not read), so the merge's name is given to
       # it only once tar succeeded.

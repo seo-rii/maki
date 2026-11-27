@@ -761,8 +761,8 @@ it, in five jobs:
    and record) is uploaded as one archive, `shard.tar` in
    `fuzz-shard-<target>-<n>`, kept for 30 days: `actions/upload-artifact@v4`
    fails with `Maximum call stack size exceeded` on a directory of more
-   than about 123,000 entries, and a 24 CPU-hour shard's corpus held up to
-   405,750 inputs. The archive takes that name only once `tar` succeeded.
+   than about 123,000 entries (measured on Node 22; the action declares
+   `node20`), and a 24 CPU-hour shard's corpus held up to 405,750 inputs. The archive takes that name only once `tar` succeeded.
    The record (`fuzz-stats-*`) and the failing inputs (`fuzz-crashes-*`)
    are also kept on their own, for 90 days.
 4. `merge` unpacks the archive of each shard the plan has, from the
@@ -773,8 +773,10 @@ it, in five jobs:
    (it is cut short, or holds anything but files and directories below
    `shard/`) or holds no corpus fails the merge (`the merge had no corpus
    of shard N`), whatever the shard's record says: the merge records the
-   shards it merged (`sources`) and why it had no corpus of the others
-   (`unmerged`). libFuzzer's merge survives an input that
+   shards it merged (`sources`, with the inputs and bytes of each corpus)
+   and why it had no corpus of the others (`unmerged`). It removes each
+   archive once it unpacked it and keeps one it did not, to be looked at.
+   libFuzzer's merge survives an input that
    fails its inner process: it writes the input to the merge's artifacts as
    a crash, timeout or out-of-memory input, runs the inner process
    again (`MERGE-OUTER: attempt 2` in its log), which leaves the input out,
@@ -803,7 +805,8 @@ runs for the CPU time still missing), every process was charged its share,
 no process wrote a crash, timeout, out-of-memory or leak input,
 the CPU time charged to its processes reaches the requested CPU-hours, the
 merge had a corpus of every planned shard (the summary reads the merge's
-`sources` against the plan) and exited 0 after one attempt without writing
+`sources` against the plan), each of the inputs and bytes its shard's record
+counted, and exited 0 after one attempt without writing
 such an input, its coverage run exited 0 and printed its `INITED` line, and
 the shards and the merge ran the build's binary. A CPU-hour is an hour of
 CPU time the kernel charged to the target's fuzzing processes; their wall

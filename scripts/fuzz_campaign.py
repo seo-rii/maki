@@ -129,9 +129,10 @@ TARGET_NAME = re.compile(r"[a-z0-9_]+")
 # shard), and the merge job the merged corpus as one archive too:
 # upload-artifact@v4 lists a directory's files with @actions/glob, which
 # spreads each directory's entries into one call and fails with "Maximum
-# call stack size exceeded" beyond about 123,000 of them, and a 24 CPU-hour
-# shard's corpus held up to 405,750 inputs. The merge job downloads each
-# shard's artifact to a directory named after it.
+# call stack size exceeded" beyond about 123,000 of them (measured on Node
+# 22; the action declares node20), and a 24 CPU-hour shard's corpus held up
+# to 405,750 inputs. The merge job downloads each shard's artifact to a
+# directory named after it.
 SHARD_ARCHIVE = "shard.tar"
 # PEP 706's filter for archives of plain data, where this Python has it
 # (3.12, and 3.11.4 and the other backports); unpack checks the members
