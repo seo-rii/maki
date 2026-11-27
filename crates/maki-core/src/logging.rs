@@ -17,9 +17,16 @@
 //! `tracing-log` bridge). Some dependencies print payload or credential bytes
 //! at their most verbose levels, so those targets are capped whatever
 //! [`LOG_ENV`] says (see `CAPPED_TARGETS`).
+//!
+//! A command can hold back what the sink writes ([`hold`]) until it may
+//! report it: `maki`'s read-only commands of a remote-protected volume write
+//! what they logged while they read only once the authority has answered
+//! that it still selects what was read (SPEC §27), and drop it otherwise.
 
 use std::ffi::OsStr;
-use std::io;
+use std::io::{self, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use tracing_subscriber::filter::{FilterExt, LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
@@ -83,7 +90,7 @@ pub fn install_default_logging() -> bool {
         .with_default(LevelFilter::TRACE)
         .with_targets(CAPPED_TARGETS);
     let layer = fmt::layer()
-        .with_writer(io::stderr)
+        .with_writer(|| Sink)
         .with_ansi(false)
         .with_target(true)
         .with_filter(filter.and(cap));
@@ -98,6 +105,145 @@ pub fn install_default_logging() -> bool {
         );
     }
     installed
+}
+
+/// The most log text [`hold`] keeps, in bytes. Lines held back beyond it are
+/// counted, not kept.
+const HELD_BYTES: usize = 16 << 20;
+
+/// Whether the sink holds back what it writes ([`hold`]). Read before
+/// [`HELD`] is locked, so a process that never holds (the plugin) writes as
+/// before; it changes only with [`HELD`] locked.
+static HOLDING: AtomicBool = AtomicBool::new(false);
+
+static HELD: Mutex<Held> = Mutex::new(Held::EMPTY);
+
+/// What the sink holds back.
+struct Held {
+    /// The text held back and kept, in the order it was written.
+    text: Vec<u8>,
+    /// The lines `text` holds.
+    lines: usize,
+    /// The lines held back and not kept, which came after `text` filled
+    /// [`HELD_BYTES`].
+    unkept: usize,
+}
+
+impl Held {
+    const EMPTY: Self = Self {
+        text: Vec::new(),
+        lines: 0,
+        unkept: 0,
+    };
+
+    /// Keep `text`, one event's lines, while it fits and nothing before it
+    /// was left out: what is written later is then everything held back up
+    /// to a point, in order.
+    fn keep(&mut self, text: &[u8]) {
+        let lines = text.iter().filter(|&&byte| byte == b'\n').count()
+            + usize::from(text.last().is_some_and(|&byte| byte != b'\n'));
+        if self.unkept == 0 && text.len() <= HELD_BYTES - self.text.len() {
+            self.text.extend_from_slice(text);
+            self.lines += lines;
+        } else {
+            self.unkept += lines;
+        }
+    }
+}
+
+fn held() -> MutexGuard<'static, Held> {
+    HELD.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The default sink's writer: stderr, or [`HELD`] while lines are held.
+/// The fmt layer formats an event and writes it with one `write_all`, so
+/// one event is held back or written whole.
+struct Sink;
+
+impl io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if HOLDING.load(Ordering::Acquire) {
+            let mut held = held();
+            // Asked again under the lock: lines released meanwhile have
+            // been written, and this one follows them.
+            if HOLDING.load(Ordering::Relaxed) {
+                held.keep(buf);
+                return Ok(buf.len());
+            }
+        }
+        io::stderr().lock().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
+
+/// Hold back the lines the default sink writes from now on, until the
+/// returned [`HeldLines`] is released or dropped, which writes them to
+/// stderr in order, or discarded. `None` while lines are held already. At
+/// most 16 MiB of text is kept: lines held back beyond it are counted, and
+/// the release says how many were not kept. Nothing changes for a process
+/// whose subscriber is not the default sink ([`install_default_logging`]).
+pub fn hold() -> Option<HeldLines> {
+    let _held = held();
+    if HOLDING.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    Some(HeldLines(()))
+}
+
+/// The lines the default sink holds back ([`hold`]). Dropping it writes
+/// them, as [`HeldLines::release`] does.
+#[must_use = "dropping it writes the held lines at once"]
+pub struct HeldLines(());
+
+impl HeldLines {
+    /// Write the held lines to stderr, in the order they were logged, and
+    /// write later lines at once again.
+    pub fn release(self) {
+        // `Drop` writes them.
+    }
+
+    /// Drop the held lines unwritten, and write later lines at once again.
+    /// Returns how many lines were held back, kept or not.
+    pub fn discard(self) -> usize {
+        std::mem::forget(self);
+        end(false)
+    }
+}
+
+impl Drop for HeldLines {
+    fn drop(&mut self) {
+        end(true);
+    }
+}
+
+/// Stop holding: write what was kept to stderr where `write`, before any
+/// line logged after it, and return how many lines were held back.
+fn end(write: bool) -> usize {
+    let mut held = held();
+    let Held {
+        text,
+        lines,
+        unkept,
+    } = std::mem::replace(&mut *held, Held::EMPTY);
+    if write {
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(&text);
+        let _ = stderr.flush();
+    }
+    HOLDING.store(false, Ordering::Release);
+    drop(held);
+    if write && unkept > 0 {
+        tracing::warn!(
+            lines = unkept,
+            "log lines held back beyond {} MiB of log text were not kept",
+            HELD_BYTES >> 20
+        );
+    }
+    lines + unkept
 }
 
 /// Parse a [`LOG_ENV`] value: `Ok(None)` when it holds no directive (empty),
@@ -329,6 +475,87 @@ mod tests {
             );
             assert!(!stderr.contains(REFUSED), "MAKI_LOG={value:?}:\n{stderr}");
         }
+    }
+
+    #[test]
+    fn child_holds_lines() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        assert!(super::install_default_logging());
+        tracing::warn!("logged before the hold");
+        let held = super::hold().unwrap();
+        assert!(super::hold().is_none(), "one hold at a time");
+        tracing::warn!("held, then released");
+        // Another thread's lines are held back too.
+        std::thread::spawn(|| tracing::warn!("held from another thread"))
+            .join()
+            .unwrap();
+        held.release();
+        tracing::warn!("logged after the release");
+        let held = super::hold().unwrap();
+        tracing::warn!("held, then discarded\nwith a second line");
+        assert_eq!(held.discard(), 2);
+        tracing::warn!("logged after the discard");
+        {
+            let _held = super::hold().unwrap();
+            tracing::warn!("held, then written by the drop");
+        }
+        let held = super::hold().unwrap();
+        tracing::warn!("held and kept before the bound");
+        tracing::warn!("{}", "x".repeat(super::HELD_BYTES));
+        tracing::warn!("held after the bound, not kept");
+        held.release();
+        let held = super::hold().unwrap();
+        tracing::warn!("{}", "y".repeat(super::HELD_BYTES));
+        tracing::warn!("held after the bound, then discarded");
+        assert_eq!(held.discard(), 2);
+        tracing::warn!("logged last");
+    }
+
+    /// Held lines are written at the release, after every line logged
+    /// before the hold and before every line logged after it, from any
+    /// thread; discarded ones are not written and are counted. At most
+    /// `HELD_BYTES` of text is kept, and what is not kept is counted and
+    /// said, never dropped unsaid.
+    #[test]
+    fn held_lines_are_written_in_order_at_the_release_and_counted_when_discarded() {
+        let stderr = child_stderr_of("logging::tests::child_holds_lines", None);
+        let at = |line: &str| {
+            stderr
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} is missing:\n{stderr}"))
+        };
+        let order = [
+            "logged before the hold",
+            "held, then released",
+            "logged after the release",
+            "logged after the discard",
+            "held, then written by the drop",
+            "held and kept before the bound",
+            "lines=2",
+            "logged last",
+        ]
+        .map(at);
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{stderr}");
+        assert!(at("held from another thread") > order[1], "{stderr}");
+        assert!(at("held from another thread") < order[2], "{stderr}");
+        for unwritten in [
+            "held, then discarded",
+            "with a second line",
+            "held after the bound",
+            &"x".repeat(64),
+            &"y".repeat(64),
+        ] {
+            assert!(!stderr.contains(unwritten), "{unwritten:?}:\n{stderr}");
+        }
+        assert_eq!(
+            stderr
+                .matches("log lines held back beyond 16 MiB of log text were not kept")
+                .count(),
+            1,
+            "{stderr}"
+        );
     }
 
     /// Payload-carrying targets and whether their debug output is safe.

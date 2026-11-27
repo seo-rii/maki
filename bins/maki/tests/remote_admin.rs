@@ -1815,7 +1815,9 @@ fn an_authority_that_changes_before_a_command_fails_is_reported_instead() {
 /// failure (`read_failure`) and at the last inspection before a report
 /// (`still_current`). Each answer costs one inspection. The view answered from its stop alone and sent
 /// nothing, where a view that asked before every operation reported the
-/// change first.
+/// change first. Each answer also says whether the authority still selects
+/// what was read, which decides whether the command's held-back log lines
+/// are written.
 #[test]
 fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_reported() {
     use maki_backing::ReadOnlyRollbackBacking;
@@ -1872,8 +1874,14 @@ fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_repor
             "rollback arena page authentication failed"
         };
         assert!(
-            reported.contains(expected),
+            reported.error.contains(expected),
             "changed {changed}, last {last}: {reported}"
+        );
+        // Whether what the command logged while it read may be written: the
+        // authority still selects what was read only where it did not change.
+        assert_eq!(
+            reported.witness_selects, !changed,
+            "changed {changed}, last {last}"
         );
         assert_eq!(
             fixture.sent(),
@@ -1884,7 +1892,8 @@ fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_repor
         // stop's reason, or the authority's answer, is reported for it.
         let generic = "rollback session stopped; reopen against the independent witness";
         let reported = maki_nbdkit::daemon::read_failure(&view, generic.into());
-        assert!(reported.contains(expected), "{reported}");
+        assert!(reported.error.contains(expected), "{reported}");
+        assert_eq!(reported.witness_selects, !changed, "{reported}");
     }
 }
 

@@ -450,7 +450,18 @@ no longer authenticates). An authority that changed since the view was
 opened fails the command (`the remote authority changed after the backing
 was opened read-only`, or `… while the backing was opened read-only: run the
 command again` when the open itself failed), and that is reported instead of
-what the command read or of the failure it met. That keeps what asking before every operation
+what the command read or of the failure it met. The command's log lines are
+held back the same way: what it logs once the view is open (the store's
+warnings about repairs recovery would make, such as `shard data file not
+listed by the loaded catalog copy; adopting it`, or the view's own
+`read-only rollback session stopped: …`) is written to stderr only once the
+authority has answered that it still selects what was read, before the
+report or the failure. When the authority does not confirm it (it changed,
+answered so that the view stopped, or could not be asked), the lines are
+dropped, and `warning: dropped N log lines held back since the volume was
+opened: …` says how many before the error. A command that succeeds writes
+every line it held, up to 16 MiB of log text: lines beyond that are counted
+and not kept, and a warning says how many. That keeps what asking before every operation
 proved: the view's locks keep every operation that changes the root out
 while it reads, each read is authenticated, and the authority's record
 never takes an earlier value again, so a record that is the same at the end

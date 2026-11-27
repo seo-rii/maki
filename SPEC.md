@@ -2117,7 +2117,12 @@ failure it met once the open had read the record twice (the open's own
 included, and one that stopped the view, such as a page that no longer
 authenticates), and a record that differs from the one the open read MUST stop
 the view and be reported instead of what was read or of the failure; it is not
-asked before every operation, as a writer's view asks it. That proves what an
+asked before every operation, as a writer's view asks it. What the command logs
+while it reads (a repair the store would make, a page that stopped the view) is
+a report of what it read too: those lines MUST be held back until the authority
+has answered, written once it has answered that it still selects what was read
+(also before a failure the command then reports), and otherwise dropped, with a
+line that says how many were. That proves what an
 inspection before every operation proves: while the view is open its locks keep
 out every operation that changes the root, every read is authenticated against
 the manifest, and a record never takes an earlier value again (every claim,

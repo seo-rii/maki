@@ -740,6 +740,10 @@ instead of what it read or of the failure; because a record never
 takes an earlier value again, one that is the same at the end was the same
 throughout
 ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+What the command logs while it reads (the store's warnings about repairs
+recovery would make, for example) is held back until the authority has
+answered, written once it has answered that it still selects what was read,
+and otherwise dropped, with a warning that says how many lines were.
 Its deep verdict is `unproven`. It loads the witness client's TLS identity to
 ask the authority, but no volume key, and decrypts nothing, so it does not
 replace an offline data-integrity check. A configuration whose root is a

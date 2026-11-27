@@ -75,7 +75,12 @@ directory; it asks a remote witness only to inspect, and never claims a
 writer there. It asks a remote witness twice while it opens and once more
 before the command reports what it read or a failure, and the deep check
 once more before its verdict, however much it reads; an authority whose
-record changed meanwhile fails the command, and the change is reported. That view takes the locks a writer holds shared, so there
+record changed meanwhile fails the command, and the change is reported.
+What the command logs while it reads is held back until the remote witness
+has answered: written once it still selects what was read, and otherwise
+dropped, with a
+.B "warning: dropped"
+line that counts them. That view takes the locks a writer holds shared, so there
 .B "volume inspect"
 and both checks refuse a backing that a daemon holds, and one whose lock file
 is missing. A remote root whose current namespace has no

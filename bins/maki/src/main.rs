@@ -970,28 +970,91 @@ fn existing_backing(
     maki_nbdkit::daemon::build_backing_to_read(cfg).map_err(|error| error.to_string())
 }
 
-/// Ask the witness, once everything a command reports has been read,
-/// whether it still selects what was read
-/// ([`maki_nbdkit::daemon::still_current`]): a remote rollback view asks its
-/// authority only here (one inspection, however much the command read), and
-/// a record that changed since the view was opened fails the command.
-fn still_current(backing: &dyn maki_backing::Backing) -> Result<(), String> {
-    maki_nbdkit::daemon::still_current(backing)
-}
+/// A command reading a volume whose backing it has opened, and the log
+/// lines it holds back meanwhile. With a remote witness, what the command
+/// logs while it reads (a repair the store would make, a page that stopped
+/// the view) is a report of what it read, and the authority must be asked
+/// again before the command reports anything it read (SPEC §27): the lines
+/// are written once the authority has answered that it still selects what
+/// was read, and otherwise dropped, with a warning that counts them. The
+/// view's open logs nothing, and reports its own failures only after asking.
+/// A local witness is read before every operation, and nothing is held.
+struct Reading(Option<maki_core::logging::HeldLines>);
 
-/// `error`, met after the backing was opened, as the command reports it:
-/// once the witness has been asked again, as before a report
-/// ([`maki_nbdkit::daemon::read_failure`]).
-fn read_failure(backing: &dyn maki_backing::Backing, error: impl std::fmt::Display) -> String {
-    maki_nbdkit::daemon::read_failure(backing, error.to_string())
+impl Reading {
+    fn start(cfg: &maki_format::config::VolumeConfig) -> Self {
+        let remote = cfg
+            .backing
+            .rollback_protection
+            .as_ref()
+            .is_some_and(|rollback| rollback.remote.is_some());
+        Self(if remote {
+            maki_core::logging::hold()
+        } else {
+            None
+        })
+    }
+
+    /// Ask the witness, once everything the command reports has been read,
+    /// whether it still selects what was read
+    /// ([`maki_nbdkit::daemon::still_current`]): a remote rollback view asks
+    /// its authority only here (one inspection, however much the command
+    /// read), and a record that changed since the view was opened fails the
+    /// command.
+    fn still_current(&mut self, backing: &dyn maki_backing::Backing) -> Result<(), String> {
+        match maki_nbdkit::daemon::still_current(backing) {
+            Ok(()) => {
+                self.answered(true);
+                Ok(())
+            }
+            Err(reported) => {
+                self.answered(reported.witness_selects);
+                Err(reported.error)
+            }
+        }
+    }
+
+    /// `error`, met after the backing was opened, as the command reports it:
+    /// once the witness has been asked again, as before a report
+    /// ([`maki_nbdkit::daemon::read_failure`]).
+    fn read_failure(
+        &mut self,
+        backing: &dyn maki_backing::Backing,
+        error: impl std::fmt::Display,
+    ) -> String {
+        let reported = maki_nbdkit::daemon::read_failure(backing, error.to_string());
+        self.answered(reported.witness_selects);
+        reported.error
+    }
+
+    /// Write the held lines where the witness answered that it still
+    /// selects what was read, and drop them, saying so, where it did not.
+    fn answered(&mut self, witness_selects: bool) {
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        if witness_selects {
+            held.release();
+            return;
+        }
+        let dropped = held.discard();
+        if dropped > 0 {
+            diagnostic!(
+                "warning: dropped {dropped} log line{} held back since the volume was opened: \
+                 the remote authority did not confirm that it still selects what was read",
+                if dropped == 1 { "" } else { "s" }
+            );
+        }
+    }
 }
 
 fn inspect(config: &std::path::Path) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
+    let mut reading = Reading::start(&cfg);
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
-        .map_err(|e| read_failure(backing.as_ref(), e))?;
-    still_current(backing.as_ref())?;
+        .map_err(|e| reading.read_failure(backing.as_ref(), e))?;
+    reading.still_current(backing.as_ref())?;
     let sb = envelope.superblock;
     let mut text = format!(
         "volume:        {}\n\
@@ -1045,18 +1108,19 @@ fn inspect(config: &std::path::Path) -> Result<(), String> {
 fn check(config: &str, deep: bool) -> Result<bool, String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
+    let mut reading = Reading::start(&cfg);
     let mut report = if deep {
         maki_core::check::deep_check(backing.clone(), cfg.backing.journal_segment_size.0)
-            .map_err(|e| read_failure(backing.as_ref(), e))?
+            .map_err(|e| reading.read_failure(backing.as_ref(), e))?
     } else {
         maki_format::checker::check_volume(backing.as_ref())
-            .map_err(|e| read_failure(backing.as_ref(), e))?
+            .map_err(|e| reading.read_failure(backing.as_ref(), e))?
     };
     // After the deep verdict, which describes the volume: a configuration
     // that attach refuses for it fails the check whatever the verdict says.
     maki_nbdkit::daemon::report_configuration_mismatches(&cfg, backing.as_ref(), &mut report)
-        .map_err(|e| read_failure(backing.as_ref(), e))?;
-    still_current(backing.as_ref())?;
+        .map_err(|e| reading.read_failure(backing.as_ref(), e))?;
+    reading.still_current(backing.as_ref())?;
     let mut text = String::new();
     for info in &report.info {
         text += &format!("info: {info}\n");
