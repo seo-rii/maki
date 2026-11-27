@@ -592,6 +592,30 @@ def shard_artifact(target, shard):
     return f"fuzz-shard-{target}-{shard}"
 
 
+def remove(tree, interrupted):
+    """Remove the file or directory tree `tree`, looking at `interrupted`
+    before each entry: shutil.rmtree took 46.4 s for an unpacked corpus of
+    405,750 inputs on the host this was written on. Returns whether it
+    removed it all; at an interrupt, what is left stays."""
+    tree = Path(tree)
+    if not os.path.lexists(tree):
+        return True
+    if tree.is_symlink() or not tree.is_dir():
+        tree.unlink()
+        return True
+    for directory, subdirectories, files in os.walk(tree, topdown=False):
+        for name in files + subdirectories:
+            if interrupted.is_set():
+                return False
+            path = os.path.join(directory, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+    os.rmdir(tree)
+    return True
+
+
 def unpack(archive, directory, interrupted):
     """Unpack the shard archive `archive` into `directory`, replacing an
     earlier unpacking there. Returns None, or why it did not. It looks at
@@ -604,8 +628,12 @@ def unpack(archive, directory, interrupted):
     if not archive.is_file():
         return f"no {name}"
     unpacked = directory / "shard"
-    shutil.rmtree(unpacked, ignore_errors=True)
     stopped = "the merge was interrupted while it unpacked it"
+    try:
+        if not remove(unpacked, interrupted):
+            return stopped
+    except OSError as error:
+        return f"{name}: an earlier unpacking of it could not be removed: {error}"
     try:
         with tarfile.open(archive, "r:") as handle:
             members = []
@@ -628,7 +656,10 @@ def unpack(archive, directory, interrupted):
                     return stopped
                 handle.extract(member, directory, **EXTRACT)
     except (tarfile.TarError, OSError) as error:
-        shutil.rmtree(unpacked, ignore_errors=True)
+        try:
+            remove(unpacked, interrupted)
+        except OSError:
+            pass
         return f"{name} does not unpack: {error}"
     return None
 
@@ -636,9 +667,13 @@ def unpack(archive, directory, interrupted):
 def shard_corpora(shards, target, planned, interrupted=None):
     """Unpack the archive of each of the `planned` shards of `target`, which
     the merge job downloads to shards/<shard_artifact>/SHARD_ARCHIVE, into
-    the directory it was downloaded to. Returns (sources, unmerged): the
-    corpus of each shard unpacked (its shard, artifact, path and inputs),
-    and each planned shard without one, with why."""
+    the directory it was downloaded to, and remove each archive it unpacked:
+    a shard of 405,750 inputs takes 657 MB packed beside its 1.69 GB
+    unpacked on the runner's disk. An archive it did not unpack is kept, to
+    be looked at. Returns (sources, unmerged): the corpus of each shard
+    unpacked (its shard, artifact, path, and its inputs and bytes as `run`
+    counts them in the shard's record), and each planned shard without one,
+    with why."""
     interrupted = interrupted or threading.Event()
     sources, unmerged = [], []
     for shard in range(1, planned + 1):
@@ -652,8 +687,12 @@ def shard_corpora(shards, target, planned, interrupted=None):
         if why is None and not corpus.is_dir():
             why = f"{artifact}/{SHARD_ARCHIVE} holds no shard/corpus"
         if why is None:
+            # 2.4 s for 405,750 inputs here, within the 10 s an interrupt
+            # leaves.
+            inputs, size = files_in(corpus)
+            (directory / SHARD_ARCHIVE).unlink()
             sources.append({"shard": shard, "artifact": artifact, "path": corpus,
-                            "inputs": files_in(corpus)[0]})
+                            "inputs": inputs, "bytes": size})
         else:
             unmerged.append({"shard": shard, "artifact": artifact, "why": why})
     return sources, unmerged
@@ -709,7 +748,7 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, unmerged, plan
     seed_inputs, _ = files_in(Path(seeds))
     record = {"target": target, "max_len": length, "binary_sha256": sha256(binary),
               "seeds": seed_inputs, "planned_shards": planned,
-              "sources": [{key: source[key] for key in ("shard", "artifact", "inputs")}
+              "sources": [{key: source[key] for key in ("shard", "artifact", "inputs", "bytes")}
                           for source in sources],
               "unmerged": unmerged,
               "merge_exit": merged, "attempts": attempts,
@@ -726,16 +765,46 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, unmerged, plan
     return record
 
 
+def numbered(entry):
+    """Whether `entry` is a dict whose shard is a number (JSON's true is
+    not, though Python's True == 1)."""
+    return isinstance(entry, dict) and type(entry.get("shard")) is int
+
+
+def counted(inputs, size):
+    if type(inputs) is not int or type(size) is not int:
+        return "no count"
+    return f"{inputs:,} inputs of {size:,} bytes"
+
+
+def corpus_mismatches(result, records):
+    """Each merged source whose inputs and bytes are not those its shard's
+    record (in `records`, by shard) counted: both are files_in of the same
+    corpus, in the fuzz job once its processes ended and in the merge once
+    it unpacked the archive."""
+    reasons = []
+    for source in result.get("sources") or []:
+        record = records.get(source["shard"]) if numbered(source) else None
+        if record is None:
+            continue
+        corpus = record.get("corpus") if isinstance(record.get("corpus"), dict) else {}
+        held = (source.get("inputs"), source.get("bytes"))
+        recorded = (corpus.get("inputs"), corpus.get("bytes"))
+        if held != recorded or counted(*recorded) == "no count":
+            reasons.append(f"the merge's corpus of shard {source['shard']} held {counted(*held)}, "
+                           f"its record counted {counted(*recorded)}")
+    return reasons
+
+
 def merge_failures(record, planned):
     """Why a merge did not qualify. `planned` is the plan's number of
     shards: the merge must have merged a corpus of each of them, whatever
     the shards' records and its own say."""
     if record.get("interrupted"):
         return ["the merge was interrupted"]
-    merged = {source.get("shard") for source in record.get("sources") or []
-              if isinstance(source, dict) and isinstance(source.get("shard"), int)}
-    why = {entry.get("shard"): entry.get("why") for entry in record.get("unmerged") or []
-           if isinstance(entry, dict) and isinstance(entry.get("shard"), int)}
+    merged = {source["shard"] for source in record.get("sources") or [] if numbered(source)}
+    why = {entry["shard"]: entry.get("why") for entry in record.get("unmerged") or []
+           if numbered(entry)}
     reasons = [f"the merge had no corpus of shard {shard}"
                + (f" ({why[shard]})" if isinstance(why.get(shard), str) else "")
                for shard in range(1, planned + 1) if shard not in merged]
@@ -835,6 +904,7 @@ def summarize(plan_record, stats, coverage, build=None, environment=None):
             reasons.append("no merged corpus")
         else:
             reasons.extend(merge_failures(result, plan_record["shards"]))
+            reasons.extend(corpus_mismatches(result, {record["shard"]: record for record in found}))
         used = {record["binary_sha256"] for record in found}
         if result is not None:
             used.add(result["binary_sha256"])
