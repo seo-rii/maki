@@ -790,8 +790,9 @@ class GuestPhases(unittest.TestCase):
                 self.assertEqual(words[words.index("--device") + 1], "/dev/nbd15")
                 self.assertEqual(words[words.index("--confirm-wipe") + 1], "/dev/nbd15")
         # --kill-daemon's release by hand runs dmsetup, and the capture of the
-        # helper's inputs blkid, lvm, dmsetup and blockdev. On EL9 lvm2 does
-        # not require device-mapper, which holds dmsetup; on Debian the
+        # helper's inputs blkid, lvm, dmsetup and blockdev. On EL9 lvm2 brings
+        # device-mapper, which holds dmsetup, only through lvm2-libs and
+        # device-mapper-event, so it is named; on Debian the
         # runner's --install-missing brings lvm2 and util-linux, and dmsetup
         # is named here as well.
         runner = (ROOT / "scripts" / "privileged-linux-validation.sh").read_text()

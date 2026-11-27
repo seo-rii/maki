@@ -89,7 +89,8 @@ DAEMON_DOMAIN = "unconfined_service_t"
 # The runner's tools on EL9, from BaseOS and AppStream: nbdkit-server as the
 # RPM requires it (never the nbdkit metapackage), cpio to unpack the RPM, and
 # device-mapper for dmsetup (--kill-daemon's release by hand and the capture
-# of the helper's inputs), which lvm2 does not require there.
+# of the helper's inputs): lvm2 brings it there only through lvm2-libs and
+# device-mapper-event, and it is named so the runner does not depend on that.
 EL9_RUNNER_PACKAGES = ("git-core", "fio", "libnbd", "nbdkit-server", "binutils", "sqlite",
                        "lvm2", "device-mapper", "xfsprogs", "util-linux", "kmod", "cpio",
                        "python3", "sudo")
