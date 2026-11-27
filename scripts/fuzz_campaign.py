@@ -13,9 +13,10 @@ max-len   a target's -max_len (also used by the fuzz job of ci.yml)
 run       one shard: run each of its libFuzzer processes until the kernel
           has charged it its share of CPU time, and record that time, its
           executions and coverage, and the inputs it failed on
-merge     merge a target's seeds and shard corpora into one corpus, and
-          record the coverage that corpus reaches and the inputs the merge
-          failed on
+merge     unpack the archive of each of a target's planned shards, merge
+          the seeds and those corpora into one corpus, and record the shards
+          it merged, the coverage that corpus reaches and the inputs the
+          merge failed on
 summary   every target's evidence and verdict; fails unless every target
           qualified
 
@@ -27,13 +28,14 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -122,6 +124,19 @@ MERGE_ATTEMPT = re.compile(r"^MERGE-OUTER: attempt (\d+)$", re.MULTILINE)
 # times the executions; a runner's disk was not measured.
 MEMORY_TEMP = Path("/dev/shm")
 TARGET_NAME = re.compile(r"[a-z0-9_]+")
+# The fuzz job uploads its shard's output directory (`shard`, as `run`
+# writes it) as this one tar archive in the artifact shard_artifact(target,
+# shard), and the merge job the merged corpus as one archive too:
+# upload-artifact@v4 lists a directory's files with @actions/glob, which
+# spreads each directory's entries into one call and fails with "Maximum
+# call stack size exceeded" beyond about 123,000 of them, and a 24 CPU-hour
+# shard's corpus held up to 405,750 inputs. The merge job downloads each
+# shard's artifact to a directory named after it.
+SHARD_ARCHIVE = "shard.tar"
+# PEP 706's filter for archives of plain data, where this Python has it
+# (3.12, and 3.11.4 and the other backports); unpack checks the members
+# before either way.
+EXTRACT = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
 
 STATUS = re.compile(
     r"^#(\d+)\s+(INITED|NEW|REDUCE|pulse|RELOAD|DONE)\s+cov: (\d+) ft: (\d+) corp: (\d+)/(\S+)",
@@ -573,40 +588,106 @@ def run_group(command, log_path, environment, interrupted):
     return status
 
 
-def merge(binary, target, seeds, shards, out, temp=None):
-    """Merge `seeds` and every shard corpus below `shards` into one corpus
+def shard_artifact(target, shard):
+    return f"fuzz-shard-{target}-{shard}"
+
+
+def unpack(archive, directory, interrupted):
+    """Unpack the shard archive `archive` into `directory`, replacing an
+    earlier unpacking there. Returns None, or why it did not."""
+    name = f"{directory.name}/{archive.name}"
+    if not archive.is_file():
+        return f"no {name}"
+    unpacked = directory / "shard"
+    shutil.rmtree(unpacked, ignore_errors=True)
+    try:
+        with tarfile.open(archive, "r:") as handle:
+            members = handle.getmembers()
+            # An archive ends with two zero blocks after its last member;
+            # tarfile reads one cut in a member's header as a shorter one.
+            with open(archive, "rb") as raw:
+                raw.seek(handle.offset)
+                if raw.read(2 * tarfile.BLOCKSIZE) != bytes(2 * tarfile.BLOCKSIZE):
+                    return f"{name} does not unpack: it ends before its end-of-archive marker"
+            for member in members:
+                parts = PurePosixPath(member.name).parts
+                if parts[:1] != ("shard",) or ".." in parts or not (member.isfile() or member.isdir()):
+                    return (f"{name} holds {member.name!r}, which is not a file or directory "
+                            "below shard/")
+            for member in members:
+                if interrupted.is_set():
+                    shutil.rmtree(unpacked, ignore_errors=True)
+                    return "the merge was interrupted while it unpacked it"
+                handle.extract(member, directory, **EXTRACT)
+    except (tarfile.TarError, OSError) as error:
+        shutil.rmtree(unpacked, ignore_errors=True)
+        return f"{name} does not unpack: {error}"
+    return None
+
+
+def shard_corpora(shards, target, planned, interrupted=None):
+    """Unpack the archive of each of the `planned` shards of `target`, which
+    the merge job downloads to shards/<shard_artifact>/SHARD_ARCHIVE, into
+    the directory it was downloaded to. Returns (sources, unmerged): the
+    corpus of each shard unpacked (its shard, artifact, path and inputs),
+    and each planned shard without one, with why."""
+    interrupted = interrupted or threading.Event()
+    sources, unmerged = [], []
+    for shard in range(1, planned + 1):
+        artifact = shard_artifact(target, shard)
+        directory = Path(shards) / artifact
+        if interrupted.is_set():
+            why = "the merge was interrupted before it unpacked it"
+        else:
+            why = unpack(directory / SHARD_ARCHIVE, directory, interrupted)
+        corpus = directory / "shard" / "corpus"
+        if why is None and not corpus.is_dir():
+            why = f"{artifact}/{SHARD_ARCHIVE} holds no shard/corpus"
+        if why is None:
+            sources.append({"shard": shard, "artifact": artifact, "path": corpus,
+                            "inputs": files_in(corpus)[0]})
+        else:
+            unmerged.append({"shard": shard, "artifact": artifact, "why": why})
+    return sources, unmerged
+
+
+def merge(binary, target, seeds, shards, out, planned, temp=None):
+    """Unpack the archive of each of the `planned` shards below `shards`
+    (shard_corpora), merge `seeds` and their corpora into one corpus
     (libFuzzer's -merge=1 keeps the inputs that add coverage), then run that
     corpus once to read the coverage it reaches. Returns the record, with
-    every input the merge wrote to its artifacts and the attempts it took."""
+    the shards whose corpus it merged and those it had none of, every input
+    the merge wrote to its artifacts and the attempts it took."""
+    planned = positive(planned, "planned_shards", MAX_JOBS, integer=True)
     out = Path(out)
     corpus = out / "corpus"
     corpus.mkdir(parents=True, exist_ok=False)
     (out / "artifacts").mkdir(exist_ok=True)
     length = max_len(target)
-    sources = sorted(path for path in Path(shards).glob("*/corpus") if path.is_dir())
     limits = [f"-max_len={length}", f"-timeout={TIMEOUT_SECONDS}", f"-rss_limit_mb={RSS_LIMIT_MB}"]
     environment = asan_environment()
     merge_temp = Path(tempfile.mkdtemp(prefix=f"maki-fuzz-merge-{target}-",
                                        dir=temp if temp is not None else temporary_root()))
     environment["TMPDIR"] = str(merge_temp)
-    # As for a shard: the runner's SIGINT interrupts the merge, whose record
-    # is written before its SIGTERM.
+    # As for a shard: the runner's SIGINT interrupts the merge, also while
+    # it unpacks the archives, and its record is written before its SIGTERM.
     interrupted = threading.Event()
     previous = {sig: signal.signal(sig, lambda *_: interrupted.set())
                 for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        return merge_and_record(binary, target, seeds, out, corpus, sources, limits,
-                                environment, merge_temp, interrupted)
+        sources, unmerged = shard_corpora(shards, target, planned, interrupted)
+        return merge_and_record(binary, target, seeds, out, corpus, sources, unmerged, planned,
+                                limits, environment, merge_temp, interrupted)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
 
-def merge_and_record(binary, target, seeds, out, corpus, sources, limits, environment,
-                     merge_temp, interrupted):
+def merge_and_record(binary, target, seeds, out, corpus, sources, unmerged, planned, limits,
+                     environment, merge_temp, interrupted):
     length = max_len(target)
     merged = run_group([str(binary), "-merge=1", *limits, f"-artifact_prefix={out / 'artifacts'}/",
-                        str(corpus), str(seeds), *map(str, sources)],
+                        str(corpus), str(seeds), *(str(source["path"]) for source in sources)],
                        out / "merge.log", environment, interrupted)
     measured = None
     (out / "coverage.log").write_bytes(b"")
@@ -619,9 +700,10 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, limits, enviro
     inputs, size = files_in(corpus)
     seed_inputs, _ = files_in(Path(seeds))
     record = {"target": target, "max_len": length, "binary_sha256": sha256(binary),
-              "seeds": seed_inputs,
-              "sources": [{"shard": path.parent.name, "inputs": files_in(path)[0]}
-                          for path in sources],
+              "seeds": seed_inputs, "planned_shards": planned,
+              "sources": [{key: source[key] for key in ("shard", "artifact", "inputs")}
+                          for source in sources],
+              "unmerged": unmerged,
               "merge_exit": merged, "attempts": attempts,
               "artifacts": artifacts_in(out / "artifacts"),
               "coverage_exit": measured, "inputs": inputs, "bytes": size,
@@ -631,15 +713,24 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, limits, enviro
               if status[1] == "INITED"]
     if inited:
         record["ft"] = int(inited[0][3])
-    record["failures"] = merge_failures(record)
+    record["failures"] = merge_failures(record, planned)
     (out / "coverage.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     return record
 
 
-def merge_failures(record):
+def merge_failures(record, planned):
+    """Why a merge did not qualify. `planned` is the plan's number of
+    shards: the merge must have merged a corpus of each of them, whatever
+    the shards' records and its own say."""
     if record.get("interrupted"):
         return ["the merge was interrupted"]
-    reasons = []
+    merged = {source.get("shard") for source in record.get("sources") or []
+              if isinstance(source, dict) and isinstance(source.get("shard"), int)}
+    why = {entry.get("shard"): entry.get("why") for entry in record.get("unmerged") or []
+           if isinstance(entry, dict) and isinstance(entry.get("shard"), int)}
+    reasons = [f"the merge had no corpus of shard {shard}"
+               + (f" ({why[shard]})" if isinstance(why.get(shard), str) else "")
+               for shard in range(1, planned + 1) if shard not in merged]
     if record["merge_exit"] != 0:
         reasons.append(f"the merge ended with status {record['merge_exit']}")
     # A record without the attempts fails too: the merge's success is read
@@ -735,7 +826,7 @@ def summarize(plan_record, stats, coverage, build=None, environment=None):
         if result is None:
             reasons.append("no merged corpus")
         else:
-            reasons.extend(merge_failures(result))
+            reasons.extend(merge_failures(result, plan_record["shards"]))
         used = {record["binary_sha256"] for record in found}
         if result is not None:
             used.add(result["binary_sha256"])
@@ -836,7 +927,10 @@ def main(arguments=None):
     merging.add_argument("--binary", required=True, type=Path)
     merging.add_argument("--target", required=True)
     merging.add_argument("--seeds", required=True, type=Path)
-    merging.add_argument("--shards", required=True, type=Path)
+    merging.add_argument("--shards", required=True, type=Path,
+                         help="where each shard's artifact was downloaded, one directory each")
+    merging.add_argument("--planned-shards", required=True,
+                         help="the plan's number of shards, each of which the merge needs")
     merging.add_argument("--out", required=True, type=Path)
     summarizing = commands.add_parser("summary", help="every target's evidence and verdict")
     summarizing.add_argument("--plan", required=True, help="the plan step's `plan` output (JSON)")
@@ -871,9 +965,11 @@ def main(arguments=None):
             print(f"failure: {reason}", file=sys.stderr)
         return 1 if record["failures"] else 0
     if options.command == "merge":
-        record = merge(options.binary, options.target, options.seeds, options.shards, options.out)
-        print(f"{options.target}: {record['inputs']} inputs from {len(record['sources'])} "
-              f"shard corpora and {record['seeds']} seeds, cov {record['cov']}, ft {record['ft']}")
+        record = merge(options.binary, options.target, options.seeds, options.shards, options.out,
+                       options.planned_shards)
+        print(f"{options.target}: {record['inputs']} inputs from {len(record['sources'])} of "
+              f"{record['planned_shards']} shard corpora and {record['seeds']} seeds, "
+              f"cov {record['cov']}, ft {record['ft']}")
         for reason in record["failures"]:
             print(f"failure: {reason}", file=sys.stderr)
         return 1 if record["failures"] else 0
