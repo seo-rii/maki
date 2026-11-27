@@ -501,7 +501,7 @@ class RunAndFinish(unittest.TestCase):
     def test_a_root_phase_has_its_time_limit_run_as_root(self):
         # Inside sudo, timeout signals the phase's whole process group, root
         # children such as `bash quickstart.sh` included; outside, as `ci`,
-        # it could signal only sudo, whose relay reaches the phase alone.
+        # it could not signal the phase's root processes.
         with quiet():
             self.driver.run(self.work, ["python3", "phase", "--guest", "el9"], timeout=42, root=True)
             self.driver.main(["run", "--work", str(self.work), "--timeout", "43", "--root", "--",

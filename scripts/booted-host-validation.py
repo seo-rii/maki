@@ -417,8 +417,8 @@ def run(work, command, timeout=600, root=False):
     """Run `command` in the guest as the CI user, or as root through sudo with
     `root`; return its status. With `root` the time limit runs inside sudo:
     there `timeout` signals the command's whole process group, root children
-    included, where as the CI user it could signal only sudo, which relays a
-    signal to its command alone."""
+    included, where as the CI user it could not signal the phase's root
+    processes."""
     limit = ["timeout", "--kill-after=30", str(int(timeout))]
     remote = shlex.join(["sudo", *limit, *command] if root else [*limit, *command])
     argv = ssh_command(work, remote)

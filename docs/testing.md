@@ -319,8 +319,7 @@ waits for SSH and for `cloud-init status --wait`, asking again when the
 connection drops while cloud-init restarts sshd, and copies the payload in.
 Every step has a time limit. Each phase runs in the guest as root under
 `sudo timeout`, so the limit runs as root and reaches the phase's children
-(as `ci`, `timeout` could signal only sudo, which relays to its command
-alone), and the host gives up on the connection 90 s after that limit; the
+(as `ci`, `timeout` could not signal the phase's root processes), and the host gives up on the connection 90 s after that limit; the
 boot, its SSH probes, cloud-init's wait and the copy of the payload together
 end within the boot step's limit. `scripts/booted-host-guest.py` runs each
 phase in the guest as root:
