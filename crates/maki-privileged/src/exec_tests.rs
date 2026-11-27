@@ -1362,6 +1362,11 @@ fn cleanup_is_idempotent_when_no_trusted_record_exists() {
     assert!(state.read("pg").unwrap().is_none());
 }
 
+/// What cleanup logs for the path it takes, which its plan names only as a
+/// choice: an operator, and the kernel run of CI, read the path taken here.
+const DETACH_PATH: &str = "shows the attachment's connection; cleanup follows the detach path";
+const RECOVERY_PATH: &str = "shows no connection; cleanup follows disconnected recovery";
+
 #[test]
 fn cleanup_dispatches_an_owned_connection_to_detach() {
     let fixture = Fixture::new();
@@ -1369,13 +1374,20 @@ fn cleanup_dispatches_an_owned_connection_to_detach() {
     let request = request();
     let mut system = FakeSystem::default();
     execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    let device = state.read("pg").unwrap().unwrap().device;
     system.steps.clear();
     system.backend_probes.set(0);
 
-    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+    let (result, log) = logged(|| cleanup_with(&plan_detach(&request), &state, &mut system));
+    result.unwrap();
 
     assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
     assert!(state.read("pg").unwrap().is_none());
+    assert!(
+        log.contains(&format!("maki-attach: {device} {DETACH_PATH}")),
+        "{log}"
+    );
+    assert!(!log.contains(RECOVERY_PATH), "{log}");
 }
 
 #[test]
@@ -1385,14 +1397,21 @@ fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
     let request = request();
     let mut system = FakeSystem::default();
     execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+    let device = state.read("pg").unwrap().unwrap().device;
     system.steps.clear();
     system.backends.clear();
     system.backend_probes.set(0);
 
-    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+    let (result, log) = logged(|| cleanup_with(&plan_detach(&request), &state, &mut system));
+    result.unwrap();
 
     assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
     assert!(state.read("pg").unwrap().is_none());
+    assert!(
+        log.contains(&format!("maki-attach: {device} {RECOVERY_PATH}")),
+        "{log}"
+    );
+    assert!(!log.contains(DETACH_PATH), "{log}");
 }
 
 #[test]
