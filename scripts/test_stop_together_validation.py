@@ -361,6 +361,21 @@ class StopTogether(unittest.TestCase):
                 else:
                     self.assertEqual(report["volumes"][0]["result"], "exit-code")
 
+    def test_a_unit_that_stops_only_after_the_wait_is_reported_as_not_stopped(self):
+        # stop2 is inactive by the time its leftovers are looked at, so only
+        # the wait knows that it outlasted it: the run fails for that, and
+        # no stop job's result or times are claimed for a stop nothing saw end.
+        self.deactivating[2] = self.driver.STOP_LOOKS
+        with self.assertRaises(RuntimeError) as raised:
+            self.stop()
+        self.assertEqual(str(raised.exception), "maki-attach@stop2.service did not stop within 300 s")
+        stop2 = json.loads((self.work / "stop-together.json").read_text())["volumes"][1]
+        self.assertEqual((stop2["stop_began"], stop2["stop_ended"], stop2["stop_seconds"]),
+                         (None, None, None))
+        self.assertNotIn("job_result", stop2)
+        self.assertFalse([event for event in self.events if event[0] == "journalctl"
+                          and "UNIT=maki-attach@stop2.service" in event])
+
     def test_an_opener_that_never_holds_its_device_stops_before_any_stop(self):
         with self.assertRaisesRegex(RuntimeError, "did not start holding /dev/nbd0"):
             self.stop(holds=False, status=2)
