@@ -46,6 +46,9 @@ struct Fixture {
     /// Set to `n`, an administrator takes the authority over, elsewhere,
     /// right after the `n`th inspection from now is answered.
     takeover_after: Arc<Mutex<Option<usize>>>,
+    /// Set to `n`, the `n`th inspection from now is answered as unavailable
+    /// (the client's "witness request failed"), and changes nothing.
+    unavailable_at: Arc<Mutex<Option<usize>>>,
     /// Where a data configuration's control socket is bound.
     sockets: tempfile::TempDir,
 }
@@ -161,12 +164,28 @@ impl Fixture {
         );
         let actions = Arc::new(Mutex::new(Vec::new()));
         let takeover_after = Arc::new(Mutex::new(None::<usize>));
+        let unavailable_at = Arc::new(Mutex::new(None::<usize>));
         let sent = actions.clone();
         let countdown = takeover_after.clone();
+        let outage = unavailable_at.clone();
         let handler: Arc<maki_witness::Handler> = Arc::new(move |role, request: &[u8]| {
             let parsed = serde_json::from_slice::<Request>(request).ok();
             if let Some(request) = &parsed {
                 sent.lock().unwrap().push(action_name(&request.action));
+            }
+            if parsed
+                .as_ref()
+                .is_some_and(|request| request.action == Action::Inspect)
+            {
+                let mut outage = outage.lock().unwrap();
+                if let Some(remaining) = outage.as_mut() {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        *outage = None;
+                        // Answered as unavailable, which stops no session.
+                        return Err(std::io::Error::other("unavailable for the test"));
+                    }
+                }
             }
             let answer = state(role, request)?;
             if parsed.is_some_and(|request| request.action == Action::Inspect) {
@@ -270,6 +289,7 @@ client_key_file={key:?}
             writer: client(writer_files),
             actions,
             takeover_after,
+            unavailable_at,
             sockets: short_dir::tempdir().unwrap(),
         }
     }
@@ -1866,4 +1886,129 @@ fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_repor
         let reported = maki_nbdkit::daemon::read_failure(&view, generic.into());
         assert!(reported.contains(expected), "{reported}");
     }
+}
+
+/// What the deep check's store logs while it reads the volume below, a
+/// shard data file it would adopt.
+const ADOPTING: &str = "shard data file not listed by the loaded catalog copy; adopting it";
+/// What a command says when it drops the log lines it held back.
+const DROPPED: &str = "held back since the volume was opened: the remote authority did not \
+                       confirm that it still selects what was read";
+
+/// A remote volume holding data and a shard data file that its catalog does
+/// not list, which the store adopts when the deep check opens it, with a
+/// warning in the log; the authority is released again.
+fn volume_with_an_orphan_shard(fixture: &Fixture) -> PathBuf {
+    let config = fixture.data_config("data.toml", ("", ""));
+    success(&["volume", "create", config.to_str().unwrap()]);
+    write_data(&config);
+    let backing = RollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap();
+    let len = backing
+        .open(&maki_format::layout::shard_data(0), false)
+        .unwrap()
+        .len()
+        .unwrap();
+    let orphan = backing
+        .open(&maki_format::layout::shard_data(5), true)
+        .unwrap();
+    orphan.set_len(len).unwrap();
+    orphan.sync_data().unwrap();
+    backing.sync_dir("data").unwrap();
+    backing.sync_dir("").unwrap();
+    drop((orphan, backing));
+    assert_eq!(inspect(fixture.writer.as_ref()).phase, Phase::Released);
+    config
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A command reports what it logs while it reads a remote volume too, so it
+/// writes those lines only once the authority has answered that it still
+/// selects what was read (SPEC §27): here the store's warning that it adopts
+/// a shard data file. They are written, and nothing is dropped, when the
+/// deep check passes, and when it fails on an error of its own after which
+/// the authority, asked again, still selects what was read (here its last
+/// inspection before the verdict could not be answered, and the next one
+/// was).
+#[test]
+fn a_read_only_command_writes_its_log_once_the_authority_still_selects_what_it_read() {
+    let fixture = Fixture::new();
+    let config = volume_with_an_orphan_shard(&fixture);
+    let path = config.to_str().unwrap();
+    fixture.clear();
+    let passed = success(&["check", path, "--deep"]);
+    let log = stderr(&passed);
+    assert!(log.contains(ADOPTING), "{log}");
+    assert!(!log.contains(DROPPED), "{log}");
+    assert!(
+        String::from_utf8_lossy(&passed.stdout).contains("check passed"),
+        "{passed:?}"
+    );
+    assert_eq!(fixture.sent(), ["inspect"; 4]);
+
+    // The deep check's inspection before its verdict is unanswered: the
+    // check fails, and its failure is reported once the authority has been
+    // asked again and still selects what was read, with the log.
+    *fixture.unavailable_at.lock().unwrap() = Some(3);
+    fixture.clear();
+    let failed = run(&["check", path, "--deep"]);
+    let log = stderr(&failed);
+    assert!(!failed.status.success(), "{log}");
+    assert!(log.contains("witness request failed"), "{log}");
+    assert!(log.contains(ADOPTING), "{log}");
+    assert!(!log.contains(DROPPED), "{log}");
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("check "));
+    assert_eq!(fixture.sent(), ["inspect"; 4]);
+}
+
+/// The log lines a command held back while it read a remote volume are
+/// dropped, and a warning says how many, when the authority does not
+/// confirm that it still selects what was read: when it changed after the
+/// open (a takeover made elsewhere right after the open's second
+/// inspection) and when its last inspection before the report could not be
+/// answered. The deep check's warning about the shard it adopts described a
+/// state that may no longer be the volume's, and is not written beside the
+/// error. The fast check logs nothing while it reads; what it drops is the
+/// view's own warning that it stopped, which the error repeats.
+#[test]
+fn a_read_only_command_drops_its_log_when_the_authority_does_not_confirm_what_it_read() {
+    let fixture = Fixture::new();
+    let config = volume_with_an_orphan_shard(&fixture);
+    let path = config.to_str().unwrap();
+    // Unanswered at the last inspection before the report.
+    *fixture.unavailable_at.lock().unwrap() = Some(4);
+    fixture.clear();
+    let unanswered = run(&["check", path, "--deep"]);
+    let log = stderr(&unanswered);
+    assert!(!unanswered.status.success(), "{log}");
+    assert!(log.contains("witness request failed"), "{log}");
+    assert!(!log.contains(ADOPTING), "{log}");
+    assert!(log.contains(DROPPED), "{log}");
+    assert!(!String::from_utf8_lossy(&unanswered.stdout).contains("check "));
+    assert_eq!(fixture.sent(), ["inspect"; 4]);
+
+    // Changed after the open.
+    const CHANGED: &str = "the remote authority changed after the backing was opened read-only";
+    *fixture.takeover_after.lock().unwrap() = Some(2);
+    let changed = run(&["check", path, "--deep"]);
+    let log = stderr(&changed);
+    assert!(!changed.status.success(), "{log}");
+    assert!(log.contains(CHANGED), "{log}");
+    assert!(!log.contains(ADOPTING), "{log}");
+    assert!(log.contains(DROPPED), "{log}");
+    let (dropped, error) = (log.find(DROPPED).unwrap(), log.find("error:").unwrap());
+    assert!(dropped < error, "{log}");
+
+    *fixture.takeover_after.lock().unwrap() = Some(2);
+    let fast = run(&["check", path]);
+    let log = stderr(&fast);
+    assert!(!fast.status.success(), "{log}");
+    assert!(log.contains(CHANGED), "{log}");
+    assert!(
+        log.contains(&format!("warning: dropped 1 log line {DROPPED}")),
+        "{log}"
+    );
+    assert!(!log.contains("read-only rollback session stopped"), "{log}");
 }
