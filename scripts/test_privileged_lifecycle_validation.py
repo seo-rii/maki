@@ -169,6 +169,7 @@ confirmed_device="$device"
 install_missing=true
 discard=false
 kill_daemon={killed}
+prebuilt_dir=""
 work_root=""
 background=false
 sudo() {{ :; }}

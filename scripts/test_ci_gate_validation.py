@@ -2,8 +2,9 @@
 pull-request job every script test module, the RHEL 9 job the packaged
 build, the native suites and the RPM in a RHEL 9 userspace, the kernel
 lifecycle job a whole attachment and the documented quick start on the
-runner's kernel, and the fuzz job every fuzz target from its committed
-seeds."""
+runner's kernel, the booted-host jobs the guides and the privileged runner in
+booted Debian 12 and EL9 guests, and the fuzz job every fuzz target from its
+committed seeds."""
 
 import fnmatch
 import json
@@ -722,6 +723,222 @@ class KernelLifecycleJob(unittest.TestCase):
                             "udevadm --version", "sudo --version"):
                 self.assertIn(f"$ {command}\n", versions)
             self.assertIn(versions, result.stdout)
+
+
+# The booted-host jobs: each guest's package built on its own distribution,
+# then a fresh guest per suite booted from a pinned cloud image under KVM.
+BOOTED_GUESTS = {
+    # guest: (package job, guest job, build container, package file, builder)
+    "debian12": ("debian12-package", "debian12-guest", "debian:12", "maki.deb",
+                 "packaging/debian/build-deb.py"),
+    "el9": ("el9-package", "el9-guest", "quay.io/centos/centos:stream9", "maki.rpm",
+            "packaging/rpm/build-rpm.py"),
+}
+BOOTED_DRIVER = "python3 -B scripts/booted-host-validation.py"
+BOOTED_GUEST_STEPS = [
+    "actions/checkout@v4", "runner host", "enable KVM", "QEMU and seed tools",
+    "actions/download-artifact@v4", "guest image", "guest payload", "boot the guest", "guest facts",
+    "guest package manager", "installation guide and quick start", "privileged runner lifecycle",
+    "guest versions", "collect guest logs", "actions/upload-artifact@v4",
+]
+
+
+def guest_phase(phase, timeout, *extra):
+    """The command a guest step runs: one phase of the guest script, as root,
+    under the driver's time limit."""
+    return (f'{BOOTED_DRIVER} run --work "$RUNNER_TEMP/guest" --timeout {timeout} -- sudo python3 -B '
+            f'/var/tmp/maki-ci/booted-host-guest.py {phase} --guest "$GUEST"' + "".join(
+                f" {word}" for word in extra))
+
+
+class BootedHostJobs(unittest.TestCase):
+    """A booted Debian 12 and a booted EL9 guest per suite, on every change:
+    the guides' install steps, the quick start and the first-volume bootstrap
+    with the package from the commit, and the privileged runner's lifecycle
+    with that package's binaries; on EL9 with SELinux enforcing."""
+
+    def setUp(self):
+        self.jobs = jobs()
+        for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            self.assertIn(package, self.jobs, f"ci.yml has no {package} job")
+            self.assertIn(guest_job, self.jobs, f"ci.yml has no {guest_job} job")
+
+    def steps_of(self, job):
+        return steps(self.jobs[job])
+
+    def step(self, job, name):
+        found = dict(self.steps_of(job))
+        self.assertIn(name, found, f"{job} has no step {name!r}")
+        return found[name]
+
+    def run_line(self, job, name):
+        """A step's `run:` command, which must be a single line."""
+        body = self.step(job, name)
+        match = re.search(r"(?m)^        run: (?!\|)(.+)$", body)
+        self.assertIsNotNone(match, f"{job}'s {name!r} runs one command")
+        return match.group(1)
+
+    def test_every_job_runs_on_every_change_with_a_time_limit_and_bash(self):
+        for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            for job in (package, guest_job):
+                with self.subTest(job=job):
+                    body = self.jobs[job]
+                    self.assertIn("\n    runs-on: ubuntu-latest\n", "\n" + body)
+                    self.assertRegex(body, r"(?m)^    timeout-minutes: \d+$")
+                    self.assertNotRegex(body, r"(?m)^    (?:if|continue-on-error):")
+                    self.assertNotIn("continue-on-error", body)
+                    self.assertRegex(body, r"(?m)^    defaults:\n      run:\n        shell: bash\n")
+            # The guest job waits for its own package only: one distribution's
+            # failure does not hide the other's verdict.
+            self.assertNotRegex(self.jobs[package], r"(?m)^    needs:")
+            self.assertIn(f"\n    needs: {package}\n", "\n" + self.jobs[guest_job])
+
+    def test_every_step_has_a_time_limit_and_the_job_outlasts_them(self):
+        # A hung step fails by its own limit, so the steps after it, the log
+        # collection above all, still run within the job's.
+        for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            for job in (package, guest_job):
+                total = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", self.jobs[job]).group(1))
+                limits = {}
+                for name, body in self.steps_of(job):
+                    with self.subTest(job=job, step=name):
+                        found = re.findall(r"(?m)^        timeout-minutes: (\d+)$", body)
+                        self.assertEqual(len(found), 1, body)
+                        limits[name] = int(found[0])
+                running = sum(limits.values())
+                if job == guest_job:
+                    # One of the two suite steps runs in each of the job's guests.
+                    running -= min(limits["installation guide and quick start"],
+                                   limits["privileged runner lifecycle"])
+                with self.subTest(job=job):
+                    self.assertLess(running, total)
+
+    def test_each_package_is_built_from_the_commit_on_its_own_distribution(self):
+        baseline = [name for name, _ in steps(self.jobs["pr"]) if name.startswith("dtolnay/")][:1]
+        for guest, (package, _job, container, filename, builder) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                body = self.jobs[package]
+                self.assertIn(f"\n    container: {container}\n", "\n" + body)
+                names = [name for name, _ in self.steps_of(package)]
+                self.assertEqual([name for name in names if name.startswith("dtolnay/")], baseline)
+                self.assertIn(f"key: {package}", self.step(package, "Swatinem/rust-cache@v2"))
+                # git before the checkout, and root's git trusts the workspace.
+                self.assertLess(names.index("build dependencies"), names.index("actions/checkout@v4"))
+                self.assertIn('git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+                              self.step(package, "root in the runner-owned workspace"))
+                self.assertIn("run: cargo build --release --locked -p maki -p maki-attach -p maki-check "
+                              "-p maki-nbdkit\n", self.step(package, "packaged binaries"))
+                build = self.step(package, "guest package")
+                self.assertIn(f"python3 -B {builder} --release-dir target/release", build)
+                self.assertIn(f"--output dist/{filename}", build)
+                # The installed package keeps its native library requirements.
+                self.assertNotIn("--no-shlibdeps", build)
+                self.assertNotIn("--no-autoreq", build)
+                self.assertIn("git rev-parse --verify 'HEAD^{commit}' > dist/source-revision", build)
+                self.assertIn(f"sha256sum {filename} source-revision | tee SHA256SUMS", build)
+                upload = self.step(package, "actions/upload-artifact@v4")
+                self.assertIn(f"name: {package}\n", upload)
+                self.assertIn("path: dist\n", upload)
+                self.assertIn("if-no-files-found: error\n", upload)
+                self.assertEqual(names[-1], "actions/upload-artifact@v4")
+
+    def test_each_suite_gets_a_fresh_guest_on_a_runner_vm(self):
+        for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                body = self.jobs[guest_job]
+                # QEMU runs on the runner VM itself, not in a container.
+                self.assertNotIn("container:", body)
+                self.assertRegex(body, r"(?m)^    strategy:\n      fail-fast: false\n      matrix:\n"
+                                       r"        suite: \[guides, runner\]\n")
+                self.assertRegex(body, rf"(?m)^    env:\n      GUEST: {guest}\n"
+                                       r"      SUITE: \$\{\{ matrix\.suite \}\}\n")
+
+    def test_the_guest_steps_run_in_order(self):
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                expected = list(BOOTED_GUEST_STEPS)
+                if guest == "el9":
+                    expected.insert(expected.index("guest versions"), "SELinux")
+                self.assertEqual([name for name, _ in self.steps_of(guest_job)], expected)
+
+    def test_kvm_is_opened_to_the_runner_user_and_required(self):
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                kvm = self.step(guest_job, "enable KVM")
+                self.assertIn('KERNEL=="kvm", GROUP="kvm", MODE="0666"', kvm)
+                self.assertIn("sudo udevadm trigger --name-match=kvm", kvm)
+                for check in ("test -r /dev/kvm", "test -w /dev/kvm"):
+                    self.assertIn(check, kvm)
+                tools = self.step(guest_job, "QEMU and seed tools")
+                for tool in ("qemu-system-x86", "qemu-utils", "genisoimage", "openssh-client"):
+                    self.assertIn(tool, tools)
+                boot = self.step(guest_job, "boot the guest")
+                # KVM is the driver's default; TCG is for a local trial only.
+                self.assertNotIn("--accel", boot)
+                self.assertIn(f'{BOOTED_DRIVER} boot --guest "$GUEST" --images "$RUNNER_TEMP/images" '
+                              '--work "$RUNNER_TEMP/guest"', boot)
+                self.assertIn(f'{BOOTED_DRIVER} copy-in --work "$RUNNER_TEMP/guest" '
+                              '"$RUNNER_TEMP/payload"', boot)
+
+    def test_the_guest_gets_the_package_its_package_job_built(self):
+        for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                download = self.step(guest_job, "actions/download-artifact@v4")
+                self.assertIn(f"name: {package}\n", download)
+                self.assertIn("path: ${{ runner.temp }}/package\n", download)
+                self.assertEqual(self.run_line(guest_job, "guest image"),
+                                 f'{BOOTED_DRIVER} fetch --guest "$GUEST" --directory "$RUNNER_TEMP/images"')
+                self.assertEqual(self.run_line(guest_job, "guest payload"),
+                                 f'{BOOTED_DRIVER} payload --guest "$GUEST" --suite "$SUITE" --package '
+                                 '"$RUNNER_TEMP/package" --output "$RUNNER_TEMP/payload"')
+
+    def test_each_phase_runs_as_root_in_the_guest_within_its_steps_limit(self):
+        phases = {"guest facts": ("facts", None), "guest package manager": ("prepare", None),
+                  "installation guide and quick start": ("guides", "matrix.suite == 'guides'"),
+                  "privileged runner lifecycle": ("runner", "matrix.suite == 'runner'"),
+                  "guest versions": ("versions", "${{ !cancelled() }}")}
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            these = dict(phases)
+            if guest == "el9":
+                these["SELinux"] = ("selinux", "${{ !cancelled() }}")
+            for name, (phase, condition) in these.items():
+                with self.subTest(guest=guest, step=name):
+                    body = self.step(guest_job, name)
+                    self.assertEqual(re.findall(r"(?m)^        if: (.*)$", body),
+                                     [condition] if condition else [])
+                    line = self.run_line(guest_job, name)
+                    timeout = int(re.search(r"--timeout (\d+) ", line).group(1))
+                    extra = ('--suite "$SUITE"',) if phase == "selinux" else ()
+                    self.assertEqual(line, guest_phase(phase, timeout, *extra))
+                    # The guest's own limit ends the phase before the step's.
+                    minutes = int(re.search(r"(?m)^        timeout-minutes: (\d+)$", body).group(1))
+                    self.assertLess(timeout + 90, minutes * 60)
+
+    def test_only_the_el9_guest_records_selinux(self):
+        debian = dict(self.steps_of("debian12-guest"))
+        el9 = dict(self.steps_of("el9-guest"))
+        self.assertNotIn("SELinux", debian)
+        self.assertNotIn("selinux", self.jobs["debian12-guest"])
+        self.assertIn("SELinux", el9)
+        # Otherwise the two jobs run the same steps the same way.
+        for name, body in debian.items():
+            with self.subTest(step=name):
+                self.assertEqual(el9[name].replace("el9", "GUEST"), body.replace("debian12", "GUEST"))
+
+    def test_the_logs_are_always_collected_and_kept(self):
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                collect = self.step(guest_job, "collect guest logs")
+                self.assertIn("if: always()", collect)
+                self.assertEqual(self.run_line(guest_job, "collect guest logs"),
+                                 f'{BOOTED_DRIVER} finish --work "$RUNNER_TEMP/guest" '
+                                 '--output "$RUNNER_TEMP/guest-logs"')
+                upload = self.step(guest_job, "actions/upload-artifact@v4")
+                self.assertIn("if: always()", upload)
+                self.assertIn(f"name: {guest}-guest-${{{{ matrix.suite }}}}-logs\n", upload)
+                self.assertIn("path: ${{ runner.temp }}/guest-logs\n", upload)
+                for kept_out in ("/etc/maki", "/var/lib/maki", "id_ed25519", "seed"):
+                    self.assertNotIn(kept_out, collect + upload)
 
 
 FAKE_CARGO_FUZZ = r'''#!/usr/bin/env python3
