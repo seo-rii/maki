@@ -863,6 +863,7 @@ mod quorum {
 
     struct Frontend {
         process: Child,
+        address: SocketAddr,
         client: maki_witness::Client,
     }
 
@@ -912,6 +913,7 @@ mod quorum {
                 .unwrap();
             let mut frontend = Self {
                 process,
+                address,
                 client: maki_witness::Client::new(maki_witness::ClientOptions {
                     address,
                     server_name: "localhost".into(),
@@ -1173,5 +1175,133 @@ mod quorum {
             std::io::ErrorKind::InvalidData
         );
         assert_eq!(primary.handle(Role::Writer, &inspect()).unwrap(), advanced);
+    }
+
+    /// The authority's client through a frontend, recording the action of
+    /// every request it sends.
+    #[cfg(target_os = "linux")]
+    struct Recorded {
+        client: maki_witness::Client,
+        actions: Mutex<Vec<&'static str>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl maki_backing::remote_witness::Rpc for Recorded {
+        fn call(&self, request: &Request) -> std::io::Result<maki_backing::remote_witness::Record> {
+            self.actions.lock().unwrap().push(match request.action {
+                Action::Inspect => "inspect",
+                _ => "change",
+            });
+            maki_backing::remote_witness::Rpc::call(&self.client, request)
+        }
+    }
+
+    /// `maki check` and `maki volume inspect` read a remote-protected volume
+    /// through `ReadOnlyRollbackBacking`. Over a real three-member etcd
+    /// quorum behind an mTLS frontend it opens with two inspections, reads
+    /// the committed payload, asks once more when asked for freshness and
+    /// sends nothing else: the record at the quorum and the backing root are
+    /// unchanged. A takeover made at the quorum afterwards stops the view at
+    /// its next freshness check.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires verified MAKI_ETCD_BIN, matching etcdctl, and built MAKI_WITNESS_BIN; launches a disposable quorum and an mTLS frontend"]
+    fn a_remote_volume_on_an_etcd_quorum_is_read_with_inspections_only() {
+        use maki_backing::{Backing, ReadOnlyRollbackBacking, RollbackBacking};
+        let cluster = Cluster::new();
+        let enrollment = cluster.dir.path().join("enroll-etcd.toml");
+        std::fs::write(&enrollment, cluster.config_text("")).unwrap();
+        let initialized = Command::new(cli_binary())
+            .arg("init-etcd")
+            .arg(&enrollment)
+            .arg(Uuid::from_bytes(IDENTITY).to_string())
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        let credentials = Credentials::new();
+        let frontend = Frontend::new(&cluster, &credentials);
+        let rpc = Arc::new(Recorded {
+            client: maki_witness::Client::new(maki_witness::ClientOptions {
+                address: frontend.address,
+                server_name: "localhost".into(),
+                timeout_ms: 8000,
+                tls: credentials.client.clone(),
+            })
+            .unwrap(),
+            actions: Mutex::new(Vec::new()),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..3 * 4096 + 100).map(|i| (i % 251) as u8 + 1).collect();
+        {
+            let writer =
+                RollbackBacking::create_remote(root.path(), rpc.clone(), 32 * 4096).unwrap();
+            let file = writer.open("payload", true).unwrap();
+            file.write_at(0, &payload).unwrap();
+            file.sync_data().unwrap();
+            writer.sync_dir("").unwrap();
+        }
+        let store = EtcdStore::open(cluster.options()).unwrap();
+        let record = store.handle(Role::Writer, &inspect()).unwrap();
+        assert_eq!(record.phase, Phase::Released);
+        let listing = || {
+            let mut entries = Vec::new();
+            let mut pending = vec![root.path().to_path_buf()];
+            while let Some(path) = pending.pop() {
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    for entry in std::fs::read_dir(&path).unwrap() {
+                        pending.push(entry.unwrap().path());
+                    }
+                    entries.push((path, None, metadata.modified().unwrap()));
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    entries.push((path, Some(bytes), metadata.modified().unwrap()));
+                }
+            }
+            entries.sort();
+            entries
+        };
+        let unchanged = listing();
+        rpc.actions.lock().unwrap().clear();
+        let view = ReadOnlyRollbackBacking::open_remote(root.path(), rpc.clone()).unwrap();
+        let file = view.open("payload", false).unwrap();
+        let mut read = vec![0; payload.len()];
+        file.read_at(0, &mut read).unwrap();
+        assert_eq!(read, payload);
+        view.check_freshness().unwrap();
+        assert_eq!(*rpc.actions.lock().unwrap(), ["inspect"; 3]);
+        assert_eq!(store.handle(Role::Writer, &inspect()).unwrap(), record);
+        assert_eq!(listing(), unchanged, "the read-only view changed the root");
+
+        store
+            .handle(
+                Role::Admin,
+                &Request {
+                    authorization: Some(
+                        maki_backing::remote_witness::SessionAuthorization::from_bytes([77; 32]),
+                    ),
+                    operation_id: [78; 16],
+                    expected: Some(record),
+                    action: Action::Takeover,
+                },
+            )
+            .unwrap();
+        let error = view.check_freshness().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert!(view.session_stopped().is_some());
+        assert!(file.read_at(0, &mut read).is_err());
+        assert!(
+            rpc.actions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|action| *action == "inspect"),
+            "the read-only view sent more than inspections"
+        );
+        drop(frontend);
     }
 }

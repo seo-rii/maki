@@ -29,6 +29,9 @@ mod volume_config;
 #[path = "support/other_filesystem.rs"]
 mod other_filesystem;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -237,6 +240,68 @@ impl Protected {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// A rollback-protected volume, made as [`Self::new`] makes one, that
+    /// holds data written through the daemon's NBD adapter (what the nbdkit
+    /// plugin's callbacks call): eight units in two shards, checkpointed
+    /// into their slots before a clean detach. Its configuration names a key
+    /// file, for the adapter in this process, and a control socket of its
+    /// own; the commands load neither.
+    fn with_data() -> Option<(Self, tempfile::TempDir)> {
+        let directory = tempfile::tempdir().unwrap();
+        let witness_parent = other_filesystem::tempdir(directory.path())?;
+        let protected = Self {
+            directory,
+            witness_parent,
+        };
+        let key = protected.directory.path().join("volume.key");
+        std::fs::write(&key, KEY_HEX).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sockets = short_dir::tempdir().unwrap();
+        volume_config::write(
+            protected.config(),
+            config(&protected.root(), Some(&protected.witness())).replace(
+                r#"key = { source = "env", name = "read-only-backing-key" }"#,
+                &format!(
+                    "key = {{ source = \"file\", name = {} }}",
+                    serde_json::to_string(key.to_str().unwrap()).unwrap()
+                ),
+            ) + &format!(
+                "[control]\nsocket = {}\n",
+                serde_json::to_string(sockets.path().join("c.sock").to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        succeeded(
+            "create",
+            &maki(&["volume", "create", protected.config().to_str().unwrap()]),
+        );
+        let adapter =
+            maki_nbdkit::adapter::NbdAdapter::open_config(protected.config().to_str().unwrap())
+                .unwrap();
+        for (index, unit) in [0u64, 1, 2, 3, 2048, 2049, 2050, 2051]
+            .into_iter()
+            .enumerate()
+        {
+            adapter
+                .pwrite(&[index as u8 + 1; 4096], unit * 4096, false)
+                .unwrap();
+        }
+        adapter.flush().unwrap();
+        adapter.checkpoint().unwrap();
+        adapter.shutdown().unwrap();
+        Some((protected, sockets))
+    }
+
+    /// The arena slot that holds page `page` of the file `name` in the
+    /// manifest the witness selects.
+    fn arena_slot(&self, name: &str, page: u64) -> u64 {
+        let (_, manifest, _) = self.newest_manifest();
+        let id = manifest["entries"][name]["File"].as_u64().unwrap();
+        manifest["files"][id.to_string()]["pages"][page.to_string()]["slot"]
+            .as_u64()
+            .unwrap()
     }
 
     /// The manifest slot the witness selects, which holds the newest
@@ -650,4 +715,138 @@ fn check_and_inspect_read_a_backing_on_a_read_only_mount() {
         "{}",
         text(&output)
     );
+}
+
+/// A rollback-protected volume that holds data the daemon's NBD adapter
+/// wrote, read through the read-only view: the deep check reads every
+/// allocated slot and finds them intact, and neither directory changes.
+#[test]
+fn a_protected_volume_holding_data_is_checked_read_only() {
+    let Some((protected, _sockets)) = Protected::with_data() else {
+        return;
+    };
+    protected.with_modes(0o500, 0o500, || {
+        read_only_commands(
+            &protected.config(),
+            &[protected.root(), protected.witness()],
+        );
+        let deep = maki(&["check", protected.config().to_str().unwrap(), "--deep"]);
+        succeeded("check --deep", &deep);
+        assert!(
+            String::from_utf8_lossy(&deep.stdout).contains("info: slots: 8 allocated, 0 invalid"),
+            "{}",
+            text(&deep)
+        );
+    });
+}
+
+/// A data slot that does not hold what the engine wrote is an error of the
+/// read-only deep check: here a ciphertext byte of unit 0 changed through
+/// the backing itself, so that every page still authenticates and only the
+/// slot's own checksum finds it. A changed arena page of a data slot fails
+/// the authentication of every command.
+#[test]
+fn a_damaged_data_slot_of_a_protected_volume_is_an_error_read_only() {
+    let Some((protected, _sockets)) = Protected::with_data() else {
+        return;
+    };
+    let shard = maki_format::layout::shard_data(0);
+    {
+        let backing =
+            maki_backing::RollbackBacking::open(&protected.root(), &protected.witness()).unwrap();
+        use maki_backing::Backing;
+        let file = backing.open(&shard, false).unwrap();
+        let at = u64::from(maki_format::slot::SLOT_HEADER_SIZE) + 7;
+        let mut byte = [0];
+        file.read_at(at, &mut byte).unwrap();
+        file.write_at(at, &[byte[0] ^ 1]).unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("data").unwrap();
+        backing.sync_dir("").unwrap();
+    }
+    let directories = [protected.root(), protected.witness()];
+    protected.with_modes(0o500, 0o500, || {
+        let before: Vec<_> = directories.iter().map(|path| tree(path)).collect();
+        let deep = maki(&["check", protected.config().to_str().unwrap(), "--deep"]);
+        let report = String::from_utf8_lossy(&deep.stdout);
+        assert_eq!(deep.status.code(), Some(1), "{}", text(&deep));
+        assert!(
+            report.contains("warning: read-only check: ")
+                && report.contains("ERROR: slot: ")
+                && report.contains("1 invalid (0 recoverable by journal replay, 1 unrecoverable)")
+                && report.ends_with("check FAILED\n"),
+            "{}",
+            text(&deep)
+        );
+        let after: Vec<_> = directories.iter().map(|path| tree(path)).collect();
+        assert_eq!(
+            after, before,
+            "the read-only deep check changed the backing"
+        );
+    });
+    let slot = protected.arena_slot(&shard, 0);
+    let arena = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(protected.root().join("rollback.arena"))
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let mut byte = [0];
+    arena.read_exact_at(&mut byte, slot * 4096 + 100).unwrap();
+    arena
+        .write_all_at(&[byte[0] ^ 1], slot * 4096 + 100)
+        .unwrap();
+    drop(arena);
+    protected.with_modes(0o500, 0o500, || {
+        refused(
+            &protected.config(),
+            &directories,
+            "rollback arena page authentication failed",
+        )
+    });
+}
+
+/// `maki check` of a protected volume, read read-only, compares the
+/// configuration with the superblock as attach does: one that attach
+/// refuses fails the check, naming the setting and both values, and
+/// changes nothing.
+#[test]
+fn a_mismatched_configuration_fails_a_read_only_check_of_a_protected_volume() {
+    let Some(protected) = Protected::new() else {
+        return;
+    };
+    let other = protected.directory.path().join("other-identity.toml");
+    volume_config::write(
+        &other,
+        config(&protected.root(), Some(&protected.witness())).replace(
+            r#"crypto_compatibility_id = "local-aes-gcm-siv-v1""#,
+            r#"crypto_compatibility_id = "local-aes-gcm-siv-v2""#,
+        ),
+    )
+    .unwrap();
+    let directories = [protected.root(), protected.witness()];
+    protected.with_modes(0o500, 0o500, || {
+        let before: Vec<_> = directories.iter().map(|path| tree(path)).collect();
+        for args in [
+            &["check", other.to_str().unwrap()][..],
+            &["check", other.to_str().unwrap(), "--deep"],
+        ] {
+            let output = maki(args);
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {}", text(&output));
+            assert!(
+                report.contains("warning: read-only check: ")
+                    && report.contains(
+                        "ERROR: configuration mismatch: crypto.crypto_compatibility_id is \
+                         \"local-aes-gcm-siv-v2\" in the configuration, the volume has \
+                         \"local-aes-gcm-siv-v1\"; attach refuses this configuration\n"
+                    )
+                    && report.ends_with("check FAILED\n"),
+                "{args:?}: {}",
+                text(&output)
+            );
+        }
+        let after: Vec<_> = directories.iter().map(|path| tree(path)).collect();
+        assert_eq!(after, before, "a read-only check changed the backing");
+    });
 }

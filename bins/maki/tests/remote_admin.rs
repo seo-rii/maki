@@ -3,6 +3,9 @@
 #[path = "support/volume_config.rs"]
 mod volume_config;
 
+#[path = "support/short_dir.rs"]
+mod short_dir;
+
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -11,10 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use maki_backing::remote_witness::{
-    namespace, Action, Descriptor, Phase, Record, Request, Role, Rpc, StateStore,
+    namespace, Action, Descriptor, Phase, Record, Request, Role, Rpc, SessionAuthorization,
+    StateStore,
 };
 use maki_backing::{Backing, RollbackBacking};
 use maki_witness::{Client, ClientOptions, Principal, Server, ServerOptions, TlsFiles};
+
+const KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 struct Service {
     address: SocketAddr,
@@ -37,6 +43,11 @@ struct Fixture {
     writer: Arc<dyn Rpc>,
     /// The action of every request the authority was sent, in order.
     actions: Arc<Mutex<Vec<&'static str>>>,
+    /// Set to `n`, an administrator takes the authority over, elsewhere,
+    /// right after the `n`th inspection from now is answered.
+    takeover_after: Arc<Mutex<Option<usize>>>,
+    /// Where a data configuration's control socket is bound.
+    sockets: tempfile::TempDir,
 }
 fn action_name(action: &Action) -> &'static str {
     match action {
@@ -149,12 +160,32 @@ impl Fixture {
             StateStore::create(&dir.path().join("authority"), [1; 16]).unwrap(),
         );
         let actions = Arc::new(Mutex::new(Vec::new()));
+        let takeover_after = Arc::new(Mutex::new(None::<usize>));
         let sent = actions.clone();
+        let countdown = takeover_after.clone();
         let handler: Arc<maki_witness::Handler> = Arc::new(move |role, request: &[u8]| {
-            if let Ok(request) = serde_json::from_slice::<Request>(request) {
+            let parsed = serde_json::from_slice::<Request>(request).ok();
+            if let Some(request) = &parsed {
                 sent.lock().unwrap().push(action_name(&request.action));
             }
-            state(role, request)
+            let answer = state(role, request)?;
+            if parsed.is_some_and(|request| request.action == Action::Inspect) {
+                let mut countdown = countdown.lock().unwrap();
+                if let Some(remaining) = countdown.as_mut() {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        *countdown = None;
+                        let takeover = Request {
+                            operation_id: *uuid::Uuid::new_v4().as_bytes(),
+                            expected: Some(serde_json::from_value(answer.clone()).unwrap()),
+                            action: Action::Takeover,
+                            authorization: Some(SessionAuthorization::generate().unwrap()),
+                        };
+                        state(Role::Admin, &serde_json::to_vec(&takeover).unwrap())?;
+                    }
+                }
+            }
+            Ok(answer)
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -238,11 +269,46 @@ client_key_file={key:?}
             admin_config,
             writer: client(writer_files),
             actions,
+            takeover_after,
+            sockets: short_dir::tempdir().unwrap(),
         }
     }
     fn create(&self) -> RollbackBacking {
         RollbackBacking::create_remote(&self.root, self.writer.clone(), 64 * 1024).unwrap()
     }
+    /// A configuration `name` of the writer for a volume that holds data:
+    /// a key in a file, a capacity the data fits in and a control socket of
+    /// its own, with `edit` applied to its text.
+    fn data_config(&self, name: &str, edit: (&str, &str)) -> PathBuf {
+        let key = self.dir.path().join("volume.key");
+        std::fs::write(&key, KEY_HEX).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let socket = self.sockets.path().join(format!("{name}.sock"));
+        let text = std::fs::read_to_string(&self.writer_config)
+            .unwrap()
+            .replace(
+                r#"key={source="env",name="unused-admin-key"}"#,
+                &format!("key={{source=\"file\",name={:?}}}", key.to_str().unwrap()),
+            )
+            .replace(r#"capacity="64KiB""#, r#"capacity="8MiB""#)
+            + &format!("[control]\nsocket={:?}\n", socket.to_str().unwrap());
+        assert!(text.contains(edit.0), "{edit:?}");
+        let path = self.dir.path().join(name);
+        volume_config::write(&path, text.replace(edit.0, edit.1)).unwrap();
+        path
+    }
+
+    /// Forget the actions sent so far.
+    fn clear(&self) {
+        self.actions.lock().unwrap().clear();
+    }
+
+    /// The actions sent since the last [`Self::clear`].
+    fn sent(&self) -> Vec<&'static str> {
+        self.actions.lock().unwrap().clone()
+    }
+
     fn path(&self, admin: bool) -> &str {
         if admin {
             &self.admin_config
@@ -1299,5 +1365,306 @@ fn diagnostic_commands_read_a_remote_volume_with_inspections_only() {
             "a read-only command changed the root"
         );
         std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// Write eight units, in two shards, through the daemon's NBD adapter (what
+/// the nbdkit plugin's callbacks call), and checkpoint them into their slots
+/// before a clean detach.
+fn write_data(config: &std::path::Path) {
+    let adapter = maki_nbdkit::adapter::NbdAdapter::open_config(config.to_str().unwrap()).unwrap();
+    for (index, unit) in [0u64, 1, 2, 3, 20, 21, 22, 23].into_iter().enumerate() {
+        adapter
+            .pwrite(&[index as u8 + 1; 4096], unit * 4096, false)
+            .unwrap();
+    }
+    adapter.flush().unwrap();
+    adapter.checkpoint().unwrap();
+    adapter.shutdown().unwrap();
+}
+
+/// The manifest of the authority's current generation, in its namespace of
+/// `root`.
+fn current_manifest(root: &std::path::Path, record: &Record) -> serde_json::Value {
+    let current = record.current.as_ref().unwrap();
+    let namespace = root.join(&current.namespace);
+    (0..2)
+        .filter_map(|index| {
+            let bytes = std::fs::read(namespace.join(format!("rollback.manifest.{index}"))).ok()?;
+            let len = u64::from_le_bytes(bytes.get(..8)?.try_into().unwrap()) as usize;
+            serde_json::from_slice::<serde_json::Value>(bytes.get(8..8 + len)?).ok()
+        })
+        .find(|manifest| manifest["generation"] == current.anchor.generation)
+        .expect("the current generation's manifest")
+}
+
+/// The arena slot that holds page `page` of the file `name` in `manifest`.
+fn arena_slot(manifest: &serde_json::Value, name: &str, page: u64) -> u64 {
+    let id = manifest["entries"][name]["File"].as_u64().unwrap();
+    manifest["files"][id.to_string()]["pages"][page.to_string()]["slot"]
+        .as_u64()
+        .unwrap()
+}
+
+/// A remote volume that holds data written through the daemon's NBD adapter
+/// is read through the read-only view: the deep check reads every slot, the
+/// authority is sent inspections only, and nothing in the root changes. Each
+/// command asks the authority three times, however much it reads: twice
+/// while the view opens and once before it reports; the deep check asks once
+/// more itself, before its verdict. The view sent one inspection before
+/// every backing operation, so the count grew with the volume.
+#[test]
+fn a_remote_volume_holding_data_is_read_with_three_inspections_per_command() {
+    let fixture = Fixture::new();
+    let config = fixture.data_config("data.toml", ("", ""));
+    let path = config.to_str().unwrap();
+    success(&["volume", "create", path]);
+    write_data(&config);
+    let record = inspect(fixture.writer.as_ref());
+    assert_eq!(record.phase, Phase::Released);
+    let unchanged = tree(&fixture.root);
+    for args in [
+        vec!["volume", "inspect", path],
+        vec!["check", path],
+        vec!["check", path, "--deep"],
+    ] {
+        fixture.clear();
+        let output = success(&args);
+        let report = String::from_utf8_lossy(&output.stdout);
+        if args[0] == "check" {
+            assert!(
+                report.contains("warning: read-only check: ")
+                    && report.contains("info: configuration matches")
+                    && report.ends_with("check passed\n"),
+                "{args:?}: {report}"
+            );
+        } else {
+            assert!(report.contains("uuid:"), "{report}");
+        }
+        // The deep check asks once more itself, before its verdict.
+        let deep = args.contains(&"--deep");
+        if deep {
+            assert!(
+                report.contains("info: slots: 8 allocated, 0 invalid")
+                    && report.contains("info: deep check verdict: unproven\n"),
+                "{report}"
+            );
+        }
+        let expected = vec!["inspect"; if deep { 4 } else { 3 }];
+        assert_eq!(fixture.sent(), expected, "{args:?}");
+    }
+    assert_eq!(inspect(fixture.writer.as_ref()), record);
+    assert_eq!(
+        tree(&fixture.root),
+        unchanged,
+        "a read-only command changed the root"
+    );
+}
+
+/// A data slot that does not hold what the engine wrote is an error of the
+/// read-only deep check: here a ciphertext byte of unit 0 changed through
+/// the backing itself, so that every page still authenticates and only the
+/// slot's own checksum finds it. A changed arena page of a data slot fails
+/// the authentication of every command.
+#[test]
+fn a_damaged_data_slot_of_a_remote_volume_is_an_error_read_only() {
+    let fixture = Fixture::new();
+    let config = fixture.data_config("data.toml", ("", ""));
+    let path = config.to_str().unwrap();
+    success(&["volume", "create", path]);
+    write_data(&config);
+    let shard = maki_format::layout::shard_data(0);
+    {
+        let backing = RollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap();
+        let file = backing.open(&shard, false).unwrap();
+        let at = u64::from(maki_format::slot::SLOT_HEADER_SIZE) + 7;
+        let mut byte = [0];
+        file.read_at(at, &mut byte).unwrap();
+        file.write_at(at, &[byte[0] ^ 1]).unwrap();
+        file.sync_data().unwrap();
+        backing.sync_dir("data").unwrap();
+        backing.sync_dir("").unwrap();
+    }
+    let record = inspect(fixture.writer.as_ref());
+    let unchanged = tree(&fixture.root);
+    fixture.clear();
+    let output = run(&["check", path, "--deep"]);
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(
+        report.contains("ERROR: slot: ")
+            && report.contains("1 invalid (0 recoverable by journal replay, 1 unrecoverable)")
+            && report.ends_with("check FAILED\n"),
+        "{report}"
+    );
+    assert_eq!(fixture.sent(), ["inspect"; 4]);
+    assert_eq!(inspect(fixture.writer.as_ref()), record);
+    assert_eq!(tree(&fixture.root), unchanged);
+
+    let arena = fixture
+        .root
+        .join(&record.current.as_ref().unwrap().namespace)
+        .join("rollback.arena");
+    let slot = arena_slot(&current_manifest(&fixture.root, &record), &shard, 0);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena)
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, slot * 4096 + 100).unwrap();
+    file.write_all_at(&[byte[0] ^ 1], slot * 4096 + 100)
+        .unwrap();
+    for args in [
+        vec!["volume", "inspect", path],
+        vec!["check", path],
+        vec!["check", path, "--deep"],
+    ] {
+        fixture.clear();
+        failure(&args, "rollback arena page authentication failed");
+        let sent = fixture.sent();
+        assert!(sent.iter().all(|action| *action == "inspect"), "{sent:?}");
+    }
+    assert_eq!(inspect(fixture.writer.as_ref()), record);
+}
+
+/// `maki check` of a remote volume, read read-only, compares the
+/// configuration with the superblock as attach does: one that attach
+/// refuses fails the check, naming the setting and both values, with the
+/// authority sent inspections only and nothing changed.
+#[test]
+fn a_mismatched_configuration_fails_a_read_only_check_of_a_remote_volume() {
+    let fixture = Fixture::new();
+    success(&["volume", "create", fixture.path(false)]);
+    let other = fixture.dir.path().join("other.toml");
+    volume_config::write(
+        &other,
+        std::fs::read_to_string(&fixture.writer_config)
+            .unwrap()
+            .replace(
+                r#"crypto_compatibility_id="local-aes-gcm-siv-v1""#,
+                r#"crypto_compatibility_id="local-aes-gcm-siv-v2""#,
+            ),
+    )
+    .unwrap();
+    let record = inspect(fixture.writer.as_ref());
+    let unchanged = tree(&fixture.root);
+    for deep in [false, true] {
+        let mut args = vec!["check", other.to_str().unwrap()];
+        if deep {
+            args.push("--deep");
+        }
+        fixture.clear();
+        let output = run(&args);
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {report}");
+        assert!(
+            report.contains(
+                "ERROR: configuration mismatch: crypto.crypto_compatibility_id is \
+                 \"local-aes-gcm-siv-v2\" in the configuration, the volume has \
+                 \"local-aes-gcm-siv-v1\"; attach refuses this configuration\n"
+            ) && report.contains("warning: read-only check: ")
+                && report.ends_with("check FAILED\n"),
+            "{args:?}: {report}"
+        );
+        let sent = fixture.sent();
+        assert!(
+            !sent.is_empty() && sent.iter().all(|action| *action == "inspect"),
+            "{args:?}: {sent:?}"
+        );
+    }
+    assert_eq!(inspect(fixture.writer.as_ref()), record);
+    assert_eq!(tree(&fixture.root), unchanged);
+}
+
+/// A configuration whose backing root is a snapshot destination is refused
+/// read-only: `maki volume snapshot` copies the current generation into a
+/// namespace of the same name, without the `rollback.lock` that a writer's
+/// namespace holds, and the read-only view refuses a namespace whose lock
+/// is missing. The authority is sent inspections only, and neither root
+/// changes.
+#[test]
+fn a_configuration_pointed_at_a_snapshot_destination_is_refused_read_only() {
+    let fixture = Fixture::new();
+    let backing = fixture.create();
+    write(&backing, b"ciphertext-in-snapshot");
+    drop(backing);
+    let target = fixture.dir.path().join("backup");
+    success(&[
+        "volume",
+        "snapshot",
+        fixture.path(false),
+        target.to_str().unwrap(),
+    ]);
+    let record = inspect(fixture.writer.as_ref());
+    let namespace = &record.current.as_ref().unwrap().namespace;
+    assert!(target.join(namespace).join("rollback.manifest.0").is_file());
+    assert!(!target.join(namespace).join("rollback.lock").exists());
+    let config = fixture.dir.path().join("snapshot.toml");
+    volume_config::write(
+        &config,
+        std::fs::read_to_string(&fixture.writer_config)
+            .unwrap()
+            .replace(
+                &format!("root={:?}", fixture.root.to_str().unwrap()),
+                &format!("root={:?}", target.to_str().unwrap()),
+            ),
+    )
+    .unwrap();
+    let path = config.to_str().unwrap();
+    let (root_tree, target_tree) = (tree(&fixture.root), tree(&target));
+    for args in [
+        vec!["volume", "inspect", path],
+        vec!["check", path],
+        vec!["check", path, "--deep"],
+    ] {
+        fixture.clear();
+        failure(
+            &args,
+            &format!("{namespace}/rollback.lock is missing, and a read-only open cannot create it"),
+        );
+        let sent = fixture.sent();
+        assert!(
+            !sent.is_empty() && sent.iter().all(|action| *action == "inspect"),
+            "{args:?}: {sent:?}"
+        );
+    }
+    assert_eq!(inspect(fixture.writer.as_ref()), record);
+    assert_eq!(tree(&fixture.root), root_tree);
+    assert_eq!(tree(&target), target_tree);
+}
+
+/// The view asks the authority once more before a command reports: an
+/// authority that changed after the view opened (here an administrator's
+/// takeover, made elsewhere right after the open's second inspection) fails
+/// every command, and none prints what it read.
+#[test]
+fn an_authority_that_changes_while_a_command_reads_fails_the_command() {
+    let fixture = Fixture::new();
+    let config = fixture.data_config("data.toml", ("", ""));
+    let path = config.to_str().unwrap();
+    success(&["volume", "create", path]);
+    write_data(&config);
+    for args in [
+        vec!["volume", "inspect", path],
+        vec!["check", path],
+        vec!["check", path, "--deep"],
+    ] {
+        let before = inspect(fixture.writer.as_ref());
+        *fixture.takeover_after.lock().unwrap() = Some(2);
+        let output = run(&args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {stdout}");
+        assert!(
+            stderr.contains("the remote authority changed after the backing was opened read-only"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stdout.contains("uuid:") && !stdout.contains("check "),
+            "{args:?}: {stdout}"
+        );
+        assert_ne!(inspect(fixture.writer.as_ref()), before, "{args:?}");
     }
 }

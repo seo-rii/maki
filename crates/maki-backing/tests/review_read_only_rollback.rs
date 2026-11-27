@@ -58,10 +58,14 @@ fn write_payload(backing: &dyn Backing) {
 }
 
 fn read_payload(backing: &dyn Backing) -> Vec<u8> {
-    let file = backing.open("data/payload", false).unwrap();
-    let mut bytes = vec![0xff; file.len().unwrap() as usize];
-    file.read_at(0, &mut bytes).unwrap();
-    bytes
+    read_payload_result(backing).unwrap()
+}
+
+fn read_payload_result(backing: &dyn Backing) -> io::Result<Vec<u8>> {
+    let file = backing.open("data/payload", false)?;
+    let mut bytes = vec![0xff; file.len()? as usize];
+    file.read_at(0, &mut bytes)?;
+    Ok(bytes)
 }
 
 /// An entry with its mode, its bytes if it is a file, and its modification
@@ -515,8 +519,9 @@ fn a_page_that_changes_after_a_read_only_open_stops_the_view() {
     assert!(file.read_at(0, &mut bytes).is_err(), "a stopped view read");
 }
 
-/// Every operation first asks the witness whether it still selects what
-/// the view read: a changed anchor stops the view for good.
+/// Every operation first reads a local witness again, to ask whether it
+/// still selects what the view read: a changed anchor stops the view for
+/// good.
 #[test]
 fn a_witness_that_changes_after_a_read_only_open_stops_the_view() {
     let Some(local) = Local::new() else {
@@ -526,6 +531,8 @@ fn a_witness_that_changes_after_a_read_only_open_stops_the_view() {
     let anchor = local.witness().join("anchor");
     let bytes = std::fs::read(&anchor).unwrap();
     std::fs::write(&anchor, b"").unwrap();
+    let error = view.list("").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     let error = view.check_freshness().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     std::fs::write(&anchor, &bytes).unwrap();
@@ -1038,9 +1045,12 @@ fn a_remote_read_only_open_authenticates_the_current_generation() {
     remote.open().unwrap();
 }
 
-/// Every operation asks the authority again, and a record that changed
-/// (here an administrator's takeover, made elsewhere) stops the view for
-/// good.
+/// The authority is asked again when the view's user asks
+/// (`check_freshness`, which a command calls before it reports), and a
+/// record that changed (here an administrator's takeover, made elsewhere)
+/// stops the view for good. What the view read before is the generation it
+/// opened, authenticated page by page: the takeover changed nothing in the
+/// root, which the view's locks keep every other operation out of.
 #[test]
 fn an_authority_that_changes_after_a_remote_read_only_open_stops_the_view() {
     let remote = Remote::new();
@@ -1055,11 +1065,133 @@ fn an_authority_that_changes_after_a_remote_read_only_open_stops_the_view() {
             authorization: Some(SessionAuthorization::generate().unwrap()),
         })
         .unwrap();
-    let file = view.open("data/payload", false);
-    let error = file.err().unwrap();
+    assert_eq!(read_payload(&view), payload());
+    let error = view.check_freshness().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("the remote authority changed after the backing was opened read-only"),
+        "{error}"
+    );
     assert!(view.session_stopped().is_some());
+    assert!(view.open("data/payload", false).is_err());
+    assert!(view.list("").is_err());
     assert!(view.check_freshness().is_err());
+}
+
+/// A remote view sends the authority two inspections while it opens and one
+/// each time its user asks for freshness, however much it reads: a deep
+/// check of a large volume sent one before every backing operation, each
+/// over a connection of its own. A local witness is still read before every
+/// operation.
+#[test]
+fn a_remote_read_only_view_asks_the_authority_only_when_asked() {
+    let remote = Remote::new();
+    remote.clear();
+    let view = remote.open().unwrap();
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "inspect"]);
+    remote.clear();
+    for _ in 0..10 {
+        assert_eq!(read_payload(&view), payload());
+        assert_eq!(view.list("").unwrap(), ["data", "volume.lock"]);
+        assert!(view.exists("data/payload").unwrap());
+        assert_eq!(view.capacity().unwrap(), 32 * PAGE);
+        view.free_bytes().unwrap();
+        drop(view.try_lock_shared_existing("volume.lock").unwrap());
+    }
+    assert_eq!(*remote.actions.lock().unwrap(), Vec::<&str>::new());
+    view.check_freshness().unwrap();
+    view.check_freshness().unwrap();
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "inspect"]);
+}
+
+/// A writable open that is given a check runs it before it claims a writer,
+/// over a view of the authority's current generation that reads only what
+/// the check reads, every page authenticated, and changes nothing: what the
+/// check refuses is refused with only the open's inspection sent, the
+/// authority's record unchanged and nothing in the root changed. A check
+/// that passes leaves the open to claim as before. It runs only where a
+/// claim could be granted: an authority that is not released refuses the
+/// claim, as it did, without the check.
+#[test]
+fn a_writable_remote_open_runs_its_check_before_the_claim() {
+    let remote = Remote::new();
+    let record = remote.record();
+    let before = tree(remote.root());
+    remote.clear();
+    let error =
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            assert_eq!(read_payload(view), payload());
+            assert_eq!(view.capacity().unwrap(), 32 * PAGE);
+            every_change_is_refused(view, "data/payload");
+            view.check_freshness().unwrap();
+            Err(io::Error::other("refused by the check"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "refused by the check");
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(remote.record(), record);
+    assert_eq!(
+        tree(remote.root()),
+        before,
+        "a refused open changed the root"
+    );
+    // A page that does not authenticate fails the check's read, before the
+    // claim too.
+    let namespace = remote
+        .root()
+        .join(record.current.as_ref().unwrap().namespace.clone());
+    let slot = committed_slot(&namespace);
+    flip(&namespace.join("rollback.arena"), slot);
+    remote.clear();
+    let error =
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            read_payload_result(view).map(drop)
+        })
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(remote.record(), record);
+    flip(&namespace.join("rollback.arena"), slot);
+
+    let mut checked = false;
+    remote.clear();
+    let writer = RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |_| {
+        checked = true;
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert!(checked);
+    assert_eq!(
+        remote.actions.lock().unwrap()[..3],
+        ["inspect", "claim", "activate"]
+    );
+    assert_eq!(read_payload(&writer), payload());
+    remote
+        .writer
+        .lose_release
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(writer);
+    let record = remote.record();
+    remote.clear();
+    let error = RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |_| {
+        Err(io::Error::other(
+            "the check ran against an occupied authority",
+        ))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "claim"]);
+    assert_eq!(remote.record(), record);
 }
 
 /// The authority's record is read again once the view holds its locks: a
