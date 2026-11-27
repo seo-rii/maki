@@ -764,7 +764,7 @@ it, in five jobs:
    runs the merged corpus once (`-runs=0`), whose `INITED` line gives the
    edges and features it covers. libFuzzer's merge survives an input that
    fails its inner process: it writes the input to the merge's artifacts as
-   a crash, timeout, out-of-memory or leak input, runs the inner process
+   a crash, timeout or out-of-memory input, runs the inner process
    again (`MERGE-OUTER: attempt 2` in its log), which leaves the input out,
    and exits 0. The job records every input the merge wrote and the
    attempts its log shows: such an input, a second attempt or a log that

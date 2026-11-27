@@ -514,8 +514,10 @@ def run(binary, target, shard, cpu_seconds, wall_seconds, workers, seeds, out,
             signal.signal(sig, handler)
 
 def shard_failures(record):
-    """Why a shard's processes were not all charged their share, each round
-    run to its time limit, without finding an input to stop on."""
+    """Why a shard did not qualify: the step or a process was interrupted
+    or stopped at its deadline, a process exited nonzero, ended
+    MAX_EARLY_ROUNDS rounds in a row early or was not charged its share, or
+    a process wrote a failing input."""
     reasons = ["the step was interrupted"] if record.get("interrupted") else []
     for worker in record["workers"]:
         if worker.get("stopped") and worker.get("stop") == "interrupted":
