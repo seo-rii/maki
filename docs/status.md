@@ -242,21 +242,42 @@ See [cache reload](operations.md#growth-and-cache-reload).
   close the device, which keeps showing the connection until then, so the
   detach must have waited (AUD-197). It attaches again and reads the data
   back, then kills nbdkit under the mount, cleans up without it, starts a new
-  nbdkit, attaches a third time and detaches. The Debian guide's install
-  steps, the quick start and its first-volume bootstrap (AUD-199) then run as
-  written on the package built from the same commit, under systemd with the
-  installed units, including the attach unit's `ExecStop` cleanup on two
-  planned stops. That is one local-provider volume at a time on one runner
-  kernel, and nbdkit is killed once, while the filesystem is idle after a
-  sync. In the job's first run the killed daemon's device still showed its
-  connection, so that cleanup took cleanup's detach path; its path for a
-  backend known to be absent (disconnected recovery) has not run on a kernel.
-  How often something holds a device open at a detach on a production host
-  has not been measured. Detach and cleanup wait for such a device without
-  the attach lock (AUD-197), so the cleanups of many volumes stopping
-  together no longer queue on it for each other's waits; that is tested on
-  the helper's fake system only, and several volumes stopping together have
-  not run on a kernel.
+  nbdkit and attaches a third time. The Debian guide's install steps, the
+  quick start and its first-volume bootstrap (AUD-199) then run as written on
+  the package built from the same commit, under systemd with the installed
+  units, including the attach unit's `ExecStop` cleanup on two planned stops.
+  In the job's runs whose logs are kept the killed daemon's device still
+  showed its connection, so that cleanup took cleanup's detach path. The job
+  now also kills nbdkit a second time and disconnects and releases its device
+  by hand so that cleanup takes its disconnected recovery (AUD-203), captures
+  what the helper's readers parse on the attachment, runs the quick start
+  with the bootstrap stopped once (at `mkfs.xfs`, and at `vgchange`) and
+  continued from its record, and stops three volumes together, each device
+  held open for 10 s, recording how long each stop takes. These additions
+  ran four times on GitHub's runner (Linux `7.0.0-1020-azure`, 2026-11-27),
+  at commits a6c2006, f933c7c, 8b9ef4d and 31b7ef8 of #413; the privileged
+  runner and both stopped quick starts passed in each. In the three runs
+  whose logs are kept (all but a6c2006's) the device still showed the
+  connection after the disconnect, with XFS mounted on the LV and again
+  after the unmount, and showed none once the LV's mapping was removed: the
+  mapping keeps the connection's attributes (the mount sits on the mapping,
+  so its own effect is not told apart); cleanup then took its disconnected
+  recovery and left nothing. The stop together failed in the first three
+  runs on its own reading of systemd's unit timestamps: at a6c2006 and
+  f933c7c, with the same driver, it read them before the attach units had
+  stopped (as f933c7c's log shows), at 8b9ef4d after systemd had forgotten
+  the stopped units; it now reads the journal. Their journals
+  show the stops queued one after another on the global attach lock: about
+  10.2, 20.3 and 30.5 s after they began at f933c7c, and about 30.5 s from
+  the first stop's start to the last one's end at 8b9ef4d (whose driver
+  found every unit stopped after 30.678 s). Detach and cleanup now wait for a held-open device without the
+  attach lock (AUD-197, #410), and at 31b7ef8, which has that change, the
+  stop together passed: the three stops took 10.183, 10.246 and 10.310 s,
+  about the 10 s hold each, and every attach unit had stopped 10.388 s after
+  the request. That is local-provider volumes on one runner kernel, and
+  nbdkit is killed only while the filesystem is idle after a sync. How often
+  something holds a device open at a detach on a production host has not
+  been measured.
 
 ## Where the evidence lives
 

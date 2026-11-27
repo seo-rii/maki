@@ -9,8 +9,10 @@ kernel device is opened and nothing runs as root.
 """
 import errno
 import importlib.util
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +23,10 @@ from unittest import mock
 
 SCRIPT = Path(__file__).with_name("privileged-linux-validation.sh")
 OPENER = Path(__file__).with_name("privileged_validation_opener.py")
+CAPTURE = Path(__file__).with_name("privileged_validation_capture.py")
+PRIVILEGED = Path(__file__).resolve().parents[1] / "crates/maki-privileged/src"
+# An attachment's connection identifier, as attach records hold it.
+ATTACHMENT = "maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"
 
 
 def load_opener():
@@ -57,6 +63,8 @@ class LifecycleOrder(unittest.TestCase):
             self.lifecycle,
             # What the release checks look for is there before the detach.
             '\nrequire_attached "the first attach"\n',
+            # What the helper's readers parse, from this attachment.
+            '\ncapture_helper_outputs\n',
             # Written and fsynced, then hashed, while attached.
             'dd if=/dev/urandom of="$mountpoint/work/lifecycle.dat" bs=1M count=32 conv=fsync',
             'sync -f "$mountpoint/work"',
@@ -82,30 +90,55 @@ class LifecycleOrder(unittest.TestCase):
         killed = fragment(self.lifecycle, 'if [[ "$kill_daemon" == true ]]; then\n', "\nelse\n")
         self.assert_in_order(
             killed,
-            'sync -f "$mountpoint/work"',
-            'kill -KILL "$nbdkit_pid"',
-            'wait "$nbdkit_pid" || killed_status=$?',
-            '[[ "$killed_status" == 137 ]] ||',
+            '\n    kill_nbdkit "after the second attach"\n',
+            # What the device shows decides the path cleanup must take.
+            '\n    shown="$(shown_backend)"\n',
             "\n    run_helper cleanup maki-cleanup-dead-daemon ||",
+            '\n    require_cleanup_path maki-cleanup-dead-daemon "$shown"\n',
             '\n    require_released "cleanup after nbdkit was killed"\n',
             # The killed nbdkit left its socket; a new one is started on the
             # same configuration and must negotiate.
-            'remove_stale_test_socket "$socket_path"',
-            '"${nbdkit_launcher[@]}" nbdkit --foreground -U "$socket_path" "$plugin_path"',
-            'config="$config_path" >>"$run_dir/nbdkit.log" 2>&1 &',
-            'nbdinfo "$nbd_uri"',
+            '\n    start_nbdkit "after the first SIGKILL" nbdinfo-after-kill\n',
             "\n    run_helper attach maki-attach-after-kill ||",
             '\n    require_attached "the attach after nbdkit was killed"\n',
             "\n    run_helper verify maki-verify-after-kill ||",
             "\n    check_lifecycle_data restart\n",
+            # Cleanup's path for a device that shows no connection: the
+            # device of a killed nbdkit is released by hand first, its
+            # attach record kept.
+            '\n    kill_nbdkit "after the third attach"\n',
+            "\n    release_by_hand\n",
+            "\n    run_helper cleanup maki-cleanup-disconnected ||",
+            '\n    require_cleanup_path maki-cleanup-disconnected ""\n',
+            '\n    require_released "cleanup of the disconnected attachment"\n',
+            '\n    start_nbdkit "after the second SIGKILL" nbdinfo-after-disconnect\n',
+            "\n    run_helper attach maki-attach-after-disconnect ||",
+            '\n    require_attached "the attach after disconnected recovery"\n',
+            "\n    run_helper verify maki-verify-after-disconnect ||",
+            "\n    check_lifecycle_data recovery\n",
             "\n    run_helper detach maki-detach-final ||",
             '\n    require_released "the final detach"',
         )
         # The cleanup trap must know whether storage is still attached.
         self.assert_in_order(killed, "run_helper cleanup", "mount_active=false",
                              "helper_cleanup_needed=false", "helper_cleanup_needed=true",
+                             "run_helper attach", "mount_active=true", "release_by_hand",
+                             "run_helper cleanup", "mount_active=false",
+                             "helper_cleanup_needed=false", "helper_cleanup_needed=true",
                              "run_helper attach", "mount_active=true", "run_helper detach",
                              "mount_active=false", "helper_cleanup_needed=false")
+
+    def test_a_kill_syncs_and_requires_sigkill_and_a_restart_negotiates(self):
+        functions = fragment(self.source, "run_helper() {\n", '\nrequire_attached "the first attach"\n')
+        kill = fragment(functions, "kill_nbdkit() {\n", "\n}\n")
+        self.assert_in_order(kill, 'sync -f "$mountpoint/work"', 'kill -KILL "$nbdkit_pid"',
+                             'wait "$nbdkit_pid" || killed_status=$?', 'nbdkit_pid=""',
+                             '[[ "$killed_status" == 137 ]] ||')
+        start = fragment(functions, "start_nbdkit() {\n", "\n}\n")
+        self.assert_in_order(start, 'remove_stale_test_socket "$socket_path"',
+                             '"${nbdkit_launcher[@]}" nbdkit --foreground -U "$socket_path" "$plugin_path"',
+                             'config="$config_path" >>"$run_dir/nbdkit.log" 2>&1 &',
+                             "nbdkit_pid=$!", 'nbdinfo "$nbd_uri" >"$run_dir/$2.txt"')
 
     def test_without_kill_daemon_cleanup_ends_the_attachment(self):
         tail = self.lifecycle[self.lifecycle.index("\nelse\n"):]
@@ -217,17 +250,22 @@ class LifecycleFragments(unittest.TestCase):
 device=/dev/nbd15
 nbd_target=nbd15
 volume_name=privval-1000-42
+vg_name=maki_validation_1000_42
+lv_name=data
 mountpoint="$FIXTURE/mnt"
 run_dir="$FIXTURE/logs"
 attach_bin="$FIXTURE/maki-attach"
 attach_config_path=/not-opened/attach.toml
 REPO_ROOT=/not-opened
 opener_pid=""
+mount_active=true
+RELEASE_LOOKS=3
 log() { printf 'LOG: %s\n' "$*"; }
 pass() { printf 'PASS: %s\n' "$*"; }
 die() { printf 'DIE: %s\n' "$*"; exit 1; }
 basename() { printf '%s\n' "$nbd_target"; }
 findmnt() { [[ -e "$FIXTURE/mounted" ]]; }
+sleep() { :; }
 sudo() {
     [[ "$1" == -n ]] || return 99
     shift
@@ -235,7 +273,10 @@ sudo() {
         env) shift 2; "$@" ;;
         blockdev) cat "$FIXTURE/size" ;;
         sh) shift; [[ -z "${SUDO_FAILS:-}" ]] || return 1; sh "$1" "$2" "$3" "$FIXTURE$4" ;;
-        python3) shift 3; "$FIXTURE/opener" "$@" ;;
+        # A script of the run, by its name, from the fixture.
+        python3) shift 2; script="${1##*/}"; shift; "$FIXTURE/$script" "$@" ;;
+        umount|dmsetup) "$FIXTURE/root-command" "$@" ;;
+        cat) shift; cat "$FIXTURE$1" ;;
         *) return 98 ;;
     esac
 }
@@ -381,9 +422,12 @@ sudo() {
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def opener(self, script):
-        opener = self.root / "opener"
-        opener.write_text("#!/bin/sh\n" + script)
-        opener.chmod(0o700)
+        self.script("privileged_validation_opener.py", script)
+
+    def script(self, name, body):
+        path = self.root / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o700)
 
     def test_the_detach_starts_only_once_the_opener_holds_the_device(self):
         self.opener('echo "  0.000s holding the device open; it shows backend \'maki-1\'"\n'
@@ -399,6 +443,144 @@ sudo() {
                 if not ok:
                     self.assertIn("DIE: the opener of /dev/nbd15 exited with status 8", result.stdout)
                 (self.root / "release").unlink()
+
+    def test_cleanup_must_take_the_path_for_what_the_device_showed(self):
+        detach = "maki-attach: /dev/nbd15 shows the attachment's connection; cleanup follows the detach path"
+        recovery = "maki-attach: /dev/nbd15 shows no connection; cleanup follows disconnected recovery"
+        for shown, logged, ok in (("maki-1", detach, True), ("", recovery, True),
+                                  ("maki-1", recovery, False), ("", detach, False), ("", "", False)):
+            with self.subTest(shown=shown, logged=logged):
+                (self.run_dir / "maki-cleanup.txt").write_text(f"# cleanup volume\n{logged}\n")
+                result = self.run_fragment(f'require_cleanup_path maki-cleanup "{shown}"\necho CHECKED')
+                self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
+                self.assertEqual("CHECKED" in result.stdout, ok)
+                if not ok:
+                    self.assertIn("DIE: cleanup did not say it took the path", result.stdout)
+
+    # The kernel keeps a connection's attributes until the last opener of
+    # the device has closed it: which step of the release by hand they go
+    # at, by what the device's openers are.
+    RELEASES = {"mapping": ["kernel-disconnect", "umount", "dmsetup"],
+                "mount": ["kernel-disconnect", "umount"], "disconnect": ["kernel-disconnect"]}
+
+    def release(self, gone_at, *, disconnect_status=0, record="kept", recorded=None):
+        """The runner's release by hand on a mounted, mapped device whose
+        connection's attributes go at `gone_at` (or never, None). The
+        attach record names `recorded` (device, identifier), the device and
+        identifier the device shows by default; `record` is "kept",
+        "missing" from the start or "gone" during the release."""
+        self.attached()
+        (self.sysfs / "backend").write_text(ATTACHMENT + "\n")
+        path = self.root / "run/maki-attach/privval-1000-42.nbd"
+        device, identifier = recorded or ("/dev/nbd15", ATTACHMENT)
+        path.write_text(json.dumps({"version": 1, "volume": "privval-1000-42", "device": device,
+                                    "connection_id": identifier}))
+        if record == "missing":
+            path.unlink()
+        (self.sysfs / "holders/dm-0/dm").mkdir(parents=True)
+        (self.sysfs / "holders/dm-0/dm/name").write_text("maki_validation_1000_42-data\n")
+        gone = f'rm -f "{self.sysfs}/backend" "{self.sysfs}/pid"\n'
+        calls = f'echo "$*" >> "{self.root}/root-calls"\n'
+        self.script("privileged_validation_nbd.py", calls.replace("$*", "kernel-disconnect $*")
+                    + 'echo "the kernel acknowledged NBD_CMD_DISCONNECT for nbd15"\n'
+                    + (gone if gone_at == "disconnect" else "") + f"exit {disconnect_status}\n")
+        self.script("root-command", calls + 'case "$1" in\n'
+                    f'  umount) rm "{self.root}/mounted"; {gone if gone_at == "mount" else ":"} ;;\n'
+                    f'  dmsetup) rm -r "{self.sysfs}/holders/dm-0"; {gone.strip() if gone_at == "mapping" else ":"}'
+                    + (f'; rm "{path}"' if record == "gone" else "") + " ;;\n"
+                    "esac\n")
+        result = self.run_fragment("release_by_hand\necho RELEASED")
+        root_calls = self.root / "root-calls"
+        made = root_calls.read_text().splitlines() if root_calls.exists() else []
+        return result, made
+
+    def test_the_release_by_hand_stops_once_the_device_shows_no_connection(self):
+        for gone_at, steps in self.RELEASES.items():
+            with self.subTest(gone_at=gone_at):
+                self.setUp()
+                result, made = self.release(gone_at)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call.split()[0] for call in made], steps)
+                disconnect = made[0].split()
+                self.assertEqual(disconnect[1:], ["--device", "/dev/nbd15", "--identifier",
+                                                  ATTACHMENT, "--helper",
+                                                  str(self.root / "maki-attach"), "--volume",
+                                                  "privval-1000-42", "kernel-disconnect"])
+                if "umount" in steps:
+                    self.assertEqual(made[1], f"umount {self.root}/mnt")
+                if "dmsetup" in steps:
+                    self.assertEqual(made[2], "dmsetup remove maki_validation_1000_42-data")
+                # Each step says what the device showed after it.
+                self.assertIn("LOG: after NBD_CMD_DISCONNECT, with XFS mounted, /dev/nbd15 shows backend "
+                              + ("none" if gone_at == "disconnect" else ATTACHMENT), result.stdout)
+                self.assertIn("PASS: /dev/nbd15 shows no connection while the attach record of its "
+                              "killed nbdkit remains", result.stdout)
+                self.assertIn("RELEASED", result.stdout)
+
+    def test_a_release_by_hand_that_leaves_a_connection_or_no_record_stops_the_run(self):
+        cases = {"never gone": ({"gone_at": None}, "/dev/nbd15 still shows a connection"),
+                 "disconnect refused": ({"gone_at": "mapping", "disconnect_status": 1},
+                                        "NBD_CMD_DISCONNECT of /dev/nbd15 failed"),
+                 "no record": ({"gone_at": "mapping", "record": "gone"},
+                               "the attach record went before cleanup ran")}
+        for name, (options, message) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                result, made = self.release(**options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"DIE: {message}", result.stdout)
+                self.assertNotIn("RELEASED", result.stdout)
+                if name == "disconnect refused":
+                    self.assertEqual([call.split()[0] for call in made], ["kernel-disconnect"])
+
+    def test_only_the_connection_the_attach_record_names_is_released_by_hand(self):
+        # The identifier the device shows is no proof of whose connection
+        # it is: the attach record's must be the one shown, on its device.
+        other = "maki-11111111-2222-3333-4444-555555555555"
+        cases = {"another identifier": ({"recorded": ("/dev/nbd15", other)},
+                                        f"names the connection {other} on /dev/nbd15, but "
+                                        f"/dev/nbd15 shows {ATTACHMENT}"),
+                 "another device": ({"recorded": ("/dev/nbd3", ATTACHMENT)},
+                                    f"names the connection {ATTACHMENT} on /dev/nbd3, but "
+                                    f"/dev/nbd15 shows {ATTACHMENT}"),
+                 "no record": ({"record": "missing"}, "could not read the attach record")}
+        for name, (options, message) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                result, made = self.release("mapping", **options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                [died] = [line for line in result.stdout.splitlines() if line.startswith("DIE: ")]
+                self.assertIn(message, died)
+                self.assertEqual(made, [])
+
+    def test_no_release_by_hand_without_an_attachments_connection(self):
+        for shown in ("maki-bootstrap-" + ATTACHMENT[5:], "maki-1", None):
+            with self.subTest(shown=shown):
+                self.setUp()
+                self.attached()
+                if shown is None:
+                    (self.sysfs / "backend").unlink()
+                else:
+                    (self.sysfs / "backend").write_text(shown + "\n")
+                self.script("privileged_validation_nbd.py", f'touch "{self.root}/root-calls"\n')
+                result = self.run_fragment("release_by_hand\necho RELEASED")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("DIE: /dev/nbd15 shows no attachment's connection before the release "
+                              f"by hand ({shown or 'none'})", result.stdout)
+                self.assertFalse((self.root / "root-calls").exists())
+
+    def test_the_helpers_outputs_are_captured_as_root_into_the_run_directory(self):
+        self.script("privileged_validation_capture.py", 'printf "%s\\n" "$@"\n')
+        result = self.run_fragment("capture_helper_outputs")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.run_dir / "helper-outputs.json").read_text().split(),
+                         ["--device", "/dev/nbd15", "--vg", "maki_validation_1000_42", "--lv", "data",
+                          "--mountpoint", str(self.root / "mnt")])
+        self.assertIn("PASS: captured the outputs of the helper's probes", result.stdout)
+        self.script("privileged_validation_capture.py", "exit 1\n")
+        result = self.run_fragment("capture_helper_outputs")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DIE: could not capture the helper's probe outputs", result.stdout)
 
     def test_an_opener_that_never_holds_the_device_stops_the_run(self):
         self.opener('echo "cannot open /dev/nbd15: Permission denied"\nexit 2\n')
@@ -565,6 +747,23 @@ class Opener(unittest.TestCase):
         self.assertTrue(device.closed)
         self.assertGreater(clock.now, self.module.DEADLINE)
 
+    def test_the_hold_after_the_disconnect_is_chosen_by_the_caller(self):
+        # Several volumes stopping together hold each device longer than
+        # the lifecycle's detach does; the default stays two seconds.
+        for arguments, seconds in (([], 2.0), (["--hold", "10"], 10.0)):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(self.module, "Device"), \
+                    mock.patch.object(self.module, "hold", return_value=0) as hold:
+                self.assertEqual(self.module.main(["--device", "/dev/nbd2", "--stop-file",
+                                                   "/nonexistent", *arguments]), 0)
+                self.assertEqual(hold.call_args.kwargs["hold_seconds"], seconds)
+        for value in ("0", "-1", "61", "nan"):
+            with self.subTest(hold=value):
+                with self.assertRaises(SystemExit), open(os.devnull, "w") as quiet, \
+                        mock.patch("sys.stderr", quiet):
+                    self.module.main(["--device", "/dev/nbd2", "--stop-file", "/nonexistent",
+                                      "--hold", value])
+
     def test_only_a_canonical_nbd_device_is_opened(self):
         for device in ("/dev/sda", "/dev/nbd256", "/dev/nbd01", "nbd0"):
             with self.subTest(device=device):
@@ -572,6 +771,162 @@ class Opener(unittest.TestCase):
                         open(os.devnull, "w") as quiet, \
                         mock.patch("sys.stderr", quiet):
                     self.module.main(["--device", device, "--stop-file", "/nonexistent"])
+                self.assertEqual(raised.exception.code, 2)
+
+
+def load_capture():
+    spec = importlib.util.spec_from_file_location("privileged_validation_capture", CAPTURE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rust_literals(text):
+    """The string literals of a span of Rust, in order, decoded."""
+    found = []
+    for raw, plain in re.findall(r'r#"(.*?)"#|"((?:[^"\\]|\\.)*)"', text, re.S):
+        found.append(raw or plain.encode().decode("unicode_escape"))
+    return found
+
+
+def rust_span(name, start, end):
+    source = (PRIVILEGED / name).read_text()
+    begin = source.index(start)
+    return source[begin:source.index(end, begin + len(start))]
+
+
+class HelperOutputs(unittest.TestCase):
+    """privileged_validation_capture.py runs each probe as the helper does:
+    the commands are read from the helper's own sources here."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_capture()
+
+    def test_each_command_is_the_helpers(self):
+        lvm = self.module.lvm_report(["/dev/nbd15", "/dev/nbd15p1"])
+        devices = lvm.index("--devices") + 1
+        # `device_list` joins the candidates with commas.
+        self.assertEqual(lvm[devices], "/dev/nbd15,/dev/nbd15p1")
+        self.assertEqual(lvm[:devices] + lvm[devices + 1:],
+                         rust_literals(rust_span("lvm_preflight.rs", "fn report_command(",
+                                                 "\n}\n")))
+        self.assertEqual(self.module.label_probe("/proc/1/fd/3")[:-1],
+                         rust_literals(rust_span("lvm_preflight.rs", 'controlled_command("blkid")',
+                                                 "&pinned")))
+        self.assertEqual(self.module.filesystem_probe("/dev/vg/lv")[:-1],
+                         rust_literals(rust_span("exec.rs", "PlannedStep::VerifyFilesystemIdentity {",
+                                                 "verify_filesystem_probe(")))
+        self.assertEqual(self.module.uuid_value("/dev/mapper/vg-lv")[:-1],
+                         rust_literals(rust_span("exec.rs", "fn blkid_uuid_command(", "\n}\n")))
+        self.assertEqual(self.module.mapping_info("vg-lv"),
+                         rust_literals(rust_span("recover.rs", "fn controlled_dmsetup(", "\n}\n"))
+                         + rust_literals(rust_span("recover.rs", "fn dmsetup_info_command(", "\n}\n"))
+                         + ["vg-lv"])
+        size = rust_literals(rust_span("exec.rs", 'command::controlled("blockdev")', "\n"))
+        self.assertEqual(size, ["blockdev", "--getsize64", "/dev/{vg}/{lv}"])
+        self.assertEqual(self.module.lv_size("vg", "lv"), ["blockdev", "--getsize64", "/dev/vg/lv"])
+
+    def test_the_environment_and_limits_are_the_helpers(self):
+        pairs = rust_literals(rust_span("command.rs", "pub(crate) fn controlled(", "\n}\n"))
+        self.assertEqual(self.module.ENVIRONMENT, dict(zip(pairs[::2], pairs[1::2])))
+        policy = rust_span("command.rs", "pub(super) const STEP: Self", "\n}\n")
+        self.assertIn("max_output_bytes: 64 * 1024,", policy)
+        self.assertEqual(self.module.MAX_OUTPUT, 64 * 1024)
+        self.assertIn("timeout: Duration::from_secs(15),", rust_span(
+            "command.rs", "pub(super) const PROBE: Self", "};"))
+        self.assertEqual(self.module.TIMEOUT, 15)
+        with mock.patch.object(self.module.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 2, stdout=b"out\n", stderr=b"")
+            self.assertEqual(self.module.run(["blkid"]),
+                             {"argv": ["blkid"], "status": 2, "stdout": "out\n", "stderr": "",
+                              "truncated": False})
+        run.assert_called_once_with(["blkid"], env=self.module.ENVIRONMENT,
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+
+    def test_the_attributes_are_the_ones_the_helpers_readers_open(self):
+        opened = set()
+        for name in ("allocation.rs", "detach.rs", "displaced.rs", "recover.rs", "lvm_preflight.rs",
+                     "exec.rs", "probe.rs", "workload_verify.rs", "nbd_kernel.rs"):
+            opened |= set(re.findall(r'join\("([a-z_/]+)"\)', (PRIVILEGED / name).read_text()))
+        self.assertEqual(set(self.module.ATTRIBUTES) | {"holders", "slaves"}, opened)
+
+    def sysfs(self, root):
+        def node(name, **attributes):
+            (root / name / "holders").mkdir(parents=True)
+            (root / name / "slaves").mkdir()
+            for attribute, value in attributes.items():
+                path = root / name / attribute.replace("__", "/")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value + "\n")
+        node("nbd15", dev="43:240", size="1048576", pid="1234", backend=ATTACHMENT)
+        node("nbd15p1", dev="43:241", size="2048", partition="1", start="2048")
+        node("dm-0", dev="252:0", size="786432", dm__name="vg-data", dm__uuid="LVM-abc")
+        node("dm-1", dev="252:1", dm__name="other-data", dm__uuid="LVM-def")
+        node("nbd1", dev="43:16")
+        node("dm-5", dev="252:5", dm__name="unrelated")
+        (root / "nbd15/holders/dm-0").symlink_to("../../dm-0")
+        (root / "dm-0/slaves/nbd15").symlink_to("../../nbd15")
+        (root / "dm-0/holders/dm-1").symlink_to("../../dm-1")
+        (root / "dm-1/slaves/dm-0").symlink_to("../../dm-0")
+
+    def test_the_tree_is_the_devices_nodes_in_the_fuzz_inputs_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.sysfs(root)
+            self.assertEqual(self.module.tree(root, "nbd15"), [
+                "nbd15/", "nbd15/dev=43:240", "nbd15/size=1048576", "nbd15/pid=1234",
+                f"nbd15/backend={ATTACHMENT}", "nbd15/holders/", "nbd15/holders/dm-0>dm-0",
+                "nbd15/slaves/",
+                "nbd15p1/", "nbd15p1/dev=43:241", "nbd15p1/size=2048", "nbd15p1/partition=1",
+                "nbd15p1/start=2048", "nbd15p1/holders/", "nbd15p1/slaves/",
+                "dm-0/", "dm-0/dev=252:0", "dm-0/size=786432", "dm-0/dm/name=vg-data",
+                "dm-0/dm/uuid=LVM-abc", "dm-0/holders/", "dm-0/holders/dm-1>dm-1", "dm-0/slaves/",
+                "dm-0/slaves/nbd15>nbd15",
+                "dm-1/", "dm-1/dev=252:1", "dm-1/dm/name=other-data", "dm-1/dm/uuid=LVM-def",
+                "dm-1/holders/", "dm-1/slaves/", "dm-1/slaves/dm-0>dm-0",
+            ])
+
+    def test_a_capture_holds_each_probe_the_tree_and_the_mount_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.sysfs(root / "sys")
+            device = root / "nbd15"
+            device.write_bytes(bytes(4096))
+            mountinfo = root / "mountinfo"
+            mountinfo.write_text("22 1 0:21 / /proc rw - proc proc rw\n"
+                                 "90 22 252:0 / /srv/maki rw,nosuid,nodev - xfs /dev/mapper/vg-data rw\n")
+            ran = []
+
+            def execute(argv):
+                ran.append(argv)
+                return {"argv": argv, "status": 0, "stdout": "", "stderr": "", "truncated": False}
+            with mock.patch.object(self.module.os, "open", wraps=os.open) as opened:
+                captured = self.module.capture(str(device), "vg", "data", "/srv/maki",
+                                               sysfs=root / "sys", mountinfo=mountinfo,
+                                               execute=execute)
+            self.assertEqual(list(captured["commands"]),
+                             ["lvm_report", "pv_label", "filesystem", "dm_info", "lv_size", "blkid_value"])
+            label = captured["commands"]["pv_label"]["argv"]
+            self.assertRegex(label[-1], rf"^/proc/{os.getpid()}/fd/\d+$")
+            # The probe read the device through a descriptor opened for it.
+            self.assertEqual(opened.call_args.args[0], str(device))
+            lvm = captured["commands"]["lvm_report"]["argv"]
+            self.assertEqual(lvm[lvm.index("--devices") + 1], f"{device},/dev/nbd15p1")
+            self.assertEqual(captured["commands"]["filesystem"]["argv"][-1], "/dev/vg/data")
+            self.assertEqual(captured["commands"]["dm_info"]["argv"][-1], "vg-data")
+            self.assertEqual(captured["commands"]["blkid_value"]["argv"][-1], "/dev/mapper/vg-data")
+            self.assertTrue(captured["sysfs"].startswith("nbd15/\nnbd15/dev=43:240\n"))
+            self.assertEqual(captured["mountinfo"], mountinfo.read_text())
+            json.dumps(captured)
+
+    def test_only_a_canonical_nbd_device_is_captured(self):
+        for device in ("/dev/sda", "/dev/nbd01", "nbd0"):
+            with self.subTest(device=device):
+                with self.assertRaises(SystemExit) as raised, \
+                        open(os.devnull, "w") as quiet, mock.patch("sys.stderr", quiet):
+                    self.module.main(["--device", device, "--vg", "vg", "--lv", "lv",
+                                      "--mountpoint", "/srv/maki"])
                 self.assertEqual(raised.exception.code, 2)
 
 
