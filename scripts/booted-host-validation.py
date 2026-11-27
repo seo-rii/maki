@@ -2,16 +2,19 @@
 """Boot a disposable Debian 12 or EL9 cloud image under QEMU and run commands
 in it over SSH: the host side of CI's booted-host jobs.
 
+    booted-host-validation.py image-key --guest GUEST
     booted-host-validation.py fetch --guest GUEST --directory IMAGES
     booted-host-validation.py payload --guest GUEST --suite SUITE \\
         --package PACKAGE_DIRECTORY --output PAYLOAD
     booted-host-validation.py boot --guest GUEST --images IMAGES --work WORK
-    booted-host-validation.py copy-in --work WORK PAYLOAD
-    booted-host-validation.py run --work WORK [--timeout SECONDS] -- COMMAND...
+    booted-host-validation.py copy-in --work WORK [--timeout SECONDS] PAYLOAD
+    booted-host-validation.py run --work WORK [--timeout SECONDS] [--root] -- COMMAND...
     booted-host-validation.py finish --work WORK --output LOGS
 
-`fetch` downloads the guest's pinned cloud image and refuses one whose digest
-is not the pinned one. `payload` checks the package directory a package job
+`image-key` prints the actions/cache key of the guest's image (its pinned name
+and digest). `fetch` downloads the guest's pinned cloud image and refuses one
+whose digest is not the pinned one; an image already in IMAGES (restored from
+that cache) is checked the same way and downloaded again if it differs. `payload` checks the package directory a package job
 uploaded (its SHA256SUMS, and that its source-revision is this checkout's
 HEAD) and assembles what the guest receives: the guest script, the package
 and, for the `guides` suite, the program `documented_quickstart.py` writes
@@ -22,8 +25,9 @@ never written, and a cloud-init NoCloud seed that creates the user `ci`
 host key; it starts QEMU in the background with KVM, the serial console in
 WORK/console.log and SSH forwarded from 127.0.0.1 only, and waits for SSH and
 for cloud-init to finish. `copy-in` unpacks PAYLOAD into /var/tmp/maki-ci in
-the guest. `run` runs COMMAND in the guest as `ci` under `timeout`, and gives
-up on the connection a little later than that limit. `finish` asks the guest
+the guest. `run` runs COMMAND in the guest as `ci`, or with `--root` as root
+through sudo, under `timeout` (inside sudo with `--root`), and gives up on the
+connection a little later than that limit. `finish` asks the guest
 to pack its logs (booted-host-guest.py collect), copies them out, powers the
 guest off (killing QEMU if it does not stop) and copies the console log,
 never the keys, the seed or the disks.
@@ -127,11 +131,28 @@ def file_digest(path, algorithm):
     return digest.hexdigest()
 
 
+def cache_key(guest):
+    """The actions/cache key of the guest's image: its pinned name and digest,
+    so that no other pin's image is ever restored for it."""
+    return f"booted-host-image-{guest.image}-{guest.algorithm}-{guest.digest}"
+
+
 def fetch(guest, directory):
-    """Download the guest's pinned image into `directory` and return its path."""
+    """Download the guest's pinned image into `directory` and return its path.
+    An image already there (restored from the cache) is used only if it has
+    the pinned digest, and replaced otherwise."""
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / guest.image
     partial = directory / (guest.image + ".partial")
+    if target.exists():
+        actual = file_digest(target, guest.algorithm)
+        if actual == guest.digest:
+            say(f"image: {guest.title}")
+            say(f"file: {guest.image} ({target.stat().st_size} bytes), already here (restored from the cache)")
+            say(f"{guest.algorithm}: {actual} (the pinned digest)")
+            return target
+        say(f"{target} has {guest.algorithm} {actual}, not the pinned {guest.digest}: downloading it again")
+        target.unlink()
     failures = []
     for url in guest.urls:
         if partial.exists():
@@ -392,9 +413,14 @@ def boot(guest, images, work, *, accel="kvm", cpus=2, memory=4096, disk_size="30
     return state
 
 
-def run(work, command, timeout=600):
-    """Run `command` in the guest as the CI user; return its status."""
-    remote = shlex.join(["timeout", "--kill-after=30", str(int(timeout)), *command])
+def run(work, command, timeout=600, root=False):
+    """Run `command` in the guest as the CI user, or as root through sudo with
+    `root`; return its status. With `root` the time limit runs inside sudo:
+    there `timeout` signals the command's whole process group, root children
+    included, where as the CI user it could signal only sudo, which relays a
+    signal to its command alone."""
+    limit = ["timeout", "--kill-after=30", str(int(timeout))]
+    remote = shlex.join(["sudo", *limit, *command] if root else [*limit, *command])
     argv = ssh_command(work, remote)
     say("guest$ " + shlex.join(command))
     try:
@@ -410,14 +436,18 @@ def run(work, command, timeout=600):
     return status
 
 
-def copy_in(work, source):
-    """Unpack the directory `source` into the guest's /var/tmp/maki-ci."""
+def copy_in(work, source, timeout=300):
+    """Unpack the directory `source` into the guest's /var/tmp/maki-ci,
+    giving up after `timeout` seconds."""
     remote = (f"mkdir -p {GUEST_DIRECTORY} && chmod 0755 {GUEST_DIRECTORY} && "
               f"tar -C {GUEST_DIRECTORY} -xf -")
     say(f"copying {source} into the guest's {GUEST_DIRECTORY}")
     pack = subprocess.Popen(["tar", "-C", str(source), "-cf", "-", "."], stdout=subprocess.PIPE)
     try:
-        status = subprocess.run(ssh_command(work, remote), stdin=pack.stdout, timeout=600).returncode
+        status = subprocess.run(ssh_command(work, remote), stdin=pack.stdout, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        pack.kill()
+        raise SystemExit(f"copying {source} into the guest did not finish within {timeout} s")
     finally:
         pack.stdout.close()
         packed = pack.wait()
@@ -445,7 +475,7 @@ def stop(work, timeout=180, clock=time.monotonic, sleep=time.sleep):
         say("QEMU is not running")
         return True
     # The connection drops as the guest goes down: its status says nothing.
-    run(work, ["sudo", "systemctl", "poweroff"], timeout=30)
+    run(work, ["systemctl", "poweroff"], timeout=30, root=True)
     deadline = clock() + timeout
     while alive(pid) and clock() < deadline:
         sleep(1)
@@ -468,8 +498,8 @@ def finish(work, output):
     output.mkdir(parents=True, exist_ok=True)
     failed = []
     if (work / STATE).exists() and alive(qemu_pid(work)):
-        if run(work, ["sudo", "python3", "-B", f"{GUEST_DIRECTORY}/booted-host-guest.py",
-                      "collect", "--guest", read_state(work)["guest"]], timeout=240) != 0:
+        if run(work, ["python3", "-B", f"{GUEST_DIRECTORY}/booted-host-guest.py",
+                      "collect", "--guest", read_state(work)["guest"]], timeout=240, root=True) != 0:
             failed.append("the guest's collect phase")
         if copy_out(work, GUEST_ARCHIVE, output / "guest.tar.gz") != 0:
             failed.append("copying the guest's logs out")
@@ -495,6 +525,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    keying = commands.add_parser("image-key")
+    keying.add_argument("--guest", choices=sorted(GUESTS), required=True)
     fetching = commands.add_parser("fetch")
     fetching.add_argument("--guest", choices=sorted(GUESTS), required=True)
     fetching.add_argument("--directory", type=Path, required=True)
@@ -512,28 +544,34 @@ def main(argv=None):
     booting.add_argument("--timeout", type=int, default=900)
     copying = commands.add_parser("copy-in")
     copying.add_argument("--work", type=Path, required=True)
+    copying.add_argument("--timeout", type=int, default=300)
     copying.add_argument("source", type=Path)
     running = commands.add_parser("run")
     running.add_argument("--work", type=Path, required=True)
     running.add_argument("--timeout", type=int, default=600)
+    running.add_argument("--root", action="store_true",
+                         help="run COMMAND as root through sudo, with its time limit inside sudo")
     running.add_argument("guest_command", nargs=argparse.REMAINDER)
     finishing = commands.add_parser("finish")
     finishing.add_argument("--work", type=Path, required=True)
     finishing.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.command == "fetch":
+    if args.command == "image-key":
+        # For $GITHUB_OUTPUT.
+        print(f"key={cache_key(GUESTS[args.guest])}")
+    elif args.command == "fetch":
         fetch(GUESTS[args.guest], args.directory)
     elif args.command == "payload":
         payload(GUESTS[args.guest], args.suite, args.package, args.output, Path.cwd())
     elif args.command == "boot":
         boot(GUESTS[args.guest], args.images, args.work, accel=args.accel, timeout=args.timeout)
     elif args.command == "copy-in":
-        copy_in(args.work, args.source)
+        copy_in(args.work, args.source, args.timeout)
     elif args.command == "run":
         command = args.guest_command[1:] if args.guest_command[:1] == ["--"] else args.guest_command
         if not command:
             parser.error("run needs a command after --")
-        return run(args.work, command, args.timeout)
+        return run(args.work, command, args.timeout, root=args.root)
     elif args.command == "finish":
         return finish(args.work, args.output)
     return 0

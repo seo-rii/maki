@@ -26,8 +26,9 @@ and what it found, and keeps it below /var/tmp/maki-ci/results.
   /dev/nbd15 as the user `ci`, which has passwordless sudo: the runner refuses
   root and calls sudo itself (with --install-missing on Debian, the only
   distribution it installs for).
-- selinux (EL9): SELinux still enforcing; every AVC or SELinux error since
-  boot kept, and one that names Maki or an NBD device fails; with the guides
+- selinux (EL9): SELinux still enforcing and auditd active; every AVC or
+  SELinux error since boot kept, and one that names Maki or an NBD device
+  fails; with the guides
   suite, the domain of maki@demo.service's nbdkit and the labels of the
   installed files must be those the RHEL guide states.
 - versions: the kernel and the versions of the packages the guides and the
@@ -35,7 +36,8 @@ and what it found, and keeps it below /var/tmp/maki-ci/results.
 - collect: packs the results, the quick start's directory without the
   package, the runner's run directory without its source snapshot and
   builds, and the journal into /var/tmp/maki-ci-logs.tar.gz. Neither key
-  (/etc/maki/secrets, the runner's work tree) nor a backing is collected.
+  (/etc/maki/secrets, the runner's work tree) nor a backing nor anything of
+  /var/lib/cloud is collected, and a file that holds a private key stops it.
 
 During guides and runner a sampler records, every half second, each nbdkit
 or maki* process with its systemd unit and security label
@@ -78,6 +80,10 @@ LABELS = (("/usr/bin/maki", "bin_t"), ("/usr/bin/maki-attach", "bin_t"),
           ("/run/maki", "var_run_t"), ("/run/maki-control", "var_run_t"),
           ("/run/maki-attach", "var_run_t"),
           ("/usr/lib/systemd/system/maki@.service", "systemd_unit_file_t"),
+          ("/usr/lib/systemd/system/maki-attach@.service", "systemd_unit_file_t"),
+          ("/usr/lib/systemd/system/maki-recover@.service", "systemd_unit_file_t"),
+          ("/usr/lib/systemd/system/maki-workload@.target", "systemd_unit_file_t"),
+          # The device the quick start attaches.
           ("/dev/nbd0", "fixed_disk_device_t"))
 DAEMON_DOMAIN = "unconfined_service_t"
 # The runner's tools on EL9, from BaseOS and AppStream: nbdkit-server as the
@@ -147,6 +153,15 @@ def require_guest(guest, release=None):
     if found != guest:
         raise SystemExit(f"this guest is {release.get('PRETTY_NAME', 'unknown')} ({found}), "
                          f"not {guest}")
+
+
+def auditd_active():
+    """Whether auditd runs: without it the kernel's AVC records go to the
+    kernel log, and ausearch finds none."""
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "auditd"]).returncode == 0
+    except OSError:
+        return False
 
 
 def selinux_mode():
@@ -428,6 +443,12 @@ def selinux(guest, suite, labels=LABELS, search=None):
     if mode != "Enforcing":
         problems.append(f"SELinux is {mode}, not Enforcing")
     record(log, ["sestatus"])
+    if auditd_active():
+        report.append("auditd: active")
+    else:
+        report.append("auditd: not active")
+        problems.append("auditd is not active: AVC records go to the kernel log, and ausearch "
+                        "would find none")
     policy = record(log, ["rpm", "-q", "selinux-policy-targeted"]).stdout.strip()
     report.append(f"policy: {policy}")
     found = record(log, ["ausearch", "-m", DENIAL_TYPES, "-ts", "boot", "-i"]) if search is None \
@@ -496,21 +517,50 @@ def excluded(name, *prefixes):
     return any(name == prefix or name.startswith(prefix + "/") for prefix in prefixes)
 
 
+PRIVATE_KEY = b"PRIVATE KEY-----"
+
+
 def pack(archive, members):
-    """Write `archive` from (path, name in archive, excluded names) triples."""
-    with tarfile.open(archive, "w:gz") as output:
-        for path, arcname, leave_out in members:
-            if not path.exists():
-                continue
+    """Write `archive` from (path, name in archive, excluded names) triples.
+    A file that holds a private key (a PEM or OpenSSH armour line) stops the
+    packing, and no archive is left: the logs must never carry one."""
+    try:
+        with tarfile.open(archive, "w:gz") as output:
+            for path, arcname, leave_out in members:
+                if not path.exists():
+                    continue
 
-            def keep(info, leave_out=leave_out, arcname=arcname):
-                relative = info.name[len(arcname):].lstrip("/")
-                if relative and excluded(relative, *leave_out):
-                    return None
-                return info
+                def keep(info, path=path, leave_out=leave_out, arcname=arcname):
+                    relative = info.name[len(arcname):].lstrip("/")
+                    if relative and excluded(relative, *leave_out):
+                        return None
+                    source = path / relative if relative else path
+                    if info.isfile() and PRIVATE_KEY in source.read_bytes():
+                        raise SystemExit(f"{source} holds a private key: refusing to collect it")
+                    return info
 
-            output.add(str(path), arcname=arcname, filter=keep)
+                output.add(str(path), arcname=arcname, filter=keep)
+    except BaseException:
+        if archive.exists():
+            archive.unlink()
+        raise
     archive.chmod(0o644)
+
+
+def collect_members():
+    """What collect packs: the results, the quick start's directory without
+    the package, cloud-init's and the audit logs and the runner's run
+    directory without its snapshot and builds. Nothing under /var/lib/cloud
+    (whose copy of the seed's user-data holds the host key), /etc/maki or
+    /var/lib/maki, and not the runner's work tree."""
+    members = [(RESULTS, "results", ()),
+               (QUICKSTART, "quickstart", ("maki.deb", "maki.rpm")),
+               (Path("/var/log/cloud-init.log"), "logs/cloud-init.log", ()),
+               (Path("/var/log/cloud-init-output.log"), "logs/cloud-init-output.log", ()),
+               (Path("/var/log/audit/audit.log"), "logs/audit.log", ())]
+    if RUNNER_LOGS.exists():
+        members.append((RUNNER_LOGS.resolve(), "privileged-run", ("source", "target", "build")))
+    return members
 
 
 def collect(guest):
@@ -523,14 +573,7 @@ def collect(guest):
                                            "-u", "maki*"])):
         with open(journal / name, "w", encoding="utf-8") as output:
             subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT)
-    members = [(RESULTS, "results", ()),
-               (QUICKSTART, "quickstart", ("maki.deb", "maki.rpm")),
-               (Path("/var/log/cloud-init.log"), "logs/cloud-init.log", ()),
-               (Path("/var/log/cloud-init-output.log"), "logs/cloud-init-output.log", ()),
-               (Path("/var/log/audit/audit.log"), "logs/audit.log", ())]
-    if RUNNER_LOGS.exists():
-        members.append((RUNNER_LOGS.resolve(), "privileged-run", ("source", "target", "build")))
-    pack(ARCHIVE, members)
+    pack(ARCHIVE, collect_members())
     say(f"packed {ARCHIVE} ({ARCHIVE.stat().st_size} bytes)")
     return 0
 

@@ -668,7 +668,7 @@ jobs:
     runs-on: ubuntu-latest
     # Above the sum of the step limits, so that a hung step fails by its own
     # limit and the logs are still collected.
-    timeout-minutes: 180
+    timeout-minutes: 210
     strategy:
       fail-fast: false
       matrix:
@@ -718,35 +718,56 @@ jobs:
         with:
           name: debian12-package
           path: ${{ runner.temp }}/package
+      # The image, cached under its pinned name and digest: fetch checks a
+      # restored image's digest as it checks a download, and the cache is
+      # saved right after a miss, also when a later step fails.
+      - name: image cache key
+        id: image
+        timeout-minutes: 1
+        run: python3 -B scripts/booted-host-validation.py image-key --guest "$GUEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: image-cache
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
       - name: guest image
         timeout-minutes: 15
         run: python3 -B scripts/booted-host-validation.py fetch --guest "$GUEST" --directory "$RUNNER_TEMP/images"
+      - uses: actions/cache/save@v4
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
       - name: guest payload
         timeout-minutes: 5
         run: python3 -B scripts/booted-host-validation.py payload --guest "$GUEST" --suite "$SUITE" --package "$RUNNER_TEMP/package" --output "$RUNNER_TEMP/payload"
+      # The boot's deadline, an SSH probe that overruns it, cloud-init's wait
+      # given up 90 s after its limit, then the copy: within the step's limit.
       - name: boot the guest
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 720
-          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" "$RUNNER_TEMP/payload"
+          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 600
+          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" --timeout 300 "$RUNNER_TEMP/payload"
       - name: guest facts
         timeout-minutes: 5
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
       - name: guest package manager
         timeout-minutes: 10
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
       - name: installation guide and quick start
         if: matrix.suite == 'guides'
         timeout-minutes: 40
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
       - name: privileged runner lifecycle
         if: matrix.suite == 'runner'
         timeout-minutes: 50
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
       - name: guest versions
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
       # The results, the program and its output (not the package), the
       # runner's run directory (not its snapshot or builds), the journal and
       # the guest's console. Neither key (/etc/maki/secrets, the runner's
@@ -777,7 +798,7 @@ jobs:
     # host.
     needs: el9-package
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 210
     strategy:
       fail-fast: false
       matrix:
@@ -827,40 +848,61 @@ jobs:
         with:
           name: el9-package
           path: ${{ runner.temp }}/package
+      # The image, cached under its pinned name and digest: fetch checks a
+      # restored image's digest as it checks a download, and the cache is
+      # saved right after a miss, also when a later step fails.
+      - name: image cache key
+        id: image
+        timeout-minutes: 1
+        run: python3 -B scripts/booted-host-validation.py image-key --guest "$GUEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: image-cache
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
       - name: guest image
         timeout-minutes: 15
         run: python3 -B scripts/booted-host-validation.py fetch --guest "$GUEST" --directory "$RUNNER_TEMP/images"
+      - uses: actions/cache/save@v4
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
       - name: guest payload
         timeout-minutes: 5
         run: python3 -B scripts/booted-host-validation.py payload --guest "$GUEST" --suite "$SUITE" --package "$RUNNER_TEMP/package" --output "$RUNNER_TEMP/payload"
+      # The boot's deadline, an SSH probe that overruns it, cloud-init's wait
+      # given up 90 s after its limit, then the copy: within the step's limit.
       - name: boot the guest
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 720
-          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" "$RUNNER_TEMP/payload"
+          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 600
+          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" --timeout 300 "$RUNNER_TEMP/payload"
       - name: guest facts
         timeout-minutes: 5
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
       - name: guest package manager
         timeout-minutes: 10
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
       - name: installation guide and quick start
         if: matrix.suite == 'guides'
         timeout-minutes: 40
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
       - name: privileged runner lifecycle
         if: matrix.suite == 'runner'
         timeout-minutes: 50
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
       # Also after a failed suite: a denial may be why it failed.
       - name: SELinux
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py selinux --guest "$GUEST" --suite "$SUITE"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py selinux --guest "$GUEST" --suite "$SUITE"
       - name: guest versions
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 -- sudo python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
       # The results, the program and its output (not the package), the
       # runner's run directory (not its snapshot or builds), the journal,
       # the audit log and the guest's console. Neither key
