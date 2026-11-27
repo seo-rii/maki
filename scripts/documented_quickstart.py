@@ -13,13 +13,15 @@ writes DIRECTORY/demo.toml and DIRECTORY/quickstart.sh. Run the program as
 root in DIRECTORY, beside the package as `maki.deb`, on a disposable host:
 `sudo bash quickstart.sh`. With `--stop-once mkfs.xfs` or `--stop-once
 vgchange`, the bootstrap's first run has a shim first on PATH that fails
-that command, and the program requires that the run stopped there with its
-record and the device showing its connection, then runs the same block again
-as the first-volume guide's recovery notes say: after `mkfs.xfs`, the next
-run must release the export, stop the daemon, remove the record and fail;
-the volume is reset (its backing directory removed while the daemon is
-stopped, the creation block run again) and a third run starts over. After
-`vgchange`, the next run must finish. It runs under `set -e -o pipefail` and checks
+that command, and the program requires that the run stopped there: that the
+shim ran (it leaves a mark the program reads), and that the run failed and
+left its record with the device showing its connection. It then runs the
+same block again as the first-volume guide's recovery notes say: after
+`mkfs.xfs`, the next run must release the export, stop the daemon, remove
+the record and fail; the volume is reset (its backing directory removed
+while the daemon is stopped, the creation block run again) and a third run
+starts over. After `vgchange`, the next run must finish. It runs under
+`set -e -o pipefail` and checks
 each block's status after it, so it stops at a failed command that `set -e`
 stops at (a pipeline included, whichever of its commands failed) and at a
 block whose last command failed, an `&&` list that ends the block included,
@@ -242,10 +244,12 @@ def bootstrap_values(block):
 
 
 def shimmed(command):
-    """Program text that puts a `command` that fails first on PATH."""
+    """Program text that puts a `command` that fails first on PATH. When it
+    runs, it leaves a mark beside itself (`mark`), which `stopped` reads."""
     quoted = shlex.quote(command)
     return (f"documented_shim=$(mktemp -d)\n"
-            f"printf '#!/bin/sh\\necho \"%s: failed once by documented_quickstart.py\" >&2\\n"
+            "printf '#!/bin/sh\\n: > \"$0.ran\"\\n"
+            f"echo \"%s: failed once by documented_quickstart.py\" >&2\\n"
             f"exit 97\\n' {quoted} >\"$documented_shim\"/{quoted}\n"
             f"chmod 0755 \"$documented_shim\"/{quoted}\n"
             "documented_path=$PATH\n"
@@ -253,20 +257,33 @@ def shimmed(command):
             "set +e\n")
 
 
+def mark(command):
+    """Where the shim of `command` leaves its mark: beside itself, as the
+    path it runs from ($0 of a script found on PATH) with `.ran` added."""
+    return f'"$documented_shim"/{shlex.quote(command + ".ran")}'
+
+
 def backend_of(dev):
     return shlex.quote(f"{SYSFS}/{dev.removeprefix('/dev/')}/backend")
 
 
 def stopped(command, values, formatted):
-    """Program text that judges the first run: it stopped at `command`, and
+    """Program text that judges the first run: it stopped at `command`,
+    whose shim ran (its mark is read before the shim's directory goes), and
     left the record of a run that had (`formatted`) or had not recorded the
     filesystem, with the device showing its connection."""
     record = shlex.quote(values["record"])
     must = "name" if formatted else "not name"
     return ("documented_status=$?\nset -e\n"
-            'export PATH="$documented_path"\nrm -rf -- "$documented_shim"\n'
+            'export PATH="$documented_path"\n'
+            f"if [ -e {mark(command)} ]; then documented_shimmed=yes; "
+            "else documented_shimmed=no; fi\n"
+            'rm -rf -- "$documented_shim"\n'
             'if [ "$documented_status" -eq 0 ]; then\n'
             f"    echo 'the bootstrap did not stop where {command} failed' >&2\n    exit 1\nfi\n"
+            'if [ "$documented_shimmed" != yes ]; then\n'
+            f'    echo "the bootstrap stopped with status $documented_status before it ran {command}: '
+            'the shim that fails it never ran" >&2\n    exit 1\nfi\n'
             f"if [ ! -f {record} ]; then\n"
             f"    echo 'the stopped bootstrap left no record {values['record']}' >&2\n    exit 1\nfi\n"
             f"echo 'the stopped bootstrap'\"'\"'s record {values['record']}:'\ncat {record}\n"
@@ -360,8 +377,9 @@ def program(found, stop_once=None):
 
     With `stop_once`, a command of `STOP_ONCE`, the bootstrap's first run
     has a shim on PATH that fails that command, and the program checks
-    that it stopped there and that the next runs of the same block do what
-    the first-volume guide's recovery notes say (`interrupted`)."""
+    that the shim ran and the run stopped there, and that the next runs of
+    the same block do what the first-volume guide's recovery notes say
+    (`interrupted`)."""
     for label, block in found:
         lines = printed_lines(label, block)
         if has_unguarded_list(lines):

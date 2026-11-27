@@ -255,8 +255,10 @@ stop after `maki drain` and on `systemctl disable --now`.
 Once that step has succeeded, the job runs the program twice more, each
 written with `--stop-once`: the bootstrap's first run has a shim first on
 `PATH` that fails one command, and the program requires that the run
-stopped there, left its record and that the device still shows its
-connection, then runs the same block again as the guide's
+stopped there (the shim leaves a mark, which the program reads, so a run
+that failed before it reached that command stops the program), left its
+record and that the device still shows its connection, then runs the same
+block again as the guide's
 [recovery notes](getting-started/first-volume.md#recovering-from-a-failed-bootstrap)
 say. Stopped at `mkfs.xfs`, the record names no filesystem: the next run must
 release the export, stop `maki@demo.service`, remove the record and fail;
