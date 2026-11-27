@@ -212,19 +212,6 @@ pub fn load_trusted_config(path: impl AsRef<Path>) -> Result<crate::config::Atta
     crate::config::parse(&text).map_err(|error| error.to_string())
 }
 
-/// Held for the whole attach so two helpers cannot pick the same device;
-/// the file lock is released when this is dropped.
-pub struct AttachLock {
-    _lock: StateLock,
-    state: TrustedState,
-}
-
-pub fn lock_attach() -> io::Result<AttachLock> {
-    let state = TrustedState::open()?;
-    let lock = state.lock()?;
-    Ok(AttachLock { _lock: lock, state })
-}
-
 fn nbd_connected(device: &str) -> bool {
     match nbd_index(device) {
         Some(n) => Path::new(&format!("/sys/block/nbd{n}/pid")).exists(),
@@ -921,9 +908,15 @@ fn disconnect_raw_with(
         device: device.into(),
     })?;
     let patience = release_patience(patience);
-    match await_release(clock, identifier, patience, |_| {
-        nbd_backend_at(sysfs, device)
-    }) {
+    // The caller holds the attach lock (the provisioning guide's `flock`),
+    // which this command never takes or lets go of.
+    match await_release(
+        clock,
+        identifier,
+        patience,
+        |_| nbd_backend_at(sysfs, device),
+        || {},
+    ) {
         Ok(Some(backend)) if backend == identifier => Err(identity_error(format!(
             "the kernel acknowledged the disconnect, but {device} still shows the connection \
              after {patience:?}: something still has the device open, and the kernel keeps a \
@@ -945,7 +938,10 @@ fn disconnect_raw_with(
 /// and while it still shows it, look again every [`NBD_RELEASE_INTERVAL`]
 /// on `clock` for up to `patience`, the last time when it is over.
 /// `nbd-disconnect`, detach and cleanup all wait so, for
-/// [`release_patience`]. Returns what the device showed at the last look:
+/// [`release_patience`]. `waiting` runs before each sleep: detach and
+/// cleanup let go of the attach lock there ([`Turn`]), so that a device
+/// that lets go at the first look costs them no second turn on the lock.
+/// Returns what the device showed at the last look:
 /// no connection or one made since under another backend identifier, when
 /// this one is gone, or still this one, when the time ran out. A look that
 /// cannot be read ends the wait with its error: a connection made since
@@ -964,6 +960,7 @@ fn await_release<C: Clock>(
     identifier: &str,
     patience: Duration,
     backend: impl Fn(&C) -> io::Result<Option<String>>,
+    mut waiting: impl FnMut(),
 ) -> io::Result<Option<String>> {
     let acknowledged = clock.now();
     loop {
@@ -972,6 +969,7 @@ fn await_release<C: Clock>(
         if shown.as_deref() != Some(identifier) || waited >= patience {
             return Ok(shown);
         }
+        waiting();
         clock.sleep(NBD_RELEASE_INTERVAL.min(patience - waited));
     }
 }
@@ -1788,6 +1786,58 @@ fn connect_recorded(
     }
 }
 
+/// How one run of a verb holds the attach lock, which it takes before it
+/// reads any record.
+///
+/// A detach or cleanup whose device still shows the connection at the first
+/// look after its disconnect lets go of the lock for the wait
+/// ([`await_release`]): while something holds the device open the wait can
+/// last 15 s, and every other helper on the host (the cleanups of the other
+/// volumes stopping at the same time above all) would wait that long too. A
+/// first look that shows no connection, or another backend identifier, needs
+/// no wait: the lock is never let go of, and the run goes on, or fails, under
+/// it without reading the record again. A wait without the lock that ends
+/// with this connection still shown, or an unreadable one, fails the run
+/// without the lock, changing nothing. One that ends with no connection, or
+/// another backend identifier, takes the lock again, in turn, before the run
+/// acts, and reads the volume's record again under it. Meanwhile only
+/// another helper of the same volume can replace or retire the record;
+/// until then it still names the device, so no other volume's attach and
+/// no provisioning connect takes the device (SPEC §8), and such a helper
+/// finds what it would find had this run been killed during the wait.
+enum Turn {
+    /// Held by the caller for the whole run, wait included: the failed-start
+    /// hook's rollback, whose commands have a budget counted from the moment
+    /// it got the lock and no room for a second turn on it, and the tests
+    /// that hold the lock themselves.
+    Kept,
+    /// Held by the run itself (`None` while it is let go of).
+    Held(Option<StateLock>),
+}
+
+impl Turn {
+    /// Let go of the lock, if the run holds it itself and still does.
+    /// Dropping the lock unlocks it before its descriptor is closed.
+    fn release(&mut self) {
+        if let Self::Held(lock) = self {
+            *lock = None;
+        }
+    }
+
+    /// Take `state`'s lock again, in turn behind the helpers that queued
+    /// meanwhile, if the run let go of it: whether it did, and so whether
+    /// another helper may have acted since.
+    fn retake(&mut self, state: &TrustedState) -> io::Result<bool> {
+        match self {
+            Self::Held(lock @ None) => {
+                *lock = Some(state.lock()?);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 /// Execute under one root-controlled lock, resolving runtime records only
 /// after taking it. A pinned device never bypasses identity verification.
 pub fn execute(plan: &Plan) -> Result<(), ExecError> {
@@ -1800,29 +1850,44 @@ pub fn execute(plan: &Plan) -> Result<(), ExecError> {
                 | PlannedStep::XfsGrowfs { .. }
         )
     });
-    let lock = if needs_lock {
-        Some(lock_attach()?)
+    let state = if needs_lock {
+        Some(TrustedState::open()?)
     } else {
         None
     };
-    execute_with(
-        plan,
-        lock.as_ref().map(|lock| &lock.state),
-        &mut LinuxSystem,
-    )
+    execute_on(plan, state.as_ref(), &mut LinuxSystem)
 }
 
+/// [`execute`] on the attach state `state`, given when the plan needs it:
+/// the run takes its attach lock, so that two helpers cannot pick the same
+/// device or act on one record at once, before it reads any record. A
+/// detach lets go of it only for its wait after the disconnect ([`Turn`]).
+fn execute_on(
+    plan: &Plan,
+    state: Option<&TrustedState>,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let Some(state) = state else {
+        return execute_with(plan, None, system);
+    };
+    let mut turn = Turn::Held(Some(state.lock()?));
+    execute_with_options(plan, Some(state), &mut turn, system, false)
+}
+
+/// Run `plan` with the attach lock of `state`, if any, held by the caller
+/// throughout ([`Turn::Kept`]).
 fn execute_with(
     plan: &Plan,
     state: Option<&TrustedState>,
     system: &mut impl System,
 ) -> Result<(), ExecError> {
-    execute_with_options(plan, state, system, false)
+    execute_with_options(plan, state, &mut Turn::Kept, system, false)
 }
 
 fn execute_with_options(
     plan: &Plan,
     state: Option<&TrustedState>,
+    turn: &mut Turn,
     system: &mut impl System,
     allow_proof_deactivation: bool,
 ) -> Result<(), ExecError> {
@@ -2168,21 +2233,44 @@ fn execute_with_options(
     // teardown; otherwise a retry must still know which device it owns.
     if disconnects && !connects {
         let current = record.as_ref().unwrap();
+        let state = state.unwrap();
         // Whatever held the device open at the disconnect keeps the
         // connection's attributes until it closes: wait for that as
-        // `nbd-disconnect` does. Any connection the device shows then, this
-        // one or another made since, keeps the record, and one that cannot be
-        // read fails.
+        // `nbd-disconnect` does, without the attach lock. Any connection the
+        // device shows then, this one or another made since, keeps the
+        // record, and one that cannot be read fails; neither needs the lock.
         let shown = await_release(
             system,
             &current.connection_id,
             release_patience(NBD_RELEASE_TIMEOUT),
             |system| system.backend(&current.device),
+            || turn.release(),
         )?;
-        if shown.is_some() {
-            return Err(identity_error(
+        let incomplete = || {
+            identity_error(
                 "disconnect has not completed; keeping the attach record for cleanup retry",
-            ));
+            )
+        };
+        // A connection under another backend identifier can be that of an
+        // attach of this volume that replaced the record during the wait and
+        // took the same device: it is told apart under the lock, below, and
+        // never reported as a disconnect a cleanup should finish, which would
+        // tear that attachment down. This connection, still shown, is not.
+        let another = shown
+            .as_deref()
+            .is_some_and(|shown| shown != current.connection_id);
+        if shown.is_some() && !another {
+            return Err(incomplete());
+        }
+        // Everything from here on decides under the lock. Another helper of
+        // this volume may have acted while it was let go of: one that
+        // retired the record found nothing of the attachment left, and one
+        // that replaced it attached the volume again.
+        if turn.retake(state)? && !record_after_wait(state, &plan, current)? {
+            return Ok(());
+        }
+        if another {
+            return Err(incomplete());
         }
         let observed = system.disconnected_recovery_observation(current)?;
         if observed.mounted || observed.vg_active || observed.nbd_in_use {
@@ -2210,9 +2298,41 @@ fn execute_with_options(
                 "attachment gained live resources before record retirement",
             ));
         }
-        state.unwrap().remove(&plan.volume)?;
+        state.remove(&plan.volume)?;
     }
     Ok(())
+}
+
+/// Whether `plan`'s volume still has the record `current`, which this run
+/// disconnected, once the run holds the attach lock again after a wait
+/// without it ([`Turn`]). No record: another helper retired it, which a
+/// helper does only once nothing of the attachment remains, and nothing is
+/// left to do. Another record: another helper attached the volume again,
+/// and that is an error that leaves the record and its attachment alone.
+fn record_after_wait(
+    state: &TrustedState,
+    plan: &Plan,
+    current: &BoundDeviceRecord,
+) -> Result<bool, ExecError> {
+    match state.read(&plan.volume)? {
+        Some(read) if read == *current => Ok(true),
+        None => {
+            tracing::info!(
+                "maki-attach: another helper retired the attach record of volume {} while this \
+                 one waited for {} to let go of the disconnected connection; nothing is left to \
+                 do",
+                plan.volume,
+                current.device
+            );
+            Ok(false)
+        }
+        Some(_) => Err(identity_error(format!(
+            "the volume's attach record was replaced while this helper waited for {} to let go \
+             of the disconnected connection: another helper attached volume {} again. That \
+             record and its attachment are left as they are",
+            current.device, plan.volume
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -2234,19 +2354,33 @@ mod command_tests;
 /// Recover only disconnected storage, under the same root-controlled lock as attach.
 /// Callers must stop workloads first; this command never starts or repairs a database.
 pub fn recover(plan: &Plan) -> Result<(), ExecError> {
-    let lock = lock_attach()?;
-    recover_with(plan, &lock.state, &mut LinuxSystem)
+    let state = TrustedState::open()?;
+    let _lock = state.lock()?;
+    recover_with(plan, &state, &mut LinuxSystem)
 }
 
-/// Converge trusted storage state under the attach lock.
+/// Converge trusted storage state, deciding under the attach lock: the
+/// detach path lets go of it only for its wait after the disconnect and
+/// takes it again before it acts ([`Turn`]).
 ///
 /// An absent record is already clean. A record whose backend still has the
 /// recorded connection identity follows the regular detach path; an absent
 /// backend follows disconnected recovery. Foreign and unreadable backends
 /// fail closed before either path can mutate storage.
 pub fn cleanup(plan: &Plan) -> Result<(), ExecError> {
-    let lock = lock_attach()?;
-    cleanup_with(plan, &lock.state, &mut LinuxSystem)
+    cleanup_on(plan, &TrustedState::open()?, &mut LinuxSystem)
+}
+
+/// [`cleanup`] on the attach state `state`, whose attach lock the run takes
+/// before it reads the record. Its detach path lets go of it only for the
+/// wait after the disconnect ([`Turn`]).
+fn cleanup_on(
+    plan: &Plan,
+    state: &TrustedState,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    let mut turn = Turn::Held(Some(state.lock()?));
+    cleanup_in(plan, state, &mut turn, system)
 }
 
 /// Check the current caller namespace's complete attachment before starting
@@ -2263,9 +2397,21 @@ fn recover_with(
     recover::execute(plan, state, system)
 }
 
+/// [`cleanup_in`] with the attach lock held by the caller throughout
+/// ([`Turn::Kept`]), as the tests that hold it themselves run it.
+#[cfg(test)]
 fn cleanup_with(
     plan: &Plan,
     state: &TrustedState,
+    system: &mut impl System,
+) -> Result<(), ExecError> {
+    cleanup_in(plan, state, &mut Turn::Kept, system)
+}
+
+fn cleanup_in(
+    plan: &Plan,
+    state: &TrustedState,
+    turn: &mut Turn,
     system: &mut impl System,
 ) -> Result<(), ExecError> {
     let Some(record) = state.read(&plan.volume)? else {
@@ -2280,7 +2426,7 @@ fn cleanup_with(
                 "maki-attach: {} shows the attachment's connection; cleanup follows the detach path",
                 record.device
             );
-            execute_with_options(plan, Some(state), system, true)
+            execute_with_options(plan, Some(state), turn, system, true)
         }
         None => {
             tracing::info!(
@@ -2401,7 +2547,9 @@ fn finish_interrupted_activation_with(
     let mut plan = plan.clone();
     plan.steps
         .retain(|step| !matches!(step, PlannedStep::Umount { .. }));
-    execute_with_options(&plan, Some(state), system, false)?;
+    // The hook keeps the lock through the wait after its disconnect: its
+    // commands' budget starts when it got the lock (see `Turn::Kept`).
+    execute_with_options(&plan, Some(state), &mut Turn::Kept, system, false)?;
     Ok(true)
 }
 

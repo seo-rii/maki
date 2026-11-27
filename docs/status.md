@@ -259,7 +259,11 @@ See [cache reload](operations.md#growth-and-cache-reload).
   reads the journal). That is local-provider volumes on one runner
   kernel, and nbdkit is killed only while the filesystem is idle after a
   sync. How often something holds a device open at a detach on a production
-  host has not been measured.
+  host has not been measured. Detach and cleanup now wait for such a device
+  without the attach lock (AUD-197), so the cleanups of many volumes
+  stopping together no longer queue on it for each other's waits. That is
+  tested on the helper's fake system; the job's runs of the stop together
+  above came before the change, and none with it is recorded yet.
 
 ## Where the evidence lives
 

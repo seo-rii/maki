@@ -866,9 +866,11 @@ impl Case {
         let attach = plan_attach(&self.request);
         let detach = plan_detach(&self.request);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match verb {
-            Verb::Attach => execute_with(&attach, Some(state), world),
-            Verb::Detach => execute_with(&detach, Some(state), world),
-            Verb::Cleanup => cleanup_with(&detach, state, world),
+            // Attach, detach and cleanup as the helper's own run takes the
+            // attach lock of `state`.
+            Verb::Attach => execute_on(&attach, Some(state), world),
+            Verb::Detach => execute_on(&detach, Some(state), world),
+            Verb::Cleanup => cleanup_on(&detach, state, world),
             Verb::Recover => recover_with(&detach, state, world),
             Verb::FailedStartHook => {
                 finish_interrupted_activation_with(&detach, state, world).map(drop)

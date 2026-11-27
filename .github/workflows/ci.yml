@@ -509,8 +509,9 @@ jobs:
       # Three volumes provisioned from the same blocks (their names edited),
       # each device held open for 10 s after its disconnect, stopped with one
       # systemctl stop: each attach unit's stop runs maki-attach cleanup,
-      # whose wait for the opener holds the global attach lock. This records
-      # how long each stop takes; it requires neither overlap nor queueing.
+      # which waits for the opener without the global attach lock, so the
+      # waits can overlap. This records how long each stop takes; it requires
+      # neither overlap nor queueing.
       - name: several volumes stopping together on the installed package
         if: ${{ !cancelled() && steps.quickstart.outcome == 'success' }}
         timeout-minutes: 15

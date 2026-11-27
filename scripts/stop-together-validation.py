@@ -18,7 +18,8 @@ target started, scripts/privileged_validation_opener.py holds each volume's
 device open, and keeps it `--hold` seconds after its disconnect; one
 `systemctl stop` then stops every target. Each attach unit's stop runs
 `maki-attach cleanup`, whose disconnect waits for the opener to close the
-device, while it holds the global attach lock.
+device; it lets go of the global attach lock for that wait (AUD-197), so the
+waits can overlap, where they used to queue on the lock.
 
 `systemctl stop` of the targets returns once the targets' own jobs are
 done, before the attach units they are ordered after have stopped, so the

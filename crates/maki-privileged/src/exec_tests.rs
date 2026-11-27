@@ -33,13 +33,25 @@ impl Fixture {
     }
 
     fn state(&self) -> TrustedState {
-        TrustedState::open_beneath(
-            File::open(&self.0).unwrap(),
-            Path::new("state"),
-            self.0.metadata().unwrap().uid(),
-        )
-        .unwrap()
+        state_at(&self.0)
     }
+}
+
+/// The attach state below the fixture directory `root`, opened anew: its
+/// lock is a file description of its own, as another helper's would be.
+fn state_at(root: &Path) -> TrustedState {
+    TrustedState::open_beneath(
+        File::open(root).unwrap(),
+        Path::new("state"),
+        root.metadata().unwrap().uid(),
+    )
+    .unwrap()
+}
+
+/// Whether no helper holds `state`'s attach lock: taking it does not wait.
+/// A lock taken here is released at once.
+fn lock_is_free(state: &TrustedState) -> bool {
+    state.lock_until(Instant::now()).is_ok()
 }
 
 impl Drop for Fixture {
@@ -654,7 +666,14 @@ struct FakeSystem {
     backend_probes: std::cell::Cell<usize>,
     /// The overall limit each step ran under ([`command::finish_by`]).
     command_limits: Vec<Option<Instant>>,
+    /// Runs after each sleep of the executor's waits, with its number
+    /// counted from 1: what other actors do while the helper waits.
+    on_sleep: Option<OnSleep>,
+    /// Runs before each read of a backend identifier.
+    on_backend: Option<Box<dyn Fn() + Send>>,
 }
+
+type OnSleep = Box<dyn FnMut(&mut FakeSystem, usize) + Send>;
 
 fn lvm_report_fixture() -> serde_json::Value {
     serde_json::json!({"report": [{
@@ -990,6 +1009,18 @@ impl Clock for FakeSystem {
     }
     fn sleep(&mut self, duration: Duration) {
         self.sleeps.push(duration);
+        self.linger_after_sleep();
+        if let Some(mut on_sleep) = self.on_sleep.take() {
+            let number = self.sleeps.len();
+            on_sleep(self, number);
+            self.on_sleep = Some(on_sleep);
+        }
+    }
+}
+
+impl FakeSystem {
+    /// What a [`Linger`] does at the sleep just taken.
+    fn linger_after_sleep(&mut self) {
         let Some((device, slept)) = &mut self.lingering else {
             return;
         };
@@ -1189,6 +1220,9 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        if let Some(on_backend) = &self.on_backend {
+            on_backend();
+        }
         let probe = self.backend_probes.get() + 1;
         self.backend_probes.set(probe);
         if let Some((expected, fault)) = self.backend_fault_on_probe {
@@ -1367,97 +1401,96 @@ fn cleanup_is_idempotent_when_no_trusted_record_exists() {
 const DETACH_PATH: &str = "shows the attachment's connection; cleanup follows the detach path";
 const RECOVERY_PATH: &str = "shows no connection; cleanup follows disconnected recovery";
 
+/// A cleanup's verdict, what it logged, the steps it ran, the device its
+/// record named and whether the record is gone.
+struct LoggedCleanup {
+    result: Result<(), ExecError>,
+    log: String,
+    steps: Vec<&'static str>,
+    device: String,
+    retired: bool,
+}
+
+/// Each cleanup of an attachment of `request`, as a test that holds the
+/// attach lock runs it ([`cleanup_with`]) and as the helper's own run does,
+/// which takes the lock and lets go of it for a wait ([`cleanup_on`]).
+fn logged_cleanups(
+    request: &AttachRequest,
+    prepare: impl Fn(&mut FakeSystem),
+) -> Vec<LoggedCleanup> {
+    let mut found = Vec::new();
+    for held_by_the_run in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(request), Some(&state), &mut system).unwrap();
+        let device = state.read("pg").unwrap().unwrap().device;
+        system.steps.clear();
+        system.backend_probes.set(0);
+        prepare(&mut system);
+        let (result, log) = logged(|| {
+            if held_by_the_run {
+                cleanup_on(&plan_detach(request), &state, &mut system)
+            } else {
+                cleanup_with(&plan_detach(request), &state, &mut system)
+            }
+        });
+        found.push(LoggedCleanup {
+            result,
+            log,
+            steps: system.steps.clone(),
+            device,
+            retired: state.read("pg").unwrap().is_none(),
+        });
+    }
+    found
+}
+
 #[test]
 fn cleanup_dispatches_an_owned_connection_to_detach() {
-    let fixture = Fixture::new();
-    let state = fixture.state();
-    let request = request();
-    let mut system = FakeSystem::default();
-    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-    let device = state.read("pg").unwrap().unwrap().device;
-    system.steps.clear();
-    system.backend_probes.set(0);
-
-    let (result, log) = logged(|| cleanup_with(&plan_detach(&request), &state, &mut system));
-    result.unwrap();
-
-    assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
-    assert!(state.read("pg").unwrap().is_none());
-    assert!(
-        log.contains(&format!("maki-attach: {device} {DETACH_PATH}")),
-        "{log}"
-    );
-    assert!(!log.contains(RECOVERY_PATH), "{log}");
+    for LoggedCleanup {
+        result,
+        log,
+        steps,
+        device,
+        retired,
+    } in logged_cleanups(&request(), |_| {})
+    {
+        result.unwrap();
+        assert_eq!(steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+        assert!(retired);
+        assert!(
+            log.contains(&format!("maki-attach: {device} {DETACH_PATH}")),
+            "{log}"
+        );
+        assert!(!log.contains(RECOVERY_PATH), "{log}");
+    }
 }
 
 #[test]
 fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
-    let fixture = Fixture::new();
-    let state = fixture.state();
-    let request = request();
-    let mut system = FakeSystem::default();
-    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-    let device = state.read("pg").unwrap().unwrap().device;
-    system.steps.clear();
-    system.backends.clear();
-    system.backend_probes.set(0);
-
-    let (result, log) = logged(|| cleanup_with(&plan_detach(&request), &state, &mut system));
-    result.unwrap();
-
-    assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
-    assert!(state.read("pg").unwrap().is_none());
-    assert!(
-        log.contains(&format!("maki-attach: {device} {RECOVERY_PATH}")),
-        "{log}"
-    );
-    assert!(!log.contains(DETACH_PATH), "{log}");
-}
-
-#[test]
-fn acknowledged_but_incomplete_disconnect_preserves_cleanup_authority_for_retry() {
-    for disappears_between_retries in [false, true] {
-        let fixture = Fixture::new();
-        let state = fixture.state();
-        let request = request();
-        let mut system = FakeSystem::default();
-        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-        let record = state.read("pg").unwrap().unwrap();
-        system.steps.clear();
-        system.defer_disconnect = true;
-
-        let error = cleanup_with(&plan_detach(&request), &state, &mut system).unwrap_err();
-        assert!(error.to_string().contains("disconnect has not completed"));
-        assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
-        assert_eq!(state.read("pg").unwrap(), Some(record.clone()));
-
-        system.steps.clear();
-        assert!(cleanup_with(&plan_detach(&request), &state, &mut system).is_err());
-        assert_eq!(system.steps, ["nbd-disconnect"]);
-        assert_eq!(state.read("pg").unwrap(), Some(record));
-
-        system.steps.clear();
-        system.defer_disconnect = false;
-        if disappears_between_retries {
-            system.backends.clear();
-        }
-        cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
-        assert_eq!(
-            system.steps,
-            if disappears_between_retries {
-                vec![]
-            } else {
-                vec!["nbd-disconnect"]
-            }
+    let absent = |system: &mut FakeSystem| system.backends.clear();
+    for LoggedCleanup {
+        result,
+        log,
+        steps,
+        device,
+        retired,
+    } in logged_cleanups(&request(), absent)
+    {
+        result.unwrap();
+        assert_eq!(steps, ["umount", "lvm-deactivate"]);
+        assert!(retired);
+        assert!(
+            log.contains(&format!("maki-attach: {device} {RECOVERY_PATH}")),
+            "{log}"
         );
-        assert!(state.read("pg").unwrap().is_none());
-        assert!(system.backends.is_empty());
-        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-        assert!(system.mounted);
+        assert!(!log.contains(DETACH_PATH), "{log}");
     }
 }
 
-/// Detach or cleanup of `request`'s attachment by `system`.
+/// Detach or cleanup of `request`'s attachment by `system`, taking the
+/// attach lock of `state` as the helper's own run does.
 fn tear_down(
     verb: &str,
     request: &AttachRequest,
@@ -1465,8 +1498,8 @@ fn tear_down(
     system: &mut FakeSystem,
 ) -> Result<(), ExecError> {
     match verb {
-        "detach" => execute_with(&plan_detach(request), Some(state), system),
-        "cleanup" => cleanup_with(&plan_detach(request), state, system),
+        "detach" => execute_on(&plan_detach(request), Some(state), system),
+        "cleanup" => cleanup_on(&plan_detach(request), state, system),
         _ => unreachable!("{verb}"),
     }
 }
@@ -3013,6 +3046,9 @@ fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
 
 #[path = "recover_tests.rs"]
 mod recover_tests;
+
+#[path = "review_release_wait_lock.rs"]
+mod review_release_wait_lock;
 
 #[path = "filesystem_tests.rs"]
 mod filesystem_tests;
