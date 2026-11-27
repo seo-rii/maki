@@ -194,6 +194,7 @@ class StopTogether(unittest.TestCase):
         # loaded while it is failed. The journal of PID 1 keeps the stop
         # job's messages, the last ones this many looks late.
         self.journal_lag = {1: 0, 2: 0, 3: 0}
+        self.job_result = "done"
 
     def host(self, argv, **_):
         self.events.append(argv)
@@ -218,7 +219,7 @@ class StopTogether(unittest.TestCase):
                 else:
                     entries.append(entry(unit, 100 + index * 10.2 - 0.001, SUCCEEDED))
                 entries.append(entry(unit, 100 + index * 10.2, STOPPED, JOB_ID=100 + index,
-                                     JOB_TYPE="stop", JOB_RESULT="done"))
+                                     JOB_TYPE="stop", JOB_RESULT=self.job_result))
             elif self.deactivating[index] == 0:
                 self.journal_lag[index] -= 1
             return subprocess.CompletedProcess(argv, 0, stdout=journal(*entries))
@@ -306,11 +307,10 @@ class StopTogether(unittest.TestCase):
             unit = f"maki-attach@stop{index}.service"
             looks = [position for position, event in enumerate(self.events)
                      if event == ["systemctl", "show", "-P", "ActiveState", unit]]
-            [read] = [position for position, event in enumerate(self.events)
-                      if event[:2] == ["systemctl", "show"] and "-P" not in event
-                      and event[-1] == unit]
+            [read, *_] = [position for position, event in enumerate(self.events)
+                          if event[0] == "journalctl" and f"UNIT={unit}" in event]
             # Each look while it was deactivating, and the one that found it
-            # stopped, came before its times were read.
+            # stopped, came before its times were read from the journal.
             self.assertGreaterEqual(len([look for look in looks if look < read]), 2 * index + 1)
         self.assertEqual([volume["result"] for volume in report["volumes"]], ["success"] * 3)
         self.assertEqual(report["stop_command_seconds"], 0.0)
@@ -329,11 +329,14 @@ class StopTogether(unittest.TestCase):
 
     def test_an_attach_unit_that_does_not_stop_or_fails_is_reported(self):
         for case, message in (("never", "maki-attach@stop2.service did not stop within 300 s"),
-                              ("failed", "maki-attach@stop1.service stopped with result exit-code")):
+                              ("failed", "maki-attach@stop1.service stopped with result exit-code"),
+                              ("timeout", "the stop job of maki-attach@stop1.service ended timeout")):
             with self.subTest(case=case):
                 self.setUp()
                 if case == "never":
                     self.deactivating[2] = 10 ** 6
+                elif case == "timeout":
+                    self.job_result = "timeout"
                 else:
                     self.ended, self.result = "failed", "exit-code"
                 with self.assertRaisesRegex(RuntimeError, re.escape(message)):
@@ -342,6 +345,8 @@ class StopTogether(unittest.TestCase):
                 if case == "never":
                     self.assertIsNone(report["volumes"][1]["stop_seconds"])
                     self.assertEqual(report["volumes"][0]["stop_seconds"], 10.19)
+                elif case == "timeout":
+                    self.assertEqual(report["volumes"][0]["job_result"], "timeout")
                 else:
                     self.assertEqual(report["volumes"][0]["result"], "exit-code")
 

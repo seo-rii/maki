@@ -23,9 +23,12 @@ device, while it holds the global attach lock.
 `systemctl stop` of the targets returns once the targets' own jobs are
 done, before the attach units they are ordered after have stopped, so the
 program then looks at each attach unit until it is inactive or failed (for
-up to 300 s). It prints, and writes to DIRECTORY/stop-together.json, when
-each attach unit's stop began and ended after the stop was requested
-(systemd's monotonic timestamps) and each opener's account, then requires every stop
+up to 300 s). systemd forgets a unit once it is inactive, its timestamps
+with it, so the times come from the journal of PID 1 for this boot: the
+monotonic timestamps of the messages that the stop job of each attach unit
+has begun and has finished, after the stop request. It prints, and writes
+to DIRECTORY/stop-together.json, when each attach unit's stop began and
+ended after the stop was requested, and each opener's account, then requires every stop
 to have succeeded, every opener to have seen its disconnect and kept the
 connection shown until it closed the device, and every attachment to be
 gone. It measures: it requires neither that the stops overlap nor that
@@ -60,6 +63,13 @@ STOP_TIMEOUT = 600
 # TimeoutStopSec=120 for each of three queued one after another.
 STOP_LOOKS = 600
 STOP_LOOK = 0.5
+# How often the journal is looked at, 0.5 s apart, for a stop's last message.
+JOURNAL_LOOKS = 20
+JOURNAL_LOOK = 0.5
+# systemd's catalog: a stop job has begun; has finished; a unit has failed.
+STOPPING = "de5b426a63be47a7b6ac3eaac82e2f6f"
+STOPPED = "9d1aaa27d60140bd96365438aad20286"
+UNIT_FAILED = "d9b373ed55a64feb8242e02dbe79a49c"
 # A hold the helper's 15 s wait for the opener outlasts.
 MAX_HOLD = 14
 
@@ -132,24 +142,54 @@ def device_of(name, state=STATE):
     return device
 
 
-def unit_times(name, started, run):
-    """When the attach unit of `name` began and ended its stop, in seconds
-    after `started` (time.monotonic, systemd's CLOCK_MONOTONIC), and its
-    result."""
-    shown = run(["systemctl", "show", "--property=ActiveExitTimestampMonotonic",
-                 "--property=InactiveEnterTimestampMonotonic", "--property=Result",
-                 f"maki-attach@{name}.service"], capture_output=True, text=True, timeout=30)
-    values = dict(line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
-    try:
-        began = int(values["ActiveExitTimestampMonotonic"])
-        ended = int(values["InactiveEnterTimestampMonotonic"])
-    except (KeyError, ValueError):
-        raise RuntimeError(f"systemd shows no stop of maki-attach@{name}.service: {shown.stdout!r}")
-    if not 0 < began <= ended:
-        raise RuntimeError(f"systemd shows no completed stop of maki-attach@{name}.service: "
-                           f"{shown.stdout!r}")
-    return {"stop_began": round(began / 1e6 - started, 3), "stop_ended": round(ended / 1e6 - started, 3),
-            "stop_seconds": round((ended - began) / 1e6, 3), "result": values.get("Result")}
+def journal_times(name, started, run, sleep):
+    """When the stop job of the attach unit of `name` that began after
+    `started` (time.monotonic, which is CLOCK_MONOTONIC as the journal's
+    timestamps are) began and finished, in seconds after `started`, with the
+    job's result and the unit's.
+
+    They come from the journal of PID 1 for this boot: systemd
+    garbage-collects a unit once it is inactive, and `systemctl show` then
+    loads a fresh one whose timestamps are all 0, while the journal keeps the
+    stop job's messages (systemd's catalog: STOPPING when it has begun,
+    STOPPED with JOB_RESULT when it has finished, the same JOB_ID; a unit
+    that failed adds UNIT_FAILED with UNIT_RESULT). The finished message can
+    reach the journal after systemd shows the unit stopped, so the journal is
+    looked at up to JOURNAL_LOOKS times."""
+    unit = f"maki-attach@{name}.service"
+    since = int(started * 1e6)
+    for look in range(JOURNAL_LOOKS):
+        if look:
+            sleep(JOURNAL_LOOK)
+        shown = run(["journalctl", "--boot", "--no-pager", "--output=json", "_PID=1",
+                     f"UNIT={unit}"], capture_output=True, text=True, timeout=60)
+        entries = []
+        for line in shown.stdout.splitlines():
+            try:
+                item = json.loads(line)
+                at = int(item["__MONOTONIC_TIMESTAMP"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if at >= since and item.get("UNIT") == unit:
+                entries.append((at, item))
+        entries.sort(key=lambda found: found[0])
+        begun = next(((at, item) for at, item in entries if item.get("MESSAGE_ID") == STOPPING),
+                     None)
+        if begun is None:
+            continue
+        ended = next(((at, item) for at, item in entries
+                      if at >= begun[0] and item.get("MESSAGE_ID") == STOPPED
+                      and item.get("JOB_ID") == begun[1].get("JOB_ID")), None)
+        if ended is None:
+            continue
+        failure = next((item.get("UNIT_RESULT", "failed") for at, item in entries
+                        if at >= begun[0] and item.get("MESSAGE_ID") == UNIT_FAILED), None)
+        return {"stop_began": round(begun[0] / 1e6 - started, 3),
+                "stop_ended": round(ended[0] / 1e6 - started, 3),
+                "stop_seconds": round((ended[0] - begun[0]) / 1e6, 3),
+                "result": failure or "success", "job_result": ended[1].get("JOB_RESULT")}
+    raise RuntimeError(f"the journal shows no stop job of {unit} begun and finished after the "
+                       "stop request")
 
 
 def unit_state(unit, run):
@@ -235,7 +275,7 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
                                          f"{STOP_LOOKS * STOP_LOOK:.0f} s"}
                 continue
             try:
-                times[name] = unit_times(name, started, run)
+                times[name] = journal_times(name, started, run, sleep)
             except RuntimeError as error:
                 times[name] = {"stop_began": None, "stop_ended": None, "stop_seconds": None,
                                "result": f"unknown ({error})"}
@@ -284,6 +324,8 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
             problems.append(times[name]["result"])
         elif times[name]["result"] != "success":
             problems.append(f"maki-attach@{name}.service stopped with result {times[name]['result']}")
+        elif times[name].get("job_result") != "done":
+            problems.append(f"the stop job of maki-attach@{name}.service ended {times[name]['job_result']}")
         if accounts[name][0]:
             problems.append(f"the opener of {devices[name]} exited with status {accounts[name][0]}")
         problems += leftovers(name, devices[name], run, sleep, state, sysfs)
