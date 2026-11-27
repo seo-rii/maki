@@ -1136,8 +1136,11 @@ class FuzzQualificationWorkflow(unittest.TestCase):
                                 ("WALL_SECONDS", "matrix.wall_seconds"), ("WORKERS", "matrix.workers")):
             self.assertIn(f"          {variable}: ${{{{ {value} }}}}\n", shard)
         script = job_step_script(fuzz, "fuzz the shard")
+        # The script itself is the step's process, which alone the runner
+        # signals when it interrupts the step (StepCancellation in
+        # scripts/test_fuzz_qualification_validation.py).
         self.assertEqual(shlex.split(script.replace("\\\n", " ")), [
-            "python3", "-B", "scripts/fuzz_campaign.py", "run", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
+            "exec", "python3", "-B", "scripts/fuzz_campaign.py", "run", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
             "--target", "$TARGET", "--shard", "$SHARD", "--cpu-seconds", "$CPU_SECONDS",
             "--wall-seconds", "$WALL_SECONDS", "--workers", "$WORKERS", "--seeds", "fuzz/seeds/$TARGET",
             "--out", "$RUNNER_TEMP/shard"])
@@ -1165,7 +1168,7 @@ class FuzzQualificationWorkflow(unittest.TestCase):
         self.assertIn("          pattern: fuzz-shard-${{ matrix.target }}-*\n", merge)
         script = job_step_script(merge, "merge the seeds and the shard corpora")
         self.assertEqual(shlex.split(script.replace("\\\n", " ")), [
-            "python3", "-B", "scripts/fuzz_campaign.py", "merge", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
+            "exec", "python3", "-B", "scripts/fuzz_campaign.py", "merge", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
             "--target", "$TARGET", "--seeds", "fuzz/seeds/$TARGET", "--shards", "$RUNNER_TEMP/shards",
             "--out", "$RUNNER_TEMP/merged"])
         uploads = [step for name, step in steps(merge) if name == "actions/upload-artifact@v4"]

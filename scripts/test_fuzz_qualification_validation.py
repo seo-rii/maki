@@ -59,6 +59,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
@@ -70,7 +71,7 @@ with open(os.environ["FAKE_CALLS"], "a+") as calls:
     calls.seek(0)
     index = len(calls.readlines())
     calls.write(json.dumps({"arguments": arguments, "asan": os.environ.get("ASAN_OPTIONS"),
-                            "temp": os.environ.get("TMPDIR")}) + "\n")
+                            "temp": os.environ.get("TMPDIR"), "pid": os.getpid()}) + "\n")
 modes = json.loads(os.environ.get("FAKE_MODES", "[]"))
 mode = modes[index] if index < len(modes) else "ok"
 out = sys.stdout
@@ -94,6 +95,13 @@ def keep(directory, data):
     path.write_bytes(data)
 
 
+if flags.get("merge") == "1" and os.environ.get("FAKE_MERGE_HANG") == "1":
+    # libFuzzer's merge runs an inner process of its own; this one ignores
+    # the interrupt, so only a kill of the merge's group ends it.
+    inner = subprocess.Popen(["sh", "-c", "trap '' INT; exec sleep 300"])
+    Path(os.environ["FAKE_CALLS"] + ".inner").write_text(str(inner.pid))
+    while True:
+        time.sleep(0.05)
 if flags.get("merge") == "1":
     output, inputs = directories[0], directories[1:]
     seen = set()
@@ -135,10 +143,12 @@ if mode in ("hang", "stubborn"):
     while True:
         time.sleep(0.05)
 if mode == "burn":
-    # Charged FAKE_BURN seconds of CPU time, after FAKE_SLEEP of waiting.
-    time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
+    # Charged FAKE_BURN seconds of CPU time, then idle to the end of the
+    # round's time, as libFuzzer runs to -max_total_time.
+    began = time.monotonic()
     while time.process_time() < float(os.environ["FAKE_BURN"]):
         pass
+    time.sleep(max(0.0, int(flags["max_total_time"]) - (time.monotonic() - began)))
 keep(directories[0], f"found by {index}".encode())
 if mode == "litter":
     Path(os.environ["TMPDIR"], f"left-by-{index}").write_text("litter")
@@ -295,10 +305,24 @@ class MaxLen(unittest.TestCase):
             "witness_rpc": 1 + 4 + rust_const("crates/maki-witness/src/lib.rs",
                                               "MAX_FRAME_BYTES") + 1,
             "witness_etcd": 1 + rust_const("crates/maki-witness/src/etcd.rs", "MAX_JSON_BYTES") + 1,
-            # The selector, the exit byte and one byte beyond the output limit.
-            "helper_reports": 2 + rust_const("crates/maki-privileged/src/command.rs",
-                                             "max_output_bytes") + 1,
+            # LVM's report after the selector, and the output of the
+            # filesystem probe and of `dmsetup info` after the selector and
+            # the exit byte, each one byte beyond its limit.
+            "helper_reports": max(
+                1 + rust_const("crates/maki-privileged/src/lvm_preflight.rs", "MAX_REPORT") + 1,
+                2 + rust_const("crates/maki-privileged/src/command.rs", "max_output_bytes") + 1),
         }
+        # Those are the limits the readers the target calls check on its
+        # input, not the drain of a command's output, which it does not run.
+        sources = {path: (ROOT / "crates/maki-privileged/src" / path).read_text()
+                   for path in ("lvm_preflight.rs", "exec.rs", "recover.rs", "exec_fuzzing.rs")}
+        self.assertIn("if bytes.len() > MAX_REPORT ||", sources["lvm_preflight.rs"])
+        for path in ("exec.rs", "recover.rs"):
+            self.assertIn("output.stdout.len() > command::Policy::PROBE.max_output_bytes",
+                          sources[path], path)
+        for reader in ("lvm_preflight::validate(", "verify_filesystem_probe(expected, &output)",
+                       "recover::fuzzing::removal_info("):
+            self.assertIn(reader, sources["exec_fuzzing.rs"])
         self.assertEqual(sorted(bounds), sorted(module.MAX_LEN))
         for target, bound in bounds.items():
             with self.subTest(target=target):
@@ -454,9 +478,9 @@ class Run(Fixture):
             f"process {hang['worker']} was stopped at its deadline",
             f"process {stubborn['worker']} was stopped at its deadline"]))
 
-    def test_a_step_that_is_interrupted_stops_its_processes_and_keeps_the_record(self):
-        # GitHub interrupts a step at its time limit or when the run is
-        # cancelled: the processes are interrupted and the record written.
+    def test_a_runner_that_is_signalled_stops_its_processes_and_keeps_the_record(self):
+        # A signal to the runner's own process (the workflow's step execs
+        # it, so GitHub's interrupt reaches it: StepCancellation below).
         os.environ["FAKE_MODES"] = json.dumps(["hang", "hang"])
         out = self.root / "shard"
         runner = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "run", "--binary", str(self.binary),
@@ -486,7 +510,10 @@ class Run(Fixture):
         record = json.loads((out / "shard.json").read_text())
         self.assertEqual([(worker["exit"], worker["stopped"]) for worker in record["workers"]],
                          [(72, True), (72, True)])
-        self.assertEqual(len(record["failures"]), 2)
+        self.assertTrue(record["interrupted"])
+        self.assertEqual(record["failures"], ["the step was interrupted",
+                                              "process 1 was interrupted with the step",
+                                              "process 2 was interrupted with the step"])
 
     def test_a_process_fuzzes_in_rounds_until_it_has_been_charged_its_share(self):
         # Each round of this stand-in is charged a quarter of a second.
@@ -509,14 +536,25 @@ class Run(Fixture):
         self.assertEqual(len(self.calls_made()), sum(worker["rounds_run"] for worker in record["workers"]))
 
     def test_a_process_short_of_its_share_when_its_wall_time_is_spent_fails_the_shard(self):
-        # Waits two thirds of a second for each fifth of a second charged.
-        os.environ.update(FAKE_MODES=json.dumps(["burn"] * 12), FAKE_BURN="0.2", FAKE_SLEEP="0.7")
+        # Charged a fifth of a second in each round of a second.
+        os.environ.update(FAKE_MODES=json.dumps(["burn"] * 12), FAKE_BURN="0.2")
         out, record = self.run_shard(workers=1, cpu_seconds=10, wall_seconds=2, min_round=1)
         worker, = record["workers"]
         self.assertLess(worker["cpu_seconds"], 10)
         self.assertLessEqual(worker["rounds_run"], 3)
         self.assertEqual(record["failures"], [
             f"process 1 was charged {worker['cpu_seconds']:.0f} of its 10 CPU seconds in 2 s"])
+
+    def test_rounds_that_end_long_before_their_time_are_not_restarted_without_end(self):
+        # libFuzzer runs to -max_total_time; a process that exits 0 at once
+        # (here the stand-in) is not restarted until the wall time is spent.
+        os.environ["FAKE_MODES"] = json.dumps(["ok"] * 50)
+        out, record = self.run_shard(workers=1, cpu_seconds=10, wall_seconds=30, min_round=1)
+        worker, = record["workers"]
+        self.assertEqual(worker["rounds_run"], 3)
+        self.assertEqual(len(list((out / "logs").iterdir())), 3)
+        self.assertEqual(record["failures"], [
+            "process 1 ended 3 rounds in a row before half of their time"])
 
     def test_a_shard_without_seeds_is_refused(self):
         empty = self.root / "empty"
@@ -617,6 +655,161 @@ class Merge(Fixture):
                                              "--shards", str(self.root / "shards"),
                                              "--out", str(self.root / "third")]), 1)
 
+
+def gates():
+    """scripts/test_ci_gate_validation.py, which reads the workflow's steps."""
+    spec = importlib.util.spec_from_file_location(
+        "ci_gates", ROOT / "scripts" / "test_ci_gate_validation.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def running(pid):
+    """Whether `pid` is a process that has not ended (a zombie has)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def cancel_like_the_runner(process):
+    """What actions/runner does to a step it cancels or that ran out of
+    time (ProcessInvoker.cs): SIGINT to the step's own process, 7.5 s,
+    SIGTERM, 2.5 s, then kill. Returns the signal it ended after."""
+    for sig, wait in ((signal.SIGINT, 7.5), (signal.SIGTERM, 2.5)):
+        process.send_signal(sig)
+        try:
+            process.wait(timeout=wait)
+            return sig
+        except subprocess.TimeoutExpired:
+            pass
+    process.kill()
+    process.wait()
+    return signal.SIGKILL
+
+
+@unittest.skipUnless(sys.platform == "linux", "the steps run in bash on Linux runners")
+class StepCancellation(Fixture):
+    """The workflow's long steps as the runner runs them: their script in
+    `bash --noprofile --norc -e -o pipefail <file>` (ScriptHandlerHelpers.cs),
+    whose own process alone the runner signals. Bash does not hand a signal
+    on to the command it waits for."""
+
+    def setUp(self):
+        super().setUp()
+        self.jobs = gates().qualification_jobs()
+        # A target name of the test's own: its temporary directory on
+        # /dev/shm is found and removed by it.
+        self.target = f"cancel_probe_{os.getpid()}"
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "fuzz_campaign.py").write_text(SCRIPT.read_text())
+        seeds = self.root / "fuzz" / "seeds" / self.target
+        seeds.mkdir(parents=True)
+        (seeds / "valid-a").write_bytes(b"seed a")
+        self.temp = self.root / "runner-temp"
+        (self.temp / "binaries").mkdir(parents=True)
+        (self.temp / "binaries" / self.target).write_text(FAKE_FUZZER)
+        (self.temp / "binaries" / self.target).chmod(0o700)
+        self.addCleanup(self.remove_temporary_directories)
+
+    def remove_temporary_directories(self):
+        for root in (Path("/dev/shm"), Path(tempfile.gettempdir())):
+            for path in root.glob(f"maki-fuzz-*{self.target}-*"):
+                subprocess.run(["rm", "-rf", str(path)], check=False)
+
+    def step(self, job, name, environment, ready):
+        """Run the step, cancel it like the runner once `ready()` holds, and
+        return the signal it ended after and the pids it started."""
+        script = self.root / "step.sh"
+        script.write_text(gates().job_step_script(self.jobs[job], name))
+        log = open(self.root / "step.log", "wb")
+        self.addCleanup(log.close)
+        process = subprocess.Popen(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", str(script)],
+                                   cwd=self.root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                   env=dict(os.environ, RUNNER_TEMP=str(self.temp), TARGET=self.target,
+                                            **environment),
+                                   start_new_session=True)
+        try:
+            for _ in range(400):
+                if process.poll() is not None or ready():
+                    break
+                time.sleep(0.05)
+            self.assertIsNone(process.poll(), (self.root / "step.log").read_text())
+            ended_after = cancel_like_the_runner(process)
+            started = [call["pid"] for call in self.calls_made()]
+            inner = Path(str(self.calls) + ".inner")
+            if inner.exists():
+                started.append(int(inner.read_text()))
+            # Give a process the kill reached a moment to go.
+            for _ in range(20):
+                if not any(running(pid) for pid in started):
+                    break
+                time.sleep(0.05)
+            left = [pid for pid in started if running(pid)]
+        finally:
+            # Whatever the step left behind: its process group, and every
+            # process it started, which may have a group of its own.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            inner = Path(str(self.calls) + ".inner")
+            for pid in [call["pid"] for call in self.calls_made()] + (
+                    [int(inner.read_text())] if inner.exists() else []):
+                if running(pid):
+                    os.kill(pid, signal.SIGKILL)
+        return ended_after, left
+
+    def shard_ready(self):
+        logs = self.temp / "shard" / "logs"
+        return len(self.calls_made()) == 2 and all(
+            "INITED" in (logs / f"worker-{worker}-round-1.log").read_text(errors="replace")
+            for worker in (1, 2) if (logs / f"worker-{worker}-round-1.log").exists()) and \
+            len(list(logs.glob("worker-*-round-1.log"))) == 2
+
+    def shard(self, modes):
+        os.environ["FAKE_MODES"] = json.dumps(modes)
+        ended_after, left = self.step("fuzz", "fuzz the shard", {
+            "SHARD": "1", "CPU_SECONDS": "3600", "WALL_SECONDS": "3600", "WORKERS": "2"},
+            self.shard_ready)
+        self.assertEqual(left, [], "fuzzing processes outlived the step")
+        record = self.temp / "shard" / "shard.json"
+        self.assertTrue(record.is_file(), (self.root / "step.log").read_text())
+        # Before the runner's SIGTERM: the record is complete and the
+        # uploads that follow (`if: always()`) read the shard as it ended.
+        self.assertEqual(ended_after, signal.SIGINT)
+        return json.loads(record.read_text())
+
+    def test_a_cancelled_shard_step_keeps_its_record_and_leaves_no_fuzzer(self):
+        record = self.shard(["hang", "hang"])
+        self.assertTrue(record["interrupted"])
+        self.assertEqual([(worker["exit"], worker["stopped"]) for worker in record["workers"]],
+                         [(72, True), (72, True)])
+        self.assertEqual(record["failures"][0], "the step was interrupted")
+
+    def test_a_process_that_ignores_the_interrupt_is_killed_in_time(self):
+        record = self.shard(["hang", "stubborn"])
+        self.assertTrue(record["interrupted"])
+        self.assertEqual(sorted(((worker["exit"], worker["signal"]) for worker in record["workers"]),
+                                key=repr),
+                         sorted([(72, None), (None, signal.SIGKILL)], key=repr))
+
+    def test_a_cancelled_merge_step_keeps_its_record_and_leaves_no_fuzzer(self):
+        corpus = self.temp / "shards" / f"fuzz-shard-{self.target}-1" / "corpus"
+        corpus.mkdir(parents=True)
+        (corpus / "input").write_bytes(b"input")
+        os.environ["FAKE_MERGE_HANG"] = "1"
+        inner = Path(str(self.calls) + ".inner")
+        ended_after, left = self.step("merge", "merge the seeds and the shard corpora", {},
+                                      lambda: inner.exists() and len(self.calls_made()) == 1)
+        self.assertEqual(left, [], "the merge's processes outlived the step")
+        record = self.temp / "merged" / "coverage.json"
+        self.assertTrue(record.is_file(), (self.root / "step.log").read_text())
+        self.assertEqual(ended_after, signal.SIGINT)
+        record = json.loads(record.read_text())
+        self.assertTrue(record["interrupted"])
+        self.assertEqual(record["failures"][0], "the merge was interrupted")
 
 class Summary(unittest.TestCase):
     DIGEST = "ab" * 32
