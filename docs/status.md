@@ -261,8 +261,9 @@ See [cache reload](operations.md#growth-and-cache-reload).
   stopped (as f933c7c's log shows), at 8b9ef4d after systemd had forgotten
   the stopped units; it now reads the journal. Their journals
   show the stops queued one after another on the global attach lock: about
-  10.2, 20.3 and 30.5 s after they began at f933c7c, about 30.7 s in all at
-  8b9ef4d. Detach and cleanup now wait for a held-open device without the
+  10.2, 20.3 and 30.5 s after they began at f933c7c, and about 30.5 s from
+  the first stop's start to the last one's end at 8b9ef4d (whose driver
+  found every unit stopped after 30.678 s). Detach and cleanup now wait for a held-open device without the
   attach lock (AUD-197, #410), and at 31b7ef8, which has that change, the
   stop together passed: the three stops took 10.183, 10.246 and 10.310 s,
   about the 10 s hold each, and every attach unit had stopped 10.388 s after
