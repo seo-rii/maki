@@ -2399,8 +2399,16 @@ ciphertext encrypted by B must decrypt on A
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
 Every configured endpoint, a lone one included, is first probed on its own
-at attach. An endpoint that is unreachable when these self-tests run at
-attach is quarantined. When no endpoint is reachable the attach MUST be
+at attach: a self-test, then the key canary check (§27). The endpoints are
+probed at the same time, each probe with its own attempts, so endpoints
+that do not answer delay the attach by about one probe however many are
+configured. The canary checks, which load the volume's canary and may write
+it, run one at a time in configuration order, so on a new volume the first
+endpoint in that order that passes its self-test establishes the canary.
+The probes' results are taken in configuration order: the first endpoint in
+that order whose probe refuses the attach refuses it, and no endpoint after
+it reaches the volume. An endpoint that is unreachable when these
+self-tests run at attach is quarantined. When no endpoint is reachable the attach MUST be
 refused, and the refusal MUST name each endpoint's failure (the first
 `EndpointFatal` failure among its probe attempts, otherwise the last). A
 lone endpoint is the exception when no probe attempt failed with
