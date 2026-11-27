@@ -260,11 +260,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
   with the bootstrap stopped once (at `mkfs.xfs`, and at `vgchange`) and
   continued from its record, and stops three volumes together, each device
   held open for 10 s, recording how long each stop takes. These additions
-  ran four times on GitHub's runner (Linux `7.0.0-1020-azure`, 2026-11-27),
-  at commits a6c2006, f933c7c, 8b9ef4d and 31b7ef8 of #413; the privileged
-  runner and both stopped quick starts passed in each. In the three runs
-  whose logs are kept (all but a6c2006's) the device still showed the
-  connection after the disconnect, with XFS mounted on the LV and again
+  ran on GitHub's runner VMs on 2026-11-27 at commits a6c2006, f933c7c,
+  8b9ef4d and 31b7ef8 of #413 and at a2db40e, the head that merged; the
+  privileged runner and both stopped quick starts passed in each. In the runs
+  whose logs are kept (all but a6c2006's; Linux `7.0.0-1020-azure`, and
+  `7.0.0-1016-aws` at 8b9ef4d) the device still showed the connection after
+  the disconnect, with XFS mounted on the LV and again
   after the unmount, and showed none once the LV's mapping was removed: the
   mapping keeps the connection's attributes (the mount sits on the mapping,
   so its own effect is not told apart); cleanup then took its disconnected
@@ -277,11 +278,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
   10.2, 20.3 and 30.5 s after they began at f933c7c, and about 30.5 s from
   the first stop's start to the last one's end at 8b9ef4d (whose driver
   found every unit stopped after 30.678 s). Detach and cleanup now wait for a held-open device without the
-  attach lock (AUD-197, #410), and at 31b7ef8, which has that change, the
+  attach lock (AUD-205, #410), and at 31b7ef8, which has that change, the
   stop together passed: the three stops took 10.183, 10.246 and 10.310 s,
   about the 10 s hold each, and every attach unit had stopped 10.388 s after
-  the request. That is local-provider volumes on one runner kernel, and
-  nbdkit is killed only while the filesystem is idle after a sync. How often
+  the request; at a2db40e they took 10.153 to 10.214 s, and 10.488 s in
+  all. That is local-provider volumes on GitHub's runner kernels, and nbdkit
+  is killed only while the filesystem is idle after a sync. How often
   something holds a device open at a detach on a production host has not
   been measured.
 - On every change, CI's booted-host jobs boot Debian 12's generic cloud image
