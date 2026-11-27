@@ -147,6 +147,21 @@ class ReleaseGateContract(unittest.TestCase):
         self.assertIn(f"{ETCD_CFG}\nmod quorum {{", gate)
         self.assertNotIn("#[cfg(unix)]\nmod quorum", gate)
 
+    def test_the_etcd_gates_run_one_at_a_time(self):
+        # Each gate starts a three-member etcd cluster and a frontend on ports
+        # it chose by binding port 0 and releasing it, so two gates started at
+        # once can take each other's ports: in one of seven runs on a shared
+        # host a member exited during startup.
+        job = jobs()["etcd-qualification"]
+        commands = [" ".join(line.split()) for line in job.splitlines()
+                    if "--test etcd_ha" in line and not line.lstrip().startswith("#")]
+        self.assertEqual(commands, [
+            "cargo test --release --locked -p maki-witness --features etcd-qualification "
+            "--test etcd_ha -- --ignored --test-threads=1"
+        ])
+        gate = ETCD_GATE.read_text()
+        self.assertGreaterEqual(gate.count("#[ignore = \"requires verified MAKI_ETCD_BIN"), 2)
+
 
 class PythonSuites(unittest.TestCase):
     def pull_request_job(self):

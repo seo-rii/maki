@@ -1236,3 +1236,119 @@ fn a_remote_read_only_open_reads_an_active_authority_whose_writer_is_gone() {
     remote.only_inspections();
     assert_eq!(remote.record(), record);
 }
+
+/// The message of every event logged on this thread.
+struct Messages(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Messages {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Run `run` and return what it returned and the messages it logged.
+fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let value = tracing::subscriber::with_default(Messages(messages.clone()), run);
+    let messages = messages.lock().unwrap().clone();
+    (value, messages)
+}
+
+/// The view a writable open reads before its claim belongs to no read-only
+/// command: a page in it that does not authenticate refuses the open, and
+/// nothing logs that a read-only session stopped. A read-only view that stops
+/// still logs it.
+#[test]
+fn a_view_read_before_a_claim_logs_no_stopped_read_only_session() {
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    let (arena, slot) = (namespace.join("rollback.arena"), committed_slot(&namespace));
+    flip(&arena, slot);
+    let (error, messages) = logged(|| {
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            read_payload_result(view).map(drop)
+        })
+        .err()
+        .unwrap()
+    });
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("read-only rollback session stopped")),
+        "{messages:?}"
+    );
+    flip(&arena, slot);
+    let view = remote.open().unwrap();
+    flip(&arena, slot);
+    let (error, messages) = logged(|| read_payload_result(&view).unwrap_err());
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("read-only rollback session stopped")),
+        "{messages:?}"
+    );
+}
+
+/// An open that fails once the authority has been inspected twice (here at
+/// a committed page that does not authenticate) asks it once more before it
+/// reports the failure: an authority that changed meanwhile (a takeover made
+/// elsewhere right after the second inspection) is reported instead, and
+/// one that did not leaves the open's own error.
+#[test]
+fn a_remote_read_only_open_that_fails_reports_an_authority_that_changed() {
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    flip(
+        &namespace.join("rollback.arena"),
+        committed_slot(&namespace),
+    );
+    *remote.writer.takeover_after.lock().unwrap() = Some(2);
+    let error = remote.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("the remote authority changed while the backing was opened read-only"),
+        "{error}"
+    );
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    remote.clear();
+    let error = remote.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"; 3]);
+}

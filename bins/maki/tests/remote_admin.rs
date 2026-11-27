@@ -1633,6 +1633,27 @@ fn a_configuration_pointed_at_a_snapshot_destination_is_refused_read_only() {
     assert_eq!(inspect(fixture.writer.as_ref()), record);
     assert_eq!(tree(&fixture.root), root_tree);
     assert_eq!(tree(&target), target_tree);
+    // Once the volume has been opened to write again, the authority names a
+    // namespace the snapshot does not hold, and the refusal says so.
+    drop(RollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap());
+    let target_tree = tree(&target);
+    for args in [
+        vec!["volume", "inspect", path],
+        vec!["check", path],
+        vec!["check", path, "--deep"],
+    ] {
+        fixture.clear();
+        failure(
+            &args,
+            "this backing root does not hold the remote authority's current generation",
+        );
+        let sent = fixture.sent();
+        assert!(
+            !sent.is_empty() && sent.iter().all(|action| *action == "inspect"),
+            "{args:?}: {sent:?}"
+        );
+    }
+    assert_eq!(tree(&target), target_tree);
 }
 
 /// The view asks the authority once more before a command reports: an
@@ -1667,4 +1688,89 @@ fn an_authority_that_changes_while_a_command_reads_fails_the_command() {
         );
         assert_ne!(inspect(fixture.writer.as_ref()), before, "{args:?}");
     }
+}
+
+/// A command that fails after the view has opened asks the authority once
+/// more before it reports the failure, as one that succeeds asks before it
+/// reports what it read: an authority that changed meanwhile (here an
+/// administrator's takeover, made elsewhere right after the open's second
+/// inspection) is reported instead of the failure, which describes a state
+/// that may no longer be the volume's. Three such exits: `volume inspect` of
+/// a backing that holds no superblock, every command with a configured
+/// capacity that is not the stored one, and every command on a committed page
+/// that does not authenticate. Where nothing changed, each reports its own
+/// error, after three inspections.
+#[test]
+fn an_authority_that_changes_before_a_command_fails_is_reported_instead() {
+    let fixture = Fixture::new();
+    let backing = fixture.create();
+    write(&backing, b"a backing without a superblock");
+    drop(backing);
+    let capacity = fixture.dir.path().join("capacity.toml");
+    volume_config::write(
+        &capacity,
+        std::fs::read_to_string(&fixture.writer_config)
+            .unwrap()
+            .replace(r#"capacity="64KiB""#, r#"capacity="128KiB""#),
+    )
+    .unwrap();
+    let (path, capacity) = (fixture.path(false), capacity.to_str().unwrap());
+    let every = |config| {
+        [
+            vec!["volume", "inspect", config],
+            vec!["check", config],
+            vec!["check", config, "--deep"],
+        ]
+    };
+    let mut cases = vec![(
+        vec!["volume", "inspect", path],
+        "no valid superblock".to_string(),
+    )];
+    for args in every(capacity) {
+        cases.push((
+            args,
+            "protected backing capacity mismatch: configuration 131072, stored 65536".into(),
+        ));
+    }
+    let failed = |cases: &[(Vec<&str>, String)]| {
+        for (args, error) in cases {
+            *fixture.takeover_after.lock().unwrap() = Some(2);
+            let output = run(args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                stderr.contains("the remote authority changed") && !stderr.contains(error.as_str()),
+                "{args:?}: {stderr}"
+            );
+            fixture.clear();
+            failure(args, error);
+            assert_eq!(fixture.sent(), ["inspect"; 3], "{args:?}");
+        }
+    };
+    failed(&cases);
+    let record = inspect(fixture.writer.as_ref());
+    let arena = fixture
+        .root
+        .join(&record.current.as_ref().unwrap().namespace)
+        .join("rollback.arena");
+    let slot = arena_slot(&current_manifest(&fixture.root, &record), "ciphertext", 0);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena)
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, slot * 4096).unwrap();
+    file.write_all_at(&[byte[0] ^ 1], slot * 4096).unwrap();
+    let damaged: Vec<_> = every(path)
+        .into_iter()
+        .map(|args| {
+            (
+                args,
+                "rollback arena page authentication failed".to_string(),
+            )
+        })
+        .collect();
+    failed(&damaged);
 }
