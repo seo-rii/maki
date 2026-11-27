@@ -307,8 +307,9 @@ class ProgramMechanics(unittest.TestCase):
 # A stand-in for the bootstrap block, with the guide's behaviour: a run
 # without a record starts over and records the layout, then the filesystem;
 # a run with a record that names no filesystem releases the export, removes
-# the record and fails; one that names it finishes. The knobs make it break
-# the rules the program checks.
+# the record and fails; one that names it finishes. As the guide's block, it
+# runs `pvcreate` before `mkfs.xfs` and `vgs` before `vgchange`. The knobs
+# make it break the rules the program checks.
 STAND_IN_BOOTSTRAP = r"""bash <<'BASH'
 set -euo pipefail
 volume=demo
@@ -326,12 +327,14 @@ if [[ -e $record ]]; then
 else
     printf 'pv_uuid=1\n' > "$record"
     echo maki-bootstrap-1 > @ROOT@/sys/block/nbd0/backend
+    pvcreate
     if ! mkfs.xfs; then
         [[ -z ${NO_RECORD:-} ]] || rm "$record"
         [[ -n ${NO_STOP:-} ]] || exit 1
     fi
     printf 'fs_uuid=2\n' >> "$record"
 fi
+vgs
 if ! vgchange; then
     [[ -n ${NO_STOP:-} ]] || exit 1
 fi
@@ -339,9 +342,16 @@ rm -f "$record" @ROOT@/sys/block/nbd0/backend
 echo created >> @ROOT@/log
 BASH
 """
+# A stand-in for a command the bootstrap runs; the one FAIL_ONCE names fails
+# the first time, on its own.
 FAKE_TOOL = """#!/bin/sh
 echo "${0##*/} $*" >> "$FIXTURE/log"
 if [ "${0##*/}" = systemctl ]; then echo "${SYSTEMCTL_STATE:-inactive}"; fi
+if [ "${0##*/}" = "${FAIL_ONCE:-}" ] && [ ! -e "$FIXTURE/failed-once" ]; then
+    : > "$FIXTURE/failed-once"
+    echo "${0##*/}: failed on its own" >&2
+    exit 5
+fi
 """
 
 
@@ -408,7 +418,9 @@ class StoppedBootstrap(unittest.TestCase):
         (root / "sys/block/nbd0").mkdir(parents=True)
         (root / "var/lib/maki/demo").mkdir(parents=True)
         (root / "bin").mkdir()
-        for name in ("mkfs.xfs", "vgchange", "systemctl"):
+        # Where the program makes its shim's directory.
+        (root / "tmp").mkdir()
+        for name in ("mkfs.xfs", "vgchange", "systemctl", "pvcreate", "vgs"):
             (root / "bin" / name).write_text(FAKE_TOOL)
             (root / "bin" / name).chmod(0o700)
         found = [(self.steps[5][0], "echo create >> " + str(root / "log")),
@@ -419,7 +431,7 @@ class StoppedBootstrap(unittest.TestCase):
                                   lambda: (str(root / "var/lib/maki/demo"), "maki@demo.service")):
             program = self.driver.program(found, stop_once=command)
         env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                   FIXTURE=str(root), **environment)
+                   FIXTURE=str(root), TMPDIR=str(root / "tmp"), **environment)
         result = subprocess.run(["bash", "-c", program], cwd=root, env=env, capture_output=True,
                                 text=True, timeout=20)
         log = (root / "log").read_text().splitlines() if (root / "log").exists() else []
@@ -428,10 +440,13 @@ class StoppedBootstrap(unittest.TestCase):
     def test_a_stop_before_the_filesystem_is_released_reset_and_started_over(self):
         result, log, root = self.run_stopped("mkfs.xfs")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(log, ["create", "run", "run", "released", "systemctl show -P ActiveState "
-                               "maki@demo.service", "systemctl show -P ActiveState maki@demo.service",
-                               "create", "run", "mkfs.xfs ", "vgchange ", "created", "after"])
+        self.assertEqual(log, ["create", "run", "pvcreate ", "run", "released",
+                               "systemctl show -P ActiveState maki@demo.service",
+                               "systemctl show -P ActiveState maki@demo.service",
+                               "create", "run", "pvcreate ", "mkfs.xfs ", "vgs ", "vgchange ",
+                               "created", "after"])
         self.assertFalse((root / "var/lib/maki/demo").exists())
+        self.assertEqual(list((root / "tmp").iterdir()), [])
         self.assertIn("mkfs.xfs: failed once by documented_quickstart.py", result.stderr)
         self.assertIn("pv_uuid=1", result.stdout)
         self.assertIn("every documented step succeeded", result.stdout)
@@ -439,8 +454,10 @@ class StoppedBootstrap(unittest.TestCase):
     def test_a_stop_after_the_filesystem_is_finished_by_the_next_run(self):
         result, log, root = self.run_stopped("vgchange")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(log, ["create", "run", "mkfs.xfs ", "run", "vgchange ", "created", "after"])
+        self.assertEqual(log, ["create", "run", "pvcreate ", "mkfs.xfs ", "vgs ", "run", "vgs ",
+                               "vgchange ", "created", "after"])
         self.assertTrue((root / "var/lib/maki/demo").exists())
+        self.assertEqual(list((root / "tmp").iterdir()), [])
         self.assertIn("vgchange: failed once by documented_quickstart.py", result.stderr)
         self.assertIn("fs_uuid=2", result.stdout)
 
@@ -465,6 +482,28 @@ class StoppedBootstrap(unittest.TestCase):
                 self.assertNotIn("every documented step succeeded", result.stdout)
                 # Each stops before the reset: nothing is removed.
                 self.assertTrue((root / "var/lib/maki/demo").exists())
+
+    def test_a_run_that_stopped_before_the_shim_ran_stops_the_program(self):
+        # A command before the one the shim fails fails once on its own: the
+        # first run stops with a record and the connection shown, as it
+        # would have at the shim, but the shim never ran, and the next runs
+        # would continue from a stop the program did not make.
+        for command, earlier, log in (
+                ("mkfs.xfs", "pvcreate", ["create", "run", "pvcreate "]),
+                ("vgchange", "vgs", ["create", "run", "pvcreate ", "mkfs.xfs ", "vgs "])):
+            with self.subTest(command=command):
+                result, found, root = self.run_stopped(command, FAIL_ONCE=earlier)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"the bootstrap stopped with status 5 before it ran {command}: the "
+                              "shim that fails it never ran", result.stderr)
+                self.assertNotIn("failed once by documented_quickstart.py", result.stderr)
+                self.assertIn(f"{earlier}: failed on its own", result.stderr)
+                self.assertIn("stopped in [", result.stderr)
+                self.assertEqual(found, log)
+                self.assertNotIn("every documented step succeeded", result.stdout)
+                self.assertTrue((root / "var/lib/maki/demo").exists())
+                # The shim's directory goes all the same.
+                self.assertEqual(list((root / "tmp").iterdir()), [])
 
     def test_the_writer_takes_the_command_to_fail(self):
         with tempfile.TemporaryDirectory() as directory:
