@@ -1297,8 +1297,9 @@ class FuzzQualificationWorkflow(unittest.TestCase):
             (temp / "stats" / "fuzz-stats-journal_scan-1").mkdir(parents=True)
             (temp / "coverage" / "fuzz-coverage-journal_scan").mkdir(parents=True)
             (temp / "coverage" / "fuzz-coverage-journal_scan" / "coverage.json").write_text(json.dumps({
-                "target": "journal_scan", "binary_sha256": digest, "merge_exit": 0, "coverage_exit": 0,
-                "cov": 169, "ft": 300, "inputs": 9, "bytes": 900, "seeds": 7}))
+                "target": "journal_scan", "binary_sha256": digest, "merge_exit": 0, "attempts": 1,
+                "artifacts": [], "coverage_exit": 0, "cov": 169, "ft": 300, "inputs": 9, "bytes": 900,
+                "seeds": 7}))
             step_summary = temp / "step-summary.md"
             for cpu, status in ((plan["cpu_seconds"], 0), (0.5, 1)):
                 with self.subTest(cpu=cpu):

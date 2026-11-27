@@ -14,7 +14,8 @@ run       one shard: run each of its libFuzzer processes until the kernel
           has charged it its share of CPU time, and record that time, its
           executions and coverage, and the inputs it failed on
 merge     merge a target's seeds and shard corpora into one corpus, and
-          record the coverage that corpus reaches
+          record the coverage that corpus reaches and the inputs the merge
+          failed on
 summary   every target's evidence and verdict; fails unless every target
           qualified
 
@@ -109,6 +110,11 @@ MAX_EARLY_ROUNDS = 3
 # -timeout, one that took more memory than -rss_limit_mb, a leak.
 # `slow-unit-` inputs are only reported.
 FAILING_ARTIFACTS = ("crash", "timeout", "oom", "leak")
+# libFuzzer's -merge=1 runs an inner process over the inputs and prints
+# this line before each run of it. An input that fails the inner process is
+# written to -artifact_prefix as above and left out, and the inner process
+# runs again: the merge still exits 0, so a second attempt is a failure.
+MERGE_ATTEMPT = re.compile(r"^MERGE-OUTER: attempt (\d+)$", re.MULTILINE)
 # The processes' temporary directory goes on this memory filesystem where
 # there is one: helper_sysfs builds a directory tree for every input. In a
 # run on the host this was written on, a process was charged 36 % of its
@@ -276,6 +282,19 @@ def parse_log(text):
         found[key] = int(value.group(1)) if value else None
     error = ERROR.search(text)
     found["error"] = error.group(1).strip() if error else None
+    return found
+
+
+def artifacts_in(directory):
+    """Each input libFuzzer wrote to `directory` (its -artifact_prefix),
+    with its kind: the prefix of its name."""
+    found = []
+    for entry in sorted(Path(directory).iterdir()):
+        if entry.is_file():
+            kind = entry.name.split("-", 1)[0] if "-" in entry.name else entry.name
+            if entry.name.startswith("slow-unit-"):
+                kind = "slow-unit"
+            found.append({"name": entry.name, "kind": kind, "bytes": entry.stat().st_size})
     return found
 
 
@@ -450,13 +469,7 @@ def run(binary, target, shard, cpu_seconds, wall_seconds, workers, seeds, out,
                 "seeds": [entry["seed"] for entry in rounds],
                 "cov": last["cov"], "ft": last["ft"],
             })
-        found = []
-        for entry in sorted(artifacts.iterdir()):
-            if entry.is_file():
-                kind = entry.name.split("-", 1)[0] if "-" in entry.name else entry.name
-                if entry.name.startswith("slow-unit-"):
-                    kind = "slow-unit"
-                found.append({"name": entry.name, "kind": kind, "bytes": entry.stat().st_size})
+        found = artifacts_in(artifacts)
         # What the processes left in their temporary directory, two levels
         # deep: helper_sysfs removes its trees (docs/testing.md, "Fuzzing"),
         # but a process interrupted or killed leaves its directory and the
@@ -561,7 +574,8 @@ def run_group(command, log_path, environment, interrupted):
 def merge(binary, target, seeds, shards, out, temp=None):
     """Merge `seeds` and every shard corpus below `shards` into one corpus
     (libFuzzer's -merge=1 keeps the inputs that add coverage), then run that
-    corpus once to read the coverage it reaches. Returns the record."""
+    corpus once to read the coverage it reaches. Returns the record, with
+    every input the merge wrote to its artifacts and the attempts it took."""
     out = Path(out)
     corpus = out / "corpus"
     corpus.mkdir(parents=True, exist_ok=False)
@@ -598,6 +612,7 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, limits, enviro
         measured = run_group([str(binary), "-runs=0", *limits, str(corpus)],
                              out / "coverage.log", environment, interrupted)
     shutil.rmtree(merge_temp, ignore_errors=True)
+    attempts = len(MERGE_ATTEMPT.findall((out / "merge.log").read_text(errors="replace")))
     found = parse_log((out / "coverage.log").read_text(errors="replace"))
     inputs, size = files_in(corpus)
     seed_inputs, _ = files_in(Path(seeds))
@@ -605,7 +620,9 @@ def merge_and_record(binary, target, seeds, out, corpus, sources, limits, enviro
               "seeds": seed_inputs,
               "sources": [{"shard": path.parent.name, "inputs": files_in(path)[0]}
                           for path in sources],
-              "merge_exit": merged, "coverage_exit": measured, "inputs": inputs, "bytes": size,
+              "merge_exit": merged, "attempts": attempts,
+              "artifacts": artifacts_in(out / "artifacts"),
+              "coverage_exit": measured, "inputs": inputs, "bytes": size,
               "cov": found["inited_cov"], "ft": None, "error": found["error"],
               "interrupted": interrupted.is_set()}
     inited = [status for status in STATUS.findall((out / "coverage.log").read_text(errors="replace"))
@@ -623,6 +640,17 @@ def merge_failures(record):
     reasons = []
     if record["merge_exit"] != 0:
         reasons.append(f"the merge ended with status {record['merge_exit']}")
+    # A record without the attempts fails too: the merge's success is read
+    # from its log, not only from its status.
+    attempts = record.get("attempts")
+    if not attempts:
+        reasons.append("the merge's log shows no attempt of its inner process")
+    elif attempts > 1:
+        reasons.append(f"the merge took {attempts} attempts: an input failed its inner process "
+                       "and was left out")
+    for artifact in record.get("artifacts") or []:
+        if artifact["kind"] in FAILING_ARTIFACTS:
+            reasons.append(f"the merge wrote the {artifact['kind']} input {artifact['name']}")
     if record["coverage_exit"] != 0:
         reasons.append(f"the coverage run ended with status {record['coverage_exit']}")
     if record["cov"] is None:
@@ -691,6 +719,9 @@ def summarize(plan_record, stats, coverage, build=None, environment=None):
         executions = sum(worker.get("executions") or 0 for worker in workers)
         artifacts = [dict(artifact, shard=record["shard"]) for record in found
                      for artifact in record["artifacts"]]
+        result = merged.get(target)
+        if result is not None:
+            artifacts += [dict(artifact, merge=True) for artifact in result.get("artifacts") or []]
         reasons = []
         if missing:
             reasons.append("no record of shard " + ", ".join(map(str, missing)))
@@ -699,7 +730,6 @@ def summarize(plan_record, stats, coverage, build=None, environment=None):
                            for reason in shard_failures(record))
         if cpu < requested:
             reasons.append(f"{hours(cpu)} of {plan_record['cpu_hours']:g} CPU-hours")
-        result = merged.get(target)
         if result is None:
             reasons.append("no merged corpus")
         else:
@@ -757,7 +787,8 @@ def markdown(summary):
                  "| Corpus | Inputs it stopped on | Verdict |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|---|")
     for row in summary["targets"]:
-        stopped = ", ".join(f"`{artifact['name']}` (shard {artifact['shard']})"
+        stopped = ", ".join(f"`{artifact['name']}` "
+                            + ("(merge)" if artifact.get("merge") else f"(shard {artifact['shard']})")
                             for artifact in row["artifacts"]
                             if artifact["kind"] in FAILING_ARTIFACTS) or "none"
         verdict = "qualified" if row["qualified"] else "not qualified: " + "; ".join(row["reasons"])
