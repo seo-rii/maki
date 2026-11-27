@@ -20,9 +20,12 @@ device open, and keeps it `--hold` seconds after its disconnect; one
 `maki-attach cleanup`, whose disconnect waits for the opener to close the
 device, while it holds the global attach lock.
 
-It prints, and writes to DIRECTORY/stop-together.json, when each attach
-unit's stop began and ended after the stop was requested (systemd's
-monotonic timestamps) and each opener's account, then requires every stop
+`systemctl stop` of the targets returns once the targets' own jobs are
+done, before the attach units they are ordered after have stopped, so the
+program then looks at each attach unit until it is inactive or failed (for
+up to 300 s). It prints, and writes to DIRECTORY/stop-together.json, when
+each attach unit's stop began and ended after the stop was requested
+(systemd's monotonic timestamps) and each opener's account, then requires every stop
 to have succeeded, every opener to have seen its disconnect and kept the
 connection shown until it closed the device, and every attachment to be
 gone. It measures: it requires neither that the stops overlap nor that
@@ -52,6 +55,11 @@ START = "6. Start the lifecycle and write data"
 BLOCK_TIMEOUT = 600
 # Above every unit's TimeoutStopSec=120.
 STOP_TIMEOUT = 600
+# How long the attach units may take to stop after `systemctl stop` of the
+# targets returned, in looks at their state 0.5 s apart: 300 s, also above
+# TimeoutStopSec=120 for each of three queued one after another.
+STOP_LOOKS = 600
+STOP_LOOK = 0.5
 # A hold the helper's 15 s wait for the opener outlasts.
 MAX_HOLD = 14
 
@@ -149,6 +157,23 @@ def unit_state(unit, run):
                timeout=30).stdout.strip()
 
 
+def await_stops(volumes, run, sleep):
+    """Look at each attach unit's state until it is inactive or failed,
+    for up to STOP_LOOKS looks; return the units that were still stopping.
+
+    `systemctl stop` of a target returns once the target's own job is done:
+    a target stops before the units it is ordered after, and systemctl waits
+    only for the jobs of the units it names. Until an attach unit has
+    stopped, systemd shows no time for the end of its stop."""
+    stopping = [f"maki-attach@{name}.service" for name in volumes]
+    for _ in range(STOP_LOOKS):
+        stopping = [unit for unit in stopping if unit_state(unit, run) not in ("inactive", "failed")]
+        if not stopping:
+            break
+        sleep(STOP_LOOK)
+    return stopping
+
+
 def leftovers(name, device, run, sleep, state=STATE, sysfs=SYSFS):
     """What is left of the attachment of `name` on `device`."""
     found = []
@@ -199,9 +224,16 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
                  "after its disconnect")
         started = clock()
         stop = run(["systemctl", "stop", *targets], timeout=STOP_TIMEOUT)
+        returned = clock()
+        unfinished = await_stops(volumes, run, sleep)
         stopped = clock()
         times = {}
         for name in volumes:
+            if f"maki-attach@{name}.service" in unfinished:
+                times[name] = {"stop_began": None, "stop_ended": None, "stop_seconds": None,
+                               "result": f"maki-attach@{name}.service did not stop within "
+                                         f"{STOP_LOOKS * STOP_LOOK:.0f} s"}
+                continue
             try:
                 times[name] = unit_times(name, started, run)
             except RuntimeError as error:
@@ -228,7 +260,8 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
                 process.kill()
                 process.wait()
     report = {"hold_seconds": hold, "stop_status": stop.returncode,
-              "stop_command_seconds": round(stopped - started, 3),
+              "stop_command_seconds": round(returned - started, 3),
+              "stopped_seconds": round(stopped - started, 3),
               "volumes": [{"volume": name, "device": devices[name], **times[name],
                            "opener_status": accounts[name][0]} for name in volumes]}
     (directory / "stop-together.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -238,7 +271,8 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
     for volume in report["volumes"]:
         print(f"{volume['volume']:8} {volume['device']:10} {seconds(volume['stop_began'])} "
               f"{seconds(volume['stop_ended'])} {seconds(volume['stop_seconds'])}  {volume['result']}")
-    print(f"systemctl stop returned {stop.returncode} after {report['stop_command_seconds']:.3f} s")
+    print(f"systemctl stop returned {stop.returncode} after {report['stop_command_seconds']:.3f} s; "
+          f"every attach unit had stopped, or was given up, after {report['stopped_seconds']:.3f} s")
     for name in volumes:
         print(f"\n--- the opener of {devices[name]} ({name}), status {accounts[name][0]}")
         print(accounts[name][1], end="")
@@ -246,7 +280,9 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
     if stop.returncode:
         problems.append(f"systemctl stop exited with status {stop.returncode}")
     for name in volumes:
-        if times[name]["result"] != "success":
+        if f"maki-attach@{name}.service" in unfinished:
+            problems.append(times[name]["result"])
+        elif times[name]["result"] != "success":
             problems.append(f"maki-attach@{name}.service stopped with result {times[name]['result']}")
         if accounts[name][0]:
             problems.append(f"the opener of {devices[name]} exited with status {accounts[name][0]}")
