@@ -138,7 +138,7 @@ class StopTogether(unittest.TestCase):
         self.result = "success"
         self.left = None
 
-    def run(self, argv, **_):
+    def host(self, argv, **_):
         self.events.append(argv)
         if argv[:2] == ["systemctl", "stop"]:
             for index, name in enumerate(("stop1", "stop2", "stop3")):
@@ -167,7 +167,7 @@ class StopTogether(unittest.TestCase):
         with mock.patch("sys.stdout", io.StringIO()) as output:
             try:
                 return self.driver.stop_together(
-                    ["stop1", "stop2", "stop3"], 10, self.work, run=self.run,
+                    ["stop1", "stop2", "stop3"], 10, self.work, run=self.host,
                     popen=lambda *a, **k: self.popen(*a, **k, **opener), clock=lambda: 100.0,
                     sleep=lambda _: None, state=self.state, sysfs=self.sysfs), output.getvalue()
             finally:

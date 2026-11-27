@@ -7,8 +7,8 @@ opener has closed it; detach and cleanup wait for that (AUD-197). This process
 is such an opener. It opens the device before the detach and reads its first
 block with O_DIRECT every 50 ms, so that each read reaches the kernel's queue:
 the first read that fails shows that the disconnect was acknowledged. It then
-notes what the device shows, holds it open for two seconds more, closes it and
-requires the attributes to go once it has. Its output says what it saw, with
+notes what the device shows, holds it open for two seconds more (`--hold`),
+closes it and requires the attributes to go once it has. Its output says what it saw, with
 times from its start.
 
 Exit status 0 only if whole blocks were read while it held the device, a read then
@@ -126,11 +126,21 @@ def hold(device, shown, stop_requested, *, clock=time.monotonic, sleep=time.slee
     return 0
 
 
+def hold_time(text):
+    """A hold of more than nothing and at most a minute."""
+    seconds = float(text)
+    if not 0 < seconds <= 60:
+        raise argparse.ArgumentTypeError("must be more than 0 and at most 60 seconds")
+    return seconds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", required=True)
     parser.add_argument("--stop-file", required=True, type=Path,
                         help="a file whose existence stops the hold before a disconnect")
+    parser.add_argument("--hold", type=hold_time, default=HOLD,
+                        help=f"seconds to hold the device after the disconnect (default {HOLD:.0f})")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"/dev/nbd(?:0|[1-9][0-9]{0,2})", args.device) or int(args.device[8:]) > 255:
         parser.error("device must be a canonical /dev/nbdN with N <= 255")
@@ -141,7 +151,7 @@ def main(argv=None):
         print(f"cannot open {args.device}: {error}", flush=True)
         return 2
     return hold(device, lambda: backend(attribute), args.stop_file.exists,
-                say=lambda message: print(message, flush=True))
+                say=lambda message: print(message, flush=True), hold_seconds=args.hold)
 
 
 if __name__ == "__main__":
