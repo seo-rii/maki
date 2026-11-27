@@ -659,9 +659,10 @@ documents.
   the 64 KiB state. No 24 CPU-hour campaign had finished when this was
   written. The first, dispatched on 2026-11-27, had already failed both
   `nbd_handshake` shards: every process ended at libFuzzer's 2048 MB memory
-  limit after about 10 million executions, because that target's entry
-  function spawns a thread for every input, under which an AddressSanitizer
-  build grows; a fix is pending, so `nbd_handshake` is not qualified ([fuzz
+  limit after about 10 million executions. The coordinator measured the
+  cause: that target's entry function spawns a thread for every input, under
+  which an AddressSanitizer build grows; a fix is pending, so
+  `nbd_handshake` is not qualified ([fuzz
   qualification](docs/testing.md#fuzz-qualification)).
 - **CI requires the IPv6 loopback address for the connect tests and runs a
   packet-drop test as root** (AUD-206, 2026-11-27;
