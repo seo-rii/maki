@@ -13,9 +13,11 @@ maki-attach cleanup --volume pg --config /etc/maki/attach/pg.toml --plan
 sudo maki-attach cleanup --volume pg --config /etc/maki/attach/pg.toml
 ```
 
-Under one attach lock, `cleanup` treats a missing trusted record as success,
+Under the attach lock, `cleanup` treats a missing trusted record as success,
 routes a matching connected backend through detach, and routes a known absent
-backend through recovery. An unreadable backend fails without mutation and
+backend through recovery; the detach path lets go of the lock only for its
+wait after the disconnect and takes it again before it acts
+([privileged helper](operations.md#privileged-helper)). An unreadable backend fails without mutation and
 preserves the record. A backend under another identity is never touched; its
 record is retired only when nothing of the recorded attachment remains
 ([privileged helper](operations.md#privileged-helper)). Use explicit `detach` for planned connected

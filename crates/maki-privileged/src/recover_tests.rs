@@ -461,6 +461,49 @@ fn the_failed_start_rollback_has_its_command_budget_once_it_holds_the_lock() {
     }
 }
 
+/// Detach and cleanup let go of the attach lock while they wait for an
+/// opener of the device after their disconnect; the failed-start hook's
+/// rollback keeps it through that wait. Its commands' budget counts from
+/// the moment it got the lock, and a second turn on the lock, behind
+/// helpers that queued meanwhile, has no place in the unit's stop timeout.
+#[test]
+fn the_failed_start_rollback_keeps_the_attach_lock_through_its_wait() {
+    let (fixture, state, req, mut system) = activation_crashed();
+    let record = state.read("pg").unwrap().unwrap();
+    system
+        .fake
+        .backends
+        .insert(record.device.clone(), record.connection_id.clone());
+    system.fake.linger = Some(Linger {
+        sleeps: 4,
+        then: Released::Gone,
+    });
+    let free = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (seen, root) = (free.clone(), fixture.0.clone());
+    system.fake.on_sleep = Some(Box::new(move |_, _| {
+        seen.lock().unwrap().push(lock_is_free(&state_at(&root)));
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    assert!(finish_interrupted_activation_by(
+        &plan_detach(&req),
+        &state,
+        &mut system,
+        deadline,
+        COMMANDS
+    )
+    .unwrap());
+
+    assert_eq!(
+        *free.lock().unwrap(),
+        [false; 4],
+        "the hook let go of the lock"
+    );
+    assert_eq!(system.fake.steps, ["lvm-deactivate", "nbd-disconnect"]);
+    assert!(state.read("pg").unwrap().is_none());
+    assert!(lock_is_free(&state));
+}
+
 #[test]
 fn connected_detach_cleans_a_verified_partial_activation() {
     let (fixture, state, req, mut system) = activation_crashed();

@@ -244,9 +244,12 @@ See [cache reload](operations.md#growth-and-cache-reload).
   sync. In the job's first run the killed daemon's device still showed its
   connection, so that cleanup took cleanup's detach path; its path for a
   backend known to be absent (disconnected recovery) has not run on a kernel.
-  How often something holds a device open at a detach on a production host,
-  and many volumes stopping together while their devices are held open, have
-  not been measured.
+  How often something holds a device open at a detach on a production host
+  has not been measured. Detach and cleanup wait for such a device without
+  the attach lock (AUD-197), so the cleanups of many volumes stopping
+  together no longer queue on it for each other's waits; that is tested on
+  the helper's fake system only, and several volumes stopping together have
+  not run on a kernel.
 
 ## Where the evidence lives
 
