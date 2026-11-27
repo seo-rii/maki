@@ -18,6 +18,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).parents[1]
@@ -199,6 +200,24 @@ echo "$stage"
 [[ "$stage" != "$FAIL_AT" ]] || exit 42
 '''
 
+
+# `rm` as the block runs it, for the race of a staged copy: once the block
+# has removed the staged name BOOTSTRAP_RACE_NAME, another process takes it
+# before the block writes it, with a symbolic link to a file elsewhere
+# (BOOTSTRAP_RACE=symlink) or with a file of its own (file).
+RACING_RM = r'''#!@BASH@
+status=0
+command -p rm "$@" || status=$?
+if [[ $status == 0 && $# == 2 && $1 == -f && $2 == */etc/maki/attach/$BOOTSTRAP_RACE_NAME &&
+      ! -e $BOOTSTRAP_FIXTURE/raced ]]; then
+    touch "$BOOTSTRAP_FIXTURE/raced"
+    case $BOOTSTRAP_RACE in
+        symlink) ln -s "$BOOTSTRAP_FIXTURE/srv/victim" "$2" ;;
+        file) printf 'made by another process\n' > "$2" ;;
+    esac
+fi
+exit "$status"
+'''
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires Bash")
 class ProvisioningContract(unittest.TestCase):
@@ -666,7 +685,11 @@ class ProvisioningContract(unittest.TestCase):
             "unknown name": lambda path: path.write_text(path.read_text() + "colour=blue\n"),
             "unterminated last line": lambda path: path.write_text(path.read_text()[:-1]),
             "empty": lambda path: path.write_text(""),
+            # Each value the block writes first must be there: one that is
+            # missing is refused as such, not by an unbound variable later.
+            "missing volume UUID": rewrite(f"volume_uuid={UUID}\n", ""),
             "missing connection identifier": rewrite(f"connection_id={CONNECTION}\n", ""),
+            "missing boot ID": rewrite(f"boot_id={BOOT}\n", ""),
             "group-readable": lambda path: path.chmod(0o640),
             "FIFO": fifo,
             "filesystem without VG UUID": rewrite(f"vg_uuid={VG}\n", ""),
@@ -789,6 +812,43 @@ class ProvisioningContract(unittest.TestCase):
         self.assertEqual(state["config"], (expected, 0o600))
         self.assertEqual(state["staged"], [])
         self.assertEqual(records[1], (None, None))
+
+    def test_a_staged_name_taken_after_its_removal_is_never_written_through(self):
+        # Each staged copy is written into a name the block has just
+        # removed. Another process can take that name in between: a link
+        # to a file elsewhere, or a file of its own. The write must refuse
+        # both (`set -C`), never write through the link or into that file.
+        for staged in ("demo.bootstrap.next", "demo.toml.next"):
+            for taken in ("symlink", "file"):
+                with self.subTest(staged=staged, taken=taken), \
+                        tempfile.TemporaryDirectory(prefix="maki-bootstrap-") as directory:
+                    root = Path(directory)
+                    self.make_fixture(directory, "success")
+                    victim = root / "srv/victim"
+                    victim.write_text("another file\n")
+                    rm = root / "bin/rm"
+                    rm.write_text(RACING_RM.replace("@BASH@", shutil.which("bash")))
+                    rm.chmod(0o700)
+                    race = {"BOOTSTRAP_RACE_NAME": staged, "BOOTSTRAP_RACE": taken}
+                    with mock.patch.dict(os.environ, race):
+                        result, calls = self.run_block(directory, "success")
+                    self.assertTrue((root / "raced").exists(), "the name was never removed")
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("cannot overwrite existing file", result.stderr)
+                    self.assertEqual(victim.read_text(), "another file\n")
+                    if taken == "file":
+                        self.assertEqual((root / "etc/maki/attach" / staged).read_text(),
+                                         "made by another process\n")
+                    self.assertFalse((root / "etc/maki/attach/demo.toml").exists())
+                    if staged == "demo.bootstrap.next":
+                        # The first copy: the run stops before its first
+                        # change to the host, and leaves no record.
+                        self.assertFalse((root / RECORD).exists())
+                        self.assertFalse({"systemctl", "maki-attach"} & {call[0] for call in calls})
+                    else:
+                        # The record stays for the next run to continue from.
+                        self.assertTrue((root / RECORD).exists())
+                        self.assertIn(self.CONTINUES, result.stderr)
 
     def test_a_record_that_appears_during_a_fresh_run_is_never_replaced(self):
         runs, records, state = self.run_again("racing-record")
