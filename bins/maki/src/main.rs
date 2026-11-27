@@ -976,9 +976,11 @@ fn existing_backing(
 /// the view) is a report of what it read, and the authority must be asked
 /// again before the command reports anything it read (SPEC §27): the lines
 /// are written once the authority has answered that it still selects what
-/// was read, and otherwise dropped, with a warning that counts them. The
-/// view's open logs nothing, and reports its own failures only after asking.
-/// A local witness is read before every operation, and nothing is held.
+/// was read, and otherwise dropped, with a warning that counts them. Lines
+/// are held from the moment the view is open: its open logs nothing, and
+/// asks the authority once more before it reports a failure it met after
+/// reading the record twice. A local witness is read before every operation,
+/// and nothing is held.
 struct Reading(Option<maki_core::logging::HeldLines>);
 
 impl Reading {
