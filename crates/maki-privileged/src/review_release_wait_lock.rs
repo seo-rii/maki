@@ -92,6 +92,40 @@ fn a_teardown_waits_for_a_held_open_device_without_the_attach_lock() {
     }
 }
 
+/// A device that shows no connection at the first look after the disconnect
+/// needs no wait, and its teardown keeps its one turn on the lock: every
+/// look at the device, the last included, is made with the lock held. A
+/// teardown that let go of the lock there anyway would queue again, behind
+/// every helper waiting for the lock, for nothing.
+#[test]
+fn a_device_that_lets_go_at_once_keeps_the_teardowns_one_turn() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        system.steps.clear();
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let (seen, root) = (free.clone(), fixture.0.clone());
+        system.on_backend = Some(Box::new(move || {
+            seen.lock().unwrap().push(lock_is_free(&state_at(&root)));
+        }));
+
+        tear_down(verb, &request, &state, &mut system)
+            .unwrap_or_else(|error| panic!("{verb}: {error}"));
+
+        let free = free.lock().unwrap();
+        assert!(!free.is_empty(), "{verb}");
+        assert!(
+            free.iter().all(|free| !free),
+            "{verb}: a look found the lock let go of: {free:?}"
+        );
+        assert!(system.sleeps.is_empty(), "{verb}: {:?}", system.sleeps);
+        assert!(state.read("pg").unwrap().is_none(), "{verb}");
+    }
+}
+
 /// What the helpers of two volumes stopping together tell each other.
 #[derive(Default)]
 struct Board {

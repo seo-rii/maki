@@ -669,6 +669,8 @@ struct FakeSystem {
     /// Runs after each sleep of the executor's waits, with its number
     /// counted from 1: what other actors do while the helper waits.
     on_sleep: Option<OnSleep>,
+    /// Runs before each read of a backend identifier.
+    on_backend: Option<Box<dyn Fn() + Send>>,
 }
 
 type OnSleep = Box<dyn FnMut(&mut FakeSystem, usize) + Send>;
@@ -1218,6 +1220,9 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        if let Some(on_backend) = &self.on_backend {
+            on_backend();
+        }
         let probe = self.backend_probes.get() + 1;
         self.backend_probes.set(probe);
         if let Some((expected, fault)) = self.backend_fault_on_probe {
