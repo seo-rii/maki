@@ -1793,9 +1793,10 @@ fn connect_recorded(
 /// disconnect lets go of the lock for the wait ([`await_release`]): while
 /// something holds the device open the wait can last 15 s, and every other
 /// helper on the host (the cleanups of the other volumes stopping at the
-/// same time above all) would wait that long too. A wait that ends with a
-/// connection shown, or an unreadable one, fails the run without the lock,
-/// changing nothing. Otherwise the run takes the lock again, in turn, before
+/// same time above all) would wait that long too. A wait that ends with
+/// this connection still shown, or an unreadable one, fails the run without
+/// the lock, changing nothing. Otherwise (no connection, or one under
+/// another backend identifier) the run takes the lock again, in turn, before
 /// it acts, and reads the volume's record again under it. Meanwhile only
 /// another helper of the same volume can replace or retire the record;
 /// until then it still names the device, so no other volume's attach and
@@ -2242,37 +2243,31 @@ fn execute_with_options(
             |system| system.backend(&current.device),
             || turn.release(),
         )?;
-        if shown.is_some() {
-            return Err(identity_error(
+        let incomplete = || {
+            identity_error(
                 "disconnect has not completed; keeping the attach record for cleanup retry",
-            ));
+            )
+        };
+        // A connection under another backend identifier can be that of an
+        // attach of this volume that replaced the record during the wait and
+        // took the same device: it is told apart under the lock, below, and
+        // never reported as a disconnect a cleanup should finish, which would
+        // tear that attachment down. This connection, still shown, is not.
+        let another = shown
+            .as_deref()
+            .is_some_and(|shown| shown != current.connection_id);
+        if shown.is_some() && !another {
+            return Err(incomplete());
         }
         // Everything from here on decides under the lock. Another helper of
         // this volume may have acted while it was let go of: one that
         // retired the record found nothing of the attachment left, and one
         // that replaced it attached the volume again.
-        if turn.retake(state)? {
-            match state.read(&plan.volume)? {
-                Some(read) if read == *current => {}
-                None => {
-                    tracing::info!(
-                        "maki-attach: another helper retired the attach record of volume {} \
-                         while this one waited for {} to let go of the disconnected connection; \
-                         nothing is left to do",
-                        plan.volume,
-                        current.device
-                    );
-                    return Ok(());
-                }
-                Some(_) => {
-                    return Err(identity_error(format!(
-                        "the volume's attach record was replaced while this helper waited for \
-                         {} to let go of the disconnected connection: another helper attached \
-                         volume {} again. That record and its attachment are left as they are",
-                        current.device, plan.volume
-                    )))
-                }
-            }
+        if turn.retake(state)? && !record_after_wait(state, &plan, current)? {
+            return Ok(());
+        }
+        if another {
+            return Err(incomplete());
         }
         let observed = system.disconnected_recovery_observation(current)?;
         if observed.mounted || observed.vg_active || observed.nbd_in_use {
@@ -2305,6 +2300,38 @@ fn execute_with_options(
     Ok(())
 }
 
+/// Whether `plan`'s volume still has the record `current`, which this run
+/// disconnected, once the run holds the attach lock again after a wait
+/// without it ([`Turn`]). No record: another helper retired it, which a
+/// helper does only once nothing of the attachment remains, and nothing is
+/// left to do. Another record: another helper attached the volume again,
+/// and that is an error that leaves the record and its attachment alone.
+fn record_after_wait(
+    state: &TrustedState,
+    plan: &Plan,
+    current: &BoundDeviceRecord,
+) -> Result<bool, ExecError> {
+    match state.read(&plan.volume)? {
+        Some(read) if read == *current => Ok(true),
+        None => {
+            tracing::info!(
+                "maki-attach: another helper retired the attach record of volume {} while this \
+                 one waited for {} to let go of the disconnected connection; nothing is left to \
+                 do",
+                plan.volume,
+                current.device
+            );
+            Ok(false)
+        }
+        Some(_) => Err(identity_error(format!(
+            "the volume's attach record was replaced while this helper waited for {} to let go \
+             of the disconnected connection: another helper attached volume {} again. That \
+             record and its attachment are left as they are",
+            current.device, plan.volume
+        ))),
+    }
+}
+
 #[cfg(test)]
 #[path = "exec_tests.rs"]
 mod tests;
@@ -2329,7 +2356,9 @@ pub fn recover(plan: &Plan) -> Result<(), ExecError> {
     recover_with(plan, &state, &mut LinuxSystem)
 }
 
-/// Converge trusted storage state under the attach lock.
+/// Converge trusted storage state, deciding under the attach lock: the
+/// detach path lets go of it only for its wait after the disconnect and
+/// takes it again before it acts ([`Turn`]).
 ///
 /// An absent record is already clean. A record whose backend still has the
 /// recorded connection identity follows the regular detach path; an absent

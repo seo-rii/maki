@@ -90,20 +90,22 @@ device open. If the device shows another connection by then, the record is
 kept as well, and a later
 .B cleanup
 removes it only when nothing of the attachment remains on the host.
-The wait does not hold the attach lock, so the helpers of other volumes do
-not wait for it. The lock is taken again before the record is removed, and
-the record must then still be the one the command disconnected: one that
-another helper removed meanwhile ends the command successfully, and one that
-another helper replaced (the volume attached again) is kept, and the command
-fails.
+The wait of a
+.BR detach " or " cleanup
+does not hold the attach lock, so the helpers of other volumes do not wait
+for it. The lock is taken again before the record is removed, and the record
+must then still be the one the command disconnected: one that another helper
+removed meanwhile ends the command successfully, and one that another helper
+replaced (the volume attached again, possibly on the same device) is kept,
+and the command fails and says so.
 .B recover-failed-start
 is the systemd failed-start cleanup hook. It asks systemd to queue the
 recovery coordinator and, when the start died between LVM activation and the
 mapping proof, rolls back that activation itself while the daemon still
 serves the device, also when systemd refused the request: the scoped VG
-deactivation, the NBD disconnect, the same wait for the device, within the
-hook's time for its commands, and the removal of the record. It never
-unmounts.
+deactivation, the NBD disconnect, the same wait for the device but with the
+attach lock held, within the hook's time for its commands, and the removal of
+the record. It never unmounts.
 .PP
 The helper negotiates with the daemon's NBD socket and connects and
 disconnects the kernel NBD device over netlink itself; no NBD client program
