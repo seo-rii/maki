@@ -838,6 +838,90 @@ class GuestPhases(unittest.TestCase):
                         self.assertEqual(self.guest.runner(guest), status)
                     self.assertEqual(steps[-1], self.guest.runner_command(guest))
 
+    def test_the_runner_phase_fails_before_the_runner_when_its_preparation_fails(self):
+        # Each failure ends the phase where it happened: a runner started
+        # without its tools, the package's binaries or /dev/nbd15 could pass
+        # on what the guest happened to have.
+        install = {"debian12": "apt-get", "el9": "dnf"}
+        cases = (("install", "installing the runner's tools failed (status 100)"),
+                 ("extract", "unpacking the package failed"),
+                 ("modprobe", "the nbd module did not load"),
+                 ("device", "/dev/nbd15 is missing after loading nbd"))
+        for guest in ("debian12", "el9"):
+            for case, message in cases:
+                with self.subTest(guest=guest, case=case):
+                    steps = []
+
+                    def step(argv, **options):
+                        steps.append(argv)
+                        if case == "install" and argv[0] == install[guest] and "install" in argv:
+                            return 100
+                        if case == "modprobe" and argv[0] == "modprobe":
+                            return 1
+                        return 0
+                    extract = mock.Mock(return_value=2 if case == "extract" else 0)
+                    with mock.patch.multiple(self.guest, require_guest=mock.DEFAULT, step=step,
+                                             extract_package=extract, prebuilt_from=mock.DEFAULT,
+                                             Sampler=mock.DEFAULT) as patched, \
+                            mock.patch.object(Path, "is_block_device", return_value=case != "device"), \
+                            quiet(), self.assertRaises(SystemExit) as failed:
+                        self.guest.runner(guest)
+                    self.assertEqual(str(failed.exception), message)
+                    self.assertNotIn(self.guest.runner_command(guest), steps)
+                    patched["Sampler"].assert_not_called()
+                    self.assertEqual(extract.called, case != "install")
+                    self.assertEqual(patched["prebuilt_from"].called, case not in ("install", "extract"))
+                    self.assertEqual(any(argv[0] == "modprobe" for argv in steps),
+                                     case not in ("install", "extract"))
+
+    def test_the_prepare_phase_ends_with_the_refresh_of_the_package_lists(self):
+        # A failed refresh fails the phase; apt-get update exits 0 when an
+        # index could not be fetched unless it is told to fail on any error.
+        for guest, refresh in (("debian12", ["apt-get", "-o", "DPkg::Lock::Timeout=600", "update",
+                                             "-q", "--error-on=any"]),
+                               ("el9", ["dnf", "-q", "makecache"])):
+            for status in (0, 100):
+                with self.subTest(guest=guest, status=status):
+                    steps = []
+
+                    def step(argv, **options):
+                        steps.append(argv)
+                        return status if argv[0] == refresh[0] else 0
+                    with mock.patch.multiple(self.guest, require_guest=mock.DEFAULT, step=step):
+                        self.assertEqual(self.guest.prepare(guest), status)
+                    self.assertEqual(steps[-1], refresh)
+                    # The timers are stopped first, so they cannot take the lock.
+                    self.assertEqual(steps[0][:2], ["systemctl", "stop"])
+
+    def test_unpacking_the_package_fails_with_either_command_of_its_pipe(self):
+        # rpm2cpio feeds cpio: an rpm2cpio that fails, a truncated package
+        # for one, can leave cpio content with what it was given.
+        binary = self.root / "bin"
+        binary.mkdir()
+        for name, script in (
+                ("rpm2cpio", 'printf "archive of %s" "$1"\nexit "${RPM2CPIO_STATUS:-0}"\n'),
+                ("cpio", 'test "$*" = "-idm --quiet" || exit 9\ncat > unpacked\n'
+                         'exit "${CPIO_STATUS:-0}"\n'),
+                ("dpkg-deb", 'test "$1" = -x && printf "%s" "$2" > "$3/unpacked"\n'
+                             'exit "${DPKG_STATUS:-0}"\n')):
+            (binary / name).write_text("#!/bin/sh\n" + script)
+            (binary / name).chmod(0o700)
+        package = self.root / "maki.pkg"
+        package.write_text("package\n")
+        cases = (("el9", {}, True), ("el9", {"RPM2CPIO_STATUS": "1"}, False),
+                 ("el9", {"CPIO_STATUS": "2"}, False),
+                 ("el9", {"RPM2CPIO_STATUS": "1", "CPIO_STATUS": "2"}, False),
+                 ("debian12", {}, True), ("debian12", {"DPKG_STATUS": "2"}, False))
+        for number, (guest, statuses, succeeds) in enumerate(cases):
+            with self.subTest(guest=guest, statuses=statuses):
+                root = self.root / f"package-root-{number}"
+                environment = {"PATH": str(binary) + os.pathsep + os.environ["PATH"], **statuses}
+                with mock.patch.dict(os.environ, environment), quiet():
+                    status = self.guest.extract_package(guest, package, root)
+                self.assertEqual(status == 0, succeeds, status)
+                expected = f"archive of {package}" if guest == "el9" else str(package)
+                self.assertEqual((root / "unpacked").read_text(), expected)
+
     def test_the_runners_artifacts_are_the_packages_own_files(self):
         package = self.root / "package-root"
         for source, _name, _mode in self.guest.PACKAGED_BINARIES:
