@@ -692,11 +692,14 @@ lone one included, is probed on its own at attach (three attempts, spaced by
 `retry.initial_delay`, for a `retry_safe` provider; one otherwise). The
 endpoints are probed at the same time, so endpoints that do not answer delay
 the attach by about one probe however many are listed: for a `retry_safe`
-provider three times `timeout` and the two delays, twice that over
-WebSocket, whose provider makes a second attempt of each request of a
-`retry_safe` provider (about 30 s over HTTP or gRPC and 60 s over WebSocket
-at the default 10 s). Each probe ends with the key canary check, which the
-endpoints take one at a time in configuration order, and each probe request
+provider three times `timeout` (six times over WebSocket, whose provider
+makes a second attempt of each request of a `retry_safe` provider) and the
+two delays, about 30 s over HTTP or gRPC and 60 s over WebSocket at the
+default 10 s. Each probe ends with the key canary check, which the
+endpoints take one at a time in configuration order: an endpoint that
+answers its self-test but fails its canary check with a transport failure
+keeps the endpoints after it waiting through its remaining attempts, so
+such endpoints still delay the attach one after another. Each probe request
 that ends extends the service's start deadline
 ([data-plane readiness](operations.md#data-plane-readiness)). When none
 is reachable the attach is refused with "no remote endpoint is reachable;

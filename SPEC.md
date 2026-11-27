@@ -2407,8 +2407,11 @@ probed at the same time, each probe with its own attempts, so endpoints
 that do not answer delay the attach by about one probe however many are
 configured. The canary checks, which load the volume's canary and may write
 it, run one at a time in configuration order, so on a new volume the first
-endpoint in that order that passes its self-test establishes the canary.
-The probes' results are taken in configuration order: the first endpoint in
+endpoint in that order whose canary check succeeds establishes the canary.
+An endpoint whose check fails with a transport failure keeps that turn
+through its remaining attempts, so endpoints that pass their self-test and
+then fail their canary check delay the endpoints after them one after
+another, each by at most its own probe. The probes' results are taken in configuration order: the first endpoint in
 that order whose probe refuses the attach refuses it, and no endpoint after
 it reaches the volume. An endpoint that is unreachable when these
 self-tests run at attach is quarantined. When no endpoint is reachable the attach MUST be

@@ -1067,8 +1067,9 @@ impl EndpointProbe<'_> {
                     // The canary check loads the volume's canary, rewrites
                     // it, and on a new volume establishes it: one endpoint
                     // at a time, in configuration order, so the first
-                    // endpoint that passes its self-test establishes it, as
-                    // when the endpoints were probed one after another.
+                    // endpoint whose check succeeds establishes it, as when
+                    // the endpoints were probed one after another. A check
+                    // that fails keeps the turn through the attempts left.
                     if !turn {
                         self.turn(index).await?;
                         turn = true;
