@@ -1644,12 +1644,14 @@ class FuzzQualificationWorkflow(unittest.TestCase):
                 "target": "journal_scan", "binary_sha256": digest, "merge_exit": 0, "attempts": 1,
                 "artifacts": [], "coverage_exit": 0, "cov": 169, "ft": 300, "inputs": 9, "bytes": 900,
                 "seeds": 7, "planned_shards": 1, "unmerged": [],
-                "sources": [{"shard": 1, "artifact": "fuzz-shard-journal_scan-1", "inputs": 4}]}))
+                "sources": [{"shard": 1, "artifact": "fuzz-shard-journal_scan-1", "inputs": 4,
+                             "bytes": 400}]}))
             step_summary = temp / "step-summary.md"
             for cpu, status in ((plan["cpu_seconds"], 0), (0.5, 1)):
                 with self.subTest(cpu=cpu):
                     (temp / "stats" / "fuzz-stats-journal_scan-1" / "shard.json").write_text(json.dumps({
                         "target": "journal_scan", "shard": 1, "binary_sha256": digest, "artifacts": [],
+                        "corpus": {"inputs": 4, "bytes": 400},
                         "cpu_seconds": plan["cpu_seconds"], "wall_seconds": plan["wall_seconds"],
                         "workers": [{"worker": worker, "exit": 0, "stopped": False, "cpu_seconds": cpu,
                                      "wall_seconds": cpu, "executions": 10} for worker in range(1, 5)]}))

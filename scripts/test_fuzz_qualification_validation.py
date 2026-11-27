@@ -196,6 +196,18 @@ sys.exit(0)
 '''
 
 
+class InterruptedAfter:
+    """An interrupt that is not set for its first `answers` questions, then
+    is."""
+
+    def __init__(self, answers):
+        self.answers = answers
+
+    def is_set(self):
+        self.answers -= 1
+        return self.answers < 0
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="maki-fuzz-campaign-")
@@ -668,6 +680,11 @@ REAL_LOG_FOUND = {
 
 @unittest.skipUnless(sys.platform == "linux", "a merge runs on a Linux runner")
 class Merge(Fixture):
+    def setUp(self):
+        super().setUp()
+        # Each shard's packed output and extra members, by shard.
+        self.downloads = {}
+
     def shard(self, number, *inputs, extra=()):
         """What the merge job downloads of shard `number`: the directory of
         its artifact, with the archive of the shard's output the fuzz job
@@ -678,14 +695,26 @@ class Merge(Fixture):
         for index, data in enumerate(inputs):
             (packed / "corpus" / f"input-{index}").write_bytes(data)
         (packed / "shard.json").write_text("{}")
+        self.downloads[number] = (packed, list(extra))
         return self.archive(number, extra, packed)
+
+    def download(self):
+        """Download again each shard archive a merge removed once it had
+        unpacked it, as a later merge job would."""
+        for number, (packed, extra) in self.downloads.items():
+            directory = self.root / "shards" / f"fuzz-shard-witness_etcd-{number}"
+            if packed.is_dir() and not (directory / "shard.tar").exists():
+                self.archive(number, extra, packed)
+
+    def downloaded(self, number):
+        return self.root / "shards" / f"fuzz-shard-witness_etcd-{number}" / "shard.tar"
 
     def archive(self, number, members, packed=None):
         """A downloaded shard artifact whose archive, in the format GNU tar
         writes, holds `packed` as shard/ and then `members`, (TarInfo, bytes
         or None) pairs."""
         directory = self.root / "shards" / f"fuzz-shard-witness_etcd-{number}"
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=True)
         with tarfile.open(directory / "shard.tar", "w", format=tarfile.GNU_FORMAT) as archive:
             if packed is not None:
                 archive.add(packed, arcname="shard")
@@ -699,10 +728,12 @@ class Merge(Fixture):
         return self.root / "shards" / f"fuzz-shard-witness_etcd-{number}" / "shard" / "corpus"
 
     def merge(self, out, planned=1):
+        self.download()
         return self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
                                    self.root / out, planned, temp=self.root)
 
     def main(self, out, planned=1):
+        self.download()
         return self.campaign.main(["merge", "--binary", str(self.binary), "--target", "witness_etcd",
                                    "--seeds", str(self.seeds), "--shards", str(self.root / "shards"),
                                    "--planned-shards", str(planned), "--out", str(self.root / out)])
@@ -727,9 +758,14 @@ class Merge(Fixture):
         self.assertFalse(Path(merge["temp"]).exists())
         self.assertEqual(record["planned_shards"], 2)
         self.assertEqual(record["sources"], [
-            {"shard": 1, "artifact": "fuzz-shard-witness_etcd-1", "inputs": 2},
-            {"shard": 2, "artifact": "fuzz-shard-witness_etcd-2", "inputs": 2}])
+            {"shard": 1, "artifact": "fuzz-shard-witness_etcd-1", "inputs": 2, "bytes": 6},
+            {"shard": 2, "artifact": "fuzz-shard-witness_etcd-2", "inputs": 2, "bytes": 8}])
         self.assertEqual(record["unmerged"], [])
+        # An archive it unpacked is removed: on the runner's disk, a shard of
+        # 405,750 inputs takes 657 MB packed and 1.69 GB unpacked.
+        for number in (1, 2):
+            self.assertFalse(self.downloaded(number).exists())
+            self.assertTrue(self.unpacked(number).is_dir())
         # Two seeds and three distinct shard inputs.
         self.assertEqual((record["inputs"], record["cov"], record["ft"], record["seeds"]),
                          (5, 50, 100, 2))
@@ -777,8 +813,12 @@ class Merge(Fixture):
         merge, _ = self.calls_made()[-2:]
         self.assertEqual(merge["arguments"][-2:], [str(self.seeds), str(self.unpacked(1))])
         self.assertEqual(record["sources"], [{"shard": 1, "artifact": "fuzz-shard-witness_etcd-1",
-                                              "inputs": 1}])
+                                              "inputs": 1, "bytes": 3}])
         self.assertEqual([entry["shard"] for entry in record["unmerged"]], [2, 3, 4, 5, 6, 7, 8])
+        # The archive of shard 1 was unpacked and removed; those it did not
+        # unpack are kept, to be looked at.
+        self.assertEqual([number for number in range(1, 9) if self.downloaded(number).exists()],
+                         [3, 4, 5, 6, 7, 8])
         failures = record["failures"]
         self.assertEqual(len(failures), 7, failures)
         self.assertEqual(failures[0],
@@ -808,11 +848,50 @@ class Merge(Fixture):
         # An archive whose members all pass, that fails only once they are
         # written out: a member below a file an earlier member made.
         self.shard(1, b"one", extra=[(tarfile.TarInfo("shard/corpus/input-0/below"), b"x")])
+        removed = []
+        remove = self.campaign.remove
+
+        def spy(tree, interrupted):
+            removed.append(Path(tree))
+            return remove(tree, interrupted)
+
+        self.campaign.remove = spy
         record = self.merge("merged")
         self.assertEqual(record["sources"], [])
         self.assertRegex(record["failures"][0], r"^the merge had no corpus of shard 1 "
                                                 r"\(fuzz-shard-witness_etcd-1/shard\.tar does not unpack: .+\)$")
-        self.assertFalse((self.root / "shards" / "fuzz-shard-witness_etcd-1" / "shard").exists())
+        unpacked = self.root / "shards" / "fuzz-shard-witness_etcd-1" / "shard"
+        self.assertFalse(unpacked.exists())
+        # Removed the way an interrupt can stop (an earlier unpacking first,
+        # then what this one left), and the archive is kept.
+        self.assertEqual(removed, [unpacked, unpacked])
+        self.assertTrue(self.downloaded(1).exists())
+
+    def test_removing_a_tree_stops_at_an_interrupt(self):
+        # shutil.rmtree took 46.4 s here for an unpacked corpus of 405,750
+        # inputs, and the runner kills the step 10 s after its interrupt.
+        tree = self.root / "tree"
+        (tree / "corpus").mkdir(parents=True)
+        for index in range(50):
+            (tree / "corpus" / f"input-{index}").write_bytes(b"x")
+        self.assertFalse(self.campaign.remove(tree, InterruptedAfter(2)))
+        self.assertEqual(len(list((tree / "corpus").iterdir())), 48)
+        self.assertTrue(self.campaign.remove(tree, threading.Event()))
+        self.assertFalse(tree.exists())
+        self.assertTrue(self.campaign.remove(tree, threading.Event()))
+
+    def test_an_earlier_unpacking_is_removed_only_until_an_interrupt(self):
+        self.shard(1, b"one")
+        stale = self.unpacked(1)
+        stale.mkdir(parents=True)
+        for index in range(50):
+            (stale / f"stale-{index}").write_bytes(b"x")
+        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 1,
+                                                        InterruptedAfter(3))
+        self.assertEqual((sources, [entry["why"] for entry in unmerged]),
+                         ([], ["the merge was interrupted while it unpacked it"]))
+        self.assertEqual(len(list(stale.iterdir())), 48)
+        self.assertTrue(self.downloaded(1).exists())
 
     def test_an_earlier_unpacking_is_replaced_not_merged(self):
         self.shard(1, b"one", b"two")
@@ -837,6 +916,7 @@ class Merge(Fixture):
             {"shard": shard, "artifact": f"fuzz-shard-witness_etcd-{shard}",
              "why": "the merge was interrupted before it unpacked it"} for shard in (1, 2)])
         self.assertFalse(self.unpacked(1).exists())
+        self.assertTrue(self.downloaded(1).exists() and self.downloaded(2).exists())
 
         # Interrupted once it has begun to unpack the first archive: what it
         # unpacked is not merged, and is left where it is, since removing a
@@ -854,20 +934,13 @@ class Merge(Fixture):
                          ["the merge was interrupted while it unpacked it",
                           "the merge was interrupted before it unpacked it"])
         self.assertTrue(unpacked.is_dir())
+        self.assertTrue(self.downloaded(1).exists() and self.downloaded(2).exists())
 
     def test_an_interrupt_is_answered_while_an_archive_is_listed(self):
         # Listing an archive of 405,755 members took 9.8 s here, and the
         # runner kills the step 10 s after its interrupt: the merge stops
         # reading the archive at the interrupt, before it reaches what it
         # would refuse at its end, a link or damage.
-        class InterruptedAfter:
-            def __init__(self, answers):
-                self.answers = answers
-
-            def is_set(self):
-                self.answers -= 1
-                return self.answers < 0
-
         link = tarfile.TarInfo("shard/corpus/link")
         link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
         for case in ("link", "damage"):
@@ -908,18 +981,15 @@ class Merge(Fixture):
     def test_a_failed_merge_or_a_coverage_run_without_its_line_fails(self):
         self.shard(1, b"one")
         os.environ["FAKE_MERGE_EXIT"] = "1"
-        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
-                                     self.root / "merged", 1)
+        record = self.merge("merged")
         self.assertEqual(record["failures"], ["the merge ended with status 1"])
         os.environ["FAKE_MERGE_EXIT"] = "0"
         os.environ["FAKE_NO_INITED"] = "1"
-        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
-                                     self.root / "again", 1)
+        record = self.merge("again")
         self.assertEqual(record["failures"], ["the coverage run printed no INITED line"])
         os.environ["FAKE_NO_INITED"] = "0"
         os.environ["FAKE_COVERAGE_EXIT"] = "1"
-        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
-                                     self.root / "measured", 1)
+        record = self.merge("measured")
         self.assertEqual(record["coverage_exit"], 1)
         self.assertEqual(record["failures"], ["the coverage run ended with status 1"])
         self.assertEqual(self.main("third"), 1)
@@ -994,16 +1064,19 @@ class Merge(Fixture):
         digest = self.campaign.sha256(self.binary)
         (self.root / "build").mkdir()
         (self.root / "build" / "SHA256SUMS").write_text(f"{digest}  witness_etcd\n")
-        for shard in (1, 2):
+        def recorded(shard, inputs, size):
             directory = self.root / "stats" / f"fuzz-stats-witness_etcd-{shard}"
-            directory.mkdir(parents=True)
+            directory.mkdir(parents=True, exist_ok=True)
             (directory / "shard.json").write_text(json.dumps({
                 "target": "witness_etcd", "shard": shard, "binary_sha256": digest,
                 "cpu_seconds": plan["cpu_seconds"], "wall_seconds": plan["wall_seconds"],
-                "artifacts": [],
+                "artifacts": [], "corpus": {"inputs": inputs, "bytes": size},
                 "workers": [{"worker": worker, "exit": 0, "signal": None, "stopped": False,
                              "cpu_seconds": plan["cpu_seconds"], "wall_seconds": 3,
                              "executions": 1000, "error": None} for worker in range(1, 5)]}))
+
+        recorded(1, 2, 6)
+        recorded(2, 1, 5)
         self.shard(1, b"one", b"two")
         coverage = self.root / "coverage"
 
@@ -1019,6 +1092,15 @@ class Merge(Fixture):
             "the merge had no corpus of shard 2 (no fuzz-shard-witness_etcd-2/shard.tar)"]))
         self.shard(2, b"three")
         self.assertEqual(verdict(), (True, []))
+        # The review's probe: shard 2's record counted 143,835 inputs, and
+        # its archive's corpus is empty.
+        shutil.rmtree(self.root / "shards" / "fuzz-shard-witness_etcd-2")
+        shutil.rmtree(self.root / "packed" / "2")
+        self.shard(2)
+        recorded(2, 143835, 519875759)
+        self.assertEqual(verdict(), (False, [
+            "the merge's corpus of shard 2 held 0 inputs of 0 bytes, "
+            "its record counted 143,835 inputs of 519,875,759 bytes"]))
 
 
 def gates():
@@ -1181,7 +1263,7 @@ class StepCancellation(Fixture):
         self.assertTrue(record["interrupted"])
         self.assertEqual(record["failures"][0], "the merge was interrupted")
         self.assertEqual(record["sources"], [{"shard": 1, "artifact": f"fuzz-shard-{self.target}-1",
-                                              "inputs": 1}])
+                                              "inputs": 1, "bytes": 5}])
 
 class Summary(unittest.TestCase):
     DIGEST = "ab" * 32
@@ -1206,7 +1288,7 @@ class Summary(unittest.TestCase):
         cpu = self.plan["cpu_seconds"] * 1.0 if cpu is None else cpu
         record = {"target": target, "shard": shard, "binary_sha256": self.DIGEST,
                   "cpu_seconds": self.plan["cpu_seconds"], "wall_seconds": self.plan["wall_seconds"],
-                  "artifacts": [], "host": {"vcpus": 4},
+                  "artifacts": [], "host": {"vcpus": 4}, "corpus": {"inputs": 20, "bytes": 2000},
                   "workers": [{"worker": worker, "exit": 0, "signal": None, "stopped": False,
                                "cpu_seconds": cpu, "wall_seconds": cpu + 1, "executions": 1000,
                                "error": None} for worker in range(1, 5)]}
@@ -1220,8 +1302,8 @@ class Summary(unittest.TestCase):
                   "coverage_exit": 0, "cov": 300, "ft": 900, "inputs": 40, "bytes": 5000,
                   "seeds": 30, "error": None, "attempts": 1, "artifacts": [],
                   "planned_shards": self.plan["shards"],
-                  "sources": [{"shard": shard, "artifact": f"fuzz-shard-{target}-{shard}", "inputs": 20}
-                              for shard in range(1, self.plan["shards"] + 1)],
+                  "sources": [{"shard": shard, "artifact": f"fuzz-shard-{target}-{shard}", "inputs": 20,
+                               "bytes": 2000} for shard in range(1, self.plan["shards"] + 1)],
                   "unmerged": []}
         record.update(changes)
         directory = self.root / "coverage" / f"fuzz-coverage-{target}"
@@ -1326,7 +1408,7 @@ class Summary(unittest.TestCase):
             self.coverage(target)
         self.assertEqual(self.verdicts(), {"format_decoders": [], "witness_etcd": []})
         self.coverage("witness_etcd", sources=[
-            {"shard": shard, "artifact": f"fuzz-shard-witness_etcd-{shard}", "inputs": 20}
+            {"shard": shard, "artifact": f"fuzz-shard-witness_etcd-{shard}", "inputs": 20, "bytes": 2000}
             for shard in (1, 3)],
             unmerged=[{"shard": 2, "artifact": "fuzz-shard-witness_etcd-2",
                        "why": "no fuzz-shard-witness_etcd-2/shard.tar"}])
@@ -1342,11 +1424,42 @@ class Summary(unittest.TestCase):
                 ("seeds alone", {"sources": [], "unmerged": [], "planned_shards": 0}),
                 ("no account", {"sources": None, "unmerged": None, "planned_shards": None}),
                 ("by artifact", {"sources": [{"shard": f"fuzz-shard-witness_etcd-{shard}", "inputs": 20}
-                                             for shard in (1, 2, 3)]})):
+                                             for shard in (1, 2, 3)]}),
+                # JSON's true is no shard number, though Python's True == 1.
+                ("true", {"sources": [{"shard": True, "inputs": 20, "bytes": 2000},
+                                      {"shard": 1.0, "inputs": 20, "bytes": 2000}]})):
             with self.subTest(case=case):
                 self.coverage("witness_etcd", **changes)
                 self.assertEqual(self.verdicts()["witness_etcd"], [
                     f"the merge had no corpus of shard {shard}" for shard in (1, 2, 3)])
+
+    def test_a_merged_corpus_that_is_not_the_one_its_shard_counted_does_not_qualify(self):
+        # The review's probe: the shard's record counted 143,835 inputs, and
+        # the merge had an empty corpus of it. The merge counts its sources
+        # as `run` counts the shard's corpus (files_in), on the same files.
+        counted = {"inputs": 143835, "bytes": 519875759}
+        self.shard("witness_etcd", 1, corpus=counted)
+        recorded = "its record counted 143,835 inputs of 519,875,759 bytes"
+        for case, inputs, size, held in (("empty", 0, 0, "0 inputs of 0 bytes"),
+                                         ("one input fewer", 143834, 519875000,
+                                          "143,834 inputs of 519,875,000 bytes"),
+                                         ("shorter", 143835, 519875758,
+                                          "143,835 inputs of 519,875,758 bytes"),
+                                         ("no count", None, None, "no count")):
+            with self.subTest(case=case):
+                self.coverage("witness_etcd", sources=[
+                    {"shard": 1, "artifact": "fuzz-shard-witness_etcd-1", "inputs": inputs, "bytes": size}])
+                self.assertEqual(self.verdicts()["witness_etcd"],
+                                 [f"the merge's corpus of shard 1 held {held}, {recorded}"])
+        self.coverage("witness_etcd", sources=[
+            {"shard": 1, "artifact": "fuzz-shard-witness_etcd-1", **counted}])
+        self.assertEqual(self.verdicts()["witness_etcd"], [])
+        # A shard record without the count does not vouch for any corpus.
+        self.shard("witness_etcd", 1, corpus=None)
+        self.assertEqual(self.verdicts()["witness_etcd"], [
+            "the merge's corpus of shard 1 held 143,835 inputs of 519,875,759 bytes, "
+            "its record counted no count"])
+        self.assertFalse(self.summarize()["qualified"])
 
     def test_a_binary_the_build_did_not_make_does_not_qualify(self):
         self.shard("witness_etcd", 1, binary_sha256="cd" * 32)
