@@ -10,17 +10,30 @@ Everything here runs as root unless stated otherwise. Use a disposable host.
 ## Status: not qualified
 
 RHEL 9 is **not qualified** ([support matrix](../deployment/support-matrix.md)).
-No kernel attachment and no external campaign has run on RHEL 9 or a rebuild.
-What is checked, on every change, is the userspace: the CI `rhel9` job builds
-the packaged binaries in a CentOS Stream 9 container, checks the nbdkit plugin
-ABI against EL9's header, runs the helper, attach and plugin test suites
-(whose native tests load Maki's plugin into EL9's nbdkit 1.38), and builds,
-installs and removes the RPM ([testing](../testing.md#automated-ci)). That
-container runs on the CI runner's Ubuntu kernel, so the following have never
-run: RHEL's kernel and its `nbd` driver, SELinux in enforcing mode,
-`maki-attach` attach, detach or grow, and any workload. Rocky Linux and
-AlmaLinux were not tested; they rebuild RHEL, of which CentOS Stream 9 is the
-upstream.
+No external campaign has run on RHEL 9 or a rebuild, and nothing has run on
+RHEL itself. Two CI jobs run on every change
+([testing](../testing.md#automated-ci)):
+
+- The `rhel9` job checks the userspace: it builds the packaged binaries in a
+  CentOS Stream 9 container, checks the nbdkit plugin ABI against EL9's
+  header, runs the helper, attach and plugin test suites (whose native tests
+  load Maki's plugin into EL9's nbdkit 1.38), and builds, installs and
+  removes the RPM. That container runs on the CI runner's Ubuntu kernel.
+- The `el9-guest` job boots Rocky Linux 9.9's GenericCloud image as a KVM
+  guest on a GitHub runner VM, with SELinux enforcing as the image ships it,
+  and runs, as root on Rocky's kernel and its `nbd` driver, this guide's
+  "Repositories" and "Install the Maki package" steps, the quick start and
+  the first-volume bootstrap with an RPM built from the commit, so
+  `maki-attach` attaches and detaches under systemd; in another guest it runs
+  the privileged runner's attach lifecycle and workload with that RPM's
+  binaries. It requires SELinux still enforcing afterwards and no AVC denial
+  that names Maki or an NBD device, and after the quick start the domain and
+  labels the [SELinux section](#selinux) states.
+
+Rocky Linux rebuilds RHEL's published sources unchanged; it is not RHEL, and
+its kernel is Rocky's build. The guest is a virtual machine on GitHub's
+hardware, not a bare-metal host. `maki-attach grow` has not run on any EL9
+kernel, and AlmaLinux has not been tested.
 
 RHEL 8 is outside the design: its systemd 239 lacks the `OnSuccess=` that the
 recovery unit needs.
@@ -210,9 +223,13 @@ without `--devices` did not find the new VG, and `vgs --devices` did.
 ## SELinux
 
 Maki ships no SELinux policy module, and the targeted policy has none for it.
-What follows is read from the CentOS Stream 9 targeted policy
-(`selinux-policy-targeted` 38.1.87) with `sesearch` and `selabel_lookup`;
-**nothing was run with SELinux enforcing.**
+What follows was read from the CentOS Stream 9 targeted policy
+(`selinux-policy-targeted` 38.1.87) with `sesearch` and `selabel_lookup`. The
+`el9-guest` CI job runs the quick start on Rocky Linux 9.9 with SELinux
+enforcing and fails unless the nbdkit of `maki@demo.service` runs in
+`unconfined_service_t`, the files below carry the labels listed here, and no
+AVC denial names Maki or an NBD device ([testing](../testing.md#automated-ci));
+the metapackage case below was not run.
 
 - The installed files take the policy's default labels: the binaries
   `bin_t`, the plugin `lib_t`, `/etc/maki` `etc_t`, `/var/lib/maki`

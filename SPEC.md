@@ -2940,7 +2940,13 @@ Every change also drives whole attachments through a disposable runner VM's
 kernel NBD, device-mapper, LVM, XFS and systemd (the privileged validation
 runner, then the documented installation, quick start and first-volume
 bootstrap on the built package); that is one Ubuntu host and the local
-provider, not the qualification of a target platform.
+provider, not the qualification of a target platform. It also boots Debian 12
+and Rocky Linux 9 cloud images (SELinux enforcing) as KVM guests on runner VMs
+and runs in each, on the guest's kernel, the installation guide's host steps,
+the quick start and the first-volume bootstrap with the package built from the
+commit for that distribution, and the privileged runner's lifecycle with that
+package's binaries; those are virtual machines on GitHub's hardware, not
+bare-metal hosts, and qualify no target platform either.
 See [the testing guide](docs/testing.md) for the implemented commands and limits.
 
 ## Pull Request

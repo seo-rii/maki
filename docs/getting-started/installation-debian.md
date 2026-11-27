@@ -4,7 +4,11 @@ This guide takes a clean Debian 12 (bookworm) host to an installed Maki
 package with every dependency satisfied. It ends where the
 [quick start](quickstart.md) begins. Debian 12 is the primary platform (see
 the [support matrix](../deployment/support-matrix.md)); other distributions
-need the same components but are not qualified.
+need the same components but are not qualified. On every change CI runs the
+[install steps](#install-the-maki-package), the quick start and its
+first-volume bootstrap as written in a booted Debian 12 cloud image, a KVM
+guest on a GitHub runner VM, after refreshing its package lists
+([testing](../testing.md#automated-ci)).
 
 Everything here runs as root unless stated otherwise. Use a disposable host
 for a first installation.

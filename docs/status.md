@@ -6,7 +6,7 @@ with this page about the *current* state, this page wins and the other
 document needs a fix. Dated reports under [`qualification/`](qualification/README.md)
 describe what was true when they were written and never claim current state.
 
-Last updated: 2026-11-26. External campaign evidence below runs through
+Last updated: 2026-11-27. External campaign evidence below runs through
 2026-10-05; each report identifies the revision it exercised. See the
 [remediation log](review-remediation.md) for implementation changes.
 
@@ -19,7 +19,7 @@ Last updated: 2026-11-26. External campaign evidence below runs through
 | Recommended use | Evaluation and development on disposable Linux hosts |
 | Primary platform | Debian 12 (bookworm), Linux 6.1, systemd 252, on Google Compute Engine VMs |
 | Prebuilt packages | Only in GitHub pre-releases from the [release workflow](releasing.md#publishing-a-pre-release): a Debian 12 amd64 `.deb`, a RHEL 9 x86_64 `.rpm` and the source, unsigned, with `SHA256SUMS`; otherwise build from source ([Debian](getting-started/installation-debian.md), [RHEL 9](getting-started/installation-rhel.md)) |
-| RHEL 9 | Not qualified: an RPM and an [installation guide](getting-started/installation-rhel.md) exist, and CI checks the userspace in a CentOS Stream 9 container; no kernel attachment or campaign has run there |
+| RHEL 9 | Not qualified: an RPM and an [installation guide](getting-started/installation-rhel.md) exist; CI checks the userspace in a CentOS Stream 9 container and, on every change, attaches through the kernel of a booted Rocky Linux 9 KVM guest with SELinux enforcing ([testing](testing.md#automated-ci)); no RHEL host and no campaign |
 
 ## Volume formats
 
@@ -247,6 +247,22 @@ See [cache reload](operations.md#growth-and-cache-reload).
   How often something holds a device open at a detach on a production host,
   and many volumes stopping together while their devices are held open, have
   not been measured.
+- On every change, CI's booted-host jobs boot Debian 12's generic cloud image
+  (Debian's standard kernel, Linux 6.1) and Rocky Linux 9.9's GenericCloud
+  image with SELinux enforcing as KVM guests on GitHub runner VMs, a fresh
+  guest per suite, with images pinned by digest
+  ([testing](testing.md#automated-ci)). In each guest, as root on its own
+  kernel, systemd and udev, the installation guide's host steps (the RHEL
+  guide's on Rocky Linux), the quick start and the first-volume bootstrap run
+  as written with the package built from the commit on that distribution;
+  in another guest the privileged runner's lifecycle runs with that
+  package's binaries. On Rocky Linux the job requires, after either suite,
+  SELinux still enforcing and no AVC that names Maki or an NBD device, and
+  after the guides the nbdkit of `maki@` in `unconfined_service_t` and the
+  file labels the RHEL guide lists. These are virtual machines on GitHub's
+  hardware with QEMU's user-mode network, not bare-metal hosts, Rocky Linux
+  is a rebuild of RHEL rather than RHEL, and the jobs use the local
+  provider, one volume at a time and no power loss.
 
 ## Where the evidence lives
 
