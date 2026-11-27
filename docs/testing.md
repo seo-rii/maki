@@ -757,22 +757,36 @@ it, in five jobs:
    shard, and a slow unit is only listed); and what the processes left in
    their temporary directory. A process that stopped on an input, was
    interrupted, ended its rounds early or was charged less than its share
-   fails the shard. Its corpus and logs are
-   kept for 30 days, its record (`fuzz-stats-*`) and failing inputs
-   (`fuzz-crashes-*`) for 90.
-4. `merge` merges each target's seeds and shard corpora with `-merge=1` and
-   runs the merged corpus once (`-runs=0`), whose `INITED` line gives the
-   edges and features it covers. libFuzzer's merge survives an input that
+   fails the shard. The shard's output (its corpus, logs, failing inputs
+   and record) is uploaded as one archive, `shard.tar` in
+   `fuzz-shard-<target>-<n>`, kept for 30 days: `actions/upload-artifact@v4`
+   fails with `Maximum call stack size exceeded` on a directory of more
+   than about 123,000 entries, and a 24 CPU-hour shard's corpus held up to
+   405,750 inputs. The archive takes that name only once `tar` succeeded.
+   The record (`fuzz-stats-*`) and the failing inputs (`fuzz-crashes-*`)
+   are also kept on their own, for 90 days.
+4. `merge` unpacks the archive of each shard the plan has, from the
+   directory its artifact was downloaded to, merges the target's seeds and
+   those corpora with `-merge=1` and runs the merged corpus once
+   (`-runs=0`), whose `INITED` line gives the edges and features it
+   covers. A planned shard whose archive did not arrive, does not unpack
+   (it is cut short, or holds anything but files and directories below
+   `shard/`) or holds no corpus fails the merge (`the merge had no corpus
+   of shard N`), whatever the shard's record says: the merge records the
+   shards it merged (`sources`) and why it had no corpus of the others
+   (`unmerged`). libFuzzer's merge survives an input that
    fails its inner process: it writes the input to the merge's artifacts as
    a crash, timeout or out-of-memory input, runs the inner process
    again (`MERGE-OUTER: attempt 2` in its log), which leaves the input out,
    and exits 0. The job records every input the merge wrote and the
    attempts its log shows: such an input, a second attempt or a log that
-   shows none fails the merge, and a slow unit is only listed. The corpus
-   and those inputs (`fuzz-corpus-<target>`) are kept for 90 days, also
-   after a shard failed. Interrupted like a shard's, the step stops
-   libFuzzer's processes (the merge runs one of its own) and writes
-   `coverage.json`, marked interrupted.
+   shows none fails the merge, and a slow unit is only listed. The merged
+   corpus, those inputs and the logs are uploaded as one archive too,
+   `merged.tar` in `fuzz-corpus-<target>` (`tar -xf merged.tar` gives
+   `merged/corpus/`), kept for 90 days, also after a shard failed.
+   Interrupted like a shard's, the step stops unpacking and libFuzzer's
+   processes (the merge runs one of its own) and writes `coverage.json`,
+   marked interrupted.
 5. `summary` writes a table to the run's summary and to
    `fuzz-qualification-summary` (`summary.md`, `summary.json`), kept for 90
    days: per target, the CPU-hours charged to its processes, their
@@ -788,12 +802,13 @@ time while it still lacked CPU time (a round may end early: the next one
 runs for the CPU time still missing), every process was charged its share,
 no process wrote a crash, timeout, out-of-memory or leak input,
 the CPU time charged to its processes reaches the requested CPU-hours, the
-merge exited 0 after one attempt without writing such an input, its
-coverage run exited 0 and printed its `INITED` line, and the shards and the
-merge ran the build's binary. A CPU-hour is an hour of CPU time the kernel
-charged to the target's fuzzing processes; their wall time is reported
-beside it. A hosted runner is a virtual machine on GitHub's hardware, and
-its vCPUs may be hardware threads that share cores.
+merge had a corpus of every planned shard (the summary reads the merge's
+`sources` against the plan) and exited 0 after one attempt without writing
+such an input, its coverage run exited 0 and printed its `INITED` line, and
+the shards and the merge ran the build's binary. A CPU-hour is an hour of
+CPU time the kernel charged to the target's fuzzing processes; their wall
+time is reported beside it. A hosted runner is a virtual machine on
+GitHub's hardware, and its vCPUs may be hardware threads that share cores.
 
 A campaign of all 16 targets at 24 CPU-hours is 32 shards. A process that
 is charged nearly all of its wall time is done after about 3 hours, one
