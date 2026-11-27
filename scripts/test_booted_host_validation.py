@@ -510,6 +510,17 @@ class RunAndFinish(unittest.TestCase):
         self.assertEqual(first, ["sudo", "timeout", "--kill-after=30", "42", "python3", "phase", "--guest", "el9"])
         self.assertEqual(second, ["sudo", "timeout", "--kill-after=30", "43", "python3", "phase"])
 
+    def test_the_run_command_exits_with_the_guest_commands_status(self):
+        # The workflow's step for each guest phase fails on this status.
+        for status in (0, 3):
+            with self.subTest(status=status):
+                self.stubs.set(command=[status])
+                with quiet():
+                    self.assertEqual(self.driver.main(["run", "--work", str(self.work), "--root",
+                                                       "--", "python3", "phase"]), status)
+                    self.assertEqual(self.driver.main(["run", "--work", str(self.work), "--",
+                                                       "true"]), status)
+
     def test_a_copy_into_the_guest_is_given_up_after_its_limit(self):
         payload = self.stubs.root / "payload"
         payload.mkdir()
@@ -809,6 +820,23 @@ class GuestPhases(unittest.TestCase):
         self.assertIn("nbdkit-server", packages)
         self.assertNotIn("nbdkit", packages)
         self.assertNotIn("nbdkit-selinux", packages)
+
+    def test_the_runner_phase_ends_with_the_privileged_runners_status(self):
+        # The phase's status is the job step's verdict on the runner.
+        for guest in ("debian12", "el9"):
+            for status in (0, 4):
+                with self.subTest(guest=guest, status=status):
+                    steps = []
+
+                    def step(argv, **options):
+                        steps.append(argv)
+                        return status if argv == self.guest.runner_command(guest) else 0
+                    with mock.patch.multiple(self.guest, require_guest=mock.DEFAULT, step=step,
+                                             extract_package=mock.Mock(return_value=0),
+                                             prebuilt_from=mock.DEFAULT, Sampler=mock.DEFAULT), \
+                            mock.patch.object(Path, "is_block_device", return_value=True), quiet():
+                        self.assertEqual(self.guest.runner(guest), status)
+                    self.assertEqual(steps[-1], self.guest.runner_command(guest))
 
     def test_the_runners_artifacts_are_the_packages_own_files(self):
         package = self.root / "package-root"
