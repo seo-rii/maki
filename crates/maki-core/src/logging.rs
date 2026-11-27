@@ -181,8 +181,10 @@ impl io::Write for Sink {
 }
 
 /// Hold back the lines the default sink writes from now on, until the
-/// returned [`HeldLines`] is released or dropped, which writes them to
-/// stderr in order, or discarded. `None` while lines are held already. At
+/// returned [`HeldLines`] is released, which writes them to stderr in
+/// order, or discarded. A guard dropped otherwise (an early return, a panic
+/// that unwinds) drops them too and logs how many: a holder writes them only
+/// once it knows it may. `None` while lines are held already. At
 /// most 16 MiB of text is kept: lines held back beyond it are counted, and
 /// the release says how many were not kept. Nothing changes for a process
 /// whose subscriber is not the default sink ([`install_default_logging`]).
@@ -194,16 +196,18 @@ pub fn hold() -> Option<HeldLines> {
     Some(HeldLines(()))
 }
 
-/// The lines the default sink holds back ([`hold`]). Dropping it writes
-/// them, as [`HeldLines::release`] does.
-#[must_use = "dropping it writes the held lines at once"]
+/// The lines the default sink holds back ([`hold`]). Dropping it without
+/// [`HeldLines::release`] drops them, as [`HeldLines::discard`] does, and
+/// logs how many there were.
+#[must_use = "dropping it drops the held lines; release them to write them"]
 pub struct HeldLines(());
 
 impl HeldLines {
     /// Write the held lines to stderr, in the order they were logged, and
     /// write later lines at once again.
     pub fn release(self) {
-        // `Drop` writes them.
+        std::mem::forget(self);
+        end(true);
     }
 
     /// Drop the held lines unwritten, and write later lines at once again.
@@ -216,7 +220,13 @@ impl HeldLines {
 
 impl Drop for HeldLines {
     fn drop(&mut self) {
-        end(true);
+        let dropped = end(false);
+        if dropped > 0 {
+            tracing::warn!(
+                lines = dropped,
+                "log lines held back were dropped unwritten: nothing released them"
+            );
+        }
     }
 }
 
