@@ -411,10 +411,11 @@ phase in the guest as root:
   attach record, mount or active unit of the volume and no NBD connection
   remains, as the `kernel-lifecycle` job does. The guide's own `apt install` or `dnf
   install` brings the package's dependencies onto the cloud image.
-- `runner` installs what the privileged runner needs (on Debian `git`, the
-  runner's `--install-missing` installs the rest; on EL9 its tools from
-  BaseOS and AppStream with dnf, `nbdkit-server` rather than the
-  metapackage), takes `maki`, `maki-attach` and the plugin out of the package
+- `runner` installs what the privileged runner needs (on Debian `git` and
+  `dmsetup`, the runner's `--install-missing` installs the rest; on EL9 its
+  tools from BaseOS and AppStream with dnf, `nbdkit-server` rather than the
+  metapackage, and `device-mapper` for `dmsetup`, which `--kill-daemon`'s
+  release by hand and the capture of the helper's inputs run), takes `maki`, `maki-attach` and the plugin out of the package
   without installing it, loads `nbd` with `nbds_max=16 max_part=8` and runs
   `scripts/privileged-linux-validation.sh --kill-daemon --prebuilt DIR
   --device /dev/nbd15 --confirm-wipe /dev/nbd15` from a clone of the commit as

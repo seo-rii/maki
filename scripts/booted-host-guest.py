@@ -87,10 +87,15 @@ LABELS = (("/usr/bin/maki", "bin_t"), ("/usr/bin/maki-attach", "bin_t"),
           ("/dev/nbd0", "fixed_disk_device_t"))
 DAEMON_DOMAIN = "unconfined_service_t"
 # The runner's tools on EL9, from BaseOS and AppStream: nbdkit-server as the
-# RPM requires it (never the nbdkit metapackage), cpio to unpack the RPM.
+# RPM requires it (never the nbdkit metapackage), cpio to unpack the RPM, and
+# device-mapper for dmsetup (--kill-daemon's release by hand and the capture
+# of the helper's inputs), which lvm2 does not require there.
 EL9_RUNNER_PACKAGES = ("git-core", "fio", "libnbd", "nbdkit-server", "binutils", "sqlite",
-                       "lvm2", "xfsprogs", "util-linux", "kmod", "cpio", "python3", "sudo")
-DEBIAN_RUNNER_PACKAGES = ("git",)
+                       "lvm2", "device-mapper", "xfsprogs", "util-linux", "kmod", "cpio",
+                       "python3", "sudo")
+# On Debian the runner's --install-missing brings the rest, lvm2 and
+# util-linux among them; dmsetup is named as on EL9.
+DEBIAN_RUNNER_PACKAGES = ("git", "dmsetup")
 VERSION_PACKAGES = {
     "debian12": ("nbdkit", "lvm2", "xfsprogs", "util-linux", "systemd", "udev", "kmod",
                  "cloud-init", "python3", "maki"),
