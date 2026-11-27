@@ -179,11 +179,26 @@ jobs:
             --target "$TARGET" --shard "$SHARD" --cpu-seconds "$CPU_SECONDS" \
             --wall-seconds "$WALL_SECONDS" --workers "$WORKERS" \
             --seeds "fuzz/seeds/$TARGET" --out "$RUNNER_TEMP/shard"
+      # The shard's output (corpus, logs, inputs, record) as one archive:
+      # upload-artifact@v4 lists a directory's files with @actions/glob,
+      # which fails with "Maximum call stack size exceeded" on a directory
+      # of more than about 123,000 entries (measured on Node 22; the action
+      # declares node20), and a 24 CPU-hour shard's corpus held up to
+      # 405,750 inputs. The upload compresses the archive. tar
+      # writes an archive also when it fails (empty without the directory,
+      # without a file it could not read), so the merge's name is given to
+      # it only once tar succeeded.
+      - name: pack the shard
+        if: always()
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/shard.tar.part" shard
+          mv "$RUNNER_TEMP/shard.tar.part" "$RUNNER_TEMP/shard.tar"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: fuzz-shard-${{ matrix.target }}-${{ matrix.shard }}
-          path: ${{ runner.temp }}/shard
+          path: ${{ runner.temp }}/shard.tar
           if-no-files-found: warn
           retention-days: 30
       - uses: actions/upload-artifact@v4
@@ -227,20 +242,32 @@ jobs:
         with:
           pattern: fuzz-shard-${{ matrix.target }}-*
           path: ${{ runner.temp }}/shards
-      # `exec`, as for a shard: an interrupted merge stops libFuzzer's
-      # processes and writes coverage.json, marked interrupted.
+      # Each shard's archive arrives in a directory named after its
+      # artifact, or not at all when its upload failed. The script unpacks
+      # the archive of every shard the plan has and fails a merge without a
+      # corpus of each, whatever the shards' records say. `exec`, as for a
+      # shard: an interrupted merge stops unpacking and libFuzzer's processes
+      # and writes coverage.json, marked interrupted.
       - name: merge the seeds and the shard corpora
         env:
           TARGET: ${{ matrix.target }}
+          SHARDS: ${{ fromJSON(needs.plan.outputs.plan).shards }}
         run: |
           exec python3 -B scripts/fuzz_campaign.py merge --binary "$RUNNER_TEMP/binaries/$TARGET" \
             --target "$TARGET" --seeds "fuzz/seeds/$TARGET" --shards "$RUNNER_TEMP/shards" \
-            --out "$RUNNER_TEMP/merged"
+            --planned-shards "$SHARDS" --out "$RUNNER_TEMP/merged"
+      # One archive, as for a shard.
+      - name: pack the merged corpus
+        if: always()
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/merged.tar.part" merged
+          mv "$RUNNER_TEMP/merged.tar.part" "$RUNNER_TEMP/merged.tar"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: fuzz-corpus-${{ matrix.target }}
-          path: ${{ runner.temp }}/merged
+          path: ${{ runner.temp }}/merged.tar
           if-no-files-found: warn
           retention-days: 90
       - uses: actions/upload-artifact@v4
