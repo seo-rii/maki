@@ -70,10 +70,10 @@ an operator's `blkid`) has closed it. The disconnect's own change event comes
 only when the connection goes; the udev probe it starts is what can make a
 connect right after it busy. If the device still shows the connection at the
 end, `nbd-disconnect` fails, and detach and cleanup keep the attachment record
-and fail; run them again once nothing holds the device open. Detach and cleanup
-wait without the attach lock, so other volumes' helpers do not wait for this
-device, and take it again before they retire the record
-([privileged helper](#privileged-helper)). The
+and fail; run them again once nothing holds the device open. When they have to
+wait, detach and cleanup let go of the attach lock for the wait, so other
+volumes' helpers do not wait for this device, and take it again before they
+retire the record ([privileged helper](#privileged-helper)). The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 

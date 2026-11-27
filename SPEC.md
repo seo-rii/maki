@@ -365,28 +365,33 @@ Detach and cleanup MUST NOT hold the attach lock while they wait: when their
 first look after the disconnect still shows the connection, they release the
 lock for the rest of the wait, so that the other helpers (the cleanups of
 other volumes stopping at the same time above all) do not wait for an opener
-of this device. A wait that ends with the device still showing the
-connection they disconnected, or one that cannot be read, fails the command
-as above without taking the lock again. Otherwise (no connection, or one
-under another backend identifier) they MUST take the lock again, in turn
-behind the helpers that queued meanwhile, before they act on what the wait
-showed, and MUST read the volume's trusted record again under it: only the
-record they disconnected may be retired, once observations under the lock
-show that nothing of its attachment remains and the device no connection
-(§8). A record that another helper retired meanwhile, which it does only when
-nothing of the attachment remains, ends the command as a success; one that
-another helper replaced (the volume attached again, possibly on the same
-device, whose connection under the new identifier then ends the wait) is
-kept with the attachment it names, and the command fails saying so, never as
-a disconnect that a later cleanup should finish, which would tear that
-attachment down. A connection under another identifier beside an unchanged
-record fails the command as above. Only another helper of the same volume can replace or retire
-the record while they wait; until then it still names the device, so no other
-volume's attach and no provisioning connect takes the device (§8), and such a
-helper finds what it would find had the waiting one been killed during its
-wait. The failed-start hook's rollback keeps the
-lock through its wait: its command budget counts from the moment it got the
-lock, and its time bounds leave no room for a second turn on the lock.
+of this device. A first look that shows no connection, or one under another
+backend identifier, ends the wait at once with the lock still held: no other
+helper can have acted, and the command goes on, or fails as above, without a
+second turn on the lock. A wait without the lock that ends with the device
+still showing the connection they disconnected, or with one that cannot be
+read, fails the command as above without taking the lock again. A wait
+without the lock that ends with no connection, or with one under another
+backend identifier, MUST take the lock again, in turn behind the helpers that
+queued meanwhile, before the command acts on what the wait showed, and MUST
+read the volume's trusted record again under it: only the record they
+disconnected may be retired, once observations under the lock show that
+nothing of its attachment remains and the device no connection (§8). A
+record that another helper retired meanwhile, which it does only when nothing
+of the attachment remains, ends the command as a success, whatever the device
+shows; one that another helper replaced (the volume attached again, possibly
+on the same device, whose connection under the new identifier then ends the
+wait) is kept with the attachment it names, and the command fails saying so,
+never as a disconnect that a later cleanup should finish, which would tear
+that attachment down. A connection under another identifier beside an
+unchanged record fails the command as above. Only another helper of the same
+volume can replace or retire the record while they wait; until then it still
+names the device, so no other volume's attach and no provisioning connect
+takes the device (§8), and such a helper finds what it would find had the
+waiting one been killed during its wait. The failed-start hook's rollback
+keeps the lock through its wait: its command budget counts from the moment
+it got the lock, and its time bounds leave no room for a second turn on the
+lock.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal

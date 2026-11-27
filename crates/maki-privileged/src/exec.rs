@@ -1789,15 +1789,18 @@ fn connect_recorded(
 /// How one run of a verb holds the attach lock, which it takes before it
 /// reads any record.
 ///
-/// A detach or cleanup whose device still shows the connection after its
-/// disconnect lets go of the lock for the wait ([`await_release`]): while
-/// something holds the device open the wait can last 15 s, and every other
-/// helper on the host (the cleanups of the other volumes stopping at the
-/// same time above all) would wait that long too. A wait that ends with
-/// this connection still shown, or an unreadable one, fails the run without
-/// the lock, changing nothing. Otherwise (no connection, or one under
-/// another backend identifier) the run takes the lock again, in turn, before
-/// it acts, and reads the volume's record again under it. Meanwhile only
+/// A detach or cleanup whose device still shows the connection at the first
+/// look after its disconnect lets go of the lock for the wait
+/// ([`await_release`]): while something holds the device open the wait can
+/// last 15 s, and every other helper on the host (the cleanups of the other
+/// volumes stopping at the same time above all) would wait that long too. A
+/// first look that shows no connection, or another backend identifier, needs
+/// no wait: the lock is never let go of, and the run goes on, or fails, under
+/// it without reading the record again. A wait without the lock that ends
+/// with this connection still shown, or an unreadable one, fails the run
+/// without the lock, changing nothing. One that ends with no connection, or
+/// another backend identifier, takes the lock again, in turn, before the run
+/// acts, and reads the volume's record again under it. Meanwhile only
 /// another helper of the same volume can replace or retire the record;
 /// until then it still names the device, so no other volume's attach and
 /// no provisioning connect takes the device (SPEC §8), and such a helper

@@ -90,14 +90,15 @@ device open. If the device shows another connection by then, the record is
 kept as well, and a later
 .B cleanup
 removes it only when nothing of the attachment remains on the host.
-The wait of a
+When the device still shows the connection right after the disconnect, a
 .BR detach " or " cleanup
-does not hold the attach lock, so the helpers of other volumes do not wait
-for it. The lock is taken again before the record is removed, and the record
-must then still be the one the command disconnected: one that another helper
-removed meanwhile ends the command successfully, and one that another helper
-replaced (the volume attached again, possibly on the same device) is kept,
-and the command fails and says so.
+waits without the attach lock, so the helpers of other volumes do not wait
+for it. Unless the device still shows that connection when the wait is over,
+or its backend cannot be read, the lock is taken again before anything else
+is done, and the record must then still be the one the command disconnected:
+one that another helper removed meanwhile ends the command successfully, and
+one that another helper replaced (the volume attached again, possibly on the
+same device) is kept, and the command fails and says so.
 .B recover-failed-start
 is the systemd failed-start cleanup hook. It asks systemd to queue the
 recovery coordinator and, when the start died between LVM activation and the
