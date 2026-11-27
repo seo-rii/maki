@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -408,6 +409,56 @@ sudo() {
         self.assertIn("DIE: the opener did not start holding /dev/nbd15", result.stdout)
         self.assertIn("Permission denied", result.stderr)
         self.assertNotIn("STARTED", result.stdout)
+
+    # sudo checks its policy with real, effective and saved uid 0, so for
+    # that moment the invoking user's `kill -0` on its PID fails with EPERM.
+    # In CI's first booted-host run (Debian 12) the wait's first look fell
+    # there, before the opener had written that it held the device, and the
+    # run stopped although the opener was starting.
+    REFUSE_SIGNALS = ('kill() { if [ "$1" = -0 ]; then echo "kill: ($2) - Operation not permitted" >&2; '
+                      'return 1; fi; builtin kill "$@"; }\n')
+
+    def test_the_wait_does_not_signal_the_opener_that_sudo_started(self):
+        self.opener('sleep 0.3\necho "  0.000s holding the device open; it shows backend \'maki-1\'"\n'
+                    'while [ ! -e "$FIXTURE/release" ]; do sleep 0.01; done\n')
+        result = self.run_fragment(self.REFUSE_SIGNALS + 'hold_device_open\necho HOLDING\n'
+                                   'touch "$FIXTURE/release"\nfinish_opener\necho FINISHED')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("HOLDING", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        self.assertNotIn("DIE:", result.stdout)
+
+    def test_an_opener_that_exits_before_holding_the_device_ends_the_wait_at_once(self):
+        # Without signals the wait still sees the opener go, long before its
+        # ten seconds are up.
+        self.opener('echo "cannot open /dev/nbd15: No such device or address"\nexit 2\n')
+        started = time.monotonic()
+        result = self.run_fragment(self.REFUSE_SIGNALS + "hold_device_open\necho STARTED")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("DIE: the opener did not start holding /dev/nbd15", result.stdout)
+        self.assertIn("No such device or address", result.stderr)
+        self.assertNotIn("STARTED", result.stdout)
+
+    def test_a_process_runs_until_it_exits_whoever_owns_it(self):
+        # PID 1 belongs to root: a runner user cannot signal it, and it runs.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.kill)
+        zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+        deadline = time.monotonic() + 10
+        while (Path(f"/proc/{zombie.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.addCleanup(zombie.wait)
+        script = "".join(f'if process_running {pid}; then echo "{pid} running"; else echo "{pid} gone"; fi\n'
+                         for pid in (1, child.pid, zombie.pid, 2 ** 22 + 1))
+        result = self.run_fragment(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "1 running", f"{child.pid} running", f"{zombie.pid} gone", f"{2 ** 22 + 1} gone"])
+        if os.geteuid() != 0:
+            # What the wait cannot rely on.
+            self.assertNotEqual(subprocess.run(["bash", "-c", "kill -0 1"], capture_output=True).returncode, 0)
 
 
 class ScriptedDevice:
