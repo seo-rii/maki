@@ -538,7 +538,12 @@ above `n` times the time a connect is expected to take: with a short
 `timeout`, a host with many addresses can have every live one given up, and on
 Linux one lost SYN already delays a connect by 1 s. With a `timeout` of 300 ms
 or less the other family is never tried when the first one does not answer,
-and below 600 ms it has `timeout` minus 300 ms, less than half.
+and below 600 ms it has `timeout` minus 300 ms, less than half. Such a
+`timeout` is accepted with a warning that names it, which `maki volume
+create` and `maki check` print and attach logs: "[crypto.http] timeout is
+300ms: under 600 ms the other address family of an endpoint's host gets less
+than half of it, and at 300 ms or less it is never tried, so a host whose
+first address family does not answer can fail every connect".
 
 Maki cannot shorten those 300 ms over HTTP. reqwest builds hyper-util's
 connector itself and never sets its other-family delay
@@ -553,7 +558,8 @@ the connection type reqwest uses, so it can only wrap reqwest's own connect.
 Two clients, one for each family, raced by Maki would keep a pool each and
 could both send a request that is not retry-safe. Shortening the delay needs
 a change to reqwest, or an HTTP client built on hyper-util with a connector of
-Maki's own, as the WebSocket transport dials the addresses itself.
+Maki's own, as the WebSocket transport dials the addresses itself. The gRPC
+transport builds hyper-util's connector itself and sets the delay (below).
 
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
@@ -616,20 +622,25 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
 `timeout`, so a slow handshake still serves the next request; a peer that never
 completes the handshake is abandoned then and the next request reconnects.
-Its TCP connector is hyper-util's, as for HTTP, and tries the addresses the
-same way: each of a family's `n` addresses may take `timeout / n`, and the
-other family starts 300 ms after the first, or at once when the first family
-has failed. So with a `timeout` of 300 ms or less and a first family that does
-not answer, the request that opened the connection fails, retryable and not
-sent, and the attempt dials the other family when the first family's shares
-have run out, at that `timeout`; its connection serves a later request.
+Its TCP connector is hyper-util's, as for HTTP, built by the provider: each
+of a family's `n` addresses may take `timeout / n`, and the other family
+starts 300 ms after the first, or halfway through the `timeout` when that is
+under 600 ms, or at once when the first family has failed. The first family
+keeps connecting meanwhile, and the first connection made is used. The delay
+is fixed when the provider is built: half the `timeout`, counted from the
+start of the dial, after the name is resolved, where the WebSocket transport
+halves what is left of its deadline then. The connection attempt starts with
+the request that needs it, so with a `timeout` of 300 ms or less, a request
+whose first family does not answer can still be served by the other family,
+which has the second half of that `timeout`.
 
 A WebSocket request's `timeout` covers the connection it opens, including the
 time the request waited for the connection. The endpoint's host is resolved;
 the family of the first address goes first, and the other family starts 300 ms
-later, as in the gRPC transport's connector, or at once when the first family
-has failed. With less than 600 ms of the request left when the addresses are
-dialed, it starts once half of what is left has passed instead, so it always
+later, as in the gRPC transport's connector with a `timeout` of 600 ms or more,
+or at once when the first family has failed. With less than 600 ms of the
+request left when the addresses are dialed, it starts once half of what is
+left has passed instead, so it always
 has at least half of that time, also with a `timeout` of 300 ms or less. Within
 a family the addresses are tried one at a time, in the
 resolver's order: each but the last may take an equal share of what is left of

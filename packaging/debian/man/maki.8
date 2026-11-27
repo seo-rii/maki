@@ -40,6 +40,14 @@ loads no provider credential and contacts no provider (with a remote witness
 it loads the witness client's TLS identity, to ask the authority), so a
 different key under the same name, an unavailable credential and a provider
 that fails its self-test are found only at attach.
+A valid configuration that serves badly passes with a
+.B "warning:"
+line, which
+.B "volume create"
+prints too: an HTTP provider
+.B timeout
+under 600 ms, which leaves the other address family of an endpoint's host
+less than half of it and, at 300 ms or less, none.
 .PP
 .BR "volume inspect" " and " check
 first ask, on Linux, whether the user running them may write the backing
