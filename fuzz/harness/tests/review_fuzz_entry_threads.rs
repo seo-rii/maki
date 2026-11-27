@@ -11,10 +11,10 @@
 //! each, and the inputs libFuzzer wrote as out-of-memory include the empty
 //! one. A server thread kept for every input is no way out either:
 //! libFuzzer counts the mallocs and frees of each call, in every thread,
-//! runs a call that ended with more mallocs than frees again and then
-//! checks the process for leaks, and after 1,000 such checks it stops
-//! looking for leaks per input. The kept thread freed each input's memory
-//! after the call had returned.
+//! runs a call that ended with more mallocs than frees again and, when that
+//! run ends so too, checks the process for leaks, and after 1,000 such
+//! checks it stops looking for leaks per input. The kept thread freed each
+//! input's memory after the call had returned.
 //!
 //! This test binary counts both. It defines `pthread_create`, which the
 //! standard library's `std::thread` calls (the definition in the executable
@@ -29,18 +29,24 @@
 //! allocates. A pattern that starts a thread or keeps a block only every
 //! more than [`CALLS`] calls is not seen. The counts are the process's,
 //! so this file holds one test: another test running beside it would be
-//! counted too. `nbd_handshake` writes an input its socket's send buffer
-//! cannot hold with a thread (`queue` in `src/nbd.rs`): on a host whose
-//! `net.core.wmem_default` is below 65,968 bytes its longest seed (65,840
-//! bytes) fails here, as fuzzing it would start a thread there, and below
-//! 65,546 bytes also the next (65,418 bytes).
+//! counted too. The process's main thread is counted only when it is the
+//! calling thread: otherwise it is libtest's, which runs no entry but
+//! allocates when it prints that a test "has been running for over 60
+//! seconds", and a counted call that spanned that moment would fail its
+//! seed (as one did in review). `nbd_handshake` writes an input its
+//! socket's send buffer cannot hold with a thread (`queue` in
+//! `src/nbd.rs`): on a host whose `net.core.wmem_default` is below 65,968
+//! bytes its longest seed (65,840 bytes) fails here, as fuzzing it would
+//! start a thread there, and below 65,546 bytes also the next (65,418
+//! bytes); the failure names the buffer each such seed needs.
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
+use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use maki_fuzz_harness::{seeds, TARGETS};
@@ -60,6 +66,7 @@ type PthreadCreate =
 
 extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn gettid() -> c_int;
 }
 
 /// glibc's and musl's `RTLD_NEXT`: the next object in the search order
@@ -106,6 +113,8 @@ static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static FREED: AtomicU64 = AtomicU64::new(0);
 /// What other threads allocated or freed while a call was counted.
 static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+/// This process's id, which its main thread's id is.
+static PROCESS: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     /// Whether this thread is the one whose call is counted. A `const`
@@ -119,9 +128,17 @@ fn note(counter: &AtomicU64) {
     }
     if CALLER.try_with(Cell::get).unwrap_or(false) {
         counter.fetch_add(1, Ordering::SeqCst);
-    } else {
+    } else if !on_the_main_thread() {
         ELSEWHERE.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// Whether this thread is the process's main thread, which, when it is not
+/// the calling thread, is libtest's (see the module's documentation).
+fn on_the_main_thread() -> bool {
+    // SAFETY: gettid has no preconditions.
+    let thread = unsafe { gettid() };
+    i64::from(thread) == i64::from(PROCESS.load(Ordering::SeqCst))
 }
 
 // SAFETY: every method hands its arguments to `System` unchanged and only
@@ -180,6 +197,7 @@ fn counted(call: impl FnOnce()) -> Call {
     for counter in [&ALLOCATED, &FREED, &ELSEWHERE] {
         counter.store(0, Ordering::SeqCst);
     }
+    PROCESS.store(std::process::id(), Ordering::SeqCst);
     let threads = THREADS.load(Ordering::SeqCst);
     CALLER.with(|caller| caller.set(true));
     COUNTING.store(true, Ordering::SeqCst);
@@ -218,6 +236,15 @@ fn seeds_of(target: &str) -> Vec<(String, Vec<u8>)> {
         .collect();
     files.sort();
     files
+}
+
+/// The size of a new socket's send buffer: `net.core.wmem_default`.
+fn wmem_default() -> String {
+    let path = "/proc/sys/net/core/wmem_default";
+    std::fs::read_to_string(path).map_or_else(
+        |error| format!("unreadable ({path}: {error})"),
+        |value| format!("{} bytes", value.trim()),
+    )
 }
 
 /// The counts see what they must: a thread started, a block kept, a block
@@ -287,7 +314,19 @@ fn entry_calls_start_no_thread_and_free_what_they_allocate() {
                 })
                 .collect();
             if !calls.iter().all(Call::is_clean) {
-                unclean.push(format!("{}/{name}: {calls:?}", target.name));
+                let mut seed = format!("{}/{name}: {calls:?}", target.name);
+                if target.name == "nbd_handshake" && calls.iter().any(|call| call.threads > 0) {
+                    let _ = write!(
+                        seed,
+                        "; nbd_handshake writes an input its socket's send buffer cannot hold \
+                         with a thread: this input of {} bytes needs a buffer of {} bytes \
+                         (measured on Linux 6.18), and net.core.wmem_default is {}",
+                        bytes.len(),
+                        bytes.len() + 128,
+                        wmem_default()
+                    );
+                }
+                unclean.push(seed);
             }
             replayed += 1;
         }

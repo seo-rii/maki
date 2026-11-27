@@ -12,8 +12,9 @@
 //! allocates before it returns (`tests/review_fuzz_entry_threads.rs`):
 //! libFuzzer runs millions of inputs in one process, under AddressSanitizer
 //! the process's memory grows with every thread it has started, and
-//! libFuzzer stops looking for leaks per input after 1,000 calls that end
-//! with more mallocs than frees.
+//! libFuzzer runs a call that ended with more mallocs than frees again and,
+//! when that run ends so too, checks the process for leaks, and after 1,000
+//! such checks it stops looking for leaks per input.
 
 #[cfg(target_os = "linux")]
 mod nbd;

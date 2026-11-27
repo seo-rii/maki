@@ -43,11 +43,12 @@ const GREETING: usize = 18;
 /// (`tests/review_fuzz_entry_threads.rs`): the input is in the socket and
 /// the server's sending side is closed before the client starts, and the
 /// client's request is read once the client has closed its socket.
-/// libFuzzer leak-checks a call that ends with more mallocs than frees, in
-/// any thread, and stops checking after 1,000 such calls; under
-/// AddressSanitizer a thread per input grows the process's memory with
-/// every input. Only an input the socket cannot hold is written by a thread
-/// of the call's own ([`queue`]).
+/// libFuzzer runs a call that ended with more mallocs than frees, in any
+/// thread, again and, when that run ends so too, checks the process for
+/// leaks, and after 1,000 such checks it stops looking for leaks per
+/// input; under AddressSanitizer a thread per input grows the process's
+/// memory with every input. Only an input the socket cannot hold is written
+/// by a thread of the call's own ([`queue`]).
 pub fn nbd_handshake(data: &[u8]) -> bool {
     let (client, mut server) = UnixStream::pair().expect("a socket pair");
     let queued = queue(&server, data);
