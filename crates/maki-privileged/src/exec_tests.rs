@@ -1489,6 +1489,49 @@ fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
     }
 }
 
+#[test]
+fn acknowledged_but_incomplete_disconnect_preserves_cleanup_authority_for_retry() {
+    for disappears_between_retries in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let record = state.read("pg").unwrap().unwrap();
+        system.steps.clear();
+        system.defer_disconnect = true;
+
+        let error = cleanup_with(&plan_detach(&request), &state, &mut system).unwrap_err();
+        assert!(error.to_string().contains("disconnect has not completed"));
+        assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+        assert_eq!(state.read("pg").unwrap(), Some(record.clone()));
+
+        system.steps.clear();
+        assert!(cleanup_with(&plan_detach(&request), &state, &mut system).is_err());
+        assert_eq!(system.steps, ["nbd-disconnect"]);
+        assert_eq!(state.read("pg").unwrap(), Some(record));
+
+        system.steps.clear();
+        system.defer_disconnect = false;
+        if disappears_between_retries {
+            system.backends.clear();
+        }
+        cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
+        assert_eq!(
+            system.steps,
+            if disappears_between_retries {
+                vec![]
+            } else {
+                vec!["nbd-disconnect"]
+            }
+        );
+        assert!(state.read("pg").unwrap().is_none());
+        assert!(system.backends.is_empty());
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        assert!(system.mounted);
+    }
+}
+
 /// Detach or cleanup of `request`'s attachment by `system`, taking the
 /// attach lock of `state` as the helper's own run does.
 fn tear_down(
