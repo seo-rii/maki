@@ -1333,14 +1333,15 @@ HTTP). An upgrade reply cut short by a lost connection is `Retryable`.
 
 Without a classified answer, every transport reports a timeout or a lost
 connection, also one that cuts a reply short, as `Retryable`, and a TLS
-authentication or protocol failure as `EndpointFatal`. On an established
-connection, a reply that breaks the framing of the transport's messages or
-their size limit is a contract violation: an HTTP/1.1 response head or chunked
-body that does not parse, or a body that only the connection's close ends; a
-gRPC message whose length prefix, count or final status breaks the gRPC
-protocol, or a stream that ends inside a message; a WebSocket frame that breaks
-the WebSocket protocol or is not a JSON text frame with a numeric `id`. Two
-protocol failures are classified otherwise. A WebSocket upgrade reply that is
+authentication or protocol failure as `EndpointFatal` where its TLS error
+reaches the transport (below). On an established connection, a reply that
+breaks the framing of the transport's messages or their size limit is a
+contract violation: an HTTP/1.1 response head or chunked body that does not
+parse, or a body that only the connection's close ends; a gRPC message whose
+length prefix, count or final status breaks the gRPC protocol, or a stream
+that ends inside a message; a WebSocket frame that breaks the WebSocket
+protocol or is not a JSON text frame with a numeric `id`. Two protocol
+failures are classified otherwise. A WebSocket upgrade reply that is
 not a valid upgrade is `EndpointFatal`, as above. An HTTP/2 error below the
 gRPC messages, a reset stream or a GOAWAY, is no framing violation: it reaches
 Maki as the gRPC status that the gRPC library derives from it and is classified
@@ -1352,6 +1353,24 @@ code is `Retryable`. A GOAWAY that accepted the call and then closes the
 connection under it is `Retryable` whatever its code. Either way the request
 was handed to the connection and counts as sent: a call that a GOAWAY refused
 is not resent or failed over unless the provider is `retry_safe`.
+
+A TLS failure is `EndpointFatal` wherever its rustls error reaches the
+transport: in the connection attempt; on an established HTTP or WebSocket
+connection while a request waits for its reply (a record that does not
+decrypt, a fatal alert), where the request counts as sent; and when the gRPC
+library reconnects inside an established channel, which counts as sent too,
+since that library holds the request while it reconnects. The provider MUST
+then retire that channel, also one no call has completed on, so that no later
+call uses it and the next call opens a new connection through the provider's
+own connection attempt, which hands no request over before the connection is
+ready. A TLS failure on an established gRPC connection does not reach the
+transport as one: the HTTP/2 library under the gRPC library keeps only the
+kind and text of the connection's I/O error, and no failure is classified by
+its text, so the call is classified by the gRPC status that library derives
+(in practice `Unknown`, `Cancelled` or `Unavailable`, which are `Retryable`)
+and counts as sent. A TLS 1.3 server's refusal of the client certificate,
+which arrives after the client has finished its side of the handshake,
+reaches a gRPC call this way.
 
 ---
 

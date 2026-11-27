@@ -133,10 +133,15 @@ See [cache reload](operations.md#growth-and-cache-reload).
 - Remote transport libraries may keep plaintext copies outside `SecretBuffer`,
   and stack temporaries of the local cipher implementations are outside the
   `secure-buffers` page lock ([transport memory](transport-memory.md)).
-- A gRPC endpoint whose TLS 1.3 server refuses the client certificate is
-  reported with a retryable status (`grpc status Unknown`, `Cancelled` or
-  `Unavailable`), not as a TLS authentication failure: the refusal arrives
-  after the handshake and the HTTP/2 library does not keep the TLS error
+- A TLS failure on an established gRPC connection (a record that does not
+  decrypt, a fatal alert, a TLS 1.3 server's refusal of the client
+  certificate, which arrives after the handshake) is reported with a
+  retryable status (`grpc status Unknown`, `Cancelled` or `Unavailable`)
+  counted as sent, not as a TLS authentication or protocol failure: the
+  HTTP/2 library does not keep the TLS error. HTTP and WebSocket report the
+  same failures as endpoint failures when they read the bad record or the
+  server's alert before the connection is lost; a connection reset first
+  leaves a retryable lost connection on every transport
   ([provider error signals](configuration.md#provider-error-signals)).
 - An endpoint address that does not answer still costs time on every
   connect. All three remote transports try the other address family 300 ms
