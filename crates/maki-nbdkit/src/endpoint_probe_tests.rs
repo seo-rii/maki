@@ -187,7 +187,7 @@ async fn probe(
     endpoints: &[Arc<Scripted>],
 ) -> (Duration, Result<Arc<EndpointSet>, DaemonError>) {
     let started = tokio::time::Instant::now();
-    let result = dispatch_endpoint_set(config, named(endpoints), None).await;
+    let result = dispatch_endpoint_set(config, named(endpoints), None, None).await;
     (started.elapsed(), result)
 }
 
@@ -344,4 +344,79 @@ async fn results_are_reported_in_configuration_order() {
         result.err().expect("refused").to_string(),
         "unsupported: endpoint \"ep0\" failed its self-test: provider fatal: refused"
     );
+}
+
+/// Probe `endpoints` as the native plugin's attach does, and when each
+/// report of the probe's progress came, on the paused clock, from `started`
+/// to `ended`.
+async fn probe_reporting(
+    config: &VolumeConfig,
+    endpoints: &[Arc<Scripted>],
+) -> (Vec<tokio::time::Instant>, Arc<EndpointSet>) {
+    let reports = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let progress: Arc<ProbeProgress> = {
+        let reports = reports.clone();
+        Arc::new(move || reports.lock().push(tokio::time::Instant::now()))
+    };
+    let started = tokio::time::Instant::now();
+    let set = dispatch_endpoint_set(config, named(endpoints), None, Some(progress))
+        .await
+        .unwrap();
+    let ended = tokio::time::Instant::now();
+    let mut times = vec![started];
+    times.extend(reports.lock().iter().copied());
+    times.push(ended);
+    // The set's own requests (its validation of quarantined endpoints) do
+    // not report: nothing extends the start deadline once the set is built.
+    let reported = reports.lock().len();
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(reports.lock().len(), reported, "reported after the probes");
+    (times, set)
+}
+
+/// The longest time without a report between the probe's start and end.
+fn longest_gap(times: &[tokio::time::Instant]) -> Duration {
+    times
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap()
+}
+
+/// Each probe request that ends reports progress, which the native plugin
+/// turns into `EXTEND_TIMEOUT_USEC` (`startup.rs`): a probe of an endpoint
+/// whose requests time out after 60 s runs past `TimeoutStartSec=180`, and
+/// no time between reports is longer than one request and the delay before
+/// the next attempt.
+#[tokio::test(start_paused = true)]
+async fn every_probe_request_that_ends_reports_progress() {
+    let volume = fixture(true);
+    let request = Duration::from_secs(60);
+    let endpoints = [
+        Scripted::new(Answer::Away, request),
+        Scripted::new(Answer::Serve, Duration::ZERO),
+    ];
+    let (times, _set) = probe_reporting(&volume.config, &endpoints).await;
+    let elapsed = *times.last().unwrap() - times[0];
+    assert!(elapsed > Duration::from_secs(180), "{elapsed:?}");
+    assert!(longest_gap(&times) <= request + DELAY, "{times:?}");
+}
+
+/// The cross-endpoint check after the probes reports each request that
+/// ends as well: a check against an endpoint that answers each request in
+/// 50 s makes several of them.
+#[tokio::test(start_paused = true)]
+async fn every_cross_endpoint_check_request_that_ends_reports_progress() {
+    let volume = fixture(true);
+    let request = Duration::from_secs(50);
+    let endpoints = [
+        Scripted::new(Answer::Serve, Duration::ZERO),
+        Scripted::new(Answer::Serve, request),
+    ];
+    let (times, set) = probe_reporting(&volume.config, &endpoints).await;
+    assert_eq!(
+        validated(&set),
+        [("ep0".to_string(), true), ("ep1".to_string(), true)]
+    );
+    assert!(longest_gap(&times) <= request, "{times:?}");
 }

@@ -273,6 +273,44 @@ mod tests {
         );
     }
 
+    /// The endpoint probes at attach extend the same window, at the same
+    /// rate shared with recovery, and say that they are probing.
+    #[test]
+    fn probe_progress_extends_the_window_under_its_own_status() {
+        let dir = crate::short_dir::tempdir().unwrap();
+        let path = dir.path().join("progress.sock");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let notifier = RecoveryNotifier::new(Some(path.into_os_string()));
+        let mut message = [0; 128];
+        notifier.probing_at(Duration::from_secs(29));
+        assert_eq!(
+            receiver.recv(&mut message).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        notifier.progress_at(Duration::from_secs(30));
+        let len = receiver.recv(&mut message).unwrap();
+        assert_eq!(&message[..len], PROGRESS_NOTIFICATION);
+        notifier.probing_at(Duration::from_secs(59));
+        assert_eq!(
+            receiver.recv(&mut message).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for elapsed in [60, 90, 300] {
+            notifier.probing_at(Duration::from_secs(elapsed));
+            let len = receiver.recv(&mut message).unwrap();
+            assert_eq!(
+                &message[..len],
+                b"EXTEND_TIMEOUT_USEC=180000000\nSTATUS=Probing crypto endpoints"
+            );
+            notifier.progress_at(Duration::from_secs(elapsed + 29));
+            assert_eq!(
+                receiver.recv(&mut message).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
     #[test]
     fn a_failed_extension_permanently_prevents_readiness() {
         let dir = crate::short_dir::tempdir().unwrap();
