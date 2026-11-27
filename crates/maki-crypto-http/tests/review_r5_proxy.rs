@@ -55,10 +55,11 @@ async fn environment_proxies_are_never_used() {
     }))
     .await;
     // The configured endpoint is a closed loopback port: only a proxied
-    // request can succeed.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // request can succeed. Its socket is bound and never listens, so the
+    // port stays reserved for the whole test.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let endpoint = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
     for name in ["NO_PROXY", "no_proxy"] {
         std::env::remove_var(name);
     }

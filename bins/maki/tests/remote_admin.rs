@@ -1247,9 +1247,12 @@ fn resume_enrollment_refuses_a_provider_this_build_cannot_construct() {
 #[test]
 fn volume_cli_uses_identity_pinned_frontend_failover_for_create_and_witness() {
     let f = Fixture::new();
-    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bound and never listening, for the whole test: the connect is refused,
+    // and a test beside this one cannot be given the port for its service.
+    // (Creating and binding the socket needs no runtime.)
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let unavailable = closed.local_addr().unwrap();
-    drop(closed);
     let identity = uuid::Uuid::from_bytes([1; 16]).to_string();
     let raw = std::fs::read_to_string(&f.writer_config).unwrap().replace(
         &format!("address=\"{}\"", f._service.address),

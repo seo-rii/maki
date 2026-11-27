@@ -34,3 +34,6 @@ libc = "0.2"
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+# `tokio::net::TcpSocket`: a port bound without listening, which refuses
+# connections (`tests/failover.rs`).
+tokio.workspace = true

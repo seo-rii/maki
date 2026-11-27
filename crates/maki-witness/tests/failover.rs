@@ -124,9 +124,12 @@ fn refused_frontend_connection_fails_over_to_same_authority() {
     let store = f.state("state", [1; 16]);
     let calls = Arc::new(AtomicUsize::new(0));
     let service = f.service(handler(store, calls.clone()));
-    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bound and never listening, for the whole test: the connect is refused,
+    // and a test beside this one cannot be given the port for its service.
+    // (Creating and binding the socket needs no runtime.)
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let unavailable = closed.local_addr().unwrap();
-    drop(closed);
     let client = FailoverClient::new(
         vec![f.options(unavailable), f.options(service.address)],
         [1; 16],
