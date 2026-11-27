@@ -156,8 +156,7 @@ class UnguardedLists(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_lists_that_end_their_block_or_never_run_at_its_level_are_accepted(self):
-        for block in ("a && b && c", "a\nb || c", "f() {\n  a || return 1\n  b\n}\nc && d",
-                      "{ findmnt /srv/demo || echo unmounted; }",
+        for block in ("a && b && c", "a\nb || c", "f() {\n  a\n  b\n}\nc && d",
                       "bash <<'BASH'\na && b\nc || d\nBASH",
                       "python3 - <<PY\nx = 1 if a and b else 2\nPY\nok",
                       "if a; then\n  b\nfi\nc"):
@@ -176,18 +175,43 @@ class UnguardedLists(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.driver.program([("block", block)])
 
-    def test_lists_inside_compound_commands_groups_and_functions_are_not_seen(self):
-        # A known gap: Bash prints these bodies deeper than the block's
-        # level, which the check does not read, so it accepts them although
-        # set -e does not stop at their failure and the program goes on. Nor
-        # does it refuse set -e's other exemptions, a negated or a background
-        # command. What the guides hold there is pinned below.
-        for block in ("{\n  false && true\n  echo inner\n}\ntouch after",
-                      "if true; then\n  false && true\n  echo inner\nfi\ntouch after",
-                      "for i in 1; do\n  false && true\n  echo inner\ndone\ntouch after",
-                      "f() {\n  false && true\n  echo inner\n}\nf\ntouch after",
-                      "case x in\n x) false && true\n echo inner;;\nesac\ntouch after",
-                      "! true\ntouch after", "false && true &\ntouch after"):
+    # Lists that Bash prints below a block's level: in the bodies of
+    # compound commands, brace groups and functions. set -e does not stop at
+    # their failure there either, and the program would go on.
+    DEEPER = ("{\n  false && true\n  echo inner\n}\ntouch after",
+              "if true; then\n  false && true\n  echo inner\nfi\ntouch after",
+              "for i in 1; do\n  false && true\n  echo inner\ndone\ntouch after",
+              "while true; do\n  false || break\ndone\ntouch after",
+              "f() {\n  false && true\n  echo inner\n}\nf\ntouch after",
+              "f() {\n  a || return 1\n  b\n}\nc && d",
+              "case x in\n x) false && true\n echo inner;;\nesac\ntouch after",
+              "{ findmnt /srv/demo || echo unmounted; }",
+              "(\n  if a; then\n    b && c\n  fi\n  d\n)\ne")
+
+    def test_lists_below_the_blocks_level_are_refused_at_every_depth(self):
+        for block in self.DEEPER:
+            with self.subTest(block=block):
+                with self.assertRaises(ValueError) as raised:
+                    self.driver.program([("block one", "true"), ("block two", block)])
+                self.assertIn("block two has && or || below its own level", str(raised.exception))
+
+    def test_only_the_lists_read_for_a_block_are_accepted_below_its_level(self):
+        # An entry of the allow-list holds for its own block, by its label,
+        # and for nothing else: the same text in another block is refused,
+        # and so is another list beside it in its own.
+        (label, line), *_ = sorted(self.driver.DEEPER_LISTS)
+        _, block = next(step for step in self.driver.steps() if step[0] == label)
+        self.driver.program([(label, block)])
+        with self.assertRaisesRegex(ValueError, "below its own level"):
+            self.driver.program([(label.replace("block 1", "block 2"), block)])
+        with self.assertRaisesRegex(ValueError, "below its own level"):
+            self.driver.program([(label, "f() {\n  a && b\n  c\n}\n" + block)])
+
+    def test_a_negated_or_a_background_command_is_not_seen(self):
+        # set -e's other exemptions are a known gap: the check reads only
+        # && and ||, so these are accepted and a failure there lets the
+        # program go on.
+        for block in ("! true\ntouch after", "false &\ntouch after"):
             with self.subTest(block=block), tempfile.TemporaryDirectory() as directory:
                 program = self.driver.program([("block", block)])
                 result = subprocess.run(["bash", "-c", program], cwd=directory, capture_output=True,
@@ -196,12 +220,13 @@ class UnguardedLists(unittest.TestCase):
                 self.assertTrue((Path(directory) / "after").exists())
                 self.assertIn("every documented step succeeded", result.stdout)
 
-    def test_the_guides_lists_below_the_block_level_are_their_own_handling(self):
-        # The gap above, for the guides as they are: below a block's level
-        # (here-document bodies, which run in a shell of their own under
-        # `set -euo pipefail`, left out) the only lists are wait_stopped's
-        # returns and the unmount check's alternative. A new one must be
-        # read and added here, or the block reworded.
+    def test_the_allow_list_is_the_guides_lists_below_the_block_level(self):
+        # Below a block's level (here-document bodies, which run in a shell
+        # of their own under `set -euo pipefail`, left out) the guides hold
+        # only wait_stopped's returns and the unmount check's alternative,
+        # each its own handling, and the allow-list names exactly those: a
+        # new one must be read and added, or the block reworded, and one the
+        # guides no longer hold must go.
         bash = shutil.which("bash")
         deeper = []
         for label, block in self.driver.steps():
@@ -210,14 +235,15 @@ class UnguardedLists(unittest.TestCase):
                  'eval "documented_block() {\n$1\n}" && declare -f documented_block', "bash",
                  self.driver.without_heredoc_bodies(block)],
                 capture_output=True, text=True, check=True, timeout=10).stdout
-            deeper += [(label.split(",")[1].strip(), line.strip()) for line in printed.splitlines()
+            deeper += [(label, line.strip()) for line in printed.splitlines()
                        if line.startswith("     ") and ("&&" in line or "||" in line)]
+        step7 = "quickstart.md, 7. Planned stop with a durability acknowledgement, block 1"
         self.assertEqual(deeper, [
-            ("7. Planned stop with a durability acknowledgement",
-             'state=$(systemctl show -P ActiveState "$unit") || return 1;'),
-            ("7. Planned stop with a durability acknowledgement", '[ -n "$pending" ] || return 0;'),
-            ("7. Planned stop with a durability acknowledgement", 'findmnt /srv/demo || echo "unmounted"'),
+            (step7, 'state=$(systemctl show -P ActiveState "$unit") || return 1;'),
+            (step7, '[ -n "$pending" ] || return 0;'),
+            (step7, 'findmnt /srv/demo || echo "unmounted"'),
         ])
+        self.assertEqual(self.driver.DEEPER_LISTS, set(deeper))
 
     def test_the_guides_have_no_unguarded_list(self):
         # The program CI runs is written from them, so this is what CI runs.
