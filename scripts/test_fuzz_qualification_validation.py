@@ -858,8 +858,8 @@ class Merge(Fixture):
     def test_an_interrupt_is_answered_while_an_archive_is_listed(self):
         # Listing an archive of 405,755 members took 9.8 s here, and the
         # runner kills the step 10 s after its interrupt: the merge stops
-        # reading the archive at the interrupt, before it reaches the member
-        # at its end that it would refuse.
+        # reading the archive at the interrupt, before it reaches what it
+        # would refuse at its end, a link or damage.
         class InterruptedAfter:
             def __init__(self, answers):
                 self.answers = answers
@@ -870,11 +870,20 @@ class Merge(Fixture):
 
         link = tarfile.TarInfo("shard/corpus/link")
         link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
-        self.shard(1, b"one", extra=[(link, None)])
-        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 1,
-                                                        InterruptedAfter(2))
-        self.assertEqual((sources, [entry["why"] for entry in unmerged]),
-                         ([], ["the merge was interrupted while it unpacked it"]))
+        for case in ("link", "damage"):
+            with self.subTest(case=case):
+                shutil.rmtree(self.root / "shards", ignore_errors=True)
+                shutil.rmtree(self.root / "packed", ignore_errors=True)
+                if case == "link":
+                    self.shard(1, b"one", extra=[(link, None)])
+                else:
+                    archive = self.shard(1, b"one", b"x" * 2000) / "shard.tar"
+                    data = archive.read_bytes()
+                    archive.write_bytes(data[:data.index(b"x" * 2000) + 1000])
+                sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 1,
+                                                                InterruptedAfter(2))
+                self.assertEqual((sources, [entry["why"] for entry in unmerged]),
+                                 ([], ["the merge was interrupted while it unpacked it"]))
 
     def test_an_interrupt_while_the_archives_are_unpacked_is_recorded(self):
         # The merge's handlers are in place before it unpacks: the runner's
