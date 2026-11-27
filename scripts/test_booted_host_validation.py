@@ -103,7 +103,7 @@ if name == "ssh":
         if plan.get("copy_sleep"):
             time.sleep(plan["copy_sleep"])
         (root / "copied.tar").write_bytes(sys.stdin.buffer.read())
-        sys.exit(0)
+        sys.exit(plan.get("copy_status", 0))
     if plan.get("ssh_sleep"):
         time.sleep(plan["ssh_sleep"])
     sys.exit(next_status("command"))
@@ -334,6 +334,28 @@ class Payload(unittest.TestCase):
         self.assertEqual((output / "maki.deb").read_bytes(), b"package debian12")
         self.assertFalse((output / "quickstart").exists())
 
+    def test_a_clone_that_is_not_at_head_is_refused(self):
+        # The runner would otherwise validate another revision's scripts
+        # beside this commit's package.
+        guest = self.driver.GUESTS["debian12"]
+        output = self.root / "payload"
+        clone = self.driver.checked
+
+        def clone_elsewhere(argv, **options):
+            result = clone(argv, **options)
+            subprocess.run(["git", "-C", str(argv[-1]), "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false",
+                            "commit", "-q", "--allow-empty", "-m", "not the checkout's"],
+                           check=True, capture_output=True)
+            return result
+        with quiet(), mock.patch.object(self.driver, "checked", clone_elsewhere), \
+                self.assertRaises(SystemExit) as refused:
+            self.driver.payload(guest, "runner", self.package(guest), output, self.checkout)
+        self.assertEqual(str(refused.exception),
+                         f"the clone in {output / 'source'} is not at this checkout's HEAD")
+        self.assertFalse((output / guest.package).exists())
+        self.assertFalse((output / "source-revision").exists())
+
     def test_a_package_that_is_not_this_commits_or_does_not_check_out_is_refused(self):
         guest = self.driver.GUESTS["el9"]
         for case, arguments, expected in (
@@ -532,6 +554,29 @@ class RunAndFinish(unittest.TestCase):
         with quiet(), self.assertRaises(SystemExit) as failed:
             self.driver.copy_in(self.work, payload, timeout=1)
         self.assertIn("within 1 s", str(failed.exception))
+
+    def test_a_copy_into_the_guest_fails_when_its_tar_or_its_ssh_fails(self):
+        # The guest phases would otherwise run on what an earlier copy, or
+        # none, left in /var/tmp/maki-ci.
+        payload = self.stubs.root / "payload"
+        payload.mkdir()
+        (payload / "file").write_text("payload\n")
+        self.stubs.set(copy_status=1)
+        with quiet(), self.assertRaises(SystemExit) as failed:
+            self.driver.copy_in(self.work, payload, timeout=30)
+        self.assertEqual(str(failed.exception),
+                         f"copying {payload} into the guest failed (tar 0, ssh 1)")
+        # The archive was sent whole: only the status of the guest's command,
+        # which ssh passes on, says that unpacking it failed.
+        self.assertTrue((self.stubs.root / "copied.tar").stat().st_size > 0)
+        self.stubs.set(copy_status=0)
+        missing = self.stubs.root / "missing"
+        with quiet(), self.assertRaises(SystemExit) as failed:
+            self.driver.copy_in(self.work, missing, timeout=30)
+        message = str(failed.exception)
+        self.assertTrue(message.startswith(f"copying {missing} into the guest failed (tar "), message)
+        self.assertTrue(message.endswith(", ssh 0)"), message)
+        self.assertNotIn("(tar 0,", message)
 
     def test_a_guest_that_stops_answering_is_given_up_after_the_limit(self):
         self.stubs.set(ssh_sleep=5)
