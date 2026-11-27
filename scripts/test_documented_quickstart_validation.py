@@ -4,6 +4,7 @@ that stops at the first command that fails. These tests compose the program
 from the guides and run its mechanics with stand-in blocks; nothing here
 installs, attaches or runs as root."""
 import importlib.util
+import os
 from pathlib import Path
 import re
 import shutil
@@ -301,6 +302,179 @@ class ProgramMechanics(unittest.TestCase):
                 self.assertTrue((root / "before").exists())
                 self.assertFalse(any(root.glob("after*")) or (root / "later").exists())
                 self.assertNotIn("every documented step succeeded", result.stdout)
+
+
+# A stand-in for the bootstrap block, with the guide's behaviour: a run
+# without a record starts over and records the layout, then the filesystem;
+# a run with a record that names no filesystem releases the export, removes
+# the record and fails; one that names it finishes. The knobs make it break
+# the rules the program checks.
+STAND_IN_BOOTSTRAP = r"""bash <<'BASH'
+set -euo pipefail
+volume=demo
+dev=/dev/nbd0
+record=@ROOT@/demo.bootstrap
+echo run >> @ROOT@/log
+if [[ -e $record ]]; then
+    if ! grep -q '^fs_uuid=' "$record"; then
+        [[ -n ${KEEP_RECORD:-} ]] || rm "$record"
+        [[ -n ${KEEP_BACKEND:-} ]] || rm -f @ROOT@/sys/block/nbd0/backend
+        echo released >> @ROOT@/log
+        [[ -n ${RELEASE_SUCCEEDS:-} ]] && exit 0
+        exit 1
+    fi
+else
+    printf 'pv_uuid=1\n' > "$record"
+    echo maki-bootstrap-1 > @ROOT@/sys/block/nbd0/backend
+    if ! mkfs.xfs; then
+        [[ -z ${NO_RECORD:-} ]] || rm "$record"
+        [[ -n ${NO_STOP:-} ]] || exit 1
+    fi
+    printf 'fs_uuid=2\n' >> "$record"
+fi
+if ! vgchange; then
+    [[ -n ${NO_STOP:-} ]] || exit 1
+fi
+rm -f "$record" @ROOT@/sys/block/nbd0/backend
+echo created >> @ROOT@/log
+BASH
+"""
+FAKE_TOOL = """#!/bin/sh
+echo "${0##*/} $*" >> "$FIXTURE/log"
+if [ "${0##*/}" = systemctl ]; then echo "${SYSTEMCTL_STATE:-inactive}"; fi
+"""
+
+
+@unittest.skipUnless(shutil.which("bash"), "requires Bash")
+class StoppedBootstrap(unittest.TestCase):
+    """--stop-once: the bootstrap's first run stops where a shim on PATH
+    fails one command, and the same block runs again, as the first-volume
+    guide's recovery notes say, before the rest of the quick start."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.driver = load_driver()
+        cls.steps = cls.driver.steps()
+        cls.bootstrap = cls.steps[6][1]
+        cls.creation = cls.steps[5][1]
+
+    def test_the_bootstraps_values_and_the_guides_reset_are_read(self):
+        self.assertEqual(self.driver.bootstrap_values(self.bootstrap),
+                         {"volume": "demo", "dev": "/dev/nbd0",
+                          "record": "/etc/maki/attach/demo.bootstrap"})
+        self.assertEqual(self.driver.recovery_reset(), ("/var/lib/maki/demo", "maki@demo.service"))
+        with tempfile.TemporaryDirectory() as directory:
+            guide = Path(directory) / "first-volume.md"
+            guide.write_text((GUIDES / "first-volume.md").read_text().replace(
+                "remove `/var/lib/maki/demo`", "delete `/var/lib/maki/demo`"))
+            with mock.patch.object(self.driver, "FIRST_VOLUME", guide), \
+                    self.assertRaisesRegex(ValueError, "reset"):
+                self.driver.recovery_reset()
+
+    def test_the_bootstrap_runs_again_as_the_recovery_notes_say(self):
+        for command, runs in (("mkfs.xfs", 3), ("vgchange", 2)):
+            with self.subTest(command=command):
+                program = self.driver.program(self.steps, stop_once=command)
+                labels = re.findall(r"(?m)^step='\[\d+/\d+\] (.*)'$", program)
+                self.assertEqual(len(labels), len(self.steps) + (runs - 1) + (2 if runs == 3 else 0))
+                provision = self.driver.QUICKSTART.name + ", " + self.driver.PROVISION_STEP
+                bootstrap_label = next(label for label, _ in self.steps if label.startswith(provision))
+                expected = [f"{bootstrap_label} (run 1 of {runs}: {command} fails)",
+                            f"{bootstrap_label} (run 2 of {runs}: continues from the record)"]
+                if runs == 3:
+                    expected += ["first-volume.md, Recovering from a failed bootstrap: remove "
+                                 "/var/lib/maki/demo while maki@demo.service is stopped",
+                                 self.steps[5][0] + " (again)", f"{bootstrap_label} (run 3 of 3)"]
+                start = labels.index(expected[0])
+                self.assertEqual(labels[start:start + len(expected)], expected)
+                self.assertEqual(labels[:start], [label for label, _ in self.steps[:6]])
+                self.assertEqual(labels[start + len(expected):], [label for label, _ in self.steps[7:]])
+                # Each run is the block itself, and the creation block runs
+                # again only after the reset.
+                self.assertEqual(program.count(self.bootstrap), runs)
+                self.assertEqual(program.count(self.creation), 2 if runs == 3 else 1)
+                # Only the first run has the shim on its PATH.
+                self.assertEqual(program.count('export PATH="$documented_shim:$PATH"'), 1)
+                shim = program.index('export PATH="$documented_shim:$PATH"')
+                self.assertLess(shim, program.index(self.bootstrap))
+                self.assertLess(program.index('export PATH="$documented_path"'),
+                                program.index(self.bootstrap, program.index(self.bootstrap) + 1))
+                self.assertEqual("rm -rf -- /var/lib/maki/demo\n" in program, runs == 3)
+
+    def run_stopped(self, command, **environment):
+        directory = tempfile.TemporaryDirectory(prefix="maki-stopped-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "sys/block/nbd0").mkdir(parents=True)
+        (root / "var/lib/maki/demo").mkdir(parents=True)
+        (root / "bin").mkdir()
+        for name in ("mkfs.xfs", "vgchange", "systemctl"):
+            (root / "bin" / name).write_text(FAKE_TOOL)
+            (root / "bin" / name).chmod(0o700)
+        found = [(self.steps[5][0], "echo create >> " + str(root / "log")),
+                 (self.steps[6][0], STAND_IN_BOOTSTRAP.replace("@ROOT@", str(root))),
+                 ("after", "echo after >> " + str(root / "log"))]
+        with mock.patch.object(self.driver, "SYSFS", str(root / "sys/block")), \
+                mock.patch.object(self.driver, "recovery_reset",
+                                  lambda: (str(root / "var/lib/maki/demo"), "maki@demo.service")):
+            program = self.driver.program(found, stop_once=command)
+        env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                   FIXTURE=str(root), **environment)
+        result = subprocess.run(["bash", "-c", program], cwd=root, env=env, capture_output=True,
+                                text=True, timeout=20)
+        log = (root / "log").read_text().splitlines() if (root / "log").exists() else []
+        return result, log, root
+
+    def test_a_stop_before_the_filesystem_is_released_reset_and_started_over(self):
+        result, log, root = self.run_stopped("mkfs.xfs")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(log, ["create", "run", "run", "released", "systemctl show -P ActiveState "
+                               "maki@demo.service", "systemctl show -P ActiveState maki@demo.service",
+                               "create", "run", "mkfs.xfs ", "vgchange ", "created", "after"])
+        self.assertFalse((root / "var/lib/maki/demo").exists())
+        self.assertIn("mkfs.xfs: failed once by documented_quickstart.py", result.stderr)
+        self.assertIn("pv_uuid=1", result.stdout)
+        self.assertIn("every documented step succeeded", result.stdout)
+
+    def test_a_stop_after_the_filesystem_is_finished_by_the_next_run(self):
+        result, log, root = self.run_stopped("vgchange")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(log, ["create", "run", "mkfs.xfs ", "run", "vgchange ", "created", "after"])
+        self.assertTrue((root / "var/lib/maki/demo").exists())
+        self.assertIn("vgchange: failed once by documented_quickstart.py", result.stderr)
+        self.assertIn("fs_uuid=2", result.stdout)
+
+    def test_a_run_that_breaks_the_recovery_notes_stops_the_program(self):
+        cases = {
+            ("mkfs.xfs", "NO_STOP"): "the bootstrap did not stop where mkfs.xfs failed",
+            ("vgchange", "NO_STOP"): "the bootstrap did not stop where vgchange failed",
+            ("mkfs.xfs", "NO_RECORD"): "the stopped bootstrap left no record",
+            ("mkfs.xfs", "RELEASE_SUCCEEDS"): "must fail once it has released the export",
+            ("mkfs.xfs", "KEEP_RECORD"): "kept its record",
+            ("mkfs.xfs", "KEEP_BACKEND"): "still shows the connection maki-bootstrap-1",
+            ("mkfs.xfs", "SYSTEMCTL_STATE"): "maki@demo.service is active, not stopped",
+        }
+        for (command, knob), message in cases.items():
+            with self.subTest(command=command, knob=knob):
+                result, log, root = self.run_stopped(
+                    command, **{knob: "active" if knob == "SYSTEMCTL_STATE" else "1"})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stderr)
+                self.assertIn("stopped in [", result.stderr)
+                self.assertNotIn("after", log)
+                self.assertNotIn("every documented step succeeded", result.stdout)
+                # Each stops before the reset: nothing is removed.
+                self.assertTrue((root / "var/lib/maki/demo").exists())
+
+    def test_the_writer_takes_the_command_to_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "stopped"
+            with mock.patch("builtins.print"):
+                self.assertEqual(self.driver.main(["--stop-once", "mkfs.xfs", str(target)]), 0)
+            self.assertEqual((target / "quickstart.sh").read_text(),
+                             self.driver.program(self.steps, stop_once="mkfs.xfs"))
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                self.driver.main(["--stop-once", "lvcreate", str(Path(directory) / "other")])
 
 
 
