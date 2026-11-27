@@ -762,7 +762,8 @@ authority and fork the current generation inside the snapshot directory.
 Attach, `check`, `volume inspect`, `volume snapshot`, `volume takeover` and
 `volume gc` would then refuse the volume's own root as one that does not
 hold the current generation; `volume restore` does not, since the root's
-`remote.enrollment` identifies it, and a snapshot of the copy restored onto
+`remote.enrollment` identifies it (a root without that binding is refused
+by restore too), and a snapshot of the copy restored onto
 the volume's root, as [above](#snapshot-takeover-and-restore), puts the
 volume back with what was written on the copy. A root without
 `remote.operation.lock`, which every operation that changes a remote root

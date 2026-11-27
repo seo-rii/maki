@@ -442,7 +442,9 @@ too:
   takeover` and `volume gc` with the volume's own configuration then refuse
   its own root as one that does not hold the authority's current generation;
   `maki volume restore` does not, since the root's `remote.enrollment`
-  identifies it. To put the volume back on its own root, detach it, snapshot
+  identifies it (a root without that binding, such as an activated root an
+  older release wrote, is refused by restore too, and this way back is
+  closed to it). To put the volume back on its own root, detach it, snapshot
   the copy (with a configuration that names it) into a new directory and
   restore that snapshot onto the volume's root
   ([snapshot, takeover and restore](remote-witness-service.md#snapshot-takeover-and-restore)):
