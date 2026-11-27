@@ -702,8 +702,10 @@ class Opener(unittest.TestCase):
         cls.module = load_opener()
 
     def hold(self, reads, *, shown_at_failure="maki-1", gone_after_close=True, stop_after=None,
-             hold_seconds=2.0, initial="maki-1", during_hold="maki-1"):
-        state = {"backend": initial, "reads": 0}
+             hold_seconds=2.0, initial="maki-1", during_hold="maki-1", linger=0.0):
+        """`linger`: how long after the close the device still shows the
+        connection, when it goes at all (`gone_after_close`)."""
+        state = {"backend": initial, "reads": 0, "closed": None}
         clock = Clock()
 
         def sleep(seconds):
@@ -715,7 +717,12 @@ class Opener(unittest.TestCase):
 
         def on_close():
             if gone_after_close:
+                state["closed"] = clock.now
+
+        def shown():
+            if state["closed"] is not None and clock.now - state["closed"] >= linger:
                 state["backend"] = None
+            return state["backend"]
 
         device = ScriptedDevice(reads, on_close)
         original_read = device.read
@@ -730,7 +737,7 @@ class Opener(unittest.TestCase):
 
         device.read = read
         status = self.module.hold(
-            device, lambda: state["backend"],
+            device, shown,
             lambda: stop_after is not None and state["reads"] >= stop_after,
             clock=clock, sleep=sleep, say=output.append, hold_seconds=hold_seconds)
         return status, "\n".join(output), device, clock
@@ -764,6 +771,22 @@ class Opener(unittest.TestCase):
         status, output, _, clock = self.hold([True, errno.EIO], gone_after_close=False)
         self.assertEqual(status, 5, output)
         self.assertIn("still shows a connection 5 s after the close", output)
+
+    def test_attributes_that_go_within_the_release_window_after_the_close_pass(self):
+        # The kernel drops them when the last reference to the device goes,
+        # which can be a moment after this opener's close: the opener waits
+        # up to five seconds for that, and not longer.
+        for linger, expected in ((0.2, 0), (4.9, 0), (5.2, 5)):
+            with self.subTest(linger=linger):
+                status, output, _, clock = self.hold([True, errno.EIO], linger=linger)
+                self.assertEqual(status, expected, output)
+                closed = self.module.INTERVAL + 2.0
+                if expected == 0:
+                    self.assertIn("the device shows no connection now that it is closed", output)
+                    self.assertGreaterEqual(clock.now, closed + linger)
+                else:
+                    self.assertIn("still shows a connection 5 s after the close", output)
+                    self.assertLess(clock.now, closed + linger)
 
     def test_a_failure_before_any_served_read_or_other_than_eio_is_refused(self):
         status, output, device, _ = self.hold([errno.EIO])
