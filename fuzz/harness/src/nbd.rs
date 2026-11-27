@@ -7,14 +7,14 @@
 //! commands and the kernel report what LVM metadata, partition tables,
 //! filesystems and device-mapper tables on the volume's device say.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use maki_privileged::nbd_kernel::fuzzing;
 use maki_privileged::nbd_kernel::handshake::{
-    client_request, negotiate, IHAVEOPT, MAX_EXPORT_SIZE, MAX_HANDSHAKE_BYTES, NBDMAGIC,
+    client_request, negotiate, Export, IHAVEOPT, MAX_EXPORT_SIZE, MAX_HANDSHAKE_BYTES, NBDMAGIC,
     NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_HAS_FLAGS, NBD_FLAG_NO_ZEROES, NBD_FLAG_SEND_FLUSH,
     NBD_FLAG_SEND_FUA, NBD_FLAG_SEND_TRIM, NBD_INFO_BLOCK_SIZE, NBD_INFO_DESCRIPTION,
     NBD_INFO_EXPORT, NBD_INFO_NAME, NBD_OPT_GO, NBD_REP_ACK, NBD_REP_ERR_POLICY,
@@ -37,32 +37,42 @@ const GREETING: usize = 18;
 /// exactly the handshake: what follows the acknowledgement is the
 /// transmission phase, the kernel's to read. An input is accepted when the
 /// client returns an export.
+///
+/// The server runs on the calling thread, and a call frees every heap
+/// block it allocates before it returns
+/// (`tests/review_fuzz_entry_threads.rs`): the input is in the socket and
+/// the server's sending side is closed before the client starts, and the
+/// client's request is read once the client has closed its socket.
+/// libFuzzer runs a call that ended with more mallocs than frees, in any
+/// thread, again and, when that run ends so too, checks the process for
+/// leaks, and after 1,000 such checks it stops looking for leaks per
+/// input; under AddressSanitizer a thread per input grows the process's
+/// memory with every input. Only an input the socket cannot hold is written
+/// by a thread of the call's own ([`queue`]).
 pub fn nbd_handshake(data: &[u8]) -> bool {
     let (client, mut server) = UnixStream::pair().expect("a socket pair");
-    let sent_by_server = data.to_vec();
-    let writer = std::thread::spawn(move || {
-        // The client stops reading at its first error; the bytes it left
-        // are drained below, so this write always ends.
-        let _ = server.write_all(&sent_by_server);
+    let queued = queue(&server, data);
+    let (result, left) = if queued == data.len() {
         let _ = server.shutdown(Shutdown::Write);
-        let mut request = Vec::new();
-        let _ = server.read_to_end(&mut request);
-        request
-    });
-    let result = negotiate(&client, Instant::now() + DEADLINE);
-    let mut left = 0;
-    let mut reader = &client;
-    let mut buffer = [0; 65536];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => left += count,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => panic!("draining the client: {error}"),
-        }
-    }
-    drop(client);
-    let request = writer.join().expect("the server thread");
+        client_side(client)
+    } else {
+        std::thread::scope(|scope| {
+            let server = &server;
+            scope.spawn(move || {
+                // The client stops reading at its first error; the bytes
+                // it left are drained by `client_side`, so this write
+                // always ends.
+                let mut writer = server;
+                let _ = writer.write_all(&data[queued..]);
+                let _ = server.shutdown(Shutdown::Write);
+            });
+            client_side(client)
+        })
+    };
+    // The client has closed its socket: its request is in the server's
+    // receive queue, followed by the end of the stream.
+    let mut request = Vec::new();
+    let _ = server.read_to_end(&mut request);
     let consumed = data.len() - left;
     assert!(
         consumed <= MAX_HANDSHAKE_BYTES,
@@ -98,6 +108,55 @@ pub fn nbd_handshake(data: &[u8]) -> bool {
         "the client did not read exactly the handshake"
     );
     true
+}
+
+/// Write as much of `data` into the server's socket as it takes without
+/// waiting, and return how much that was. Nothing reads the server's
+/// bytes before the client starts, so the input must fit in the socket's
+/// send buffer: `net.core.wmem_default` when the pair is made, 212,992
+/// bytes by default. On Linux 6.18 that buffer took 219,264 bytes in one
+/// write, and a smaller one an input up to 128 bytes shorter than itself,
+/// so the target's `-max_len` of 70,000 bytes fits unless the buffer is
+/// below 70,128 bytes. Where it does not fit, a thread writes the rest
+/// while the client reads.
+fn queue(server: &UnixStream, data: &[u8]) -> usize {
+    server
+        .set_nonblocking(true)
+        .expect("a nonblocking server socket");
+    let mut writer = server;
+    let mut queued = 0;
+    while queued < data.len() {
+        match writer.write(&data[queued..]) {
+            Ok(0) => break,
+            Ok(count) => queued += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("writing the input: {error}"),
+        }
+    }
+    server
+        .set_nonblocking(false)
+        .expect("a blocking server socket");
+    queued
+}
+
+/// The client: the helper's handshake on `client`, then the number of the
+/// server's bytes it left unread. The client's socket is closed when this
+/// returns, and also when it unwinds, so a thread still writing to it ends.
+fn client_side(client: UnixStream) -> (io::Result<Export>, usize) {
+    let result = negotiate(&client, Instant::now() + DEADLINE);
+    let mut left = 0;
+    let mut reader = &client;
+    let mut buffer = [0; 65536];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => left += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => panic!("draining the client: {error}"),
+        }
+    }
+    (result, left)
 }
 
 /// The server's handshake flags, if `data` starts with a greeting that
