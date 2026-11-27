@@ -141,6 +141,12 @@ class StopTogether(unittest.TestCase):
         self.result = "success"
         self.left = None
         self.stop_status = 0
+        # As systemd does: `systemctl stop` of the targets returns once the
+        # targets' own jobs are done, and each attach unit is then still
+        # deactivating for this many looks at its state, without the time
+        # it entered inactive (GitHub's run of 2026-11-27).
+        self.deactivating = {1: 2, 2: 4, 3: 6}
+        self.ended = "inactive"
 
     def host(self, argv, **_):
         self.events.append(argv)
@@ -150,13 +156,20 @@ class StopTogether(unittest.TestCase):
                     (self.state / f"{name}.nbd").unlink()
                     (self.sysfs / f"nbd{index}/backend").unlink()
             return subprocess.CompletedProcess(argv, self.stop_status)
+        attach = argv[-1].startswith("maki-attach@stop")
+        index = int(argv[-1][len("maki-attach@stop"):-len(".service")]) if attach else None
+        stopping = attach and self.deactivating[index] > 0
         if argv[:2] == ["systemctl", "show"] and "-P" in argv:
-            return subprocess.CompletedProcess(argv, 0, stdout="inactive\n")
+            if stopping:
+                self.deactivating[index] -= 1
+                return subprocess.CompletedProcess(argv, 0, stdout="deactivating\n")
+            return subprocess.CompletedProcess(argv, 0, stdout=(self.ended if attach
+                                                                 else "inactive") + "\n")
         if argv[:2] == ["systemctl", "show"]:
-            index = int(argv[-1][len("maki-attach@stop"):-len(".service")])
+            ended = 0 if stopping else (100 + index * 10.2) * 1e6
             return subprocess.CompletedProcess(argv, 0, stdout=(
                 f"ActiveExitTimestampMonotonic={(100 + index * 0.01) * 1e6:.0f}\n"
-                f"InactiveEnterTimestampMonotonic={(100 + index * 10.2) * 1e6:.0f}\n"
+                f"InactiveEnterTimestampMonotonic={ended:.0f}\n"
                 f"Result={self.result}\n"))
         if argv[0] == "findmnt":
             return subprocess.CompletedProcess(argv, 1)
@@ -214,6 +227,39 @@ class StopTogether(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, re.escape(message)):
                     self.stop(**opener)
                 self.assertTrue((self.work / "stop-together.json").exists())
+
+    def test_each_attach_units_times_are_read_once_it_has_stopped(self):
+        report, _ = self.stop()
+        for index in (1, 2, 3):
+            unit = f"maki-attach@stop{index}.service"
+            looks = [position for position, event in enumerate(self.events)
+                     if event == ["systemctl", "show", "-P", "ActiveState", unit]]
+            [read] = [position for position, event in enumerate(self.events)
+                      if event[:2] == ["systemctl", "show"] and "-P" not in event
+                      and event[-1] == unit]
+            # Each look while it was deactivating, and the one that found it
+            # stopped, came before its times were read.
+            self.assertGreaterEqual(len([look for look in looks if look < read]), 2 * index + 1)
+        self.assertEqual([volume["result"] for volume in report["volumes"]], ["success"] * 3)
+        self.assertEqual(report["stop_command_seconds"], 0.0)
+
+    def test_an_attach_unit_that_does_not_stop_or_fails_is_reported(self):
+        for case, message in (("never", "maki-attach@stop2.service did not stop within 300 s"),
+                              ("failed", "maki-attach@stop1.service stopped with result exit-code")):
+            with self.subTest(case=case):
+                self.setUp()
+                if case == "never":
+                    self.deactivating[2] = 10 ** 6
+                else:
+                    self.ended, self.result = "failed", "exit-code"
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self.stop()
+                report = json.loads((self.work / "stop-together.json").read_text())
+                if case == "never":
+                    self.assertIsNone(report["volumes"][1]["stop_seconds"])
+                    self.assertEqual(report["volumes"][0]["stop_seconds"], 10.19)
+                else:
+                    self.assertEqual(report["volumes"][0]["result"], "exit-code")
 
     def test_an_opener_that_never_holds_its_device_stops_before_any_stop(self):
         with self.assertRaisesRegex(RuntimeError, "did not start holding /dev/nbd0"):
