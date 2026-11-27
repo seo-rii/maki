@@ -675,6 +675,37 @@ mod receive_contract_tests {
 /// many RPC timeouts (BUG-115).
 const CONNECT_BOUND_RPC_TIMEOUTS: u32 = 4;
 
+/// hyper-util's delay before its connector dials the other address family,
+/// which tonic's own connector keeps.
+const OTHER_FAMILY_DELAY: Duration = Duration::from_millis(300);
+
+/// The connector's delay before it dials the other address family: 300 ms,
+/// or half the RPC `timeout` when that is shorter, the WebSocket
+/// transport's rule, which halves what is left when its dial begins.
+/// hyper-util takes one delay for every connect, set when the provider is
+/// built. The connection worker starts with the call that needs it, so the
+/// delay is half of that call's whole `timeout`, and the other family has
+/// the other half, less the time the name took to resolve.
+fn other_family_delay(timeout: Duration) -> Duration {
+    OTHER_FAMILY_DELAY.min(timeout / 2)
+}
+
+#[cfg(test)]
+mod other_family_delay_tests {
+    use super::{other_family_delay, Duration};
+
+    #[test]
+    fn the_other_family_waits_300_ms_or_half_of_a_shorter_timeout() {
+        for (timeout, delay) in [(10_000, 300), (600, 300), (598, 299), (200, 100), (2, 1)] {
+            assert_eq!(
+                other_family_delay(Duration::from_millis(timeout)),
+                Duration::from_millis(delay),
+                "a {timeout} ms timeout"
+            );
+        }
+    }
+}
+
 pub struct GrpcProviderSpec {
     /// e.g. `http://crypto.internal:7000` (or https with TLS config).
     pub url: String,
@@ -907,16 +938,18 @@ impl GrpcCryptoProvider {
         // immediately rather than leaving it in tonic's background queue.
         // The bound is several RPC timeouts: a slow but working handshake
         // still completes in the background for the next RPC, as before.
-        // The TCP connector is configured like tonic's own: hyper-util
-        // divides its timeout among the resolved addresses of each family
-        // and starts the other family 300 ms after the first, so an
-        // unreachable first address (`localhost` as `::1` on Windows) leaves
-        // time for the next (`connect_tests.rs`).
+        // The TCP connector is configured like tonic's own, but for the
+        // other family's delay: hyper-util divides its timeout among the
+        // resolved addresses of each family and starts the other family
+        // after `other_family_delay`, so an unreachable first address
+        // (`localhost` as `::1` on Windows) leaves time for the next
+        // (`connect_tests.rs`).
         let mut tcp =
             hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(resolver);
         tcp.enforce_http(false);
         tcp.set_nodelay(true);
         tcp.set_connect_timeout(Some(spec.timeout));
+        tcp.set_happy_eyeballs_timeout(Some(other_family_delay(spec.timeout)));
         let endpoint = endpoint
             .timeout(spec.timeout)
             .connect_timeout(spec.timeout.saturating_mul(CONNECT_BOUND_RPC_TIMEOUTS));
