@@ -29,7 +29,11 @@
 //! allocates. A pattern that starts a thread or keeps a block only every
 //! more than [`CALLS`] calls is not seen. The counts are the process's,
 //! so this file holds one test: another test running beside it would be
-//! counted too.
+//! counted too. `nbd_handshake` writes an input its socket's send buffer
+//! cannot hold with a thread (`queue` in `src/nbd.rs`): on a host whose
+//! `net.core.wmem_default` is below 65,968 bytes its longest seed (65,840
+//! bytes) fails here, as fuzzing it would start a thread there, and below
+//! 65,546 bytes also the next (65,418 bytes).
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};

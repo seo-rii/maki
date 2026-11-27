@@ -8,10 +8,12 @@
 //! (libFuzzer reports that as a crash), and otherwise returns whether the
 //! code accepted the input. [`seeds`] writes the committed seeds.
 //!
-//! A function starts no thread per input
-//! (`tests/review_fuzz_entry_threads.rs`): libFuzzer runs millions of
-//! inputs in one process, and under AddressSanitizer the process's memory
-//! grows with every thread it has started.
+//! A function starts no thread per input and frees every heap block it
+//! allocates before it returns (`tests/review_fuzz_entry_threads.rs`):
+//! libFuzzer runs millions of inputs in one process, under AddressSanitizer
+//! the process's memory grows with every thread it has started, and
+//! libFuzzer stops looking for leaks per input after 1,000 calls that end
+//! with more mallocs than frees.
 
 #[cfg(target_os = "linux")]
 mod nbd;
