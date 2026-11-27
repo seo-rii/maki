@@ -1582,8 +1582,9 @@ fn a_mismatched_configuration_fails_a_read_only_check_of_a_remote_volume() {
 /// read-only: `maki volume snapshot` copies the current generation into a
 /// namespace of the same name, without the `rollback.lock` that a writer's
 /// namespace holds, and the read-only view refuses a namespace whose lock
-/// is missing. The authority is sent inspections only, and neither root
-/// changes.
+/// is missing, saying that the root is probably such a copy and must not
+/// be attached or opened to write (which would move the volume onto it).
+/// The authority is sent inspections only, and neither root changes.
 #[test]
 fn a_configuration_pointed_at_a_snapshot_destination_is_refused_read_only() {
     let fixture = Fixture::new();
@@ -1620,10 +1621,20 @@ fn a_configuration_pointed_at_a_snapshot_destination_is_refused_read_only() {
         vec!["check", path, "--deep"],
     ] {
         fixture.clear();
-        failure(
-            &args,
-            &format!("{namespace}/rollback.lock is missing, and a read-only open cannot create it"),
-        );
+        let output = run(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        for said in [
+            format!("{namespace}/rollback.lock is missing, and a read-only open cannot create it"),
+            "a copy of its current namespace, such as a `maki volume snapshot` destination".into(),
+            "do not attach it or open it to write".into(),
+        ] {
+            assert!(
+                stderr.contains(&said),
+                "{args:?}: {said:?} is missing: {stderr}"
+            );
+        }
+        assert!(!stderr.contains("recreates the file"), "{args:?}: {stderr}");
         let sent = fixture.sent();
         assert!(
             !sent.is_empty() && sent.iter().all(|action| *action == "inspect"),
