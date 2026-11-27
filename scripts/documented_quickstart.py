@@ -21,11 +21,13 @@ that Bash cannot read, and one with `&&` or `||`, matched as text, on any line t
 prints at the block's own level (a subshell's commands print there too) up to
 the last such line, before the last line it prints at that level, that ends in `;` or
 holds a here-document's command; so a condition, a test expression, quoted
-text or a command substitution there is refused too. It does not see
-lists inside the bodies of `if`, `while`, `for` or `case`, brace groups or
-functions, nor `set -e`'s other exemptions (a negated or a background
-command): a failure there lets the program go on. The check relies on the
-layout of `declare -f`.
+text or a command substitution there is refused too. Below the block's level
+(the bodies of `if`, `while`, `for` or `case`, brace groups and functions,
+at any depth) it refuses every line with `&&` or `||` that `DEEPER_LISTS`
+does not name for that block: the guides' current ones, each read. It does
+not see `set -e`'s other exemptions (a negated or a background command): a
+failure there lets the program go on. Here-document bodies run in a shell of
+their own and are not read. The check relies on the layout of `declare -f`.
 """
 import argparse
 import os
@@ -129,18 +131,31 @@ def without_heredoc_bodies(block):
     return "\n".join(lines) + "\n"
 
 
-def has_unguarded_list(label, block):
-    """Whether `block` has `&&` or `||`, matched as text, on a line that
-    `declare -f` prints at the block's own level (four spaces in; a
-    subshell's commands print there too) up to the last such line, before
-    the last line it prints at that level, that ends in `;` or holds a
-    here-document's command. Lines printed deeper (the bodies of compound
-    commands, brace groups and functions) and the block-level lines after
-    that one are not read.
+# The `&&` and `||` lists the guides hold below a block's own level, as
+# `declare -f` prints them (stripped), by the label of their block. Each was
+# read, and handles its own failure where it is: `wait_stopped`'s returns
+# give the function's status to its caller, and the unmount check's
+# alternative is what that step reports. Any other list below a block's
+# level is refused: read a new one and add it here, or reword the block.
+DEEPER_LISTS = {
+    ("quickstart.md, 7. Planned stop with a durability acknowledgement, block 1",
+     'state=$(systemctl show -P ActiveState "$unit") || return 1;'),
+    ("quickstart.md, 7. Planned stop with a durability acknowledgement, block 1",
+     '[ -n "$pending" ] || return 0;'),
+    ("quickstart.md, 7. Planned stop with a durability acknowledgement, block 1",
+     'findmnt /srv/demo || echo "unmounted"'),
+}
 
-    The block is first only read (`bash -n`): a
-    block that Bash reads alone cannot close the function it is put in, so
-    defining that function runs none of it."""
+
+def printed_lines(label, block):
+    """The lines Bash prints for `block`, without its here-document
+    bodies, as the body of a function (`declare -f`), each without the
+    function's own four spaces of indentation: a line printed at the block's
+    own level starts with no space, one printed deeper with one or more.
+
+    The block is first only read (`bash -n`): a block that Bash reads alone
+    cannot close the function it is put in, so defining that function runs
+    none of it."""
     bash = shutil.which("bash")
     if bash is None:
         raise ValueError("Bash is needed to read the guides' blocks")
@@ -154,11 +169,26 @@ def has_unguarded_list(label, block):
         [bash, "--noprofile", "--norc", "-c",
          'eval "documented_block() {\n$1\n}" && declare -f documented_block', "bash", body],
         env=environment, capture_output=True, text=True, timeout=10, check=True).stdout
-    level = [line[4:] for line in printed.splitlines()
-             if line.startswith("    ") and not line.startswith("     ")]
+    return [line[4:] for line in printed.splitlines() if line.startswith("    ")]
+
+
+def has_unguarded_list(lines):
+    """Whether `lines` (`printed_lines`) have `&&` or `||`, matched as text,
+    on a line printed at the block's own level up to the last such line,
+    before the last line printed at that level, that ends in `;` or holds a
+    here-document's command. The block-level lines after that one are not
+    read."""
+    level = [line for line in lines if not line.startswith(" ")]
     ends = [index for index, line in enumerate(level[:-1])
             if line.endswith(";") or HEREDOC.search(line)]
     return bool(ends) and any("&&" in line or "||" in line for line in level[:ends[-1] + 1])
+
+
+def deeper_lists(lines):
+    """The lines of `lines` (`printed_lines`) printed below the block's own
+    level that have `&&` or `||`, matched as text, stripped."""
+    return [line.strip() for line in lines
+            if line.startswith(" ") and ("&&" in line or "||" in line)]
 
 
 def program(found):
@@ -167,13 +197,20 @@ def program(found):
     `set -e -o pipefail` stops at a failed command or pipeline; one inside an
     `&&` or `||` list does not trigger it, so each block's own status is
     checked after it, and a block that `has_unguarded_list` finds with `&&`
-    or `||` at its own level before its last command is refused (lists in
-    compound-command bodies, brace groups and functions are not seen)."""
+    or `||` at its own level before its last command is refused, as is one
+    with a list below its level (in a compound command's body, a brace group
+    or a function, at any depth) that `DEEPER_LISTS` does not name for it."""
     for label, block in found:
-        if has_unguarded_list(label, block):
+        lines = printed_lines(label, block)
+        if has_unguarded_list(lines):
             raise ValueError(f"{label} has && or || at its own level before its last command: "
                              "set -e does not stop at a failed list there, and the block's status "
                              "is its last command's")
+        unread = [line for line in deeper_lists(lines) if (label, line) not in DEEPER_LISTS]
+        if unread:
+            raise ValueError(f"{label} has && or || below its own level that DEEPER_LISTS does not "
+                             f"name for it: {unread[0]!r}. set -e does not stop at a failed list "
+                             "there either: read it and add it, or reword the block")
     lines = [PRELUDE]
     for number, (label, block) in enumerate(found, 1):
         lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")
