@@ -1000,24 +1000,26 @@ documents.
   the service's start deadline** (AUD-216, 2026-11-27;
   [#419](https://github.com/seo-rii/maki/pull/419)). Attach probed the
   endpoints of a remote provider one after another, so each endpoint that
-  never answered delayed the next by about three times `timeout` (six over
-  WebSocket) and two `retry.initial_delay`s: at the default 10 s, three such
-  WebSocket endpoints listed before a healthy one, six over HTTP or gRPC, or
-  two at a 30 s `timeout`, held its probe past `maki@`'s
-  `TimeoutStartSec=180`, and systemd would stop the start. The endpoints are
-  now probed at once: endpoints that do not answer cost the attach about one
-  probe however many are listed (60 s for three WebSocket endpoints at 10 s in
-  the pull request's test), and the attach still waits until every probe has
-  ended. Their key canary checks still run one at a time in configuration
-  order, so the same endpoint establishes, rewrites or verifies the canary as
-  before, and endpoints that pass their self-test and then fail their canary
-  check with transport failures still delay the ones after them, each by up to
-  its own probe. Every endpoint is now sent its self-test requests at the
-  start, also one listed after an endpoint whose probe refuses the attach,
-  which was never contacted before. The refusals, their texts and their order
-  (configuration order) are unchanged, and a lone endpoint is probed as
-  before. With `NOTIFY_SOCKET` set, each probe request that ends, answered or
-  failed, and each request of the cross-endpoint check after the probes sends
+  never answered delayed the next: for a `retry_safe` provider by about three
+  times `timeout` (six over WebSocket) and two `retry.initial_delay`s, and by
+  about one `timeout` for one that is not. At the default 10 s and with a
+  `retry_safe` provider, three such WebSocket endpoints listed before a
+  healthy one, six over HTTP or gRPC, or two at a 30 s `timeout`, held its
+  probe past `maki@`'s `TimeoutStartSec=180`, and systemd would stop the
+  start. The endpoints are now probed at once: endpoints that do not answer
+  cost the attach about one probe however many are listed (60 s for three
+  WebSocket endpoints at 10 s in the pull request's test), and the attach
+  still waits until every probe has ended. Their key canary checks still run
+  one at a time in configuration order, so the same endpoint establishes,
+  rewrites or verifies the canary as before, and endpoints that pass their
+  self-test and then fail their canary check with transport failures still
+  delay the ones after them, each by up to its own probe. Every endpoint is
+  now sent its self-test requests at the start, also one listed after an
+  endpoint whose probe refuses the attach, which was never contacted before.
+  The refusals, their texts and their order (configuration order) are
+  unchanged, and a lone endpoint is probed as before. With `NOTIFY_SOCKET`
+  set, each probe request that ends, answered or failed, and each request of
+  the cross-endpoint check after the probes sends
   `EXTEND_TIMEOUT_USEC=180000000` with `STATUS=Probing crypto endpoints`, at
   most once every 30 s, a limit it shares with recovery's extension. The
   deadline still expires when no request ends for about 150 s, and the
@@ -1519,13 +1521,13 @@ documents.
   corpus of every one, and the summary checks the merge's sources against the
   plan and each merged corpus against its shard record's count.
   `actions/upload-artifact@v4` had failed with `Maximum call stack size
-  exceeded` on the shard corpora of four targets (143,835 to 405,750 files),
-  whose merges then held their seeds alone and which the summary of the first
-  24 CPU-hour campaign (run 45983119347) called qualified. `nbd_handshake`'s
-  entry function runs the server side of its socket pair on the calling
-  thread, where it started a thread for every input, under which every process
-  of that campaign's AddressSanitizer build ran out of memory after about 10
-  million executions ([fuzz
+  exceeded` on the shard corpora of four targets (143,835 to 405,750 files in
+  their first shards), whose merges then held their seeds alone and which the
+  summary of the first 24 CPU-hour campaign (run 45983119347) called
+  qualified. `nbd_handshake`'s entry function runs the server side of its
+  socket pair on the calling thread, where it started a thread for every
+  input, under which every process of that campaign's AddressSanitizer build
+  ran out of memory after about 10 million executions ([fuzz
   qualification](docs/testing.md#fuzz-qualification)).
 - **2026-11-27 tenth round: tests** (AUD-221, AUD-222, AUD-225;
   [#416](https://github.com/seo-rii/maki/pull/416),
@@ -1536,11 +1538,14 @@ documents.
   now have tests: a plan without targets, the coverage run's status, a round
   after one that failed, the stopped bootstrap's record, connection and reset,
   a leftover backend or mount after the stop together, and the guest runner
-  phase's and the `run` command's exit statuses. Refused test endpoints are
-  sockets that are bound and never listen, held for the whole test, where a
-  listener was dropped and its port could be handed to a parallel test's
-  `127.0.0.1:0` bind, which failed two tests of maki-crypto-websocket's
-  `review_unsent_failover.rs` in CI ([automated
+  phase's and the `run` command's exit statuses. Ten others that the audit
+  found, in the stop together, the opener and the booted-host scripts, still
+  have none (the [remediation
+  log](docs/review-remediation.md#not-closed-in-the-tenth-round)). Refused
+  test endpoints are sockets that are bound and never listen, held for the
+  whole test, where a listener was dropped and its port could be handed to a
+  parallel test's `127.0.0.1:0` bind, which failed two tests of
+  maki-crypto-websocket's `review_unsent_failover.rs` in CI ([automated
   CI](docs/testing.md#automated-ci)).
 - **2026-11-25 ninth round: refusals of the rollback-protected backing**
   (AUD-183 to AUD-186; [#391](https://github.com/seo-rii/maki/pull/391)).
@@ -2064,7 +2069,10 @@ documents.
   decryption; a hit no longer re-verifies an already validated payload's
   CRC until the entry is evicted; `cache.verify_on_hit = true` restores
   payload verification on every hit and skips only the decryption (R4-006;
-  [configuration](docs/configuration.md#read-cache)).
+  [configuration](docs/configuration.md#read-cache)). *Changed on 2026-11-27
+  (AUD-211, [#422](https://github.com/seo-rii/maki/pull/422)): on a cleared
+  allocation bit the read takes the slot's ciphertext area with its header, to
+  tell a hole from damage.*
 - Local providers now encrypt and decrypt in place inside pre-allocated
   `SecretBuffer`s and key files are read straight into guarded memory, so
   plaintext and keys never first exist in an unlocked allocation; the
