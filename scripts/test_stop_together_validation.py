@@ -180,7 +180,11 @@ class StopTogether(unittest.TestCase):
             (self.sysfs / f"nbd{index}").mkdir(parents=True)
             (self.sysfs / f"nbd{index}/backend").write_text(f"maki-{index}\n")
         self.result = "success"
+        # A volume whose attach record and connection remain; one whose
+        # connection alone remains; one whose filesystem stays mounted.
         self.left = None
+        self.left_backend = None
+        self.mounted = None
         self.stop_status = 0
         # As systemd does: `systemctl stop` of the targets returns once the
         # targets' own jobs are done, and each attach unit is then still
@@ -202,7 +206,8 @@ class StopTogether(unittest.TestCase):
             for index, name in enumerate(("stop1", "stop2", "stop3")):
                 if self.left != name:
                     (self.state / f"{name}.nbd").unlink()
-                    (self.sysfs / f"nbd{index}/backend").unlink()
+                    if self.left_backend != name:
+                        (self.sysfs / f"nbd{index}/backend").unlink()
             return subprocess.CompletedProcess(argv, self.stop_status)
         if argv[0] == "journalctl":
             unit = next(word[len("UNIT="):] for word in argv if word.startswith("UNIT="))
@@ -244,7 +249,7 @@ class StopTogether(unittest.TestCase):
                 f"InactiveEnterTimestampMonotonic={ended:.0f}\n"
                 f"Result={self.result}\n"))
         if argv[0] == "findmnt":
-            return subprocess.CompletedProcess(argv, 1)
+            return subprocess.CompletedProcess(argv, 0 if argv[-1] == f"/srv/{self.mounted}" else 1)
         raise AssertionError(argv)
 
     def popen(self, argv, stdout, stderr, **opener):
@@ -283,7 +288,9 @@ class StopTogether(unittest.TestCase):
         cases = {"stop": (1, "systemctl stop exited with status 1"),
                  "result": ("failed", "maki-attach@stop1.service stopped with result failed"),
                  "opener": (3, "the opener of /dev/nbd0 exited with status 3"),
-                 "left": ("stop2", "stop2: its attach record remains")}
+                 "left": ("stop2", "stop2: its attach record remains"),
+                 "backend": ("stop2", "stop2: /dev/nbd1 still shows the connection maki-1"),
+                 "mounted": ("stop3", "stop3: /srv/stop3 is still mounted")}
         for name, (value, message) in cases.items():
             with self.subTest(case=name):
                 self.setUp()
@@ -295,6 +302,10 @@ class StopTogether(unittest.TestCase):
                     self.ended, self.result = "failed", value
                 elif name == "opener":
                     opener = {"status": value}
+                elif name == "backend":
+                    self.left_backend = value
+                elif name == "mounted":
+                    self.mounted = value
                 else:
                     self.left = value
                 with self.assertRaisesRegex(RuntimeError, re.escape(message)):
