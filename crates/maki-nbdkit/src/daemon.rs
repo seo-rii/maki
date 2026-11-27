@@ -1472,15 +1472,18 @@ fn refuse_configuration_mismatch(
 
 /// Add every [`ConfigurationMismatch`] between `config` and the volume in
 /// `backing` to `report` as an error, as `maki check` and `maki check
-/// --deep` do after the format checks. The report's other lines, and the
-/// deep check's verdict, describe the volume; a mismatch means the
-/// configuration is wrong for it. A backing without a valid superblock has
-/// nothing to compare with, and the format checks have said so.
+/// --deep` do after the format checks, and the configuration's own
+/// warnings ([`VolumeConfig::warnings`]) as warnings. The report's other
+/// lines, and the deep check's verdict, describe the volume; a mismatch
+/// means the configuration is wrong for it. A backing without a valid
+/// superblock has nothing to compare with, and the format checks have said
+/// so.
 pub fn report_configuration_mismatches(
     config: &VolumeConfig,
     backing: &dyn Backing,
     report: &mut CheckReport,
 ) -> Result<(), DaemonError> {
+    report.warnings.extend(config.warnings());
     let superblock = match maki_format::superblock::load_volume_superblock(backing) {
         Ok(envelope) => envelope.superblock,
         Err(error @ FormatError::Io(_)) => return Err(error.into()),
@@ -1582,6 +1585,9 @@ async fn attach_hardened(
     // identity and a writer claim) and recovery come first: the superblock
     // is inside the backing.
     refuse_configuration_mismatch(config, volume.superblock())?;
+    for warning in config.warnings() {
+        tracing::warn!("{warning}");
+    }
     if let Some(identity) = &mut options.identity {
         identity.key_identity = configured_key_identity(config, &volume.superblock().key_identity);
     }

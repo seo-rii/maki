@@ -33,13 +33,25 @@ impl Fixture {
     }
 
     fn state(&self) -> TrustedState {
-        TrustedState::open_beneath(
-            File::open(&self.0).unwrap(),
-            Path::new("state"),
-            self.0.metadata().unwrap().uid(),
-        )
-        .unwrap()
+        state_at(&self.0)
     }
+}
+
+/// The attach state below the fixture directory `root`, opened anew: its
+/// lock is a file description of its own, as another helper's would be.
+fn state_at(root: &Path) -> TrustedState {
+    TrustedState::open_beneath(
+        File::open(root).unwrap(),
+        Path::new("state"),
+        root.metadata().unwrap().uid(),
+    )
+    .unwrap()
+}
+
+/// Whether no helper holds `state`'s attach lock: taking it does not wait.
+/// A lock taken here is released at once.
+fn lock_is_free(state: &TrustedState) -> bool {
+    state.lock_until(Instant::now()).is_ok()
 }
 
 impl Drop for Fixture {
@@ -654,7 +666,14 @@ struct FakeSystem {
     backend_probes: std::cell::Cell<usize>,
     /// The overall limit each step ran under ([`command::finish_by`]).
     command_limits: Vec<Option<Instant>>,
+    /// Runs after each sleep of the executor's waits, with its number
+    /// counted from 1: what other actors do while the helper waits.
+    on_sleep: Option<OnSleep>,
+    /// Runs before each read of a backend identifier.
+    on_backend: Option<Box<dyn Fn() + Send>>,
 }
+
+type OnSleep = Box<dyn FnMut(&mut FakeSystem, usize) + Send>;
 
 fn lvm_report_fixture() -> serde_json::Value {
     serde_json::json!({"report": [{
@@ -990,6 +1009,18 @@ impl Clock for FakeSystem {
     }
     fn sleep(&mut self, duration: Duration) {
         self.sleeps.push(duration);
+        self.linger_after_sleep();
+        if let Some(mut on_sleep) = self.on_sleep.take() {
+            let number = self.sleeps.len();
+            on_sleep(self, number);
+            self.on_sleep = Some(on_sleep);
+        }
+    }
+}
+
+impl FakeSystem {
+    /// What a [`Linger`] does at the sleep just taken.
+    fn linger_after_sleep(&mut self) {
         let Some((device, slept)) = &mut self.lingering else {
             return;
         };
@@ -1189,6 +1220,9 @@ impl System for FakeSystem {
     }
 
     fn backend(&self, device: &str) -> io::Result<Option<String>> {
+        if let Some(on_backend) = &self.on_backend {
+            on_backend();
+        }
         let probe = self.backend_probes.get() + 1;
         self.backend_probes.set(probe);
         if let Some((expected, fault)) = self.backend_fault_on_probe {
@@ -1438,7 +1472,8 @@ fn acknowledged_but_incomplete_disconnect_preserves_cleanup_authority_for_retry(
     }
 }
 
-/// Detach or cleanup of `request`'s attachment by `system`.
+/// Detach or cleanup of `request`'s attachment by `system`, taking the
+/// attach lock of `state` as the helper's own run does.
 fn tear_down(
     verb: &str,
     request: &AttachRequest,
@@ -1446,8 +1481,8 @@ fn tear_down(
     system: &mut FakeSystem,
 ) -> Result<(), ExecError> {
     match verb {
-        "detach" => execute_with(&plan_detach(request), Some(state), system),
-        "cleanup" => cleanup_with(&plan_detach(request), state, system),
+        "detach" => execute_on(&plan_detach(request), Some(state), system),
+        "cleanup" => cleanup_on(&plan_detach(request), state, system),
         _ => unreachable!("{verb}"),
     }
 }
@@ -2994,6 +3029,9 @@ fn growth_rechecks_ownership_between_lv_and_filesystem_changes() {
 
 #[path = "recover_tests.rs"]
 mod recover_tests;
+
+#[path = "review_release_wait_lock.rs"]
+mod review_release_wait_lock;
 
 #[path = "filesystem_tests.rs"]
 mod filesystem_tests;

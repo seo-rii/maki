@@ -351,6 +351,9 @@ fn main() -> ExitCode {
                     if let Some(hint) = ownership_hint(running_as_root(), cfg) {
                         let _ = writeln!(io::stderr().lock(), "warning: {hint}");
                     }
+                    for warning in cfg.warnings() {
+                        let _ = writeln!(io::stderr().lock(), "warning: {warning}");
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e.to_string()),

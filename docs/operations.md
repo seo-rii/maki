@@ -70,7 +70,10 @@ an operator's `blkid`) has closed it. The disconnect's own change event comes
 only when the connection goes; the udev probe it starts is what can make a
 connect right after it busy. If the device still shows the connection at the
 end, `nbd-disconnect` fails, and detach and cleanup keep the attachment record
-and fail; run them again once nothing holds the device open. The
+and fail; run them again once nothing holds the device open. When they have to
+wait, detach and cleanup let go of the attach lock for the wait, so other
+volumes' helpers do not wait for this device, and take it again before they
+retire the record ([privileged helper](#privileged-helper)). The
 [Debian installation guide](getting-started/installation-debian.md) shows how to
 build and install the Maki package.
 
@@ -253,9 +256,12 @@ both values. The check loads no provider credential and contacts no provider
 authority), so attach alone finds a different key under the same name (the key
 canary), a credential that is unavailable or does not fit the provider, a
 provider that fails its self-test, endpoints that are unreachable or not
-interchangeable, and the memory and swap checks. `maki-check <root>` reads no
-configuration and compares none. `maki volume inspect` reports what the volume
-stores and does not compare the geometry or crypto identity with the
+interchangeable, and the memory and swap checks. A valid configuration that
+serves badly passes with a `warning:` line, which `maki volume create` prints
+too and attach logs: an HTTP provider `timeout` under 600 ms, named in the line
+([remote HTTP mapping](configuration.md#remote-http-mapping)).
+`maki-check <root>` reads no configuration and compares none. `maki volume
+inspect` reports what the volume stores and does not compare the geometry or crypto identity with the
 configuration; like the check, it stops on a protected backing whose
 `backing.rollback_protection.capacity` differs.
 
@@ -873,13 +879,32 @@ with that record and the live `/sys/block/nbdN/backend` before unmounting or
 deactivating a VG. It verifies the backend again immediately before disconnect,
 including rollback. Missing records or mismatched identities refuse execution;
 an explicit `--nbd-device` cannot bypass this check. After the disconnect,
-detach and cleanup wait, still under the lock, until the device shows no
-connection (up to 15 s, as described under [prerequisites](#prerequisites)),
-and retire the record only then. A device that still shows the connection, or
-shows one under another identity, keeps the record and fails the command; one
-whose backend cannot be read fails it too. Once nothing holds the device open,
-a later run finishes the first case; in the second a later cleanup retires the
-record only by the rules above for a device connected under another identity.
+detach and cleanup wait until the device shows no connection (up to 15 s, as
+described under [prerequisites](#prerequisites)), and retire the record only
+then. When the device still shows the connection at their first look, they
+let go of the attach lock for the wait, and take it again, in turn behind the
+helpers that queued meanwhile, before they retire the record. A device that
+still shows the connection at the end, or shows one under another identity
+while the record is unchanged, keeps the record and fails the command; one
+whose backend cannot be read fails it too. Once nothing holds the device open, a later run finishes the
+first case; in the second a later cleanup retires the record only by the
+rules above for a device connected under another identity. Under the lock
+again they read the record anew and retire only the record they
+disconnected, once they have observed again that nothing of its attachment
+remains. If another helper retired it meanwhile (a `cleanup` run by hand
+finds the disconnected record with nothing left of it), the command
+succeeds; if another helper replaced it (an `attach` of the same volume),
+that record and its attachment are left alone and the command fails and says
+so, also when that attach took the same device and its connection is what
+ended the wait; do not run `cleanup` then, which would detach the new
+attachment. Only a helper of the same volume can replace or retire the record
+meanwhile; until then it still names the device, so no other volume's attach
+takes it: an attach pinned to that device (`nbd_device`) is refused at once,
+where it waited for the lock before and could then take the device once the
+detach had retired the record, and an automatic attach for which that device
+was the last free one fails with no free device. Run it again once the
+detach has finished. The failed-start hook's rollback keeps the lock through
+its wait, within its time for commands.
 
 Detach, cleanup, recover and grow address the VG only where attach found it.
 Their `vgchange --activate n` and `lvextend` run with the record's candidate
@@ -903,10 +928,11 @@ pre-activation intent selects the VG by UUID without naming it, as before; the
 helper observes the mappings again afterwards instead of trusting its status.
 
 `maki-attach cleanup --volume <volume>` is the idempotent selector used by the
-packaged service lifecycle. Under the same single attach lock, no trusted
-record is already clean and succeeds without probing the backend. A matching
-connected backend follows the detach path; a known absent backend follows the
-recovery path. An unreadable backend fails before mutation and keeps the
+packaged service lifecycle. It reads the record and chooses its path under the
+attach lock: no trusted record is already clean and succeeds without probing
+the backend. A matching connected backend follows the detach path, which lets
+go of the lock only for its wait after the disconnect (above); a known absent
+backend follows the recovery path. An unreadable backend fails before mutation and keeps the
 record; a backend under another identity is never touched, and its record is
 retired only as described above. Re-run cleanup after a partial successful effect; each selected
 path re-observes storage identity before its next change.
@@ -1210,25 +1236,37 @@ one way into
 [the state below](#interrupted-activation-after-the-daemon-stopped).
 
 The planned stop's `cleanup` (`ExecStop`) runs under the same
-`TimeoutStopSec=120`, and its wait for the device after the disconnect holds
-the attach lock for up to 15 seconds. When the devices of many volumes are all
-held open at their disconnects (a monitoring tool that keeps every
-`/dev/nbdN` open) and the volumes stop together, their cleanups queue on the
-lock and each keeps it for the whole 15 seconds. From about the eighth in the
-queue on, cleanups reach their stop timeout, the later ones while they still
-wait for the lock. systemd ends such a cleanup before it has changed anything:
-the attachment and its record stay as they were. In a planned stop of the
-attach units the daemon keeps serving, and the stop is retried as for any
-[failed planned stop](#retry-a-failed-planned-stop). At a host shutdown
-nothing retries it: `maki@` is stopped next all the same (`maki-attach@` is
-ordered after it), so a filesystem that such a cleanup did not unmount stays
-mounted, for the rest of the shutdown, on a device whose daemon is gone.
-Either way the record is kept and the stop fails, as it does for a cleanup
-whose own wait ran out; the failure only comes by timeout, and in a planned
-stop a cleanup ended during its own steps is resumed by the next one, which
-observes again before each step.
-Behind three such cleanups the failed-start hook's 40-second lock wait expires
-as well, and the coordinator proceeds without it, as above.
+`TimeoutStopSec=120`. Its wait for the device after the disconnect, up to 15
+seconds, runs without the attach lock. When the devices of many volumes are
+all held open at their disconnects (a monitoring tool that keeps every
+`/dev/nbdN` open) and the volumes stop together, their cleanups still take
+the lock one at a time, for their own steps (the unmount, the VG deactivation
+and the disconnect) and for the checks before the record is retired, but
+their waits run side by side: no cleanup waits for another volume's opener. A
+device held open for the whole 15 seconds fails its own cleanup with
+"disconnect has not completed", as it does when one volume stops; by then the
+volume is unmounted, its VG deactivated and its device disconnected, and only
+the record is kept, which a later cleanup retires once nothing holds the
+device open.
+
+A cleanup reaches its stop timeout only when its two turns on the lock, its
+own steps and its wait (at most 15 seconds) add up to 120 seconds. A turn is
+long when the helpers ahead of it hold the lock long: the steps of the
+cleanups ahead of it, whose length on a host (an unmount that writes back a
+large page cache, above all) has not been measured, and an attach of another
+volume, which can hold it for up to its 180-second start timeout, in either
+turn; the second turn, after the wait, queues behind every helper that took
+the lock meanwhile. systemd ends a cleanup that waits for its first turn
+before it has changed anything: the attachment and its record stay as they
+were. One that waits for its second turn has torn its volume down, and the
+next cleanup retires its record from what the device shows. In a planned stop
+of the attach units the daemon keeps serving, and the stop is retried as for
+any [failed planned stop](#retry-a-failed-planned-stop); a
+cleanup ended during its own steps is resumed by the next one, which observes
+again before each step. At a host shutdown nothing retries it: `maki@` is
+stopped next all the same (`maki-attach@` is ordered after it), so a
+filesystem that such a cleanup did not unmount stays mounted, for the rest of
+the shutdown, on a device whose daemon is gone.
 
 Attach starts are limited to three in 300 seconds; inspect the failure before
 resetting a start-limit failure.
