@@ -939,8 +939,9 @@ class GuestPhases(unittest.TestCase):
                     self.assertEqual(steps[0][:2], ["systemctl", "stop"])
 
     def test_unpacking_the_package_fails_with_either_command_of_its_pipe(self):
-        # rpm2cpio feeds cpio: an rpm2cpio that fails, a truncated package
-        # for one, can leave cpio content with what it was given.
+        # rpm2cpio feeds cpio, and the pipe's status must count both: with
+        # the real tools a truncated package fails cpio too, so this check
+        # is defence in depth, held here with stand-ins that can fail alone.
         binary = self.root / "bin"
         binary.mkdir()
         for name, script in (
