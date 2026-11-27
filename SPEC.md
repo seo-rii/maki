@@ -779,8 +779,11 @@ configured provider validation, and control socket binding precede the first
 NBD client. It sends `READY=1` from nbdkit's main process only after those
 steps succeed. Initialization or configured notification failure fails startup.
 Manual runs without `NOTIFY_SOCKET` perform the same initialization without
-notifying a service manager. The startup timeout needs qualification for the
-deployment's recovery size and provider latency.
+notifying a service manager. Completed recovery work and every request of the
+endpoint probes and cross-endpoint checks at attach (§34) that ends, whatever
+its answer, extend the start timeout (`EXTEND_TIMEOUT_USEC`), at most once
+every 30 seconds; nothing else does. The startup timeout needs qualification
+for the deployment's recovery size and provider latency.
 
 Initial data-plane readiness is separate from the helper's verified XFS mount,
 the fresh `maki-attach verify` workload gate, and database recovery. It does not

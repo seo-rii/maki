@@ -696,7 +696,9 @@ provider three times `timeout` and the two delays, twice that over
 WebSocket, whose provider makes a second attempt of each request of a
 `retry_safe` provider (about 30 s over HTTP or gRPC and 60 s over WebSocket
 at the default 10 s). Each probe ends with the key canary check, which the
-endpoints take one at a time in configuration order. When none
+endpoints take one at a time in configuration order, and each probe request
+that ends extends the service's start deadline
+([data-plane readiness](operations.md#data-plane-readiness)). When none
 is reachable the attach is refused with "no remote endpoint is reachable;
 attach refused" followed by each endpoint's name and failure (the first
 endpoint failure among its attempts, otherwise the last failure), in

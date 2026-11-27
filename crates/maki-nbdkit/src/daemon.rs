@@ -483,7 +483,10 @@ pub async fn build_provider(config: &VolumeConfig) -> Result<Arc<dyn CryptoProvi
 pub async fn build_provider_with_endpoints(
     config: &VolumeConfig,
 ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
-    prepare_provider(config).await?.verify(config, None).await
+    prepare_provider(config)
+        .await?
+        .verify(config, None, None)
+        .await
 }
 
 enum PreparedProvider {
@@ -496,10 +499,13 @@ impl PreparedProvider {
         self,
         config: &VolumeConfig,
         volume: Option<&Arc<Volume>>,
+        progress: Option<Arc<ProbeProgress>>,
     ) -> Result<(Arc<dyn CryptoProvider>, Option<Arc<EndpointSet>>), DaemonError> {
         let set = match self {
             Self::Local(provider) => return Ok((provider, None)),
-            Self::Remote(endpoints) => dispatch_endpoint_set(config, endpoints, volume).await?,
+            Self::Remote(endpoints) => {
+                dispatch_endpoint_set(config, endpoints, volume, progress).await?
+            }
         };
         // Expand before entering the dispatcher, so retry and admission account
         // for the actual provider payload and reuse one prepared prefix per call.
@@ -915,6 +921,71 @@ fn note_probe_failure(
     *maybe_sent |= !error.is_not_sent();
 }
 
+/// Called each time a request of an endpoint probe or of a cross-endpoint
+/// check ends at attach, whatever its answer, so that the native plugin
+/// extends systemd's start deadline while the probes make progress
+/// (`startup.rs`). Every such request ends within the transport's
+/// `timeout` (twice that over WebSocket, where a retry-safe provider makes a
+/// second attempt), and the probes make a bounded number of them; the
+/// endpoint set's own requests never report.
+pub(crate) type ProbeProgress = dyn Fn() + Send + Sync;
+
+/// An endpoint's view for the attach probes and checks that reports each
+/// of its requests that ends ([`ProbeProgress`]), and is otherwise the
+/// endpoint itself. It sits on the transport, below the random-prefix
+/// wrapper. The self-test hooks a provider may override
+/// (`checks_plaintext_echo`, `decrypt_compatibility_probe`) are sealed in
+/// `maki-crypto`, so neither this view nor a transport, which comes from
+/// another crate, overrides them: both keep the defaults, and the endpoint is
+/// sent and answers exactly what it would be without the view.
+struct ReportingEndpoint {
+    inner: Arc<dyn CryptoProvider>,
+    progress: Arc<ProbeProgress>,
+}
+
+fn reporting(
+    inner: Arc<dyn CryptoProvider>,
+    progress: &Arc<ProbeProgress>,
+) -> Arc<dyn CryptoProvider> {
+    Arc::new(ReportingEndpoint {
+        inner,
+        progress: progress.clone(),
+    })
+}
+
+#[async_trait::async_trait]
+impl CryptoProvider for ReportingEndpoint {
+    fn max_operation_time(&self) -> Option<std::time::Duration> {
+        self.inner.max_operation_time()
+    }
+
+    async fn capabilities(
+        &self,
+    ) -> Result<maki_crypto::CryptoCapabilities, maki_crypto::CryptoError> {
+        self.inner.capabilities().await
+    }
+
+    async fn encrypt_batch(
+        &self,
+        context: &maki_crypto::CryptoContext,
+        items: &[maki_crypto::PlaintextUnit],
+    ) -> Result<Vec<maki_crypto::CiphertextUnit>, maki_crypto::CryptoError> {
+        let result = self.inner.encrypt_batch(context, items).await;
+        (self.progress)();
+        result
+    }
+
+    async fn decrypt_batch(
+        &self,
+        context: &maki_crypto::CryptoContext,
+        items: &[maki_crypto::CiphertextUnit],
+    ) -> Result<Vec<maki_crypto::PlaintextUnit>, maki_crypto::CryptoError> {
+        let result = self.inner.decrypt_batch(context, items).await;
+        (self.progress)();
+        result
+    }
+}
+
 /// What one endpoint's attach probe found, when it did not refuse the
 /// attach.
 enum ProbeOutcome {
@@ -935,6 +1006,7 @@ struct EndpointProbe<'a> {
     prefix_bytes: u32,
     compat: &'a str,
     delay: std::time::Duration,
+    progress: &'a Arc<ProbeProgress>,
     /// How many endpoints, counted from the first in configuration order,
     /// have finished their probe without refusing the attach.
     finished: tokio::sync::watch::Sender<usize>,
@@ -970,8 +1042,13 @@ impl EndpointProbe<'_> {
         use maki_crypto::selftest::provider_self_test;
 
         let (unit, context, compat) = (self.unit, self.context, self.compat);
-        let validation_provider =
-            apply_random_prefix(provider.clone(), unit as u32, self.prefix_bytes, compat).await?;
+        let validation_provider = apply_random_prefix(
+            reporting(provider.clone(), self.progress),
+            unit as u32,
+            self.prefix_bytes,
+            compat,
+        )
+        .await?;
         // Self-tests and canary checks make real RPCs. A lost response does
         // not prove the operation was unapplied, so the whole probe must not
         // be restarted for a provider that does not promise retry safety.
@@ -1052,6 +1129,7 @@ async fn cross_validate_reachable(
     context: &maki_crypto::CryptoContext,
     unit: usize,
     prefix_bytes: u32,
+    progress: &Arc<ProbeProgress>,
 ) -> Result<Vec<CheckedEndpoint>, maki_crypto::CryptoError> {
     use maki_crypto::selftest::{cross_endpoint_self_test_attributed, CrossCheckSide};
     let mut quarantined = Vec::new();
@@ -1060,14 +1138,14 @@ async fn cross_validate_reachable(
     let mut reference = remaining.pop_front().expect("at least one reachable peer");
     while let Some(candidate) = remaining.pop_front() {
         let a = apply_random_prefix(
-            reference.1.clone(),
+            reporting(reference.1.clone(), progress),
             unit as u32,
             prefix_bytes,
             &context.crypto_compatibility_id,
         )
         .await?;
         let b = apply_random_prefix(
-            candidate.1.clone(),
+            reporting(candidate.1.clone(), progress),
             unit as u32,
             prefix_bytes,
             &context.crypto_compatibility_id,
@@ -1128,6 +1206,7 @@ async fn dispatch_endpoint_set(
     config: &VolumeConfig,
     endpoints: Vec<(String, Arc<dyn CryptoProvider>)>,
     volume: Option<&Arc<Volume>>,
+    progress: Option<Arc<ProbeProgress>>,
 ) -> Result<Arc<EndpointSet>, DaemonError> {
     // Provider-only construction still needs a real, exclusively held volume;
     // constructing transports first retains early credential/config errors.
@@ -1173,6 +1252,7 @@ async fn dispatch_endpoint_set(
     //    served passed `maki@.service`'s start deadline at the default
     //    timeout. The results are taken in configuration order; the first
     //    refusal in that order refuses the attach and drops the other probes.
+    let progress = progress.unwrap_or_else(|| Arc::new(|| {}));
     let probe = EndpointProbe {
         volume,
         context: &context,
@@ -1180,6 +1260,7 @@ async fn dispatch_endpoint_set(
         prefix_bytes,
         compat: &compat,
         delay: config.crypto.retry.initial_delay.0,
+        progress: &progress,
         finished: tokio::sync::watch::Sender::new(0),
     };
     let mut outcomes = Vec::with_capacity(endpoints.len());
@@ -1196,7 +1277,7 @@ async fn dispatch_endpoint_set(
     }
     let mut reachable: Vec<(String, Arc<dyn CryptoProvider>)> = Vec::new();
     // A failed endpoint with the failure to report and whether the
-    // dispatcher may send the probe's request again.
+    // dispatcher may send the probe's request to it again.
     let mut failed: Vec<(
         String,
         Arc<dyn CryptoProvider>,
@@ -1251,7 +1332,8 @@ async fn dispatch_endpoint_set(
     }
 
     // 2. Interchangeability among the reachable ones (SPEC 34).
-    let mut flagged = cross_validate_reachable(reachable, &context, unit, prefix_bytes).await?;
+    let mut flagged =
+        cross_validate_reachable(reachable, &context, unit, prefix_bytes, &progress).await?;
     flagged.extend(
         quarantined
             .into_iter()
@@ -1760,12 +1842,15 @@ pub async fn attach_from_config_with_stats(
     ),
     DaemonError,
 > {
-    attach_from_config_with_progress(config, None).await
+    attach_from_config_with_progress(config, None, None).await
 }
 
+/// Attach, reporting each completed unit of recovery work to `recovery` and
+/// each request of the endpoint probes that ends to `probing`.
 pub(crate) async fn attach_from_config_with_progress(
     config: &VolumeConfig,
-    progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    recovery: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    probing: Option<Arc<ProbeProgress>>,
 ) -> Result<
     (
         Engine,
@@ -1776,12 +1861,13 @@ pub(crate) async fn attach_from_config_with_progress(
 > {
     // Process hardening first (SPEC 36-37): nothing secret exists yet.
     crate::security::apply(config)?;
-    attach_hardened(config, progress, None).await
+    attach_hardened(config, recovery, probing, None).await
 }
 
 async fn attach_hardened(
     config: &VolumeConfig,
     progress: Option<Arc<maki_core::recovery::RecoveryProgress<'static>>>,
+    probing: Option<Arc<ProbeProgress>>,
     prepared: Option<PreparedProvider>,
 ) -> Result<
     (
@@ -1827,7 +1913,7 @@ async fn attach_hardened(
         Some(provider) => provider,
         None => prepare_provider(config).await?,
     };
-    let (provider, endpoints) = prepared.verify(config, Some(&volume)).await?;
+    let (provider, endpoints) = prepared.verify(config, Some(&volume), probing).await?;
     let (provider, stats) = if config.crypto.provider.starts_with("remote-") {
         let scheduler = maki_crypto::scheduler::BatchScheduler::with_unit_size(
             provider,
@@ -1918,7 +2004,9 @@ impl VolumeCreationConfig {
         crate::security::apply(&self.0)?;
         let prepared = prepare_provider(&self.0).await?;
         self.create(false)?;
-        Ok(attach_hardened(&self.0, None, Some(prepared)).await?.0)
+        Ok(attach_hardened(&self.0, None, None, Some(prepared))
+            .await?
+            .0)
     }
 }
 
@@ -2263,7 +2351,8 @@ mod startup_reference_tests {
             ("b".into(), Arc::new(FakeCryptoProvider::new(512))),
             ("c".into(), Arc::new(FakeCryptoProvider::new(512))),
         ];
-        let checked = cross_validate_reachable(peers, &context, 512, 0)
+        let progress: Arc<ProbeProgress> = Arc::new(|| {});
+        let checked = cross_validate_reachable(peers, &context, 512, 0, &progress)
             .await
             .unwrap();
         let flags: std::collections::BTreeMap<_, _> = checked
