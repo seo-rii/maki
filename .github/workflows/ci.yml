@@ -740,4 +740,7 @@ jobs:
         shell: bash
         run: |
           export MAKI_WITNESS_BIN="$GITHUB_WORKSPACE/target/release/maki-witness"
-          cargo test --release --locked -p maki-witness --features etcd-qualification --test etcd_ha -- --ignored
+          # One gate at a time: each starts a three-member cluster and a
+          # frontend on ports chosen by binding port 0 and releasing it, and
+          # two started together can take each other's ports.
+          cargo test --release --locked -p maki-witness --features etcd-qualification --test etcd_ha -- --ignored --test-threads=1

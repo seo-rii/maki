@@ -58,10 +58,14 @@ fn write_payload(backing: &dyn Backing) {
 }
 
 fn read_payload(backing: &dyn Backing) -> Vec<u8> {
-    let file = backing.open("data/payload", false).unwrap();
-    let mut bytes = vec![0xff; file.len().unwrap() as usize];
-    file.read_at(0, &mut bytes).unwrap();
-    bytes
+    read_payload_result(backing).unwrap()
+}
+
+fn read_payload_result(backing: &dyn Backing) -> io::Result<Vec<u8>> {
+    let file = backing.open("data/payload", false)?;
+    let mut bytes = vec![0xff; file.len()? as usize];
+    file.read_at(0, &mut bytes)?;
+    Ok(bytes)
 }
 
 /// An entry with its mode, its bytes if it is a file, and its modification
@@ -515,8 +519,9 @@ fn a_page_that_changes_after_a_read_only_open_stops_the_view() {
     assert!(file.read_at(0, &mut bytes).is_err(), "a stopped view read");
 }
 
-/// Every operation first asks the witness whether it still selects what
-/// the view read: a changed anchor stops the view for good.
+/// Every operation first reads a local witness again, to ask whether it
+/// still selects what the view read: a changed anchor stops the view for
+/// good.
 #[test]
 fn a_witness_that_changes_after_a_read_only_open_stops_the_view() {
     let Some(local) = Local::new() else {
@@ -526,6 +531,8 @@ fn a_witness_that_changes_after_a_read_only_open_stops_the_view() {
     let anchor = local.witness().join("anchor");
     let bytes = std::fs::read(&anchor).unwrap();
     std::fs::write(&anchor, b"").unwrap();
+    let error = view.list("").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     let error = view.check_freshness().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     std::fs::write(&anchor, &bytes).unwrap();
@@ -749,6 +756,9 @@ struct RecordingRpc {
     /// Set, a release is lost before the authority sees it: what a writer
     /// that died leaves.
     lose_release: std::sync::atomic::AtomicBool,
+    /// Set, every request fails before it reaches the authority, as a
+    /// connection that is refused does.
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 fn action_name(action: &Action) -> &'static str {
@@ -766,6 +776,12 @@ fn action_name(action: &Action) -> &'static str {
 
 impl Rpc for RecordingRpc {
     fn call(&self, request: &Request) -> io::Result<Record> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "authority unreachable",
+            ));
+        }
         self.actions
             .lock()
             .unwrap()
@@ -825,6 +841,7 @@ impl Remote {
                 actions: actions.clone(),
                 takeover_after: Mutex::new(None),
                 lose_release: std::sync::atomic::AtomicBool::new(false),
+                unreachable: std::sync::atomic::AtomicBool::new(false),
             })
         };
         let remote = Self {
@@ -1038,9 +1055,12 @@ fn a_remote_read_only_open_authenticates_the_current_generation() {
     remote.open().unwrap();
 }
 
-/// Every operation asks the authority again, and a record that changed
-/// (here an administrator's takeover, made elsewhere) stops the view for
-/// good.
+/// The authority is asked again when the view's user asks
+/// (`check_freshness`, which a command calls before it reports), and a
+/// record that changed (here an administrator's takeover, made elsewhere)
+/// stops the view for good. What the view read before is the generation it
+/// opened, authenticated page by page: the takeover changed nothing in the
+/// root, which the view's locks keep every other operation out of.
 #[test]
 fn an_authority_that_changes_after_a_remote_read_only_open_stops_the_view() {
     let remote = Remote::new();
@@ -1055,11 +1075,133 @@ fn an_authority_that_changes_after_a_remote_read_only_open_stops_the_view() {
             authorization: Some(SessionAuthorization::generate().unwrap()),
         })
         .unwrap();
-    let file = view.open("data/payload", false);
-    let error = file.err().unwrap();
+    assert_eq!(read_payload(&view), payload());
+    let error = view.check_freshness().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("the remote authority changed after the backing was opened read-only"),
+        "{error}"
+    );
     assert!(view.session_stopped().is_some());
+    assert!(view.open("data/payload", false).is_err());
+    assert!(view.list("").is_err());
     assert!(view.check_freshness().is_err());
+}
+
+/// A remote view sends the authority two inspections while it opens and one
+/// each time its user asks for freshness, however much it reads: a deep
+/// check of a large volume sent one before every backing operation, each
+/// over a connection of its own. A local witness is still read before every
+/// operation.
+#[test]
+fn a_remote_read_only_view_asks_the_authority_only_when_asked() {
+    let remote = Remote::new();
+    remote.clear();
+    let view = remote.open().unwrap();
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "inspect"]);
+    remote.clear();
+    for _ in 0..10 {
+        assert_eq!(read_payload(&view), payload());
+        assert_eq!(view.list("").unwrap(), ["data", "volume.lock"]);
+        assert!(view.exists("data/payload").unwrap());
+        assert_eq!(view.capacity().unwrap(), 32 * PAGE);
+        view.free_bytes().unwrap();
+        drop(view.try_lock_shared_existing("volume.lock").unwrap());
+    }
+    assert_eq!(*remote.actions.lock().unwrap(), Vec::<&str>::new());
+    view.check_freshness().unwrap();
+    view.check_freshness().unwrap();
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "inspect"]);
+}
+
+/// A writable open that is given a check runs it before it claims a writer,
+/// over a view of the authority's current generation that reads only what
+/// the check reads, every page authenticated, and changes nothing: what the
+/// check refuses is refused with only the open's inspection sent, the
+/// authority's record unchanged and nothing in the root changed. A check
+/// that passes leaves the open to claim as before. It runs only where a
+/// claim could be granted: an authority that is not released refuses the
+/// claim, as it did, without the check.
+#[test]
+fn a_writable_remote_open_runs_its_check_before_the_claim() {
+    let remote = Remote::new();
+    let record = remote.record();
+    let before = tree(remote.root());
+    remote.clear();
+    let error =
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            assert_eq!(read_payload(view), payload());
+            assert_eq!(view.capacity().unwrap(), 32 * PAGE);
+            every_change_is_refused(view, "data/payload");
+            view.check_freshness().unwrap();
+            Err(io::Error::other("refused by the check"))
+        })
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "refused by the check");
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(remote.record(), record);
+    assert_eq!(
+        tree(remote.root()),
+        before,
+        "a refused open changed the root"
+    );
+    // A page that does not authenticate fails the check's read, before the
+    // claim too.
+    let namespace = remote
+        .root()
+        .join(record.current.as_ref().unwrap().namespace.clone());
+    let slot = committed_slot(&namespace);
+    flip(&namespace.join("rollback.arena"), slot);
+    remote.clear();
+    let error =
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            read_payload_result(view).map(drop)
+        })
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(remote.record(), record);
+    flip(&namespace.join("rollback.arena"), slot);
+
+    let mut checked = false;
+    remote.clear();
+    let writer = RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |_| {
+        checked = true;
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert!(checked);
+    assert_eq!(
+        remote.actions.lock().unwrap()[..3],
+        ["inspect", "claim", "activate"]
+    );
+    assert_eq!(read_payload(&writer), payload());
+    remote
+        .writer
+        .lose_release
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(writer);
+    let record = remote.record();
+    remote.clear();
+    let error = RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |_| {
+        Err(io::Error::other(
+            "the check ran against an occupied authority",
+        ))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect", "claim"]);
+    assert_eq!(remote.record(), record);
 }
 
 /// The authority's record is read again once the view holds its locks: a
@@ -1103,4 +1245,228 @@ fn a_remote_read_only_open_reads_an_active_authority_whose_writer_is_gone() {
     drop(view);
     remote.only_inspections();
     assert_eq!(remote.record(), record);
+}
+
+/// The message of every event logged on this thread.
+struct Messages(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Messages {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Run `run` and return what it returned and the messages it logged.
+fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let value = tracing::subscriber::with_default(Messages(messages.clone()), run);
+    let messages = messages.lock().unwrap().clone();
+    (value, messages)
+}
+
+/// The view a writable open reads before its claim belongs to no read-only
+/// command: a page in it that does not authenticate refuses the open, and
+/// nothing logs that a read-only session stopped. A read-only view that stops
+/// still logs it.
+#[test]
+fn a_view_read_before_a_claim_logs_no_stopped_read_only_session() {
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    let (arena, slot) = (namespace.join("rollback.arena"), committed_slot(&namespace));
+    flip(&arena, slot);
+    let (error, messages) = logged(|| {
+        RollbackBacking::open_remote_checked(remote.root(), remote.writer.clone(), |view| {
+            read_payload_result(view).map(drop)
+        })
+        .err()
+        .unwrap()
+    });
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("read-only rollback session stopped")),
+        "{messages:?}"
+    );
+    flip(&arena, slot);
+    let view = remote.open().unwrap();
+    flip(&arena, slot);
+    let (error, messages) = logged(|| read_payload_result(&view).unwrap_err());
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("read-only rollback session stopped")),
+        "{messages:?}"
+    );
+}
+
+/// An open that fails once the authority has been inspected twice (here at
+/// a committed page that does not authenticate) asks it once more before it
+/// reports the failure: an authority that changed meanwhile (a takeover made
+/// elsewhere right after the second inspection) is reported instead, and
+/// one that did not leaves the open's own error.
+#[test]
+fn a_remote_read_only_open_that_fails_reports_an_authority_that_changed() {
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    flip(
+        &namespace.join("rollback.arena"),
+        committed_slot(&namespace),
+    );
+    *remote.writer.takeover_after.lock().unwrap() = Some(2);
+    let error = remote.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("the remote authority changed while the backing was opened read-only"),
+        "{error}"
+    );
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    remote.clear();
+    let error = remote.open().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("rollback arena page authentication failed"),
+        "{error}"
+    );
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"; 3]);
+}
+
+/// A view that stopped on a committed page that no longer authenticates
+/// still asks its witness when a caller that is about to report a failure
+/// asks it again (`ask_witness_again`): the witness's answer, not the stop,
+/// says whether what was read is still selected. A remote authority that
+/// changed (a takeover made elsewhere after the open) is reported, and from
+/// then on is the view's stop reason; one that did not leaves the page's
+/// stop; one that cannot be asked is said to be so. Each costs one
+/// inspection, and a view that its witness stopped asks nothing more.
+#[test]
+fn a_remote_view_stopped_by_a_page_asks_its_authority_again() {
+    use maki_backing::WitnessAnswer;
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    let (arena, slot) = (namespace.join("rollback.arena"), committed_slot(&namespace));
+    let stopped = |changed: bool| {
+        if changed {
+            *remote.writer.takeover_after.lock().unwrap() = Some(2);
+        }
+        let view = remote.open().unwrap();
+        flip(&arena, slot);
+        let error = read_payload_result(&view).unwrap_err();
+        flip(&arena, slot);
+        assert!(
+            error
+                .to_string()
+                .contains("rollback arena page authentication failed"),
+            "{error}"
+        );
+        view
+    };
+    let page = "rollback session stopped: rollback arena page authentication failed";
+
+    let view = stopped(false);
+    remote.clear();
+    assert!(matches!(view.ask_witness_again(), WitnessAnswer::Selects));
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(view.session_stopped().as_deref(), Some(page));
+
+    let view = stopped(false);
+    remote
+        .writer
+        .unreachable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    match view.ask_witness_again() {
+        WitnessAnswer::Unanswered(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}")
+        }
+        other => panic!("{other:?}"),
+    }
+    remote
+        .writer
+        .unreachable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(view.session_stopped().as_deref(), Some(page));
+
+    let view = stopped(true);
+    remote.clear();
+    let changed = "rollback session stopped: the remote authority changed after the backing was \
+                   opened read-only";
+    match view.ask_witness_again() {
+        WitnessAnswer::Stopped(reason) => assert_eq!(reason, changed),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(view.session_stopped().as_deref(), Some(changed));
+    // The witness has answered: asked again, the view sends nothing.
+    remote.clear();
+    assert!(matches!(
+        view.ask_witness_again(),
+        WitnessAnswer::Stopped(_)
+    ));
+    assert!(view.check_freshness().is_err());
+    assert_eq!(*remote.actions.lock().unwrap(), Vec::<&str>::new());
+}
+
+/// The same for a local witness: a view stopped on a page reads the witness
+/// again when asked, and a witness that no longer selects what was read is
+/// reported and becomes the stop reason.
+#[test]
+fn a_local_view_stopped_by_a_page_reads_its_witness_again() {
+    use maki_backing::WitnessAnswer;
+    let Some(local) = Local::new() else {
+        return;
+    };
+    let arena = local.root().join("rollback.arena");
+    let slot = committed_slot(local.root());
+    let view = local.open().unwrap();
+    flip(&arena, slot);
+    read_payload_result(&view).unwrap_err();
+    flip(&arena, slot);
+    assert!(matches!(view.ask_witness_again(), WitnessAnswer::Selects));
+    let anchor = local.witness().join("anchor");
+    let bytes = std::fs::read(&anchor).unwrap();
+    std::fs::write(&anchor, b"").unwrap();
+    let answer = view.ask_witness_again();
+    std::fs::write(&anchor, &bytes).unwrap();
+    match answer {
+        WitnessAnswer::Stopped(reason) => assert!(
+            reason.starts_with("rollback session stopped: ")
+                && !reason.contains("page authentication"),
+            "{reason}"
+        ),
+        other => panic!("{other:?}"),
+    }
 }

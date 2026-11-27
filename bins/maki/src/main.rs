@@ -970,11 +970,28 @@ fn existing_backing(
     maki_nbdkit::daemon::build_backing_to_read(cfg).map_err(|error| error.to_string())
 }
 
+/// Ask the witness, once everything a command reports has been read,
+/// whether it still selects what was read
+/// ([`maki_nbdkit::daemon::still_current`]): a remote rollback view asks its
+/// authority only here (one inspection, however much the command read), and
+/// a record that changed since the view was opened fails the command.
+fn still_current(backing: &dyn maki_backing::Backing) -> Result<(), String> {
+    maki_nbdkit::daemon::still_current(backing)
+}
+
+/// `error`, met after the backing was opened, as the command reports it:
+/// once the witness has been asked again, as before a report
+/// ([`maki_nbdkit::daemon::read_failure`]).
+fn read_failure(backing: &dyn maki_backing::Backing, error: impl std::fmt::Display) -> String {
+    maki_nbdkit::daemon::read_failure(backing, error.to_string())
+}
+
 fn inspect(config: &std::path::Path) -> Result<(), String> {
     let cfg = read_config(config)?;
     let backing = existing_backing(&cfg)?;
     let envelope = maki_format::superblock::load_volume_superblock(backing.as_ref())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| read_failure(backing.as_ref(), e))?;
+    still_current(backing.as_ref())?;
     let sb = envelope.superblock;
     let mut text = format!(
         "volume:        {}\n\
@@ -1030,14 +1047,16 @@ fn check(config: &str, deep: bool) -> Result<bool, String> {
     let backing = existing_backing(&cfg)?;
     let mut report = if deep {
         maki_core::check::deep_check(backing.clone(), cfg.backing.journal_segment_size.0)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| read_failure(backing.as_ref(), e))?
     } else {
-        maki_format::checker::check_volume(backing.as_ref()).map_err(|e| e.to_string())?
+        maki_format::checker::check_volume(backing.as_ref())
+            .map_err(|e| read_failure(backing.as_ref(), e))?
     };
     // After the deep verdict, which describes the volume: a configuration
     // that attach refuses for it fails the check whatever the verdict says.
     maki_nbdkit::daemon::report_configuration_mismatches(&cfg, backing.as_ref(), &mut report)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| read_failure(backing.as_ref(), e))?;
+    still_current(backing.as_ref())?;
     let mut text = String::new();
     for info in &report.info {
         text += &format!("info: {info}\n");

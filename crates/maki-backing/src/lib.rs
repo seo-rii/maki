@@ -192,6 +192,22 @@ pub struct FileOwner {
 /// file's descriptor.
 pub trait VolumeLock: Send + Sync {}
 
+/// What a backing's witness answers when a caller that is about to report a
+/// failure asks it again ([`Backing::ask_witness_again`]).
+#[derive(Debug)]
+pub enum WitnessAnswer {
+    /// It still selects what the backing read, or the backing has none.
+    Selects,
+    /// The session has stopped for this reason ([`Backing::session_stopped`]),
+    /// which is the witness's own answer where it gave one: it no longer
+    /// selects what was read, or it answered so that the session stopped (a
+    /// denial, an invalid answer). Report it instead of the failure.
+    Stopped(String),
+    /// The witness could not be asked (a timeout, a refused connection): the
+    /// failure is reported, saying so.
+    Unanswered(io::Error),
+}
+
 /// A confined storage namespace for one volume.
 pub trait Backing: Send + Sync + 'static {
     /// Validate the independent freshness authority, if this backing has one.
@@ -209,6 +225,25 @@ pub trait Backing: Send + Sync + 'static {
     /// storage or witness I/O, so a status query never waits for either.
     fn session_stopped(&self) -> Option<String> {
         None
+    }
+
+    /// Ask the witness again, for a caller that is about to report a
+    /// failure it met through this backing, whether it still selects what
+    /// was read: a failure is reported only once it has been asked, and a
+    /// witness that no longer does is reported instead (SPEC §27). Unlike
+    /// [`Self::check_freshness`], a backing whose session stopped for
+    /// another reason (a page that no longer authenticates) asks too, since
+    /// only the witness says whether what was read is still the volume's
+    /// state. The default asks [`Self::check_freshness`] and answers a
+    /// stopped session with its reason.
+    fn ask_witness_again(&self) -> WitnessAnswer {
+        match self.check_freshness() {
+            Ok(()) => WitnessAnswer::Selects,
+            Err(error) => match self.session_stopped() {
+                Some(reason) => WitnessAnswer::Stopped(reason),
+                None => WitnessAnswer::Unanswered(error),
+            },
+        }
     }
 
     /// Open a file. With `create = true`, creates it (volatile until the

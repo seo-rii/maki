@@ -338,21 +338,23 @@ one failing gate binary from hiding the result of every binary after it.
 
 Gates that need operator-provided infrastructure refuse to skip, so they are
 compiled only with an opt-in feature and are not part of that `-- --ignored`
-run. The etcd gate has its own scheduled job, `etcd-qualification`, which
-installs a digest-pinned etcd v3.6.5 and builds `maki-witness`; no CI job
-provides the delegated cgroup, so the cgroup gate runs only on an operator's
-host:
+run. The etcd gates have their own scheduled job, `etcd-qualification`, which
+installs a digest-pinned etcd v3.6.5, builds `maki-witness` and runs the gates
+one at a time (`--test-threads=1`): each starts a three-member cluster and a
+frontend on ports it chose by binding port 0 and releasing it, so two started
+together can take each other's ports. No CI job provides the delegated
+cgroup, so the cgroup gate runs only on an operator's host:
 
 | Feature | Gate | Requires |
 |---|---|---|
 | `maki-nbdkit/cgroup-qualification` | `memory_budget.rs` `delegated_cgroup_oom_enforces_memory_max` | `MAKI_MEMORY_TEST_CGROUP`, a disposable delegated cgroup v2 ([performance](performance.md)) |
-| `maki-witness/etcd-qualification` | `etcd_ha.rs` `real_three_member_quorum_cas_leader_failover_and_majority_loss` | `MAKI_ETCD_BIN` (verified etcd v3.6 with `etcdctl` beside it) and `MAKI_WITNESS_BIN` (built `maki-witness`) |
+| `maki-witness/etcd-qualification` | `etcd_ha.rs` `real_three_member_quorum_cas_leader_failover_and_majority_loss`, and `a_remote_volume_on_an_etcd_quorum_is_read_with_inspections_only` (the read-only view that `maki check` and `maki volume inspect` use, over the quorum behind a frontend: three inspections and nothing else) | `MAKI_ETCD_BIN` (verified etcd v3.6 with `etcdctl` beside it) and `MAKI_WITNESS_BIN` (built `maki-witness`) |
 
 ```bash
 cargo build --release --locked -p maki-witness-cli
 MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witness \
   cargo test --release --locked -p maki-witness --features etcd-qualification \
-  --test etcd_ha -- --ignored --nocapture
+  --test etcd_ha -- --ignored --test-threads=1 --nocapture
 ```
 
 The `nightly-gates` job also builds the Linux cdylib, verifies the global

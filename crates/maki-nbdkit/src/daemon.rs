@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use maki_backing::{Backing, FileBacking};
+use maki_backing::{Backing, FileBacking, WitnessAnswer};
 #[cfg(target_os = "linux")]
 use maki_backing::{ReadOnlyRollbackBacking, RollbackBacking};
 use maki_core::engine::{AttachError, Engine, EngineLimits, EngineOptions};
@@ -120,13 +120,38 @@ pub fn remote_witness_client(
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    open_backing(config, false)
+}
+
+/// [`build_backing`] for a writer that then compares the configuration with
+/// the recovered volume ([`refuse_configuration_mismatch`]): attach, and a
+/// remote provider built on its own. With remote rollback protection,
+/// opening the backing claims a writer at the authority and copies the
+/// current generation into a namespace of its own; the configuration is
+/// compared with that generation first, and one that differs is refused with
+/// nothing claimed ([`refuse_before_claim`]).
+fn build_backing_to_attach(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    open_backing(config, true)
+}
+
+fn open_backing(
+    config: &VolumeConfig,
+    compare_before_claim: bool,
+) -> Result<Arc<dyn Backing>, DaemonError> {
     if let Some(rollback) = &config.backing.rollback_protection {
         #[cfg(target_os = "linux")]
         {
             let backing = match &rollback.remote {
-                Some(remote) => RollbackBacking::open_remote(
+                Some(remote) => RollbackBacking::open_remote_checked(
                     Path::new(&config.backing.root),
                     remote_witness_client(remote)?,
+                    |current| {
+                        if compare_before_claim {
+                            refuse_before_claim(config, rollback, current)
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )?,
                 None => RollbackBacking::open(
                     Path::new(&config.backing.root),
@@ -141,7 +166,7 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = rollback;
+            let _ = (rollback, compare_before_claim);
             return Err(DaemonError::Unsupported(
                 "backing rollback protection is supported only on Linux".to_string(),
             ));
@@ -177,6 +202,36 @@ fn refuse_unfinished_creation(backing: &dyn Backing) -> Result<(), DaemonError> 
         )));
     }
     Ok(())
+}
+
+/// What attach refuses once it has opened and recovered a remote-protected
+/// volume, refused before it claims a writer: a configured capacity that is
+/// not the stored one, then a setting fixed at creation that the superblock
+/// of the authority's `current` generation does not store. That superblock
+/// is the one recovery selects after the claim, which copies the generation
+/// unchanged, and its fixed settings are the same in every valid copy;
+/// attach compares again after recovery all the same.
+///
+/// Only the two superblock copies are read, each page authenticated against
+/// the manifest the authority selects (at most two 4 KiB pages), and
+/// nothing else: the open has already sent its one inspection and read and
+/// authenticated the manifest, as it did before. A read that fails (a page
+/// that does not authenticate) is refused here too, where the claim would
+/// otherwise have been sent and the copy then failed. A generation that
+/// holds no valid superblock has nothing to compare with: recovery refuses
+/// it after the claim, as before.
+#[cfg(target_os = "linux")]
+fn refuse_before_claim(
+    config: &VolumeConfig,
+    rollback: &maki_format::config::RollbackProtectionSection,
+    current: &ReadOnlyRollbackBacking,
+) -> Result<(), DaemonError> {
+    check_protected_capacity(rollback, current.capacity()?)?;
+    match maki_format::superblock::load_volume_superblock(current) {
+        Ok(envelope) => refuse_configuration_mismatch(config, &envelope.superblock),
+        Err(error @ FormatError::Io(_)) => Err(error.into()),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Refuse a configured capacity that differs from the `stored` one.
@@ -222,7 +277,10 @@ fn check_protected_capacity(
 /// a [`ReadOnlyRollbackBacking`], which sends the authority only
 /// inspections: [`build_backing`] claims a writer at the authority and
 /// copies the current generation into a namespace of its own, which a
-/// command that only reads must never do.
+/// command that only reads must never do. That view asks the authority
+/// again only when it is asked ([`Backing::check_freshness`]): a command
+/// that reports what it read through the backing returned here calls it
+/// once it has read everything, before it reports.
 pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
     use maki_backing::configured::BACKING_ROOT;
     let root = Path::new(&config.backing.root);
@@ -242,11 +300,13 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
                         return build_backing(config);
                     }
                     let backing = ReadOnlyRollbackBacking::open(root, witness)?;
-                    refuse_unfinished_creation(&backing)?;
+                    refuse_unfinished_creation(&backing)
+                        .map_err(|error| refused_after_reading(&backing, error))?;
                     backing
                 }
             };
-            check_protected_capacity(rollback, backing.capacity()?)?;
+            check_protected_capacity(rollback, backing.capacity()?)
+                .map_err(|error| refused_after_reading(&backing, error))?;
             return Ok(Arc::new(backing));
         }
         #[cfg(not(target_os = "linux"))]
@@ -274,6 +334,74 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
         ));
     }
     Ok(Arc::new(view))
+}
+
+/// How a command that reads a backing through [`build_backing_to_read`]
+/// reports `failure`, met after the backing was opened. A remote view asks
+/// its authority only while it opens and when asked, and a command asks it
+/// before it reports what it read (SPEC §27); it asks before it reports a
+/// failure too ([`Backing::ask_witness_again`]), also when the failure
+/// stopped the view (a page that no longer authenticates). If the witness no
+/// longer selects what was read, or answered so that the view stopped (a
+/// denial, an invalid answer), that answer is reported instead of the
+/// failure; if it cannot be asked, the failure is, saying so. A view that
+/// stopped on what it read is reported by its stop reason, which names
+/// that. Any other backing answers as it answers before each of its
+/// operations.
+pub fn read_failure(backing: &dyn Backing, failure: String) -> String {
+    match backing.ask_witness_again() {
+        WitnessAnswer::Selects => backing.session_stopped().unwrap_or(failure),
+        WitnessAnswer::Stopped(reason) => reason,
+        WitnessAnswer::Unanswered(error) => unanswered(
+            &backing.session_stopped().unwrap_or(failure),
+            &error.to_string(),
+        ),
+    }
+}
+
+/// Whether the witness still selects what a command read through a backing
+/// that [`build_backing_to_read`] opened, asked once the command has read
+/// everything it reports, before it reports (SPEC §27): one inspection of a
+/// remote authority, however much was read. A record that changed since the
+/// view was opened fails the command, and so does a view that stopped, after
+/// its witness has been asked again as for any failure ([`read_failure`]).
+pub fn still_current(backing: &dyn Backing) -> Result<(), String> {
+    match backing.check_freshness() {
+        Ok(()) => Ok(()),
+        Err(error) => Err(match backing.session_stopped() {
+            None => error.to_string(),
+            Some(_) => read_failure(backing, error.to_string()),
+        }),
+    }
+}
+
+/// [`read_failure`] for a refusal of [`build_backing_to_read`] itself.
+#[cfg(target_os = "linux")]
+fn refused_after_reading(backing: &dyn Backing, refusal: DaemonError) -> DaemonError {
+    match backing.ask_witness_again() {
+        WitnessAnswer::Selects => match backing.session_stopped() {
+            Some(reason) => {
+                DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+            }
+            None => refusal,
+        },
+        WitnessAnswer::Stopped(reason) => {
+            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+        }
+        WitnessAnswer::Unanswered(error) => DaemonError::Io(std::io::Error::other(unanswered(
+            &backing
+                .session_stopped()
+                .unwrap_or_else(|| refusal.to_string()),
+            &error.to_string(),
+        ))),
+    }
+}
+
+fn unanswered(failure: &dyn std::fmt::Display, error: &str) -> String {
+    format!(
+        "{failure}; the witness could not be asked again whether it still selects what was \
+         read: {error}"
+    )
 }
 
 /// Check for volume markers without opening a writer session or contacting the witness.
@@ -876,7 +1004,7 @@ async fn dispatch_endpoint_set(
     let volume = match volume {
         Some(volume) => volume,
         None => {
-            let backing = build_backing(config)?;
+            let backing = build_backing_to_attach(config)?;
             let options = engine_options(config).volume;
             recovered = Arc::new(
                 tokio::task::spawn_blocking(move || Volume::recover(backing, options))
@@ -1565,7 +1693,7 @@ async fn attach_hardened(
     if let Err(e) = maki_backing::raise_open_file_limit() {
         tracing::warn!("cannot raise the open-file soft limit: {e}");
     }
-    let backing = build_backing(config)?;
+    let backing = build_backing_to_attach(config)?;
     let mut options = engine_options(config);
     let recovery_options = options.volume.clone();
     let volume = Arc::new(
@@ -1581,9 +1709,10 @@ async fn attach_hardened(
     );
     // Everything the configuration fixes at creation, before any provider
     // credential is loaded or transport built; `maki check` reports the same
-    // comparison. Opening the backing (for a remote witness, its TLS
-    // identity and a writer claim) and recovery come first: the superblock
-    // is inside the backing.
+    // comparison. Opening the backing and recovery come first: the
+    // superblock is inside the backing. With a remote witness the open
+    // (which loads the witness client's TLS identity to ask the authority)
+    // has compared already, before its writer claim.
     refuse_configuration_mismatch(config, volume.superblock())?;
     for warning in config.warnings() {
         tracing::warn!("{warning}");

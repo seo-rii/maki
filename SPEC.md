@@ -1405,9 +1405,28 @@ provider transport is built, and refuses a configuration that differs; the
 key identity is the key's name, and the key canary (§27) proves the key
 material itself. Process hardening (§36, §37) comes first, and so do opening
 the backing and recovery, because the superblock that is compared is the one
-recovery selects inside the backing: with remote rollback protection, opening
-it loads the witness client's TLS identity and claims a writer at the
-authority.
+recovery selects inside the backing.
+
+With remote rollback protection, opening the backing to write claims a writer
+at the authority, copies the current generation into a namespace of its own
+and recovers the volume there. Attach therefore compares first, where the
+claim would be sent, and MUST NOT claim a writer for a configuration that this
+comparison refuses. (A different key under the same name, an unavailable
+credential, a failed self-test and a generation without a valid superblock
+are still found after the claim.) With the root's operation lock held, after
+the one inspection the
+open sends (which loads the witness client's TLS identity) and once the
+authority's current generation authenticates in the root (the manifest the
+authority selects, exactly, and the arena's size), it reads that generation's
+two superblock copies, every page authenticated against that manifest, and
+refuses a configured `backing.rollback_protection.capacity` other than the
+manifest's and a setting listed above whose configured value the selected
+copy does not store: the authority is sent nothing more and nothing in the
+root changes. This adds the reading of at most two pages to the open. It does
+so only while the authority is released; otherwise the claim is refused
+anyway. It compares again after recovery. A remote provider built on its own,
+which recovers the volume to probe its endpoints against it, compares the
+same way.
 `maki check` makes the same comparison and fails on a difference, naming the
 setting and both values.
 
@@ -2015,7 +2034,8 @@ bounded ciphertext batch into checkpoint slots; sync shard data and
 allocation metadata, advance checkpoint state, then prune covered segments
  ↓
 compare the configuration's immutable settings (§20) with the superblock,
-before any provider credential is loaded or provider transport built
+before any provider credential is loaded or provider transport built (with
+remote rollback protection also before the writer claim, §20)
  ↓
 run provider self-test
  ↓
@@ -2089,8 +2109,24 @@ root's format marker, which tells whether the root is one, and MUST refuse the
 backing when one of them is missing. With a remote witness it MUST send the
 authority nothing but inspections, and MUST refuse a record that changed
 between the first inspection and the moment both locks are held. Every later
-read MUST be authenticated again, and a witness that no longer selects what was
-read MUST stop the view. The read-only check rules above then apply.
+read MUST be authenticated again against the manifest that was read. A local
+witness MUST be read again before every operation, and one that no longer
+selects what was read MUST stop the view. A remote authority MUST be asked
+again before the command reports anything it read, and before it reports a
+failure it met once the open had read the record twice (the open's own
+included, and one that stopped the view, such as a page that no longer
+authenticates), and a record that differs from the one the open read MUST stop
+the view and be reported instead of what was read or of the failure; it is not
+asked before every operation, as a writer's view asks it. That proves what an
+inspection before every operation proves: while the view is open its locks keep
+out every operation that changes the root, every read is authenticated against
+the manifest, and a record never takes an earlier value again (every claim,
+a takeover, a restore and an enrollment recovery included, raises the fence,
+an activation or a release moves the phase on within it, and an advance raises
+the generation), so a record that is the same at the end was the same
+throughout. A command sends two inspections while the view opens and one
+before it reports, and the deep check one more before its verdict, however
+much it reads. The read-only check rules above then apply.
 
 Damage beyond the required final-tail boundary MAY be treated as torn unsynced
 data. An intact later record MUST NOT be used to infer earlier durability:
