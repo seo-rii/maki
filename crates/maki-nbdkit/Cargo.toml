@@ -38,6 +38,7 @@ tracing.workspace = true
 [dev-dependencies]
 maki-nbdkit = { path = ".", features = ["fake-provider"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 base64.workspace = true
 tokio-tungstenite = "0.26"
 futures-util = "0.3"

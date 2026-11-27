@@ -2138,6 +2138,10 @@ mod capability_mode_tests {
 }
 
 #[cfg(all(test, feature = "fake-provider"))]
+#[path = "endpoint_probe_tests.rs"]
+mod endpoint_probe_tests;
+
+#[cfg(all(test, feature = "fake-provider"))]
 mod startup_reference_tests {
     use super::*;
     use maki_test_support::fake_provider::FakeCryptoProvider;
