@@ -200,10 +200,24 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
         started = clock()
         stop = run(["systemctl", "stop", *targets], timeout=STOP_TIMEOUT)
         stopped = clock()
-        times = {name: unit_times(name, started, run) for name in volumes}
+        times = {}
+        for name in volumes:
+            try:
+                times[name] = unit_times(name, started, run)
+            except RuntimeError as error:
+                times[name] = {"stop_began": None, "stop_ended": None, "stop_seconds": None,
+                               "result": f"unknown ({error})"}
         accounts = {}
+        # An opener whose device was never disconnected lets go at its stop
+        # file; one that saw its disconnect ends after its hold.
+        patience = hold + 60 if stop.returncode == 0 else 5
         for name, (process, log) in openers.items():
-            accounts[name] = (process.wait(timeout=hold + 60), log.read_text())
+            try:
+                status = process.wait(timeout=patience)
+            except subprocess.TimeoutExpired:
+                (directory / f"stop-opener-{name}").touch()
+                status = process.wait(timeout=hold + 10)
+            accounts[name] = (status, log.read_text())
     finally:
         for name in openers:
             (directory / f"stop-opener-{name}").touch()
@@ -219,9 +233,11 @@ def stop_together(volumes, hold, directory, *, run=subprocess.run, popen=subproc
                            "opener_status": accounts[name][0]} for name in volumes]}
     (directory / "stop-together.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"\n{'volume':8} {'device':10} {'stop began':>11} {'stop ended':>11} {'stop took':>11}  result")
+    def seconds(value):
+        return "        - " if value is None else f"{value:9.3f} s"
     for volume in report["volumes"]:
-        print(f"{volume['volume']:8} {volume['device']:10} {volume['stop_began']:9.3f} s "
-              f"{volume['stop_ended']:9.3f} s {volume['stop_seconds']:9.3f} s  {volume['result']}")
+        print(f"{volume['volume']:8} {volume['device']:10} {seconds(volume['stop_began'])} "
+              f"{seconds(volume['stop_ended'])} {seconds(volume['stop_seconds'])}  {volume['result']}")
     print(f"systemctl stop returned {stop.returncode} after {report['stop_command_seconds']:.3f} s")
     for name in volumes:
         print(f"\n--- the opener of {devices[name]} ({name}), status {accounts[name][0]}")

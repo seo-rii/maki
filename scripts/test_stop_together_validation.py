@@ -140,6 +140,7 @@ class StopTogether(unittest.TestCase):
             (self.sysfs / f"nbd{index}/backend").write_text(f"maki-{index}\n")
         self.result = "success"
         self.left = None
+        self.stop_status = 0
 
     def host(self, argv, **_):
         self.events.append(argv)
@@ -148,7 +149,7 @@ class StopTogether(unittest.TestCase):
                 if self.left != name:
                     (self.state / f"{name}.nbd").unlink()
                     (self.sysfs / f"nbd{index}/backend").unlink()
-            return subprocess.CompletedProcess(argv, 0)
+            return subprocess.CompletedProcess(argv, self.stop_status)
         if argv[:2] == ["systemctl", "show"] and "-P" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout="inactive\n")
         if argv[:2] == ["systemctl", "show"]:
@@ -194,14 +195,17 @@ class StopTogether(unittest.TestCase):
             self.assertTrue((self.work / f"stop-opener-{name}").exists())
 
     def test_a_failed_stop_or_opener_or_a_leftover_fails_after_the_report(self):
-        cases = {"result": ("failed", "maki-attach@stop1.service stopped with result failed"),
+        cases = {"stop": (1, "systemctl stop exited with status 1"),
+                 "result": ("failed", "maki-attach@stop1.service stopped with result failed"),
                  "opener": (3, "the opener of /dev/nbd0 exited with status 3"),
                  "left": ("stop2", "stop2: its attach record remains")}
         for name, (value, message) in cases.items():
             with self.subTest(case=name):
                 self.setUp()
                 opener = {}
-                if name == "result":
+                if name == "stop":
+                    self.stop_status = value
+                elif name == "result":
                     self.result = value
                 elif name == "opener":
                     opener = {"status": value}
