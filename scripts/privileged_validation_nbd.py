@@ -17,6 +17,7 @@ disconnected recovery.
 import argparse
 import contextlib
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,8 @@ import sys
 
 
 SYSFS = Path("/sys/block")
+# Where maki-attach keeps its attach records.
+ATTACH_STATE = Path("/run/maki-attach")
 
 
 @contextlib.contextmanager
@@ -170,6 +173,18 @@ def backend(target):
     raise RuntimeError("connected NBD device has no readable backend identifier")
 
 
+def attachment_of(volume):
+    """(device, connection identifier) of `volume`'s attach record."""
+    descriptor = os.open(ATTACH_STATE / f"{volume}.nbd", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, encoding="utf-8") as source:
+        try:
+            record = json.loads(source.read(65536))
+            return record["device"], record["connection_id"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError(f"the attach record of volume {volume} cannot be read: "
+                               f"{error}") from None
+
+
 def execute(args):
     target = args.device.removeprefix("/dev/")
     with attach_lock():
@@ -193,6 +208,14 @@ def execute(args):
         if observed != args.identifier:
             raise RuntimeError("refusing to change an absent or foreign NBD backend")
         if args.action == "kernel-disconnect":
+            # The identifier the device shows proves nothing about whose
+            # connection it is: the volume's attach record, read under the
+            # lock, must name this device and this identifier.
+            recorded = attachment_of(args.volume)
+            if recorded != (args.device, args.identifier):
+                raise RuntimeError(f"the attach record of volume {args.volume} names "
+                                   f"{recorded[1]} on {recorded[0]}, not {args.identifier} on "
+                                   f"{args.device}")
             kernel_disconnect(int(target.removeprefix("nbd")))
             # The connection's attributes stay while anything holds the
             # device open: say what it shows now, which is not a verdict.
@@ -239,6 +262,8 @@ def main(argv=None):
     parser.add_argument("--socket")
     parser.add_argument("--vg")
     parser.add_argument("--lv")
+    parser.add_argument("--volume", help="kernel-disconnect: the volume whose attach record names "
+                                         "the connection")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"/dev/nbd(?:0|[1-9][0-9]{0,2})", args.device) or int(args.device[8:]) > 255:
         parser.error("device must be a canonical /dev/nbdN with N <= 255")
@@ -250,6 +275,10 @@ def main(argv=None):
         parser.error("invalid validation connection identifier")
     if not args.helper.startswith("/"):
         parser.error("the helper must be an absolute path")
+    if args.action == "kernel-disconnect" and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}",
+                                                               args.volume or ""):
+        parser.error("kernel-disconnect requires the --volume whose attach record names the "
+                     "connection")
     if args.action == "connect" and (not args.socket or not args.socket.startswith("/")):
         parser.error("connect requires an absolute socket path")
     if args.action in ("activate-vg", "remove-lv", "remove-vg"):

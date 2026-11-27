@@ -1263,14 +1263,22 @@ start_nbdkit() {
 # keeps a connection's attributes until the last opener of the device has
 # closed it: what the device shows after each step is logged.
 release_by_hand() {
-    local connection shown holder mapping looks=0
+    local connection shown holder mapping record recorded looks=0
     connection="$(shown_backend)"
     [[ "$connection" =~ ^maki-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] ||
         die "$device shows no attachment's connection before the release by hand (${connection:-none})"
+    # What the device shows is no proof of whose connection it is: the attach
+    # record's must be the one shown, on this device.
+    record="/run/maki-attach/$volume_name.nbd"
+    recorded="$(sudo -n cat "$record" | python3 -c \
+        'import json, sys; record = json.load(sys.stdin); print(record["device"], record["connection_id"])')" ||
+        die "could not read the attach record $record"
+    [[ "$recorded" == "$device $connection" ]] ||
+        die "the attach record $record names the connection ${recorded#* } on ${recorded%% *}, but $device shows $connection"
     # The invoking user deliberately opens the log file.
     # shellcheck disable=SC2024
     if ! sudo -n python3 -B "$REPO_ROOT/scripts/privileged_validation_nbd.py" --device "$device" \
-        --identifier "$connection" --helper "$attach_bin" kernel-disconnect \
+        --identifier "$connection" --helper "$attach_bin" --volume "$volume_name" kernel-disconnect \
         >"$run_dir/kernel-disconnect.txt" 2>&1; then
         cat "$run_dir/kernel-disconnect.txt" >&2
         die "NBD_CMD_DISCONNECT of $device failed; see kernel-disconnect.txt above"

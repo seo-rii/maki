@@ -549,7 +549,8 @@ sudo() {
                 self.setUp()
                 result, made = self.release("mapping", **options)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn(f"DIE: {message}", result.stdout)
+                [died] = [line for line in result.stdout.splitlines() if line.startswith("DIE: ")]
+                self.assertIn(message, died)
                 self.assertEqual(made, [])
 
     def test_no_release_by_hand_without_an_attachments_connection(self):
