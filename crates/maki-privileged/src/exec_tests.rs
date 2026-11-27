@@ -630,6 +630,9 @@ struct FakeSystem {
     mapping_during_preflight: bool,
     backends: HashMap<String, String>,
     steps: Vec<&'static str>,
+    /// Log each step as it runs, so that a test can tell what was logged
+    /// before it.
+    announce_steps: bool,
     fail_at: Option<&'static str>,
     nonzero_at: Option<&'static str>,
     /// The step's command is terminated by a signal: the runner reports a
@@ -1131,6 +1134,9 @@ impl System for FakeSystem {
         Ok(self.lv_size)
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        if self.announce_steps {
+            tracing::info!("the fake system runs {}", step.kind());
+        }
         self.steps.push(step.kind());
         self.command_limits.push(command::finish_by_limit());
         if self.nonzero_at == Some(step.kind()) || self.signalled_at == Some(step.kind()) {
@@ -1427,6 +1433,7 @@ fn logged_cleanups(
         let device = state.read("pg").unwrap().unwrap().device;
         system.steps.clear();
         system.backend_probes.set(0);
+        system.announce_steps = true;
         prepare(&mut system);
         let (result, log) = logged(|| {
             if held_by_the_run {
@@ -1444,6 +1451,18 @@ fn logged_cleanups(
         });
     }
     found
+}
+
+/// The path's line comes before the line of the first step the path runs.
+fn assert_logged_before_the_first_step(log: &str, path: &str) {
+    let named = log.find(path).expect("the path is logged");
+    let first = log
+        .find("the fake system runs ")
+        .expect("the path runs a step");
+    assert!(
+        named < first,
+        "the path was logged after its first step:\n{log}"
+    );
 }
 
 #[test]
@@ -1464,6 +1483,7 @@ fn cleanup_dispatches_an_owned_connection_to_detach() {
             "{log}"
         );
         assert!(!log.contains(RECOVERY_PATH), "{log}");
+        assert_logged_before_the_first_step(&log, DETACH_PATH);
     }
 }
 
@@ -1486,6 +1506,7 @@ fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
             "{log}"
         );
         assert!(!log.contains(DETACH_PATH), "{log}");
+        assert_logged_before_the_first_step(&log, RECOVERY_PATH);
     }
 }
 
