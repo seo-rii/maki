@@ -620,7 +620,8 @@ jobs:
     # baseline toolchain (fuzz/harness/tests/review_fuzz_corpus.rs). Each
     # target starts from fuzz/seeds/<target> and runs for 30 seconds; what a
     # run finds stays in fuzz/corpus, which is not committed, and a crash's
-    # input is uploaded.
+    # input is uploaded. The 24 CPU-hour qualification of SPEC §56 is the
+    # fuzz-qualification workflow, dispatched by hand.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -642,8 +643,11 @@ jobs:
         run: |
           cp Cargo.lock fuzz/Cargo.lock
           cargo fuzz build
-      # The two format targets read a 4096-byte frame after their selector
-      # byte, and nbd_handshake must reach the client's 64 KiB byte limit.
+      # Each target's -max_len is the qualification's
+      # (scripts/fuzz_campaign.py): beyond every bound its readers check on
+      # a longer input (a superblock frame, the 64 KiB limits, etcd's
+      # 256 KiB answer), and at least its longest seed, which libFuzzer
+      # would otherwise cut.
       - name: run every fuzz target from its seeds
         shell: bash
         run: |
@@ -652,11 +656,7 @@ jobs:
           targets="$(cargo fuzz list)"
           test -n "$targets"
           for target in $targets; do
-            case "$target" in
-              format_decoders|format_records) max_len=8192 ;;
-              nbd_handshake) max_len=70000 ;;
-              *) max_len=4096 ;;
-            esac
+            max_len="$(python3 -B scripts/fuzz_campaign.py max-len "$target")"
             mkdir -p "fuzz/corpus/$target"
             cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
               -max_total_time=30 -max_len="$max_len" -timeout=25 -rss_limit_mb=2048
