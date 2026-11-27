@@ -124,9 +124,17 @@ fn read_only() -> io::Error {
 #[derive(Clone, Copy)]
 enum Missing {
     /// An open where the backing can be written creates it: a local root's
-    /// `rollback.lock`, a witness directory's `witness.lock` and a remote
-    /// root's operation lock.
+    /// `rollback.lock` and a witness directory's `witness.lock`.
     Recreated,
+    /// A remote root's operation lock. A writable open creates it too, but
+    /// so does every operation that changes a remote root, its creation
+    /// included ([`OperationGuard`](super::gc::OperationGuard)): a root
+    /// without it is either a live root whose file was removed or a copy
+    /// made by a tool that left lock files out, and nothing in the root tells
+    /// the two apart (a copy of the files holds the root's
+    /// `remote.enrollment`, if it has one, too). A writable open of a copy that holds the
+    /// authority's current generation moves the volume onto it.
+    LiveRootOrCopy,
     /// No open creates it: the `rollback.lock` of a remote root's current
     /// namespace. The writer that forks a namespace creates its lock before
     /// the authority names it, and a writable open forks a new namespace
@@ -160,6 +168,14 @@ fn shared_lock_refusal(error: io::Error, name: &str, holder: &str, missing: Miss
                 match missing {
                     Missing::Recreated => {
                         " (opening the backing where it can be written recreates the file)"
+                    }
+                    Missing::LiveRootOrCopy => {
+                        ". Every operation that changes a remote root, its creation included, \
+                         creates this file, so this root is either the volume's live root with \
+                         the file removed or a copy made by a tool that left lock files out: if \
+                         it is the volume's live root, opening it where it can be written \
+                         recreates the file; do not attach a copy or open it to write, which \
+                         would claim a writer at the authority and move the volume onto the copy"
                     }
                     Missing::NotTheLiveRoot => {
                         ". A writer creates its namespace's lock before the authority names the \
@@ -298,7 +314,7 @@ impl ReadOnlyRollbackBacking {
                     OPERATION_LOCK,
                     "an operation that changes the root: an attach while it opens, a takeover, \
                      a restore, a snapshot, GC or an enrollment",
-                    Missing::Recreated,
+                    Missing::LiveRootOrCopy,
                 )
             })?;
         let record = remote::inspect(rpc.as_ref())?;

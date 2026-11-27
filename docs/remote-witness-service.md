@@ -758,9 +758,17 @@ namespace, so the first refusal says that the root is probably not the
 volume's live root but a copy of its current namespace, such as a snapshot
 destination, and not to attach it or open it to write: attach, or `maki
 volume snapshot` of that configuration, would claim a writer at the
-authority and fork the current generation inside the snapshot directory,
-and the volume's own root would then be refused by every command as one
-that does not hold the current generation.
+authority and fork the current generation inside the snapshot directory.
+Attach, `check`, `volume inspect`, `volume snapshot`, `volume takeover` and
+`volume gc` would then refuse the volume's own root as one that does not
+hold the current generation; `volume restore` does not, since the root's
+`remote.enrollment` identifies it, and a snapshot of the copy restored onto
+the volume's root, as [above](#snapshot-takeover-and-restore), puts the
+volume back with what was written on the copy. A root without
+`remote.operation.lock`, which every operation that changes a remote root
+creates, is refused as either a live root whose file was removed or a copy
+made by a tool that left lock files out, and not to be attached if it is a
+copy.
 
 Attach, which claims a writer, compares the configuration with the volume
 before its claim: with the root's operation lock held and the authority's

@@ -409,15 +409,22 @@ too:
 - `volume inspect`, `check` and `check --deep` all refuse a backing that a
   daemon or another writer holds (`… is held by another process`), and a
   missing lock file (`… is missing, and a read-only open cannot create it`).
-  For the backing root's `rollback.lock`, the witness directory's
-  `witness.lock` and a remote root's `remote.operation.lock` the refusal
-  adds that opening the backing where it can be written recreates the file,
-  as attach does. No open recreates the `rollback.lock` of a remote root's
-  current namespace: a writer creates it when it forks the namespace, before
-  the authority names it, and attach forks a new namespace rather than open
-  the current one. Its refusal says instead that the root is probably not
-  the volume's live root but a copy of its current namespace, such as a
-  snapshot destination, and not to attach it or open it to write (below);
+  For a local backing root's `rollback.lock` and the witness directory's
+  `witness.lock` the refusal adds that opening the backing where it can be
+  written recreates the file, as attach does. Every operation that changes a
+  remote root, its creation included, creates its `remote.operation.lock`,
+  so a remote root without it is either the volume's live root with the file
+  removed or a copy made by a tool that left lock files out, which nothing
+  in the root tells apart; the refusal says so, that opening the live root
+  to write recreates the file, and not to attach a copy or open it to write.
+  No open recreates the `rollback.lock` of a remote root's current
+  namespace: a writer creates it when it forks the namespace, before the
+  authority names it, and attach forks a new namespace rather than open the
+  current one. Its refusal says instead that the root is probably not the
+  volume's live root but a copy of its current namespace, such as a
+  snapshot destination, and not to attach it or open it to write (below).
+  A writable open of a copy that holds the authority's current generation
+  claims a writer and moves the volume onto the copy;
 - a daemon that starts while one of them runs fails to take its lock, and
   other read-only checks are admitted;
 - with a remote witness the authority's record is read again once both locks
@@ -430,12 +437,19 @@ too:
   the `rollback.lock` that a writer's namespace holds. Do not attach that
   configuration or run `maki volume snapshot` with it: either opens the
   destination to write, which claims a writer at the authority and forks the
-  current generation inside the snapshot directory, so that the volume's own
-  root is then refused by every command as one that does not hold the
-  authority's current generation. Once the volume has been opened to write
-  again from its own root, the authority names a namespace the snapshot does
-  not hold, and the refusal is `this backing root does not hold the remote
-  authority's current generation …`.
+  current generation inside the snapshot directory, which then holds the
+  volume. Attach, `check`, `volume inspect`, `volume snapshot`, `volume
+  takeover` and `volume gc` with the volume's own configuration then refuse
+  its own root as one that does not hold the authority's current generation;
+  `maki volume restore` does not, since the root's `remote.enrollment`
+  identifies it. To put the volume back on its own root, detach it, snapshot
+  the copy (with a configuration that names it) into a new directory and
+  restore that snapshot onto the volume's root
+  ([snapshot, takeover and restore](remote-witness-service.md#snapshot-takeover-and-restore)):
+  the volume keeps what was written on the copy. Once the volume has been
+  opened to write again from its own root, the authority names a namespace
+  the snapshot does not hold, and the refusal is `this backing root does not
+  hold the remote authority's current generation …`.
 
 Every read is authenticated again against the manifest that was read. A local
 witness is read again before every operation, as a writer's operations read

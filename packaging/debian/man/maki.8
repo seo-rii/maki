@@ -89,7 +89,10 @@ is probably a copy of that namespace, such as a
 .B "volume snapshot"
 destination, and not the volume's live root, as the refusal says: do not
 attach it or open it to write, which would claim a writer and move the
-volume onto the copy.
+volume onto the copy. One without
+.I remote.operation.lock
+is either the live root with that file removed or a copy made without its
+lock files; only the live root may be opened to write.
 .PP
 An attached daemon exposes the
 .BR status ", " metrics ", " checkpoint ", " drain " and " reload
