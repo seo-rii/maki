@@ -59,6 +59,20 @@ use protected::{ResponseDecodeError, WireItem, WireRequest, WireResponse};
 mod protected_tests;
 #[cfg(test)]
 mod tls_tests;
+// A loopback address that never answers needs Linux: a listener whose
+// accept queue is full drops the SYNs sent to it.
+#[cfg(all(test, target_os = "linux"))]
+mod connect_tests;
+
+/// The TCP connector's name resolution: the system's. Tests substitute
+/// [`test_resolver::TestResolver`], which resolves to addresses of their
+/// own.
+#[cfg(not(test))]
+type Resolver = hyper_util::client::legacy::connect::dns::GaiResolver;
+#[cfg(test)]
+type Resolver = test_resolver::TestResolver;
+#[cfg(test)]
+mod test_resolver;
 
 // ---------------------------------------------------------------- messages
 
@@ -809,6 +823,15 @@ impl GrpcCryptoProvider {
     }
 
     fn build(spec: GrpcProviderSpec, tls: Option<GrpcTlsConfig>) -> Result<Self, CryptoError> {
+        Self::build_resolving(spec, tls, Resolver::new())
+    }
+
+    /// `build`, with the TCP connector resolving names through `resolver`.
+    fn build_resolving(
+        spec: GrpcProviderSpec,
+        tls: Option<GrpcTlsConfig>,
+        resolver: Resolver,
+    ) -> Result<Self, CryptoError> {
         let mut endpoint = Channel::from_shared(spec.url.clone())
             .map_err(|e| fatal(format!("bad endpoint url: {e}")))?;
         match (endpoint.uri().scheme_str(), tls) {
@@ -887,7 +910,8 @@ impl GrpcCryptoProvider {
         // The TCP connector is configured like tonic's own: its timeout is
         // divided across the resolved addresses, so an unreachable first
         // address (`localhost` as `::1` on Windows) leaves time for the next.
-        let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+        let mut tcp =
+            hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(resolver);
         tcp.enforce_http(false);
         tcp.set_nodelay(true);
         tcp.set_connect_timeout(Some(spec.timeout));

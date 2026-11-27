@@ -12,10 +12,12 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use hyper_util::client::legacy::connect::HttpConnector;
 use tonic::transport::{Channel, Endpoint};
 
 use maki_crypto::CryptoError;
+
+/// The TCP connector, with the provider's resolver.
+type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<crate::Resolver>;
 
 #[derive(Clone)]
 enum ConnectionState {
@@ -277,7 +279,7 @@ mod tests {
     fn cache() -> ConnectionCache {
         ConnectionCache::new(
             Endpoint::from_static("http://127.0.0.1:1"),
-            HttpConnector::new(),
+            HttpConnector::new_with_resolver(crate::Resolver::new()),
             Duration::from_secs(4),
         )
     }

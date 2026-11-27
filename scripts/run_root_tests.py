@@ -2,8 +2,8 @@
 """Run the test targets that need root as root, from an unprivileged build.
 
 Some regression tests give a fixture to another user, run a binary as the
-daemon user, enter a private mount namespace, set the immutable flag or
-connect a kernel NBD device.
+daemon user, enter a private mount or network namespace, set the immutable
+flag or connect a kernel NBD device.
 Without root they print why they are skipped and pass, so the ordinary
 workspace run says nothing about the behaviour they protect. ROOT_TARGETS
 names every test target with such a case;
@@ -21,8 +21,8 @@ run fails before anything is compiled.
 
 Each executable starts in its package directory with a minimal environment
 (PATH, the test harness settings and the MAKI_TEST_REQUIRE_* switches that
-turn a missing second filesystem, nbdkit, NBD headers or kernel NBD from a
-skip into a failure) and a scratch TMPDIR under /tmp that other users can
+turn a missing second filesystem, nbdkit, NBD headers, kernel NBD or IPv6
+loopback address from a skip into a failure) and a scratch TMPDIR under /tmp that other users can
 search (the fixtures hand files to uid 65534) and that is removed as root
 afterwards. Some of
 the targets run a built binary (`maki`, `maki-check`) as that user, so other
@@ -86,6 +86,10 @@ ROOT_TARGETS = (
     "crates/maki-nbdkit/tests/review_memory_budget_mountinfo.rs",
     "crates/maki-privileged/tests/review_mountinfo_bytes.rs",
     "crates/maki-privileged/tests/review_mountinfo_empty_source.rs",
+    # Unit tests: connect_tests.rs gives a thread a private network
+    # namespace whose packet filter drops the SYNs sent to one loopback
+    # address, a route that drops packets.
+    "crates/maki-crypto-http/src/lib.rs",
     # The helper's own NBD connect and disconnect through the kernel's nbd
     # netlink family, which requires CAP_SYS_ADMIN (and the nbd module).
     "crates/maki-privileged/tests/review_nbd_kernel.rs",
@@ -264,7 +268,7 @@ def run(arguments):
                         for name in ("RUST_BACKTRACE", "RUST_TEST_THREADS",
                                      "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM",
                                      "MAKI_TEST_REQUIRE_NBD", "MAKI_TEST_REQUIRE_NBDKIT",
-                                     "MAKI_TEST_REQUIRE_NBD_HEADERS")
+                                     "MAKI_TEST_REQUIRE_NBD_HEADERS", "MAKI_TEST_REQUIRE_IPV6")
                         if name in os.environ]
         for target in ROOT_TARGETS:
             executable, package = tests[target]

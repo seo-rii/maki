@@ -266,6 +266,13 @@ class RootOnlyTargetsAreNotForgotten(unittest.TestCase):
         for job in ("pr", "latest-stable"):
             self.assertRegex(jobs[job], r"apt-get install -y -q nbdkit [^\n]*\blinux-libc-dev\b")
 
+    def test_every_job_requires_the_ipv6_loopback_address(self):
+        # The connect tests across address families pass unseen without it.
+        workflow = WORKFLOW.read_text()
+        environment = workflow[workflow.index("\nenv:\n"):workflow.index("\njobs:\n")]
+        self.assertIn('  MAKI_TEST_REQUIRE_IPV6: "1"\n', environment)
+        self.assertEqual(workflow.count("MAKI_TEST_REQUIRE_IPV6:"), 1)
+
 
 TEST_BINARY = '''#!{python} -B
 import json, os, stat, sys
@@ -332,6 +339,7 @@ class RootRunner(unittest.TestCase):
         environment = {"PATH": f"{self.tools}{os.pathsep}{os.environ['PATH']}",
                        "MAKI_FIXTURE_MARKER": "inherited", "RUST_BACKTRACE": "0",
                        "MAKI_TEST_REQUIRE_OTHER_FILESYSTEM": "1",
+                       "MAKI_TEST_REQUIRE_IPV6": "1",
                        **{name: "1" for name in REQUIRED_ENVIRONMENT}}
         for patch in (mock.patch.dict(os.environ, environment),
                       mock.patch.object(runner, "owned_by", return_value=set())):
@@ -411,6 +419,7 @@ class RootRunner(unittest.TestCase):
             self.assertEqual(environment["TMPDIR"], scratch)
             self.assertEqual(environment["RUST_BACKTRACE"], "0")
             self.assertEqual(environment["MAKI_TEST_REQUIRE_OTHER_FILESYSTEM"], "1")
+            self.assertEqual(environment["MAKI_TEST_REQUIRE_IPV6"], "1")
             for name in REQUIRED_ENVIRONMENT:
                 self.assertEqual(environment[name], "1", name)
             self.assertNotIn("MAKI_FIXTURE_MARKER", environment)

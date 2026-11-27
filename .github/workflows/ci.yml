@@ -20,11 +20,14 @@ on:
 # same holds for the tests of the helper's NBD handshake against a real
 # nbdkit and of its constants against the kernel's UAPI headers: every job
 # that runs them installs nbdkit, the kernel's UAPI headers (linux-libc-dev,
-# kernel-headers on EL9) and a C compiler.
+# kernel-headers on EL9) and a C compiler. The Linux tests of the HTTP and
+# gRPC transports' connect across address families need the IPv6 loopback
+# address, which the runner VMs have; without it they would pass unseen.
 env:
   MAKI_TEST_REQUIRE_OTHER_FILESYSTEM: "1"
   MAKI_TEST_REQUIRE_NBDKIT: "1"
   MAKI_TEST_REQUIRE_NBD_HEADERS: "1"
+  MAKI_TEST_REQUIRE_IPV6: "1"
 
 jobs:
   dependency-audit:
