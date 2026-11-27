@@ -1033,9 +1033,9 @@ impl GrpcCryptoProvider {
         let handed_over = AtomicBool::new(false);
         // A TLS failure inside the call is an endpoint failure, but unlike a
         // completed error response it leaves no working connection: retire
-        // the channel, so the next call reconnects through the payload-free
-        // attempt above instead of tonic's own reconnect with its request
-        // queued (see `preserve` below).
+        // the channel, also one no RPC has completed on yet, so the next call
+        // reconnects through the payload-free attempt above instead of
+        // tonic's own reconnect with its request queued (`retire` below).
         let tls_failed = AtomicBool::new(false);
         let exchange = async {
             let channel = connection.channel().await?;
@@ -1072,7 +1072,9 @@ impl GrpcCryptoProvider {
             Ok(Err(error)) => {
                 // A completed error response keeps the connection; a local
                 // TLS failure does not (see `tls_failed`).
-                if error.class() != ErrorClass::Retryable && !tls_failed.load(Ordering::SeqCst) {
+                if tls_failed.load(Ordering::SeqCst) {
+                    connection.retire();
+                } else if error.class() != ErrorClass::Retryable {
                     connection.preserve();
                 }
                 return Err(unsent(error));

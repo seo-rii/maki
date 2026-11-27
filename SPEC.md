@@ -779,8 +779,11 @@ configured provider validation, and control socket binding precede the first
 NBD client. It sends `READY=1` from nbdkit's main process only after those
 steps succeed. Initialization or configured notification failure fails startup.
 Manual runs without `NOTIFY_SOCKET` perform the same initialization without
-notifying a service manager. The startup timeout needs qualification for the
-deployment's recovery size and provider latency.
+notifying a service manager. Completed recovery work and every request of the
+endpoint probes and cross-endpoint checks at attach (§34) that ends, whatever
+its answer, extend the start timeout (`EXTEND_TIMEOUT_USEC`), at most once
+every 30 seconds; nothing else does. The startup timeout needs qualification
+for the deployment's recovery size and provider latency.
 
 Initial data-plane readiness is separate from the helper's verified XFS mount,
 the fresh `maki-attach verify` workload gate, and database recovery. It does not
@@ -1333,14 +1336,15 @@ HTTP). An upgrade reply cut short by a lost connection is `Retryable`.
 
 Without a classified answer, every transport reports a timeout or a lost
 connection, also one that cuts a reply short, as `Retryable`, and a TLS
-authentication or protocol failure as `EndpointFatal`. On an established
-connection, a reply that breaks the framing of the transport's messages or
-their size limit is a contract violation: an HTTP/1.1 response head or chunked
-body that does not parse, or a body that only the connection's close ends; a
-gRPC message whose length prefix, count or final status breaks the gRPC
-protocol, or a stream that ends inside a message; a WebSocket frame that breaks
-the WebSocket protocol or is not a JSON text frame with a numeric `id`. Two
-protocol failures are classified otherwise. A WebSocket upgrade reply that is
+authentication or protocol failure as `EndpointFatal` where its TLS error
+reaches the transport (below). On an established connection, a reply that
+breaks the framing of the transport's messages or their size limit is a
+contract violation: an HTTP/1.1 response head or chunked body that does not
+parse, or a body that only the connection's close ends; a gRPC message whose
+length prefix, count or final status breaks the gRPC protocol, or a stream
+that ends inside a message; a WebSocket frame that breaks the WebSocket
+protocol or is not a JSON text frame with a numeric `id`. Two protocol
+failures are classified otherwise. A WebSocket upgrade reply that is
 not a valid upgrade is `EndpointFatal`, as above. An HTTP/2 error below the
 gRPC messages, a reset stream or a GOAWAY, is no framing violation: it reaches
 Maki as the gRPC status that the gRPC library derives from it and is classified
@@ -1352,6 +1356,24 @@ code is `Retryable`. A GOAWAY that accepted the call and then closes the
 connection under it is `Retryable` whatever its code. Either way the request
 was handed to the connection and counts as sent: a call that a GOAWAY refused
 is not resent or failed over unless the provider is `retry_safe`.
+
+A TLS failure is `EndpointFatal` wherever its rustls error reaches the
+transport: in the connection attempt; on an established HTTP or WebSocket
+connection while a request waits for its reply (a record that does not
+decrypt, a fatal alert), where the request counts as sent; and when the gRPC
+library reconnects inside an established channel, which counts as sent too,
+since that library holds the request while it reconnects. The provider MUST
+then retire that channel, also one no call has completed on, so that no later
+call uses it and the next call opens a new connection through the provider's
+own connection attempt, which hands no request over before the connection is
+ready. A TLS failure on an established gRPC connection does not reach the
+transport as one: the HTTP/2 library under the gRPC library keeps only the
+kind and text of the connection's I/O error, and no failure is classified by
+its text, so the call is classified by the gRPC status that library derives
+(in practice `Unknown`, `Cancelled` or `Unavailable`, which are `Retryable`)
+and counts as sent. A TLS 1.3 server's refusal of the client certificate,
+which arrives after the client has finished its side of the handshake,
+reaches a gRPC call this way.
 
 ---
 
@@ -1663,7 +1685,8 @@ shard absent from catalog
 
 shard exists
 allocation bit = 0
-slot header bytes are all zero
+every byte of the slot that a slot write reaches (its header and the
+max_ciphertext_size bytes after it) is zero below the end of the file
 → unwritten zero
 
 allocation bit = 0
@@ -1678,29 +1701,48 @@ slot header bytes are neither zero nor a valid header for this unit
   copy that listed it; a hole is never partly written)
 
 allocation bit = 0
+slot header bytes are all zero, a byte after them that a slot write
+reaches is not
+→ EIO (a written slot whose header was damaged, such as a sector that
+  reads back as zeros; a hole is never partly written)
+
+allocation bit = 0
 slot lies beyond the end of a data file shorter than its physical size
 (units_per_shard × slot_size)
 → EIO (the file is created at its full sparse size and synced before
   any slot is written, so a short file was truncated)
 ```
 
+The alignment padding after the largest ciphertext is never written and
+says nothing about the slot. A crash leaves an all-zero header over written
+ciphertext only where a slot write tore before its shard was synced: the
+checkpoint did not complete, so the unit's journal record is newer than the
+checkpoint, and before the volume is exposed recovery replays the unit's
+newest record: it rewrites the slot, or, when that record is a v3 trim,
+discards the unit, which then reads as zeros (the deep check calls such a
+slot recoverable either way). The slot of a
+discarded unit (v3, below) is answered by its discard bit, however much of it
+a hole punch released.
+
 A truncated data file is media damage, and its evidence is volatile: the
 next slot write past the end grows the file with zeros, after which a removed
-slot has an all-zero header and would read as a hole. Open therefore marks
+slot is all zero and would read as a hole. Open therefore marks
 every cleared slot beyond the end *allocated* (persisted before the file is
 grown back), so it reads as allocated-but-invalid, EIO, until it is
 rewritten. The only legitimately short data file belongs to a shard that was
 never written into: not named by the loaded catalog copy, with an empty
 allocation map (a stale empty copy from an earlier creation attempt proves
-nothing), and with no slot below the end of the file whose header bytes are
-not all zero. Its creation (§14) never finished, so no slot of it holds
+nothing), and with no byte below the end of the file, in a slot's header
+or in the bytes after it that a slot write reaches, that is not zero. Its
+creation (§14) never finished, so no slot of it holds
 data and its holes stay holes. Nothing proves such a file's size durable —
 not even a full-size page-cache view after a restart (§27) — so the
 size is set and synced again before the shard is written to or cataloged.
 The catalog and the allocation map can both fall back to a generation from
-before the first checkpoint into a shard; a written slot header cannot,
+before the first checkpoint into a shard; written slot bytes cannot,
 since only a slot write puts bytes there and the file's size is proven
-before the first one, so such a header makes a short file a truncated one.
+before the first one, so such a byte (of a header, or after a header that
+reads back as zeros) makes a short file a truncated one.
 
 ```text
 allocation bit = 1
@@ -2117,7 +2159,12 @@ failure it met once the open had read the record twice (the open's own
 included, and one that stopped the view, such as a page that no longer
 authenticates), and a record that differs from the one the open read MUST stop
 the view and be reported instead of what was read or of the failure; it is not
-asked before every operation, as a writer's view asks it. That proves what an
+asked before every operation, as a writer's view asks it. What the command logs
+while it reads (a repair the store would make, a page that stopped the view) is
+a report of what it read too: those lines MUST be held back until the authority
+has answered, written once it has answered that it still selects what was read
+(also before a failure the command then reports), and otherwise dropped, with a
+line that says how many were. That proves what an
 inspection before every operation proves: while the view is open its locks keep
 out every operation that changes the root, every read is authenticated against
 the manifest, and a record never takes an earlier value again (every claim,
@@ -2399,8 +2446,19 @@ ciphertext encrypted by B must decrypt on A
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
 Every configured endpoint, a lone one included, is first probed on its own
-at attach. An endpoint that is unreachable when these self-tests run at
-attach is quarantined. When no endpoint is reachable the attach MUST be
+at attach: a self-test, then the key canary check (§27). The endpoints are
+probed at the same time, each probe with its own attempts, so endpoints
+that do not answer delay the attach by about one probe however many are
+configured. The canary checks, which load the volume's canary and may write
+it, run one at a time in configuration order, so on a new volume the first
+endpoint in that order whose canary check succeeds establishes the canary.
+An endpoint whose check fails with a transport failure keeps that turn
+through its remaining attempts, so endpoints that pass their self-test and
+then fail their canary check delay the endpoints after them one after
+another, each by at most its own probe. The probes' results are taken in configuration order: the first endpoint in
+that order whose probe refuses the attach refuses it, and no endpoint after
+it reaches the volume. An endpoint that is unreachable when these
+self-tests run at attach is quarantined. When no endpoint is reachable the attach MUST be
 refused, and the refusal MUST name each endpoint's failure (the first
 `EndpointFatal` failure among its probe attempts, otherwise the last). A
 lone endpoint is the exception when no probe attempt failed with

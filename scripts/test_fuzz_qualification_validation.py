@@ -5,6 +5,7 @@ libFuzzer processes, the merge of a target's corpora, and the verdict of the
 summary."""
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -103,14 +104,41 @@ if flags.get("merge") == "1" and os.environ.get("FAKE_MERGE_HANG") == "1":
     while True:
         time.sleep(0.05)
 if flags.get("merge") == "1":
+    # As libFuzzer's -merge=1 does (clang 18's, run on a target that aborts
+    # on one input): an outer process runs an inner one over the inputs. An
+    # input that fails the inner one (FAKE_MERGE_FAILS) is written to
+    # -artifact_prefix as the FAKE_MERGE_ARTIFACT kind of input (none if it
+    # is empty), the outer process starts the inner one again, which leaves
+    # that input out, and exits 0. An input FAKE_MERGE_SLOW names is
+    # written as a slow unit and kept.
     output, inputs = directories[0], directories[1:]
+    entries = [entry for directory in inputs for entry in sorted(Path(directory).iterdir())]
+    failing = os.environ.get("FAKE_MERGE_FAILS", "").encode()
+    slow = os.environ.get("FAKE_MERGE_SLOW", "").encode()
+    say(f"MERGE-OUTER: {len(entries)} files, 0 in the initial corpus, 0 processed earlier")
+    attempt = 1
+    say(f"MERGE-OUTER: attempt {attempt}")
     seen = set()
-    for directory in inputs:
-        for entry in sorted(Path(directory).iterdir()):
-            data = entry.read_bytes()
-            if data not in seen:
-                seen.add(data)
-                keep(output, data)
+    for entry in entries:
+        data = entry.read_bytes()
+        if failing and data == failing:
+            kind = os.environ.get("FAKE_MERGE_ARTIFACT", "crash")
+            if kind:
+                path = flags["artifact_prefix"] + f"{kind}-{hashlib.sha1(data).hexdigest()}"
+                Path(path).write_bytes(data)
+                say(f"Test unit written to {path}")
+            say("==4243== ERROR: libFuzzer: deadly signal")
+            attempt += 1
+            say(f"MERGE-OUTER: attempt {attempt}")
+            say(f"MERGE-INNER: '{entry}' caused a failure at the previous merge step")
+            continue
+        if slow and data == slow:
+            Path(flags["artifact_prefix"] + f"slow-unit-{hashlib.sha1(data).hexdigest()}"
+                 ).write_bytes(data)
+        if data not in seen:
+            seen.add(data)
+            keep(output, data)
+    say(f"MERGE-OUTER: successful in {attempt} attempt(s)")
     say(f"MERGE-OUTER: {len(seen)} new files with {len(seen) * 3} new features added; "
         f"{len(seen) * 2} new coverage edges")
     sys.exit(int(os.environ.get("FAKE_MERGE_EXIT", "0")))
@@ -122,7 +150,7 @@ if flags.get("runs") == "0":
         say(f"#{len(files)}\tINITED cov: {len(files) * 10} ft: {len(files) * 20} "
             f"corp: {len(files)}/{size}b exec/s: 0 rss: 30Mb")
     say(f"Done {len(files)} runs in 0 second(s)")
-    sys.exit(0)
+    sys.exit(int(os.environ.get("FAKE_COVERAGE_EXIT", "0")))
 
 say(f"INFO: Seed: {1000 + index}")
 say(f"#2\tINITED cov: 10 ft: 12 corp: 1/1b exec/s: 0 rss: 30Mb")
@@ -131,6 +159,10 @@ if mode == "crash":
     Path(flags["artifact_prefix"] + "crash-0123456789abcdef").write_bytes(b"boom")
     final(50)
     sys.exit(77)
+if mode == "fail":
+    # An exit with a nonzero status and no input written.
+    final(5)
+    sys.exit(1)
 if mode in ("hang", "stubborn"):
     if mode == "hang":
         def interrupted(*_):
@@ -545,6 +577,16 @@ class Run(Fixture):
         self.assertEqual(record["failures"], [
             f"process 1 was charged {worker['cpu_seconds']:.0f} of its 10 CPU seconds in 2 s"])
 
+    def test_a_round_that_fails_is_the_processes_last_though_it_lacks_cpu_time(self):
+        # A round that exits nonzero, here at once without writing an input,
+        # is not followed by rounds that would charge the process its share.
+        os.environ.update(FAKE_MODES=json.dumps(["fail"] + ["burn"] * 12), FAKE_BURN="0.25")
+        out, record = self.run_shard(workers=1, cpu_seconds=0.6, wall_seconds=30, min_round=1)
+        worker, = record["workers"]
+        self.assertEqual((worker["rounds_run"], worker["exit"]), (1, 1))
+        self.assertEqual(len(self.calls_made()), 1)
+        self.assertEqual(record["failures"], ["process 1 ended with status 1"])
+
     def test_rounds_that_end_long_before_their_time_are_not_restarted_without_end(self):
         # libFuzzer runs to -max_total_time; a process that exits 0 at once
         # (here the stand-in) is not restarted until the wall time is spent.
@@ -555,6 +597,20 @@ class Run(Fixture):
         self.assertEqual(len(list((out / "logs").iterdir())), 3)
         self.assertEqual(record["failures"], [
             "process 1 ended 3 rounds in a row before half of their time"])
+
+    def test_a_round_that_ends_early_is_no_failure_once_a_later_one_makes_up_the_time(self):
+        # docs/testing.md: a round may end before its time limit; only three
+        # such rounds in a row, short of the share, fail the process.
+        os.environ.update(FAKE_MODES=json.dumps(["ok"] + ["burn"] * 12), FAKE_BURN="0.6")
+        out, record = self.run_shard(workers=1, cpu_seconds=0.5, wall_seconds=30, min_round=1)
+        worker, = record["workers"]
+        first, *later = worker["rounds"]
+        self.assertLess(first["wall_seconds"], first["seconds"] / 2)
+        self.assertLess(first["cpu_seconds"], 0.5)
+        self.assertTrue(later)
+        self.assertEqual((worker["exit"], worker["stopped"], worker["ended_early"]), (0, False, False))
+        self.assertGreaterEqual(worker["cpu_seconds"], 0.5)
+        self.assertEqual(record["failures"], [])
 
     def test_a_shard_without_seeds_is_refused(self):
         empty = self.root / "empty"
@@ -637,6 +693,8 @@ class Merge(Fixture):
         # Two seeds and three distinct shard inputs.
         self.assertEqual((record["inputs"], record["cov"], record["ft"], record["seeds"]),
                          (5, 50, 100, 2))
+        # One attempt of the inner process, which wrote no input.
+        self.assertEqual((record["attempts"], record["artifacts"]), (1, []))
         self.assertEqual(record["failures"], [])
 
     def test_a_failed_merge_or_a_coverage_run_without_its_line_fails(self):
@@ -650,10 +708,76 @@ class Merge(Fixture):
         record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
                                      self.root / "again")
         self.assertEqual(record["failures"], ["the coverage run printed no INITED line"])
+        os.environ["FAKE_NO_INITED"] = "0"
+        os.environ["FAKE_COVERAGE_EXIT"] = "1"
+        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
+                                     self.root / "measured")
+        self.assertEqual(record["coverage_exit"], 1)
+        self.assertEqual(record["failures"], ["the coverage run ended with status 1"])
         self.assertEqual(self.campaign.main(["merge", "--binary", str(self.binary), "--target",
                                              "witness_etcd", "--seeds", str(self.seeds),
                                              "--shards", str(self.root / "shards"),
                                              "--out", str(self.root / "third")]), 1)
+
+    def test_an_input_that_fails_the_merge_fails_it_though_libfuzzer_exits_0(self):
+        # libFuzzer's merge survives an input that fails its inner process:
+        # it writes the input to -artifact_prefix, starts the inner process
+        # again ("MERGE-OUTER: attempt 2"), which leaves the input out, and
+        # exits 0; the coverage run of the merged corpus, without it, exits
+        # 0 too (clang 18's libFuzzer on a target that aborts on one input).
+        self.shard("fuzz-shard-witness_etcd-1", b"one", b"CRASH")
+        os.environ["FAKE_MERGE_FAILS"] = "CRASH"
+        name = "-" + hashlib.sha1(b"CRASH").hexdigest()
+        for index, kind in enumerate(("crash", "timeout", "oom", "leak")):
+            with self.subTest(kind=kind):
+                os.environ["FAKE_MERGE_ARTIFACT"] = kind
+                out = self.root / f"merged-{kind}"
+                record = self.campaign.merge(self.binary, "witness_etcd", self.seeds,
+                                             self.root / "shards", out, temp=self.root)
+                self.assertEqual((record["merge_exit"], record["coverage_exit"]), (0, 0))
+                # The two seeds and "one".
+                self.assertEqual((record["inputs"], record["cov"]), (3, 30))
+                self.assertEqual(record["failures"], [
+                    "the merge took 2 attempts: an input failed its inner process and was left out",
+                    f"the merge wrote the {kind} input {kind}{name}"])
+                self.assertEqual(record["attempts"], 2)
+                self.assertEqual(record["artifacts"],
+                                 [{"name": kind + name, "kind": kind, "bytes": 5}])
+                self.assertEqual(json.loads((out / "coverage.json").read_text()), record)
+                self.assertEqual(self.campaign.main([
+                    "merge", "--binary", str(self.binary), "--target", "witness_etcd",
+                    "--seeds", str(self.seeds), "--shards", str(self.root / "shards"),
+                    "--out", str(self.root / f"main-{kind}")]), 1)
+        # An inner process that fails without writing the input (killed, say)
+        # shows only in the second attempt.
+        os.environ["FAKE_MERGE_ARTIFACT"] = ""
+        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
+                                     self.root / "merged-killed", temp=self.root)
+        self.assertEqual(record["failures"], [
+            "the merge took 2 attempts: an input failed its inner process and was left out"])
+        self.assertEqual((record["merge_exit"], record["artifacts"]), (0, []))
+
+    def test_a_slow_unit_the_merge_wrote_is_listed_and_is_no_failure(self):
+        self.shard("fuzz-shard-witness_etcd-1", b"one", b"slow")
+        os.environ["FAKE_MERGE_SLOW"] = "slow"
+        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
+                                     self.root / "merged", temp=self.root)
+        self.assertEqual(record["failures"], [])
+        self.assertEqual(record["artifacts"], [
+            {"name": "slow-unit-" + hashlib.sha1(b"slow").hexdigest(), "kind": "slow-unit",
+             "bytes": 4}])
+        self.assertEqual(record["attempts"], 1)
+
+    def test_a_merge_log_without_an_attempt_fails(self):
+        # The second attempt is read from the merge's log: a log that shows
+        # no first attempt cannot show a second either.
+        self.shard("fuzz-shard-witness_etcd-1", b"one")
+        stand_in = self.binary.read_text()
+        self.binary.write_text(stand_in.replace('say(f"MERGE-OUTER: attempt {attempt}")\n', "pass\n"))
+        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
+                                     self.root / "merged", temp=self.root)
+        self.assertEqual(record["failures"], ["the merge's log shows no attempt of its inner process"])
+        self.assertEqual(record["attempts"], 0)
 
 
 def gates():
@@ -846,7 +970,7 @@ class Summary(unittest.TestCase):
     def coverage(self, target, **changes):
         record = {"target": target, "binary_sha256": self.DIGEST, "merge_exit": 0,
                   "coverage_exit": 0, "cov": 300, "ft": 900, "inputs": 40, "bytes": 5000,
-                  "seeds": 30, "error": None}
+                  "seeds": 30, "error": None, "attempts": 1, "artifacts": []}
         record.update(changes)
         directory = self.root / "coverage" / f"fuzz-coverage-{target}"
         directory.mkdir(parents=True, exist_ok=True)
@@ -911,6 +1035,33 @@ class Summary(unittest.TestCase):
         self.assertIn("`crash-00` (shard 1)", text)
         self.assertNotIn("slow-unit-01", text.split("| Target |")[1].split("\n")[2])
 
+    def test_an_input_the_merge_failed_on_does_not_qualify_and_is_listed(self):
+        # Shards that qualify on their own, and a merge that exited 0 with a
+        # crash input in its artifacts after a second attempt (the probe's
+        # record of clang 18's libFuzzer); a slow unit is only listed.
+        merged = [{"name": "crash-1c1b", "kind": "crash", "bytes": 5},
+                  {"name": "slow-unit-02", "kind": "slow-unit", "bytes": 4}]
+        self.coverage("witness_etcd", attempts=2, artifacts=merged)
+        self.coverage("format_decoders", attempts=2)
+        summary = self.summarize()
+        self.assertFalse(summary["qualified"])
+        rows = {row["target"]: row for row in summary["targets"]}
+        restarted = "the merge took 2 attempts: an input failed its inner process and was left out"
+        self.assertEqual(rows["witness_etcd"]["reasons"],
+                         [restarted, "the merge wrote the crash input crash-1c1b"])
+        self.assertEqual(rows["format_decoders"]["reasons"], [restarted])
+        self.assertEqual(rows["witness_etcd"]["artifacts"],
+                         [dict(artifact, merge=True) for artifact in merged])
+        text = campaign().markdown(summary)
+        row = next(line for line in text.splitlines() if line.startswith("| `witness_etcd`"))
+        self.assertIn("| `crash-1c1b` (merge) |", row)
+        self.assertNotIn("slow-unit-02", row)
+        for case, changes in (("no attempt", {"attempts": 0}), ("older record", {"attempts": None})):
+            with self.subTest(case=case):
+                self.coverage("witness_etcd", **changes)
+                self.assertEqual(self.verdicts()["witness_etcd"],
+                                 ["the merge's log shows no attempt of its inner process"])
+
     def test_a_binary_the_build_did_not_make_does_not_qualify(self):
         self.shard("witness_etcd", 1, binary_sha256="cd" * 32)
         self.assertIn("the shards and the merge fuzzed different binaries",
@@ -929,6 +1080,14 @@ class Summary(unittest.TestCase):
         summary = self.summarize()
         self.assertFalse(summary["qualified"])
         self.assertEqual(summary["unreadable"], ["the build job's record (SHA256SUMS) is missing"])
+
+    def test_a_plan_without_targets_does_not_qualify(self):
+        self.plan = dict(self.plan, targets=[])
+        summary = self.summarize()
+        self.assertEqual((summary["targets"], summary["unreadable"]), ([], []))
+        self.assertFalse(summary["qualified"])
+        self.assertTrue(campaign().markdown(summary).rstrip().endswith(
+            "Qualified: no, see the verdicts"))
 
     def test_the_summary_is_written_and_its_status_is_the_verdict(self):
         out = self.root / "summary"

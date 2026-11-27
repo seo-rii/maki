@@ -689,10 +689,23 @@ Endpoints that could not be cross-validated at attach
 (unreachable at the time) are quarantined and start serving only after the
 cross-endpoint check succeeds against a validated endpoint. Each endpoint, a
 lone one included, is probed on its own at attach (three attempts, spaced by
-`retry.initial_delay`, for a `retry_safe` provider; one otherwise). When none
+`retry.initial_delay`, for a `retry_safe` provider; one otherwise). The
+endpoints are probed at the same time, so endpoints that do not answer delay
+the attach by about one probe however many are listed: for a `retry_safe`
+provider three times `timeout` (six times over WebSocket, whose provider
+makes a second attempt of each request of a `retry_safe` provider) and the
+two delays, about 30 s over HTTP or gRPC and 60 s over WebSocket at the
+default 10 s. Each probe ends with the key canary check, which the
+endpoints take one at a time in configuration order: an endpoint that
+answers its self-test but fails its canary check with a transport failure
+keeps the endpoints after it waiting through its remaining attempts, so
+such endpoints still delay the attach one after another. Each probe request
+that ends extends the service's start deadline
+([data-plane readiness](operations.md#data-plane-readiness)). When none
 is reachable the attach is refused with "no remote endpoint is reachable;
 attach refused" followed by each endpoint's name and failure (the first
-endpoint failure among its attempts, otherwise the last failure). A lone
+endpoint failure among its attempts, otherwise the last failure), in
+configuration order. A lone
 endpoint is the exception when none of its attempts gave an endpoint
 failure and its probe request may be sent again: the provider is
 `retry_safe`, or every attempt failed before the request left Maki (a
@@ -845,9 +858,16 @@ connection's close ends; a gRPC message whose length prefix, count or final
 status breaks the gRPC protocol, or a stream that ends inside a message; a
 WebSocket frame that breaks the WebSocket protocol or is not a JSON text frame
 with a numeric ID. A TLS failure is recognised wherever the TLS error reaches
-the transport: in the connection attempt, and for gRPC also when the library
-reconnects inside an established channel (a server restarted with a
-certificate Maki does not trust); the next call then opens a new connection.
+the transport: in the connection attempt; for HTTP and WebSocket also on an
+established connection while a request waits for its reply (a record that
+does not decrypt, a fatal alert from the server); and for gRPC when the
+library reconnects inside an established channel (a server restarted with a
+certificate Maki does not trust). On an established connection the request
+was handed over and counts as sent; so does the gRPC reconnect, since the
+library holds the request while it reconnects. No later call uses that gRPC
+channel, also one no call has completed on yet: the next call opens a new
+connection through Maki's own connection attempt, which sends no request
+before the connection is ready, and whose failure therefore counts as unsent.
 Three failures are classified otherwise:
 
 - A WebSocket upgrade reply that is not a valid upgrade (a 101 without the
@@ -867,18 +887,21 @@ Three failures are classified otherwise:
   counts as sent, so a call that a GOAWAY refused is sent to another endpoint
   only when the provider is `retry_safe`. The next call opens a new
   connection.
-- A gRPC server that refuses the client certificate under TLS 1.3 does so
-  after the client has finished its side of the handshake, so the refusal
-  reaches the first call, not the connection attempt. The HTTP/2 library
-  keeps only the kind and text of that connection error, or cancels the call
-  with "connection closed", and Maki never classifies by text: the call is
-  classified by the status the library derives, usually `Unknown`,
-  `Cancelled` or `Unavailable`, which is retryable and counts as sent. The
-  server's log names the refusal. Under TLS 1.2 the refusal happens inside
-  the handshake and is an endpoint failure, and HTTP and WebSocket report it
-  as one when the server's alert is read before the connection is lost. On
-  any transport, a server that resets the connection before the client has
-  read its alert leaves only a lost connection, which is retryable.
+- A TLS failure on an established gRPC connection, while a call waits for
+  its reply (a record that does not decrypt, a fatal alert from the server),
+  does not reach Maki as one. The HTTP/2 library keeps only the kind and text
+  of that connection error, or cancels the call with "connection closed", and
+  Maki never classifies by text: the call is classified by the status the
+  library derives, usually `Unknown`, `Cancelled` or `Unavailable`, which is
+  retryable and counts as sent. A gRPC server that refuses the client
+  certificate under TLS 1.3 is such a failure: it refuses it after the client
+  has finished its side of the handshake, so the refusal reaches the first
+  call, not the connection attempt. The server's log names the refusal. Under
+  TLS 1.2 the refusal happens inside the handshake and is an endpoint
+  failure, and HTTP and WebSocket report it as one when the server's alert is
+  read before the connection is lost. On any transport, a server that resets
+  the connection before the client has read its alert leaves only a lost
+  connection, which is retryable.
 
 Each error's message carries a fixed prefix, and the dispatcher handles each
 kind differently:

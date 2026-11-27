@@ -28,6 +28,7 @@ maki-witness.workspace = true
 maki-control.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
+futures-util = "0.3"
 maki-test-support = { workspace = true, optional = true }
 thiserror.workspace = true
 parking_lot.workspace = true
@@ -38,9 +39,9 @@ tracing.workspace = true
 [dev-dependencies]
 maki-nbdkit = { path = ".", features = ["fake-provider"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 base64.workspace = true
 tokio-tungstenite = "0.26"
-futures-util = "0.3"
 tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
 rcgen.workspace = true

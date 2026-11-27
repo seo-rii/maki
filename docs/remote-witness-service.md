@@ -740,6 +740,10 @@ instead of what it read or of the failure; because a record never
 takes an earlier value again, one that is the same at the end was the same
 throughout
 ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+What the command logs while it reads (the store's warnings about repairs
+recovery would make, for example) is held back until the authority has
+answered, written once it has answered that it still selects what was read,
+and otherwise dropped, with a warning that says how many lines were.
 Its deep verdict is `unproven`. It loads the witness client's TLS identity to
 ask the authority, but no volume key, and decrypts nothing, so it does not
 replace an offline data-integrity check. A configuration whose root is a
@@ -748,7 +752,24 @@ namespace the snapshot copied, because that namespace holds no
 `rollback.lock` (`… is missing, and a read-only open cannot create it`), and
 once the volume has been opened to write again, because the snapshot does
 not hold the namespace the authority names (`this backing root does not hold
-the remote authority's current generation …`).
+the remote authority's current generation …`). No open recreates a
+namespace's `rollback.lock`, which its writer creates when it forks the
+namespace, so the first refusal says that the root is probably not the
+volume's live root but a copy of its current namespace, such as a snapshot
+destination, and not to attach it or open it to write: attach, or `maki
+volume snapshot` of that configuration, would claim a writer at the
+authority and fork the current generation inside the snapshot directory.
+Attach, `check`, `volume inspect`, `volume snapshot`, `volume takeover` and
+`volume gc` would then refuse the volume's own root as one that does not
+hold the current generation; `volume restore` does not, since the root's
+`remote.enrollment` identifies it (a root without that binding is refused
+by restore too), and a snapshot of the copy restored onto
+the volume's root, as [above](#snapshot-takeover-and-restore), puts the
+volume back with what was written on the copy. A root without
+`remote.operation.lock`, which every operation that changes a remote root
+creates, is refused as either a live root whose file was removed or a copy
+made by a tool that left lock files out, and not to be attached if it is a
+copy.
 
 Attach, which claims a writer, compares the configuration with the volume
 before its claim: with the root's operation lock held and the authority's

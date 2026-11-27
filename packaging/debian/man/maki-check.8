@@ -66,7 +66,9 @@ returns zero too; a script that needs
 .B clean
 reads the
 .B "info: deep check verdict:"
-line. Invalid command usage returns 2.
+line. A deep check that stops before its verdict (the volume lock is held,
+no checkpoint state copy is valid, the root cannot be read) prints no such
+line and returns 1. Invalid command usage returns 2.
 .SH SEE ALSO
 .BR maki (8),
 .BR maki-attach (8)

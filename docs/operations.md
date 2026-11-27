@@ -278,16 +278,23 @@ segments written before the setting was lowered stay readable. Its
 `--journal-segment-size` flag is still accepted, but no value within that
 limit changes the verdict.
 
-The deep report states one of three verdicts as an `info: deep check verdict:`
-line, printed before any `warning:` and `ERROR:` lines; the report ends with
-`check passed` or `check FAILED`. The verdict describes the volume: a
+A deep check that runs to its end states one of three verdicts as an
+`info: deep check verdict:` line, printed before any `warning:` and `ERROR:`
+lines; the report ends with `check passed` or `check FAILED`. One that stops
+early prints no verdict line: when the root holds no superblock file, the
+volume lock is held, a read-only check finds `volume.lock` missing, the
+superblock no longer loads or no checkpoint state copy is valid, the report
+ends with its `ERROR:` lines and `check FAILED`, and one that cannot finish
+reading (an I/O error, or a remote witness whose record changed meanwhile)
+prints only an `error:` line on stderr. Both exit with status 1. The verdict
+describes the volume: a
 configuration mismatch (above) fails the check whatever the verdict says. A
 check of a backing root it may not write states a fourth, `unproven`, in place
 of `clean` and `recoverable` ([below](#checking-a-backing-that-cannot-be-written)).
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
-| `clean` | Every allocated slot reads back and no unlisted slot holds a damaged header; ordinary replay of the journal is all the next attach does | None |
+| `clean` | Every allocated slot reads back, and every unlisted slot is a hole or holds a valid header for its unit over ciphertext that matches the header's checksum; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
 | `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation in a way attach refuses. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
 
@@ -301,10 +308,15 @@ reports a lost canary as an `ERROR:` only when the volume has history but no
 ciphertext to probe, which every attach refuses; otherwise it is a `warning:`
 that says what attach needs.
 
-The check reads every slot the map lists and probes the header of every
-slot it does not list in an existing shard, exactly like the read path: a
-non-zero header that does not decode on a cleared slot is damage (EIO at
-runtime), not a hole.
+The check reads every slot the map lists and probes every slot it does not
+list in an existing shard, exactly like the read path: a cleared slot is a
+hole only if its header and ciphertext area are all zero. A non-zero header
+that does not decode there is damage (EIO at runtime), and so is an all-zero
+header over ciphertext bytes that are not all zero, such as a header sector
+that reads back as zeros. A slot write that tore that way in a crash has a
+journal record newer than the checkpoint and is reported as recoverable.
+Each probe reads the slot's header and ciphertext area, not only its 64
+header bytes, so a deep check reads nearly all of every shard file.
 
 The raw slot reader and recovery see different states of the same volume:
 the checker reports what is on disk, the verdict says what the next attach
@@ -408,7 +420,23 @@ too:
 
 - `volume inspect`, `check` and `check --deep` all refuse a backing that a
   daemon or another writer holds (`… is held by another process`), and a
-  missing lock file (`… is missing, and a read-only open cannot create it`);
+  missing lock file (`… is missing, and a read-only open cannot create it`).
+  For a local backing root's `rollback.lock` and the witness directory's
+  `witness.lock` the refusal adds that opening the backing where it can be
+  written recreates the file, as attach does. Every operation that changes a
+  remote root, its creation included, creates its `remote.operation.lock`,
+  so a remote root without it is either the volume's live root with the file
+  removed or a copy made by a tool that left lock files out, which nothing
+  in the root tells apart; the refusal says so, that opening the live root
+  to write recreates the file, and not to attach a copy or open it to write.
+  No open recreates the `rollback.lock` of a remote root's current
+  namespace: a writer creates it when it forks the namespace, before the
+  authority names it, and attach forks a new namespace rather than open the
+  current one. Its refusal says instead that the root is probably not the
+  volume's live root but a copy of its current namespace, such as a
+  snapshot destination, and not to attach it or open it to write (below).
+  A writable open of a copy that holds the authority's current generation
+  claims a writer and moves the volume onto the copy;
 - a daemon that starts while one of them runs fails to take its lock, and
   other read-only checks are admitted;
 - with a remote witness the authority's record is read again once both locks
@@ -416,12 +444,26 @@ too:
 - a configuration whose `backing.root` is a snapshot destination (the
   target of `maki volume snapshot`) is refused. While the authority still
   names the namespace the snapshot copied, the refusal is `… is missing, and
-  a read-only open cannot create it`: the snapshot copies the current
-  generation into a namespace of the same name without the `rollback.lock`
-  that a writer's namespace holds. Once the volume has been opened to write
-  again, the authority names a namespace the snapshot does not hold, and the
-  refusal is `this backing root does not hold the remote authority's current
-  generation …`.
+  a read-only open cannot create it`, with the warning above: the snapshot
+  copies the current generation into a namespace of the same name without
+  the `rollback.lock` that a writer's namespace holds. Do not attach that
+  configuration or run `maki volume snapshot` with it: either opens the
+  destination to write, which claims a writer at the authority and forks the
+  current generation inside the snapshot directory, which then holds the
+  volume. Attach, `check`, `volume inspect`, `volume snapshot`, `volume
+  takeover` and `volume gc` with the volume's own configuration then refuse
+  its own root as one that does not hold the authority's current generation;
+  `maki volume restore` does not, since the root's `remote.enrollment`
+  identifies it (a root without that binding, such as an activated root an
+  older release wrote, is refused by restore too, and this way back is
+  closed to it). To put the volume back on its own root, detach it, snapshot
+  the copy (with a configuration that names it) into a new directory and
+  restore that snapshot onto the volume's root
+  ([snapshot, takeover and restore](remote-witness-service.md#snapshot-takeover-and-restore)):
+  the volume keeps what was written on the copy. Once the volume has been
+  opened to write again from its own root, the authority names a namespace
+  the snapshot does not hold, and the refusal is `this backing root does not
+  hold the remote authority's current generation …`.
 
 Every read is authenticated again against the manifest that was read. A local
 witness is read again before every operation, as a writer's operations read
@@ -436,7 +478,20 @@ no longer authenticates). An authority that changed since the view was
 opened fails the command (`the remote authority changed after the backing
 was opened read-only`, or `… while the backing was opened read-only: run the
 command again` when the open itself failed), and that is reported instead of
-what the command read or of the failure it met. That keeps what asking before every operation
+what the command read or of the failure it met. The command's log lines are
+held back the same way: what it logs once the view is open (the store's
+warnings about repairs recovery would make, such as `shard data file not
+listed by the loaded catalog copy; adopting it`, or the view's own
+`read-only rollback session stopped: …`) is written to stderr only once the
+authority has answered that it still selects what was read, before the
+report or the failure. When the authority does not confirm it (it changed,
+answered so that the view stopped, or could not be asked), every line held
+is dropped, including any warning about the connections to the authority, and
+`warning: dropped N log lines held back since the volume was opened: …` says
+how many before the error. A command that panics drops them too, and logs
+how many. A command that succeeds writes every line it held, up to 16 MiB of
+log text: lines beyond that are counted and not kept, and a warning says how
+many. That keeps what asking before every operation
 proved: the view's locks keep every operation that changes the root out
 while it reads, each read is authenticated, and the authority's record
 never takes an earlier value again, so a record that is the same at the end
@@ -699,7 +754,20 @@ is 180 seconds. During journal recovery, completed scan, repair and replay work
 can send `EXTEND_TIMEOUT_USEC=180000000`, at most once every 30 seconds. There
 is no timer sending extensions while an operation is blocked; without further
 progress the last granted deadline expires. Provider verification receives no
-unconditional heartbeat. Qualify startup and recovery time for the selected
+unconditional heartbeat either. While a remote provider's endpoints are probed
+at attach, each probe request that ends, answered or failed, and each request
+of the cross-endpoint check that follows sends the same extension with
+`STATUS=Probing crypto endpoints`, under the same 30-second limit. Each such
+request ends within the transport's `timeout` (twice that over WebSocket,
+where a `retry_safe` provider makes a second attempt) and the probes
+make a bounded number of them, so an outage extends the deadline only while
+they run, and the deadline expires during them only when no request ends for
+about 150 seconds. Within a probe the longest such time is one request
+after the `retry.initial_delay` that precedes an attempt, so twice the
+WebSocket `timeout`, or another transport's `timeout`, plus that delay above
+about 150 seconds allows it. The engine's self-test after the probes, which
+goes through the dispatcher and under `stall` waits for an endpoint, sends
+none. Qualify startup and recovery time for the selected
 journal size, storage and provider, including a single slow operation that
 cannot report progress within the deadline.
 

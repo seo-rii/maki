@@ -1424,9 +1424,9 @@ impl Engine {
     ) -> Result<Admission, CoreError> {
         // Already-zero trim hints must not reserve storage or consume journal
         // capacity. All records in a request are either writes or tombstones.
-        // Only a header that proves the unit unwritten skips it: the payload
-        // is never read, and a damaged unit is retired by its tombstone
-        // instead of failing the discard with EIO (R5-012).
+        // Only a slot that proves the unit unwritten skips it: no payload is
+        // verified, and a damaged unit is retired by its tombstone instead
+        // of failing the discard with EIO (R5-012).
         let mut filtered = Vec::new();
         let mut recheck = false;
         let cts = if cts.first().is_some_and(|ct| ct.data.is_empty()) {
