@@ -699,7 +699,20 @@ is 180 seconds. During journal recovery, completed scan, repair and replay work
 can send `EXTEND_TIMEOUT_USEC=180000000`, at most once every 30 seconds. There
 is no timer sending extensions while an operation is blocked; without further
 progress the last granted deadline expires. Provider verification receives no
-unconditional heartbeat. Qualify startup and recovery time for the selected
+unconditional heartbeat either. While a remote provider's endpoints are probed
+at attach, each probe request that ends, answered or failed, and each request
+of the cross-endpoint check that follows sends the same extension with
+`STATUS=Probing crypto endpoints`, under the same 30-second limit. Each such
+request ends within the transport's `timeout` (twice that over WebSocket,
+where a `retry_safe` provider makes a second attempt) and the probes
+make a bounded number of them, so an outage extends the deadline only while
+they run, and the deadline expires during them only when no request ends for
+about 150 seconds. Within a probe the longest such time is one request
+after the `retry.initial_delay` that precedes an attempt, so twice the
+WebSocket `timeout`, or another transport's `timeout`, plus that delay above
+about 150 seconds allows it. The engine's self-test after the probes, which
+goes through the dispatcher and under `stall` waits for an endpoint, sends
+none. Qualify startup and recovery time for the selected
 journal size, storage and provider, including a single slow operation that
 cannot report progress within the deadline.
 

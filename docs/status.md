@@ -107,7 +107,8 @@ See [cache reload](operations.md#growth-and-cache-reload).
   interruption at every attach step still need campaigns on the current
   integrated revision. Shutdown procedures now allow unmount writes before
   drain. Failed attach startup can schedule the workload recovery coordinator,
-  and completed recovery work can extend the daemon startup deadline; neither
+  and completed recovery work and each request of the attach's endpoint
+  probes that ends can extend the daemon startup deadline; neither
   establishes installed-stack convergence or persistent replay progress across
   repeated interruptions. Follow the [first production campaign](deployment/first-production-candidate.md)
   and [review scope](review-boundaries-2026-10-15.md#known-operational-items).

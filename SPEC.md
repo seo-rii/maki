@@ -779,8 +779,11 @@ configured provider validation, and control socket binding precede the first
 NBD client. It sends `READY=1` from nbdkit's main process only after those
 steps succeed. Initialization or configured notification failure fails startup.
 Manual runs without `NOTIFY_SOCKET` perform the same initialization without
-notifying a service manager. The startup timeout needs qualification for the
-deployment's recovery size and provider latency.
+notifying a service manager. Completed recovery work and every request of the
+endpoint probes and cross-endpoint checks at attach (§34) that ends, whatever
+its answer, extend the start timeout (`EXTEND_TIMEOUT_USEC`), at most once
+every 30 seconds; nothing else does. The startup timeout needs qualification
+for the deployment's recovery size and provider latency.
 
 Initial data-plane readiness is separate from the helper's verified XFS mount,
 the fresh `maki-attach verify` workload gate, and database recovery. It does not
@@ -2418,8 +2421,19 @@ ciphertext encrypted by B must decrypt on A
 Cross-endpoint encrypt/decrypt self-tests are performed before attach.
 
 Every configured endpoint, a lone one included, is first probed on its own
-at attach. An endpoint that is unreachable when these self-tests run at
-attach is quarantined. When no endpoint is reachable the attach MUST be
+at attach: a self-test, then the key canary check (§27). The endpoints are
+probed at the same time, each probe with its own attempts, so endpoints
+that do not answer delay the attach by about one probe however many are
+configured. The canary checks, which load the volume's canary and may write
+it, run one at a time in configuration order, so on a new volume the first
+endpoint in that order whose canary check succeeds establishes the canary.
+An endpoint whose check fails with a transport failure keeps that turn
+through its remaining attempts, so endpoints that pass their self-test and
+then fail their canary check delay the endpoints after them one after
+another, each by at most its own probe. The probes' results are taken in configuration order: the first endpoint in
+that order whose probe refuses the attach refuses it, and no endpoint after
+it reaches the volume. An endpoint that is unreachable when these
+self-tests run at attach is quarantined. When no endpoint is reachable the attach MUST be
 refused, and the refusal MUST name each endpoint's failure (the first
 `EndpointFatal` failure among its probe attempts, otherwise the last). A
 lone endpoint is the exception when no probe attempt failed with

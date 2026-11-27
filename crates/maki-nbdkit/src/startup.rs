@@ -49,11 +49,16 @@ impl Startup {
 }
 
 // The packaged initial timeout is 180s. Refresh that finite window at most
-// once per 30s, and only when the recovery worker completes more work. A
-// blocked operation, provider outage or dead worker has no heartbeat thread.
+// once per 30s, and only when the recovery worker completes more work or a
+// request of the attach's endpoint probes ends. A blocked operation or a dead
+// worker has no heartbeat thread, and a provider outage extends the window
+// only while the probes, which make a bounded number of requests that each
+// end within the transport's timeout, run.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_NOTIFICATION: &[u8] =
     b"EXTEND_TIMEOUT_USEC=180000000\nSTATUS=Recovering volume data";
+const PROBING_NOTIFICATION: &[u8] =
+    b"EXTEND_TIMEOUT_USEC=180000000\nSTATUS=Probing crypto endpoints";
 
 pub(super) struct RecoveryNotifier {
     destination: Option<OsString>,
@@ -74,7 +79,21 @@ impl RecoveryNotifier {
         self.progress_at(self.started.elapsed());
     }
 
+    /// A request of the attach's endpoint probes ended
+    /// (`daemon::ProbeProgress`).
+    pub(super) fn probing(&self) {
+        self.probing_at(self.started.elapsed());
+    }
+
     fn progress_at(&self, elapsed: Duration) {
+        self.extend_at(elapsed, PROGRESS_NOTIFICATION);
+    }
+
+    fn probing_at(&self, elapsed: Duration) {
+        self.extend_at(elapsed, PROBING_NOTIFICATION);
+    }
+
+    fn extend_at(&self, elapsed: Duration, message: &[u8]) {
         if self.destination.is_none() {
             return;
         }
@@ -82,7 +101,7 @@ impl RecoveryNotifier {
         if state.1.is_some() || elapsed.saturating_sub(state.0) < PROGRESS_INTERVAL {
             return;
         }
-        match notify(self.destination.as_deref(), PROGRESS_NOTIFICATION) {
+        match notify(self.destination.as_deref(), message) {
             Ok(()) => state.0 = elapsed,
             Err(error) => state.1 = Some(error.kind()),
         }
@@ -90,10 +109,7 @@ impl RecoveryNotifier {
 
     pub(super) fn ready(&self) -> io::Result<()> {
         if let Some(kind) = self.state.lock().1 {
-            return Err(io::Error::new(
-                kind,
-                "recovery progress notification failed",
-            ));
+            return Err(io::Error::new(kind, "startup progress notification failed"));
         }
         notify_ready(self.destination.as_deref())
     }
@@ -271,6 +287,44 @@ mod tests {
             receiver.recv(&mut message).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    /// The endpoint probes at attach extend the same window, at the same
+    /// rate shared with recovery, and say that they are probing.
+    #[test]
+    fn probe_progress_extends_the_window_under_its_own_status() {
+        let dir = crate::short_dir::tempdir().unwrap();
+        let path = dir.path().join("progress.sock");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let notifier = RecoveryNotifier::new(Some(path.into_os_string()));
+        let mut message = [0; 128];
+        notifier.probing_at(Duration::from_secs(29));
+        assert_eq!(
+            receiver.recv(&mut message).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        notifier.progress_at(Duration::from_secs(30));
+        let len = receiver.recv(&mut message).unwrap();
+        assert_eq!(&message[..len], PROGRESS_NOTIFICATION);
+        notifier.probing_at(Duration::from_secs(59));
+        assert_eq!(
+            receiver.recv(&mut message).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for elapsed in [60, 90, 300] {
+            notifier.probing_at(Duration::from_secs(elapsed));
+            let len = receiver.recv(&mut message).unwrap();
+            assert_eq!(
+                &message[..len],
+                b"EXTEND_TIMEOUT_USEC=180000000\nSTATUS=Probing crypto endpoints"
+            );
+            notifier.progress_at(Duration::from_secs(elapsed + 29));
+            assert_eq!(
+                receiver.recv(&mut message).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[test]

@@ -158,9 +158,14 @@ unsafe extern "C" fn after_fork() -> c_int {
         let notifier = Arc::new(startup::RecoveryNotifier::new(std::env::var_os(
             "NOTIFY_SOCKET",
         )));
-        let observer = notifier.clone();
-        let adapter = NbdAdapter::open_native_config(&path, Arc::new(move || observer.progress()))
-            .map_err(|error| error.to_string())?;
+        let recovery = notifier.clone();
+        let probing = notifier.clone();
+        let adapter = NbdAdapter::open_native_config(
+            &path,
+            Arc::new(move || recovery.progress()),
+            Arc::new(move || probing.probing()),
+        )
+        .map_err(|error| error.to_string())?;
         ADAPTER
             .set(adapter)
             .map_err(|_| "adapter already initialized")?;
