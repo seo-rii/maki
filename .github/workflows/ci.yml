@@ -385,15 +385,20 @@ jobs:
     # device-mapper and XFS: attach, data written and fsynced, a detach whose
     # disconnect finds the device still held open (the wait of AUD-197), a
     # second attach that reads the data back, a cleanup after nbdkit is
-    # killed under the mount, a third attach and a final detach. The package
-    # built from the same commit then runs the Debian guide's install steps,
-    # the quick start and its first-volume bootstrap (AUD-199) as written,
-    # under systemd with the installed units. The runner is Ubuntu, not the
-    # Debian 12 primary platform.
+    # killed under the mount, a third attach, a second kill after which the
+    # device is disconnected and released by hand so that cleanup takes its
+    # disconnected recovery (AUD-203), a fourth attach and a final detach. The
+    # package built from the same commit then runs the Debian guide's install
+    # steps, the quick start and its first-volume bootstrap (AUD-199) as
+    # written, under systemd with the installed units; then twice more with
+    # the bootstrap stopped once by a failed command and continued as its
+    # recovery notes say; then three volumes stop together, each device held
+    # open, and each stop's duration is recorded (AUD-197). The runner is
+    # Ubuntu, not the Debian 12 primary platform.
     runs-on: ubuntu-latest
     # Above the sum of the step limits and the build, so that a hung step
     # fails by its own limit and the diagnostics still run.
-    timeout-minutes: 100
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash
@@ -444,6 +449,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
       - name: documented quick start on the installed package
+        id: quickstart
         if: ${{ !cancelled() }}
         timeout-minutes: 25
         run: |
@@ -472,6 +478,54 @@ jobs:
               echo "$attribute shows a connection: $(cat "$attribute")" >&2
               exit 1
             fi
+          done
+      # The quick start's clean-up leaves the host as it found it, so the
+      # program runs again, with the bootstrap's first run stopped where a
+      # shim fails one command: at mkfs.xfs (the next run releases the export
+      # and fails, the volume is reset and created again, a third run starts
+      # over) and at the release's vgchange (the next run finishes).
+      - name: documented quick start stopped once and continued from its record
+        if: ${{ !cancelled() && steps.quickstart.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          for command in mkfs.xfs vgchange; do
+            workdir="$RUNNER_TEMP/quickstart-stop-$command"
+            python3 -B scripts/documented_quickstart.py --stop-once "$command" "$workdir"
+            cp "$RUNNER_TEMP/quickstart/maki.deb" "$workdir/maki.deb"
+            (cd "$workdir" && sudo bash quickstart.sh 2>&1 | tee quickstart.log)
+            sudo test ! -e /run/maki-attach/demo.nbd
+            if findmnt /srv/demo; then exit 1; fi
+            for unit in maki@demo.service maki-attach@demo.service maki-recover@demo.service \
+              maki-workload@demo.target; do
+              test "$(systemctl show -P ActiveState "$unit")" = inactive
+            done
+            for attribute in /sys/block/nbd*/backend; do
+              if [ -e "$attribute" ] && [ -n "$(cat "$attribute")" ]; then
+                echo "$attribute shows a connection: $(cat "$attribute")" >&2
+                exit 1
+              fi
+            done
+          done
+      # Three volumes provisioned from the same blocks (their names edited),
+      # each device held open for 10 s after its disconnect, stopped with one
+      # systemctl stop: each attach unit's stop runs maki-attach cleanup,
+      # whose wait for the opener holds the global attach lock. This records
+      # how long each stop takes; it requires neither overlap nor queueing.
+      - name: several volumes stopping together on the installed package
+        if: ${{ !cancelled() && steps.quickstart.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          workdir="$RUNNER_TEMP/stop-together"
+          mkdir -p "$workdir"
+          sudo python3 -B scripts/stop-together-validation.py --volumes 3 --hold 10 "$workdir" 2>&1 |
+            tee "$workdir/stop-together.log"
+          for volume in stop1 stop2 stop3; do
+            sudo test ! -e "/run/maki-attach/$volume.nbd"
+            if findmnt "/srv/$volume"; then exit 1; fi
+            for unit in "maki@$volume.service" "maki-attach@$volume.service" \
+              "maki-recover@$volume.service" "maki-workload@$volume.target"; do
+              test "$(systemctl show -P ActiveState "$unit")" = inactive
+            done
           done
       - name: diagnostics on failure
         if: ${{ failure() || cancelled() }}
@@ -526,6 +580,10 @@ jobs:
           if [ -d "$RUNNER_TEMP/quickstart" ]; then
             tar -C "$RUNNER_TEMP/quickstart" --exclude=./maki.deb -czf "$out/quickstart.tar.gz" .
           fi
+          for directory in "$RUNNER_TEMP"/quickstart-stop-* "$RUNNER_TEMP/stop-together"; do
+            [ -d "$directory" ] || continue
+            tar -C "$directory" --exclude=./maki.deb -czf "$out/${directory##*/}.tar.gz" .
+          done
           sudo journalctl -b --no-pager -o short-monotonic -k > "$out/kernel.log"
           sudo journalctl -b --no-pager -o short-monotonic -u 'maki*' > "$out/maki-units.log"
           sudo journalctl -b --no-pager -o short-monotonic -u systemd-udevd > "$out/udev.log"

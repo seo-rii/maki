@@ -41,14 +41,17 @@ class DocumentedVolumes(unittest.TestCase):
                           "3. Create the volume", self.quickstart.PROVISION_STEP])
         for label, block in provision + [self.driver.start_block("stop2")]:
             with self.subTest(label=label):
-                self.assertEqual(block, self.steps[label].replace("demo", "stop2"))
+                expected = self.steps[label].replace("demo", "stop2")
+                if label == provision[-1][0]:
+                    expected = expected.replace("\ndev=/dev/nbd0\n", "\ndev=/dev/nbd8\n")
+                self.assertEqual(block, expected)
                 self.assertNotIn("demo", block)
                 self.assertIn("stop2", block)
         self.assertTrue(self.driver.start_block("stop2")[0].startswith(
             "quickstart.md, 6. Start the lifecycle and write data"))
         bootstrap = provision[-1][1]
         self.assertEqual(self.quickstart.bootstrap_values(bootstrap),
-                         {"volume": "stop2", "dev": "/dev/nbd0",
+                         {"volume": "stop2", "dev": "/dev/nbd8",
                           "record": "/etc/maki/attach/stop2.bootstrap"})
         for line in ("vg=vg_maki_stop2", "mountpoint=/srv/stop2",
                      "attach_config=/etc/maki/attach/stop2.toml"):

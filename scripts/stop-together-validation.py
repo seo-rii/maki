@@ -11,8 +11,8 @@ start):
 Each volume `stopN` is provisioned with the quick start's blocks and the
 first-volume bootstrap, their `demo` replaced by its name, as an operator
 edits the variables for another volume: the key, the configuration (written
-to DIRECTORY), the creation and the bootstrap, which uses /dev/nbd0 for one
-volume after the other. The quick start's start block then starts each
+to DIRECTORY), the creation and the bootstrap, which uses /dev/nbd8 (its
+`dev` edited too) for one volume after the other. The quick start's start block then starts each
 volume's target, whose attach takes the lowest free device. With every
 target started, scripts/privileged_validation_opener.py holds each volume's
 device open, and keeps it `--hold` seconds after its disconnect; one
@@ -45,6 +45,9 @@ OPENER = HERE / "privileged_validation_opener.py"
 STATE = Path("/run/maki-attach")
 SYSFS = Path("/sys/block")
 PROVISION = ("1. Create the key", "2. Write the volume configuration", "3. Create the volume")
+# The device the bootstraps use, one after the other: not the quick start's
+# /dev/nbd0, which an earlier run on the host may have left attached.
+PROVISIONING_DEVICE = "/dev/nbd8"
 START = "6. Start the lifecycle and write data"
 BLOCK_TIMEOUT = 600
 # Above every unit's TimeoutStopSec=120.
@@ -80,10 +83,16 @@ def documented(heading):
 
 def provision_blocks(name):
     """The blocks that provision the volume `name`: the quick start's key,
-    configuration and creation blocks and the bootstrap, `demo` replaced."""
-    return [(label, block.replace("demo", name))
-            for heading in (*PROVISION, QUICKSTART.PROVISION_STEP)
-            for label, block in documented(heading)]
+    configuration and creation blocks and the bootstrap, `demo` replaced,
+    and the bootstrap's device /dev/nbd0 by PROVISIONING_DEVICE."""
+    found = [(label, block.replace("demo", name))
+             for heading in (*PROVISION, QUICKSTART.PROVISION_STEP)
+             for label, block in documented(heading)]
+    label, block = found[-1]
+    if block.count("\ndev=/dev/nbd0\n") != 1:
+        raise ValueError("the bootstrap no longer provisions on dev=/dev/nbd0")
+    found[-1] = (label, block.replace("\ndev=/dev/nbd0\n", f"\ndev={PROVISIONING_DEVICE}\n"))
+    return found
 
 
 def start_block(name):

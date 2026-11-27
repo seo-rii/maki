@@ -571,7 +571,7 @@ class KernelLifecycleJob(unittest.TestCase):
             self.assertEqual(conditions[name], ["${{ !cancelled() }}"], name)
         # The later runs on the installed package need the host the quick
         # start's clean-up leaves, whatever the runner's step did.
-        self.assertIn("\n        id: quickstart\n", self.step(QUICKSTART_STEP))
+        self.assertRegex(self.step(QUICKSTART_STEP), r"(?m)^        id: quickstart$")
         for name in (STOPPED_STEP, TOGETHER_STEP):
             self.assertEqual(conditions[name],
                              ["${{ !cancelled() && steps.quickstart.outcome == 'success' }}"], name)
