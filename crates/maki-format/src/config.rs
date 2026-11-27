@@ -924,7 +924,40 @@ pub fn is_sensitive_header(name: &str) -> bool {
             .any(|fragment| name.contains(fragment))
 }
 
+/// An HTTP provider `timeout` under this is accepted with a warning
+/// ([`VolumeConfig::warnings`]).
+pub const HTTP_SHORT_TIMEOUT: Duration = Duration::from_millis(600);
+
 impl VolumeConfig {
+    /// Settings that are valid but serve badly, one sentence each, which
+    /// `maki volume create`, `maki check` and attach report as warnings. None
+    /// of them refuses the configuration.
+    ///
+    /// An HTTP `timeout` under [`HTTP_SHORT_TIMEOUT`]: the HTTP transport
+    /// starts the other address family of an endpoint's host 300 ms after the
+    /// first (hyper-util's delay, which reqwest does not let the provider
+    /// change), so that family gets less than half of the `timeout`, and none
+    /// of one of 300 ms or less. The WebSocket and gRPC transports start it
+    /// halfway through a short timeout instead.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let http_timeout = match (&self.crypto.provider[..], &self.crypto.http) {
+            ("remote-http", Some(http)) => http.timeout,
+            _ => None,
+        };
+        if let Some(MakiDuration(timeout)) = http_timeout {
+            if timeout < HTTP_SHORT_TIMEOUT {
+                warnings.push(format!(
+                    "[crypto.http] timeout is {timeout:?}: under 600 ms the other address family \
+                     of an endpoint's host gets less than half of it, and at 300 ms or less it is \
+                     never tried, so a host whose first address family does not answer can fail \
+                     every connect"
+                ));
+            }
+        }
+        warnings
+    }
+
     /// The batch size the provider can actually take. A `remote-http`
     /// operation without `items_path` sends one request per unit, so
     /// grouping units for it only serializes them: such a mapping counts as
