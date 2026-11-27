@@ -100,6 +100,8 @@ if name == "ssh":
         sys.stdout.write("archive")
         sys.exit(next_status("cat"))
     if remote.startswith("mkdir -p "):
+        if plan.get("copy_sleep"):
+            time.sleep(plan["copy_sleep"])
         (root / "copied.tar").write_bytes(sys.stdin.buffer.read())
         sys.exit(0)
     if plan.get("ssh_sleep"):
@@ -229,6 +231,33 @@ class Fetch(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b"image")
         self.assertEqual([call[-1] for call in self.stubs.calls("curl")],
                          ["https://first.example/image", "https://second.example/image"])
+
+    def test_an_image_already_there_with_the_pinned_digest_is_used_as_it_is(self):
+        # As actions/cache restores it: checked like a download, not trusted.
+        self.images.mkdir()
+        (self.images / self.guest.image).write_bytes(b"image")
+        with quiet():
+            path = self.driver.fetch(self.guest, self.images)
+        self.assertEqual(path.read_bytes(), b"image")
+        self.assertEqual(self.stubs.calls("curl"), [])
+
+    def test_an_image_already_there_with_another_digest_is_replaced(self):
+        self.images.mkdir()
+        (self.images / self.guest.image).write_bytes(b"restored, then changed")
+        self.stubs.set(curl_content="image")
+        with quiet():
+            path = self.driver.fetch(self.guest, self.images)
+        self.assertEqual(path.read_bytes(), b"image")
+        self.assertEqual(len(self.stubs.calls("curl")), 1)
+
+    def test_the_cache_key_names_the_pinned_file_and_its_digest(self):
+        for name, guest in self.driver.GUESTS.items():
+            with self.subTest(guest=name):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(self.driver.main(["image-key", "--guest", name]), 0)
+                self.assertEqual(output.getvalue(),
+                                 f"key=booted-host-image-{guest.image}-{guest.algorithm}-{guest.digest}\n")
 
     def test_an_image_no_address_serves_says_to_move_the_pin(self):
         self.stubs.set(curl_status={"https://first.example/image": 22, "https://second.example/image": 6})
@@ -469,6 +498,30 @@ class RunAndFinish(unittest.TestCase):
                          ["timeout", "--kill-after=30", "42", "sudo", "python3", "phase", "--guest", "el9 x"])
         self.assertEqual(call[-3:-1], ["ci@127.0.0.1", "--"])
 
+    def test_a_root_phase_has_its_time_limit_run_as_root(self):
+        # Inside sudo, timeout signals the phase's whole process group, root
+        # children such as `bash quickstart.sh` included; outside, as `ci`,
+        # it could signal only sudo, whose relay reaches the phase alone.
+        with quiet():
+            self.driver.run(self.work, ["python3", "phase", "--guest", "el9"], timeout=42, root=True)
+            self.driver.main(["run", "--work", str(self.work), "--timeout", "43", "--root", "--",
+                              "python3", "phase"])
+        first, second = [shlex.split(call[-1]) for call in self.stubs.calls("ssh")]
+        self.assertEqual(first, ["sudo", "timeout", "--kill-after=30", "42", "python3", "phase", "--guest", "el9"])
+        self.assertEqual(second, ["sudo", "timeout", "--kill-after=30", "43", "python3", "phase"])
+
+    def test_a_copy_into_the_guest_is_given_up_after_its_limit(self):
+        payload = self.stubs.root / "payload"
+        payload.mkdir()
+        (payload / "file").write_text("payload\n")
+        with quiet():
+            self.driver.copy_in(self.work, payload, timeout=30)
+        self.assertTrue((self.stubs.root / "copied.tar").stat().st_size > 0)
+        self.stubs.set(copy_sleep=5)
+        with quiet(), self.assertRaises(SystemExit) as failed:
+            self.driver.copy_in(self.work, payload, timeout=1)
+        self.assertIn("within 1 s", str(failed.exception))
+
     def test_a_guest_that_stops_answering_is_given_up_after_the_limit(self):
         self.stubs.set(ssh_sleep=5)
         with quiet(), mock.patch.object(self.driver, "CONNECTION_MARGIN", 0):
@@ -489,6 +542,7 @@ class RunAndFinish(unittest.TestCase):
                          ["console.log", "guest.json", "guest.tar.gz", "qemu.log"])
         self.assertEqual((output / "guest.tar.gz").read_text(), "archive")
         remote = [call[-1] for call in self.stubs.calls("ssh")]
+        self.assertTrue(remote[0].startswith("sudo timeout --kill-after=30 "), remote[0])
         self.assertIn("collect --guest el9", remote[0])
         self.assertIn("cat -- /var/tmp/maki-ci-logs.tar.gz", remote[1])
         self.assertIn("systemctl poweroff", remote[2])
@@ -610,7 +664,7 @@ class GuestPhases(unittest.TestCase):
         self.assertTrue(all("cloud-init" not in item for item in related))
         self.assertEqual(self.guest.denials(""), ([], []))
 
-    def selinux(self, suite="guides", mode="Enforcing", found=None, samples=None, labels=None):
+    def selinux(self, suite="guides", mode="Enforcing", found=None, samples=None, labels=None, auditd=True):
         unconfined = "system_u:system_r:unconfined_service_t:s0"
         if samples is None:
             samples = [{"comm": "nbdkit", "unit": "maki@demo.service", "label": unconfined}]
@@ -622,6 +676,7 @@ class GuestPhases(unittest.TestCase):
         observed = dict(labels or {})
         with mock.patch.object(self.guest, "require_guest"), \
                 mock.patch.object(self.guest, "selinux_mode", return_value=mode), \
+                mock.patch.object(self.guest, "auditd_active", return_value=auditd), \
                 mock.patch.object(self.guest, "record",
                                   return_value=subprocess.CompletedProcess([], 0, "policy-38\n", "")), \
                 mock.patch.object(self.guest, "label_type",
@@ -647,7 +702,10 @@ class GuestPhases(unittest.TestCase):
                 ("confined daemon", dict(samples=[{"comm": "nbdkit", "unit": "maki@demo.service",
                                                    "label": "system_u:system_r:nbdkit_t:s0"}])),
                 ("no daemon seen", dict(samples=[])),
-                ("relabelled nbdkit", dict(labels={"/usr/sbin/nbdkit": "nbdkit_exec_t"}))):
+                ("relabelled nbdkit", dict(labels={"/usr/sbin/nbdkit": "nbdkit_exec_t"})),
+                # Without auditd, denials go to the kernel log and ausearch
+                # prints <no matches>.
+                ("auditd stopped", dict(auditd=False))):
             with self.subTest(case=case):
                 self.assertEqual(self.selinux(**arguments), 1)
                 self.assertIn("PROBLEM:", (self.root / "results" / "selinux.txt").read_text())
@@ -656,6 +714,16 @@ class GuestPhases(unittest.TestCase):
         self.assertEqual(self.selinux(suite="runner", samples=[]), 0)
         self.assertEqual(self.selinux(suite="runner", samples=[], found=subprocess.CompletedProcess(
             [], 0, "----\ntype=AVC avc: denied { ioctl } path=/dev/nbd15\n", "")), 1)
+
+    def test_every_unit_the_package_installs_and_the_quick_starts_device_are_labelled(self):
+        labels = dict(self.guest.LABELS)
+        units = sorted(path.name for path in (ROOT / "packaging" / "systemd").iterdir())
+        self.assertEqual(len(units), 4)
+        for unit in units:
+            with self.subTest(unit=unit):
+                self.assertEqual(labels.get(f"/usr/lib/systemd/system/{unit}"), "systemd_unit_file_t")
+        # The device the quick start attaches; no other is named.
+        self.assertEqual([path for path in labels if path.startswith("/dev/")], ["/dev/nbd0"])
 
     def test_the_labels_are_those_the_rhel_guide_lists(self):
         guide = (ROOT / "docs" / "getting-started" / "installation-rhel.md").read_text()
@@ -691,6 +759,23 @@ class GuestPhases(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertIn("attach record", found[0])
         self.assertIn("maki-1234", found[1])
+
+    def test_the_guides_phase_fails_with_the_program_and_with_what_it_left(self):
+        # A program that stops before attaching leaves nothing behind: its
+        # own status must still fail the phase.
+        quickstart = self.root / "quickstart"
+        quickstart.mkdir()
+        for name in ("demo.toml", "maki.deb"):
+            (quickstart / name).write_text("fixture\n")
+        for program, left, expected in (("echo stopping\nexit 3\n", [], 3), ("echo done\n", [], 0),
+                                        ("echo done\n", ["a mount at /srv/demo"], 1)):
+            with self.subTest(program=program, left=left):
+                (quickstart / "quickstart.sh").write_text(program)
+                with mock.patch.object(self.guest, "QUICKSTART", quickstart), \
+                        mock.patch.object(self.guest, "require_guest"), \
+                        mock.patch.object(self.guest, "leftovers", return_value=left), quiet():
+                    self.assertEqual(self.guest.guides("debian12"), expected)
+                self.assertIn(program.split("\n")[0].split()[1], (quickstart / "quickstart.log").read_text())
 
     def test_the_runner_runs_as_ci_with_the_packages_binaries_on_nbd15(self):
         for name, install_missing in (("debian12", True), ("el9", False)):
@@ -750,13 +835,49 @@ class GuestPhases(unittest.TestCase):
                                  "quickstart/quickstart.sh"])
         self.assertEqual(archive.stat().st_mode & 0o777, 0o644)
 
-    def test_the_collected_paths_hold_no_key_or_backing(self):
+    def test_nothing_is_collected_from_where_keys_or_backings_live(self):
+        run = self.root / "maki-privileged-validation-20261127T000000Z-1"
+        run.mkdir()
+        latest = self.root / "maki-privileged-validation.latest"
+        latest.symlink_to(run.name)
+        with mock.patch.object(self.guest, "RUNNER_LOGS", latest):
+            members = self.guest.collect_members()
+        paths = [str(path) for path, _name, _leave_out in members]
+        self.assertIn(str(run), paths)
+        # cloud-init keeps the seed's user-data, with the guest's host key,
+        # in /var/lib/cloud; the volume's key and backing live under
+        # /etc/maki and /var/lib/maki, the runner's below its work tree.
+        for path in paths:
+            for forbidden in ("/var/lib/cloud", "/etc/maki", "/var/lib/maki", "/etc/ssh", "/root",
+                              "/home/ci/.ssh", "/var/tmp/maki-privileged-validation."):
+                with self.subTest(path=path, forbidden=forbidden):
+                    self.assertFalse(path.startswith(forbidden), path)
+
+    def test_a_file_that_holds_a_private_key_is_never_packed(self):
+        logs = self.root / "logs"
+        logs.mkdir()
+        (logs / "plain.log").write_text("nothing secret\n")
+        (logs / "leaked.log").write_text("user-data:\n-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"
+                                         "-----END OPENSSH PRIVATE KEY-----\n")
+        archive = self.root / "logs.tar.gz"
+        with self.assertRaises(SystemExit) as refused:
+            self.guest.pack(archive, [(logs, "logs", ())])
+        self.assertIn("leaked.log", str(refused.exception))
+        self.assertFalse(archive.exists())
+        (logs / "leaked.log").unlink()
+        self.guest.pack(archive, [(logs, "logs", ())])
+        self.assertTrue(archive.exists())
+
+    def test_the_package_the_snapshot_and_the_builds_are_left_out(self):
+        run = self.root / "run"
+        run.mkdir()
+        with mock.patch.object(self.guest, "RUNNER_LOGS", run):
+            members = {name: leave_out for _path, name, leave_out in self.guest.collect_members()}
+        self.assertEqual(members["quickstart"], ("maki.deb", "maki.rpm"))
+        self.assertEqual(members["privileged-run"], ("source", "target", "build"))
         source = GUEST_SCRIPT.read_text()
         collect = source[source.index("def collect("):source.index("def main(")]
-        for kept_out in ("/etc/maki", "/var/lib/maki", "secrets", "work_dir", "maki-privileged-validation."):
-            self.assertNotIn(kept_out, collect)
-        self.assertIn('("source", "target", "build")', collect)
-        self.assertIn('("maki.deb", "maki.rpm")', collect)
+        self.assertIn("pack(ARCHIVE, collect_members())", collect)
 
     def test_every_phase_needs_root(self):
         with mock.patch.object(self.guest.os, "geteuid", return_value=1000), \

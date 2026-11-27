@@ -737,7 +737,8 @@ BOOTED_GUESTS = {
 BOOTED_DRIVER = "python3 -B scripts/booted-host-validation.py"
 BOOTED_GUEST_STEPS = [
     "actions/checkout@v4", "runner host", "enable KVM", "QEMU and seed tools",
-    "actions/download-artifact@v4", "guest image", "guest payload", "boot the guest", "guest facts",
+    "actions/download-artifact@v4", "image cache key", "actions/cache/restore@v4", "guest image",
+    "actions/cache/save@v4", "guest payload", "boot the guest", "guest facts",
     "guest package manager", "installation guide and quick start", "privileged runner lifecycle",
     "guest versions", "collect guest logs", "actions/upload-artifact@v4",
 ]
@@ -745,10 +746,18 @@ BOOTED_GUEST_STEPS = [
 
 def guest_phase(phase, timeout, *extra):
     """The command a guest step runs: one phase of the guest script, as root,
-    under the driver's time limit."""
-    return (f'{BOOTED_DRIVER} run --work "$RUNNER_TEMP/guest" --timeout {timeout} -- sudo python3 -B '
+    under a time limit that runs as root too (--root puts `timeout` inside
+    sudo, so it reaches the phase's root children)."""
+    return (f'{BOOTED_DRIVER} run --work "$RUNNER_TEMP/guest" --timeout {timeout} --root -- python3 -B '
             f'/var/tmp/maki-ci/booted-host-guest.py {phase} --guest "$GUEST"' + "".join(
                 f" {word}" for word in extra))
+
+
+# How much later than a command's own limit the driver gives up on the
+# connection (CONNECTION_MARGIN), and how far an SSH probe of the boot can
+# overrun the boot's deadline.
+BOOTED_CONNECTION_MARGIN = 90
+BOOTED_PROBE_OVERRUN = 60
 
 
 class BootedHostJobs(unittest.TestCase):
@@ -877,8 +886,43 @@ class BootedHostJobs(unittest.TestCase):
                 self.assertNotIn("--accel", boot)
                 self.assertIn(f'{BOOTED_DRIVER} boot --guest "$GUEST" --images "$RUNNER_TEMP/images" '
                               '--work "$RUNNER_TEMP/guest"', boot)
-                self.assertIn(f'{BOOTED_DRIVER} copy-in --work "$RUNNER_TEMP/guest" '
-                              '"$RUNNER_TEMP/payload"', boot)
+                self.assertIn(f'{BOOTED_DRIVER} copy-in --work "$RUNNER_TEMP/guest" --timeout ', boot)
+                self.assertIn(' "$RUNNER_TEMP/payload"\n', boot)
+
+    def test_the_boot_and_the_copy_end_within_the_boot_steps_limit(self):
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                body = self.step(guest_job, "boot the guest")
+                minutes = int(re.search(r"(?m)^        timeout-minutes: (\d+)$", body).group(1))
+                boot = int(re.search(r" boot --guest .*--timeout (\d+)\n", body).group(1))
+                copy = int(re.search(r" copy-in --work \S+ --timeout (\d+) ", body).group(1))
+                # The boot's deadline, a probe that overruns it, cloud-init's
+                # wait given up after its margin, then the copy, and a minute
+                # for the keys, the seed and QEMU's start.
+                self.assertLess(boot + BOOTED_PROBE_OVERRUN + BOOTED_CONNECTION_MARGIN + copy + 60,
+                                minutes * 60)
+
+    def test_the_image_is_cached_by_its_pin_and_verified_after_a_hit(self):
+        for guest, (_package, guest_job, *_rest) in BOOTED_GUESTS.items():
+            with self.subTest(guest=guest):
+                names = [name for name, _ in self.steps_of(guest_job)]
+                key = self.step(guest_job, "image cache key")
+                self.assertIn("        id: image\n", key)
+                self.assertEqual(self.run_line(guest_job, "image cache key"),
+                                 f'{BOOTED_DRIVER} image-key --guest "$GUEST" >> "$GITHUB_OUTPUT"')
+                restore = self.step(guest_job, "actions/cache/restore@v4")
+                save = self.step(guest_job, "actions/cache/save@v4")
+                for body in (restore, save):
+                    self.assertIn("          key: ${{ steps.image.outputs.key }}\n", body)
+                    self.assertIn("          path: ${{ runner.temp }}/images\n", body)
+                    # Only the pinned image: never an older pin's.
+                    self.assertNotIn("restore-keys", body)
+                self.assertIn("        id: image-cache\n", restore)
+                self.assertIn("        if: steps.image-cache.outputs.cache-hit != 'true'\n", save)
+                # fetch checks a restored image's digest as it checks a download.
+                self.assertLess(names.index("image cache key"), names.index("actions/cache/restore@v4"))
+                self.assertLess(names.index("actions/cache/restore@v4"), names.index("guest image"))
+                self.assertLess(names.index("guest image"), names.index("actions/cache/save@v4"))
 
     def test_the_guest_gets_the_package_its_package_job_built(self):
         for guest, (package, guest_job, *_rest) in BOOTED_GUESTS.items():
