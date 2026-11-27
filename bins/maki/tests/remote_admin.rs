@@ -1774,3 +1774,66 @@ fn an_authority_that_changes_before_a_command_fails_is_reported_instead() {
         .collect();
     failed(&damaged);
 }
+
+/// A read-only view that stopped on a committed page that no longer
+/// authenticates (here a byte of it flipped after the open) still asks the
+/// authority before the failure is reported, as every other failure is
+/// reported: an authority that changed meanwhile (a takeover made elsewhere
+/// right after the open's second inspection) is reported instead of the
+/// page's error, and one that did not leaves the page's error. Each answer
+/// costs one inspection. The view answered from its stop alone and sent
+/// nothing, where a view that asked before every operation reported the
+/// change first.
+#[test]
+fn a_view_stopped_by_a_page_still_asks_the_authority_before_the_failure_is_reported() {
+    use maki_backing::ReadOnlyRollbackBacking;
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::new();
+    let backing = fixture.create();
+    write(&backing, b"ciphertext that the view reads");
+    drop(backing);
+    let record = inspect(fixture.writer.as_ref());
+    let arena = fixture
+        .root
+        .join(&record.current.as_ref().unwrap().namespace)
+        .join("rollback.arena");
+    let slot = arena_slot(&current_manifest(&fixture.root, &record), "ciphertext", 0);
+    let flip = || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena)
+            .unwrap();
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, slot * 4096).unwrap();
+        file.write_all_at(&[byte[0] ^ 1], slot * 4096).unwrap();
+    };
+    for changed in [true, false] {
+        if changed {
+            *fixture.takeover_after.lock().unwrap() = Some(2);
+        }
+        let view =
+            ReadOnlyRollbackBacking::open_remote(&fixture.root, fixture.writer.clone()).unwrap();
+        flip();
+        let file = view.open("ciphertext", false).unwrap();
+        let mut bytes = vec![0; file.len().unwrap() as usize];
+        let error = file.read_at(0, &mut bytes).unwrap_err();
+        flip();
+        assert!(
+            error
+                .to_string()
+                .contains("rollback arena page authentication failed"),
+            "{error}"
+        );
+        assert!(view.session_stopped().is_some());
+        fixture.clear();
+        let reported = maki_nbdkit::daemon::read_failure(&view, error.to_string());
+        let expected = if changed {
+            "the remote authority changed after the backing was opened read-only"
+        } else {
+            "rollback arena page authentication failed"
+        };
+        assert!(reported.contains(expected), "changed {changed}: {reported}");
+        assert_eq!(fixture.sent(), ["inspect"], "changed {changed}");
+    }
+}

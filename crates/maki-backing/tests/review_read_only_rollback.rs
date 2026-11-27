@@ -756,6 +756,9 @@ struct RecordingRpc {
     /// Set, a release is lost before the authority sees it: what a writer
     /// that died leaves.
     lose_release: std::sync::atomic::AtomicBool,
+    /// Set, every request fails before it reaches the authority, as a
+    /// connection that is refused does.
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 fn action_name(action: &Action) -> &'static str {
@@ -773,6 +776,12 @@ fn action_name(action: &Action) -> &'static str {
 
 impl Rpc for RecordingRpc {
     fn call(&self, request: &Request) -> io::Result<Record> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "authority unreachable",
+            ));
+        }
         self.actions
             .lock()
             .unwrap()
@@ -832,6 +841,7 @@ impl Remote {
                 actions: actions.clone(),
                 takeover_after: Mutex::new(None),
                 lose_release: std::sync::atomic::AtomicBool::new(false),
+                unreachable: std::sync::atomic::AtomicBool::new(false),
             })
         };
         let remote = Self {
@@ -1351,4 +1361,112 @@ fn a_remote_read_only_open_that_fails_reports_an_authority_that_changed() {
         "{error}"
     );
     assert_eq!(*remote.actions.lock().unwrap(), ["inspect"; 3]);
+}
+
+/// A view that stopped on a committed page that no longer authenticates
+/// still asks its witness when a caller that is about to report a failure
+/// asks it again (`ask_witness_again`): the witness's answer, not the stop,
+/// says whether what was read is still selected. A remote authority that
+/// changed (a takeover made elsewhere after the open) is reported, and from
+/// then on is the view's stop reason; one that did not leaves the page's
+/// stop; one that cannot be asked is said to be so. Each costs one
+/// inspection, and a view that its witness stopped asks nothing more.
+#[test]
+fn a_remote_view_stopped_by_a_page_asks_its_authority_again() {
+    use maki_backing::WitnessAnswer;
+    let remote = Remote::new();
+    let namespace = remote
+        .root()
+        .join(remote.record().current.unwrap().namespace);
+    let (arena, slot) = (namespace.join("rollback.arena"), committed_slot(&namespace));
+    let stopped = |changed: bool| {
+        if changed {
+            *remote.writer.takeover_after.lock().unwrap() = Some(2);
+        }
+        let view = remote.open().unwrap();
+        flip(&arena, slot);
+        let error = read_payload_result(&view).unwrap_err();
+        flip(&arena, slot);
+        assert!(
+            error
+                .to_string()
+                .contains("rollback arena page authentication failed"),
+            "{error}"
+        );
+        view
+    };
+    let page = "rollback session stopped: rollback arena page authentication failed";
+
+    let view = stopped(false);
+    remote.clear();
+    assert!(matches!(view.ask_witness_again(), WitnessAnswer::Selects));
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(view.session_stopped().as_deref(), Some(page));
+
+    let view = stopped(false);
+    remote
+        .writer
+        .unreachable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    match view.ask_witness_again() {
+        WitnessAnswer::Unanswered(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}")
+        }
+        other => panic!("{other:?}"),
+    }
+    remote
+        .writer
+        .unreachable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(view.session_stopped().as_deref(), Some(page));
+
+    let view = stopped(true);
+    remote.clear();
+    let changed = "rollback session stopped: the remote authority changed after the backing was \
+                   opened read-only";
+    match view.ask_witness_again() {
+        WitnessAnswer::Stopped(reason) => assert_eq!(reason, changed),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*remote.actions.lock().unwrap(), ["inspect"]);
+    assert_eq!(view.session_stopped().as_deref(), Some(changed));
+    // The witness has answered: asked again, the view sends nothing.
+    remote.clear();
+    assert!(matches!(
+        view.ask_witness_again(),
+        WitnessAnswer::Stopped(_)
+    ));
+    assert!(view.check_freshness().is_err());
+    assert_eq!(*remote.actions.lock().unwrap(), Vec::<&str>::new());
+}
+
+/// The same for a local witness: a view stopped on a page reads the witness
+/// again when asked, and a witness that no longer selects what was read is
+/// reported and becomes the stop reason.
+#[test]
+fn a_local_view_stopped_by_a_page_reads_its_witness_again() {
+    use maki_backing::WitnessAnswer;
+    let Some(local) = Local::new() else {
+        return;
+    };
+    let arena = local.root().join("rollback.arena");
+    let slot = committed_slot(local.root());
+    let view = local.open().unwrap();
+    flip(&arena, slot);
+    read_payload_result(&view).unwrap_err();
+    flip(&arena, slot);
+    assert!(matches!(view.ask_witness_again(), WitnessAnswer::Selects));
+    let anchor = local.witness().join("anchor");
+    let bytes = std::fs::read(&anchor).unwrap();
+    std::fs::write(&anchor, b"").unwrap();
+    let answer = view.ask_witness_again();
+    std::fs::write(&anchor, &bytes).unwrap();
+    match answer {
+        WitnessAnswer::Stopped(reason) => assert!(
+            reason.starts_with("rollback session stopped: ")
+                && !reason.contains("page authentication"),
+            "{reason}"
+        ),
+        other => panic!("{other:?}"),
+    }
 }
