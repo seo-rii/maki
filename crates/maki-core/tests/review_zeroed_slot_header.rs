@@ -26,6 +26,8 @@
 use std::io;
 use std::sync::Arc;
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use uuid::Uuid;
 
 use maki_backing::{Backing, BackingFile, MemBacking, VolumeLock};
@@ -42,6 +44,7 @@ use maki_format::init;
 use maki_format::journal::{RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE};
 use maki_format::layout;
 use maki_format::superblock::Superblock;
+use maki_test_support::crash_backing::FaultOp;
 use maki_test_support::failpoints::{self, FailpointAction};
 use maki_test_support::fake_provider::FakeCryptoProvider;
 use maki_test_support::CrashableBacking;
@@ -83,7 +86,11 @@ fn geometry() -> Geometry {
 }
 
 fn fixture(discard: bool) -> Arc<CrashableBacking> {
-    let backing = Arc::new(CrashableBacking::new());
+    fixture_on(CrashableBacking::new(), discard)
+}
+
+fn fixture_on(backing: CrashableBacking, discard: bool) -> Arc<CrashableBacking> {
+    let backing = Arc::new(backing);
     if discard {
         init::create_volume_with_discard(backing.as_ref(), superblock()).unwrap();
     } else {
@@ -341,7 +348,9 @@ async fn a_zeroed_header_sector_with_a_lost_newest_map_reads_eio_not_zeros() {
 /// the disk while its ciphertext did. The checkpoint never completed, so the
 /// unit's journal record is newer than the checkpoint: the deep check calls
 /// the slot recoverable (it did not see it before), recovery rewrites it from
-/// the record, and the data reads back.
+/// the record, and the data reads back. The state is built here (the header
+/// zeroed over the whole ciphertext) so the warning and the read-only verdict
+/// are checked on it exactly; the next test reaches it through power losses.
 #[test]
 fn a_torn_first_slot_write_is_rewritten_from_its_journal_record() {
     let _serial = failpoints::test_lock();
@@ -386,6 +395,83 @@ fn a_torn_first_slot_write_is_rewritten_from_its_journal_record() {
     backing.crash_all_lost();
     let volume = recover(&backing, segment).unwrap();
     assert_eq!(volume.read_ct(unit).unwrap().unwrap().1, ciphertext(0x30));
+}
+
+/// Seeds of the real-crash version of the torn first slot write, per format.
+const TORN_SEEDS: u64 = 160;
+
+/// The torn first slot write of the test above, reached through a power loss
+/// instead of built: a checkpoint's shard sync fails after it wrote unit 3's
+/// first slot, and the crash keeps any part of the unsynced writes
+/// (`with_tearing`). On v3 every other seed trims the unit (FUA) after the
+/// failed checkpoint. For every seed the deep check reports no error and,
+/// where the header was lost over ciphertext that survived, says
+/// `recoverable`; recovery serves the write (or zeros after the trim), across
+/// a second power loss too, and the deep check is `clean` afterwards.
+#[test]
+fn a_torn_first_slot_write_from_a_power_loss_is_recovered() {
+    let _serial = failpoints::test_lock();
+    let segment = VolumeOptions::default().journal_segment_size;
+    let offset = geometry().slot_offset(3);
+    let (mut torn, mut torn_and_trimmed) = ([0u64; 2], 0u64);
+    for seed in 0..TORN_SEEDS {
+        for discard in [false, true] {
+            let trim = discard && seed % 2 == 1;
+            let case = format!("seed {seed}, v{}, trim {trim}", if discard { 3 } else { 2 });
+            let backing = fixture_on(CrashableBacking::new().with_tearing(128), discard);
+            let mut volume = recover(&backing, segment).unwrap();
+            volume.write_ct(1, &ciphertext(0x11), true).unwrap();
+            volume.checkpoint().unwrap();
+            volume.write_ct(3, &ciphertext(0x33), true).unwrap();
+            {
+                let _sync = failpoints::set(
+                    "checkpoint.shard_sync",
+                    FailpointAction::IoError(io::ErrorKind::Other, "injected".into()),
+                );
+                volume
+                    .checkpoint()
+                    .expect_err("the checkpoint stops at its slot sync");
+            }
+            if trim {
+                volume.discard_ct(3, true).unwrap();
+            }
+            drop(volume);
+            backing.crash(&mut StdRng::seed_from_u64(seed));
+
+            let mut slot = vec![0u8; 64 + CT_LEN];
+            data_file(&backing, 0).read_at(offset, &mut slot).unwrap();
+            let report = deep_check(&backing, segment);
+            assert!(report.errors.is_empty(), "{case}: {report:?}");
+            if slot[..64].iter().all(|b| *b == 0) && slot[64..].iter().any(|b| *b != 0) {
+                torn[usize::from(discard)] += 1;
+                torn_and_trimmed += u64::from(trim);
+                assert_eq!(verdict(&report), "recoverable", "{case}: {report:?}");
+            } else {
+                assert!(
+                    matches!(verdict(&report), "clean" | "recoverable"),
+                    "{case}: {report:?}"
+                );
+            }
+            let expected = (!trim).then(|| ciphertext(0x33));
+            for second_crash in [false, true] {
+                if second_crash {
+                    backing.crash(&mut StdRng::seed_from_u64(seed ^ 0xABC));
+                }
+                let volume = recover(&backing, segment).unwrap();
+                assert_eq!(
+                    volume.read_ct(3).unwrap().map(|(_, data)| data),
+                    expected,
+                    "{case}, second power loss {second_crash}"
+                );
+                assert_eq!(volume.read_ct(1).unwrap().unwrap().1, ciphertext(0x11));
+            }
+            assert_eq!(verdict(&deep_check(&backing, segment)), "clean", "{case}");
+        }
+    }
+    assert!(
+        torn.iter().all(|count| *count >= TORN_SEEDS / 4) && torn_and_trimmed >= TORN_SEEDS / 16,
+        "torn states reached (v2, v3): {torn:?}, {torn_and_trimmed} of them trimmed"
+    );
 }
 
 /// A record the checkpoint covers is still in the active segment and names
@@ -511,7 +597,9 @@ fn a_large_ciphertext_area_is_probed_to_its_last_byte() {
 /// released only part of the slot (it failed after the first block, or its
 /// zeros tore in a crash) therefore leaves an all-zero header over old
 /// ciphertext only under a set discard bit, which answers zeros before the
-/// slot is probed, whichever copies survive.
+/// slot is probed, whichever copies survive. The rewrite's slot sync fails
+/// first in its checkpoint and then in recovery's replay: neither clears the
+/// bit in a durable copy, and the rewrite is served once a sync succeeds.
 #[test]
 fn a_partly_punched_slot_of_a_discarded_unit_reads_as_zeros() {
     let _serial = failpoints::test_lock();
@@ -566,13 +654,74 @@ fn a_partly_punched_slot_of_a_discarded_unit_reads_as_zeros() {
     }
     let mut volume = recover(&backing, segment).unwrap();
     volume.write_ct(unit, &ciphertext(0x44), true).unwrap();
-    volume.checkpoint().unwrap();
+    {
+        let _sync = failpoints::set(
+            "checkpoint.shard_sync",
+            FailpointAction::IoError(io::ErrorKind::Other, "injected shard sync failure".into()),
+        );
+        volume
+            .checkpoint()
+            .expect_err("the rewrite's checkpoint stops at its slot sync");
+    }
+    still_discarded(
+        &backing,
+        &a,
+        &b,
+        in_shard,
+        "after the checkpoint's failed slot sync",
+    );
     drop(volume);
-    backing.crash_all_lost();
-    let volume = recover(&backing, segment).unwrap();
-    assert_eq!(volume.read_ct(unit).unwrap().unwrap().1, ciphertext(0x44));
-    drop(volume);
+    let data_path = layout::shard_data(shard);
+    backing.set_fault_hook(Some(Arc::new(move |op: &FaultOp<'_>| match op {
+        FaultOp::SyncData { path } if *path == data_path => {
+            Some(io::Error::other("injected slot sync failure"))
+        }
+        _ => None,
+    })));
+    let replay = recover(&backing, segment);
+    backing.set_fault_hook(None);
+    assert!(replay.is_err(), "recovery's replay stops at its slot sync");
+    still_discarded(
+        &backing,
+        &a,
+        &b,
+        in_shard,
+        "after the replay's failed slot sync",
+    );
+    for crash in [false, true] {
+        backing.crash_all_lost();
+        let volume = recover(&backing, segment).unwrap();
+        assert_eq!(
+            volume.read_ct(unit).unwrap().unwrap().1,
+            ciphertext(0x44),
+            "after recovery{}",
+            if crash {
+                " and a second power loss"
+            } else {
+                ""
+            }
+        );
+    }
     assert_eq!(verdict(&deep_check(&backing, segment)), "clean");
+}
+
+/// Every discard-map copy that decodes, and at least one does, lists the
+/// unit at `in_shard`.
+fn still_discarded(backing: &CrashableBacking, a: &str, b: &str, in_shard: u64, when: &str) {
+    let mut decoded = 0;
+    for side in [a, b] {
+        let file = backing.open(side, false).unwrap();
+        let mut bytes = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut bytes).unwrap();
+        if let Ok(map) = AllocationMap::decode(&bytes) {
+            decoded += 1;
+            assert!(
+                map.get(in_shard),
+                "{when}: {side} no longer lists the discard"
+            );
+        }
+    }
+    assert!(decoded > 0, "{when}: no discard-map copy decodes");
 }
 
 /// A shard the loaded catalog copy does not name, whose allocation copies
