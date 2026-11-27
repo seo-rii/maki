@@ -726,7 +726,25 @@ volume), reads one whose active writer has gone without releasing it (after a
 crash, before a takeover), and while it runs an attach, takeover, restore,
 snapshot or GC of that root fails to take the operation lock. It reads the
 authority's record again once it holds both locks and refuses one that changed
-in between, and every later operation inspects the authority again, as a
-writer's operations do. Its deep verdict is `unproven`. It loads the witness
-client's TLS identity to ask the authority, but no volume key, and decrypts
-nothing, so it does not replace an offline data-integrity check.
+in between. Every later read is authenticated against the manifest it read,
+and the authority is asked again once the command has read everything, before
+it reports (`check --deep` asks once more, before its verdict): `volume
+inspect` and `check` send three inspections and `check --deep` four, however
+large the volume, where the view used to send one before every backing
+operation as a writer's operations do. A record that changed since the open
+fails the command and nothing it read is reported; because a record never
+takes an earlier value again, one that is the same at the end was the same
+throughout
+([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
+Its deep verdict is `unproven`. It loads the witness client's TLS identity to
+ask the authority, but no volume key, and decrypts nothing, so it does not
+replace an offline data-integrity check. A configuration whose root is a
+snapshot destination is refused: the snapshot's namespace holds no
+`rollback.lock`.
+
+Attach, which claims a writer, compares the configuration with the volume
+before its claim: with the root's operation lock held and the authority's
+current generation authenticated in the root, it reads that generation's
+superblock copies and refuses a configuration whose immutable settings or
+`backing.rollback_protection.capacity` differ, so a mismatched configuration
+raises no fence and creates no namespace (SPEC §20).

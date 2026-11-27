@@ -20,8 +20,13 @@
 //! no writer runs while it is open, other readers are admitted, and a lock
 //! file that is missing refuses the open. It asks a remote authority only to
 //! inspect, and writes no operation guard. What it reads after opening is
-//! authenticated again on every read, and every operation first asks the
-//! witness whether it still selects what was read, as a writer's view does: a
+//! authenticated again on every read against the manifest it read. A local
+//! witness is read again before every operation, as a writer's view reads
+//! it. A remote authority is asked again whenever the view's user asks
+//! ([`Backing::check_freshness`]), which a command does once, before it
+//! reports what it read: one inspection, however much it read, where a
+//! writer's view sends one before every operation (see
+//! [`ReadOnlyRollbackBacking::open_remote`] for why that keeps the rule). A
 //! change stops the view for good. What it reads may exist only in the page
 //! cache, which a check through it says ([`Backing::is_read_only`]).
 
@@ -50,13 +55,31 @@ struct View {
 
 /// What tells the view whether the witness still selects what it read.
 enum Freshness {
-    /// A local witness opened read-only ([`FileWitness::open_read_only`]).
+    /// A local witness opened read-only ([`FileWitness::open_read_only`]),
+    /// read again before every operation.
     Local(FileWitness),
-    /// The remote authority, and its record when the view was opened.
+    /// The remote authority, and its record when the view was opened, asked
+    /// again only when the view's user asks ([`Backing::check_freshness`]).
     Remote { rpc: Arc<dyn Rpc>, record: Record },
+    /// Nothing to ask: the view reads the authority's current generation for
+    /// a writable open that has not claimed a writer yet
+    /// ([`RollbackBacking::open_remote_checked`]). That open holds the root's
+    /// operation lock exclusively, which keeps every other operation that
+    /// changes the root out, and found the authority released, so no session
+    /// writes the namespace that holds the generation; the claim it sends
+    /// next carries the record it inspected, so a change in between refuses
+    /// the claim.
+    BeforeClaim,
 }
 
 impl Freshness {
+    /// Whether every operation asks the witness first. Only a local witness
+    /// is: reading it costs a file read, asking a remote authority a
+    /// connection.
+    fn before_every_operation(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
     fn verify_current(&self) -> io::Result<()> {
         match self {
             Self::Local(witness) => witness.verify_current(),
@@ -68,6 +91,7 @@ impl Freshness {
                 }
                 Ok(())
             }
+            Self::BeforeClaim => Ok(()),
         }
     }
 
@@ -76,6 +100,7 @@ impl Freshness {
         match self {
             Self::Local(witness) => witness.is_poisoned(),
             Self::Remote { .. } => remote::stops_remote_session(error),
+            Self::BeforeClaim => false,
         }
     }
 }
@@ -174,6 +199,19 @@ impl ReadOnlyRollbackBacking {
     /// lock, which its writer holds while the volume is attached, is taken
     /// shared next. The authority's record is read again once both are
     /// held, and must not have changed; only then is the namespace read.
+    ///
+    /// After that the authority is asked again only by
+    /// [`Backing::check_freshness`], not before every operation as a
+    /// writer's view asks it, and a record that differs from the one read
+    /// here stops the view. A command that reports what it read calls it
+    /// once it has read everything. That proves what asking before every
+    /// operation proves: the two locks keep every operation that changes the
+    /// root out for as long as the view is open, every read is authenticated
+    /// against the manifest read here, and the authority's record never takes
+    /// an earlier value again (every claim raises the fence, an activation
+    /// or a release moves the phase on within it, an advance raises the
+    /// generation), so a record that is the same at the end was the same at
+    /// every read in between.
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
         let disk = remote::backup_root(root)?;
         let operation = disk
@@ -232,6 +270,23 @@ impl ReadOnlyRollbackBacking {
         ))
     }
 
+    /// A view of `manifest`, the authority's current generation, in its
+    /// `namespace`, for a writable open that holds the root's operation lock
+    /// exclusively, found the authority released and has not claimed a
+    /// writer yet ([`RollbackBacking::open_remote_checked`]). Like every
+    /// view it reads only what it is asked for, each page authenticated
+    /// against `manifest`; it holds no lock and asks the authority nothing
+    /// ([`Freshness::BeforeClaim`]).
+    pub(super) fn before_claim(namespace: &dyn Backing, manifest: Manifest) -> io::Result<Self> {
+        let arena = open_arena(namespace, &manifest)?;
+        Ok(Self::assemble(
+            manifest,
+            arena,
+            Freshness::BeforeClaim,
+            Vec::new(),
+        ))
+    }
+
     fn assemble(
         manifest: Manifest,
         arena: Arc<dyn BackingFile>,
@@ -258,15 +313,24 @@ impl ReadOnlyRollbackBacking {
 }
 
 impl View {
-    /// Refuse every operation once the view has stopped, and stop it when
-    /// the witness no longer selects what it read.
+    /// What every operation checks first: refuse it once the view has
+    /// stopped, and, with a local witness, stop the view when the witness no
+    /// longer selects what it read.
     fn check(&self) -> io::Result<()> {
+        self.ask(false)
+    }
+
+    /// [`Self::check`], asking a remote authority too when `always`.
+    fn ask(&self, always: bool) -> io::Result<()> {
         if self.stopped.get().is_some() {
             return Err(invalid(
                 "rollback session stopped; reopen against the independent witness",
             ));
         }
         let witness = self.witness.lock();
+        if !always && !witness.before_every_operation() {
+            return Ok(());
+        }
         if let Err(error) = witness.verify_current() {
             if witness.stops_view(&error) {
                 self.stop(&error);
@@ -404,8 +468,12 @@ struct SharedLock;
 impl VolumeLock for SharedLock {}
 
 impl Backing for ReadOnlyRollbackBacking {
+    /// Ask the witness, a remote authority too, whether it still selects
+    /// what the view read; a change stops the view for good. A command that
+    /// reports what it read through a remote view calls this once it has
+    /// read everything, before it reports.
     fn check_freshness(&self) -> io::Result<()> {
-        self.view.check()
+        self.view.ask(true)
     }
     fn session_stopped(&self) -> Option<String> {
         self.view.stopped.get().cloned()

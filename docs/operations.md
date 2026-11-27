@@ -406,12 +406,30 @@ too:
 - a daemon that starts while one of them runs fails to take its lock, and
   other read-only checks are admitted;
 - with a remote witness the authority's record is read again once both locks
-  are held, and one that changed in between refuses the command.
+  are held, and one that changed in between refuses the command;
+- a configuration whose `backing.root` is a snapshot destination (the
+  target of `maki volume snapshot`) is refused with `… is missing, and a
+  read-only open cannot create it`: the snapshot copies the current
+  generation into a namespace of the same name without the `rollback.lock`
+  that a writer's namespace holds.
 
-Every read is authenticated again, and every operation first asks the
-witness whether it still selects what was read, as a writer's operations do:
-a witness that stops selecting it stops the command with an error. The deep
-verdict is `unproven`, as for a plain backing read read-only.
+Every read is authenticated again against the manifest that was read. A local
+witness is read again before every operation, as a writer's operations read
+it, and one that stops selecting what was read stops the command with an
+error. A remote authority is asked again once the command has read
+everything, before it reports (and by `check --deep` once more, before its
+verdict), not before every operation: `volume inspect` and `check` send it
+three inspections and `check --deep` four, however large the volume. An
+authority that changed since the view was opened fails the command (`the
+remote authority changed after the backing was opened read-only`), and
+nothing it read is reported. That keeps what asking before every operation
+proved: the view's locks keep every operation that changes the root out
+while it reads, each read is authenticated, and the authority's record
+never takes an earlier value again, so a record that is the same at the end
+was the same throughout. (Before, the view asked before every backing
+operation, each time over a TLS connection of its own, so the count grew with
+the volume.) The deep verdict is `unproven`, as for a plain backing read
+read-only.
 
 ## Swap dependency checks
 

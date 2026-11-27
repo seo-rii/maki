@@ -120,13 +120,38 @@ pub fn remote_witness_client(
 }
 
 pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    open_backing(config, false)
+}
+
+/// [`build_backing`] for a writer that then compares the configuration with
+/// the recovered volume ([`refuse_configuration_mismatch`]): attach, and a
+/// remote provider built on its own. With remote rollback protection,
+/// opening the backing claims a writer at the authority and copies the
+/// current generation into a namespace of its own; the configuration is
+/// compared with that generation first, and one that differs is refused with
+/// nothing claimed ([`refuse_before_claim`]).
+fn build_backing_to_attach(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
+    open_backing(config, true)
+}
+
+fn open_backing(
+    config: &VolumeConfig,
+    compare_before_claim: bool,
+) -> Result<Arc<dyn Backing>, DaemonError> {
     if let Some(rollback) = &config.backing.rollback_protection {
         #[cfg(target_os = "linux")]
         {
             let backing = match &rollback.remote {
-                Some(remote) => RollbackBacking::open_remote(
+                Some(remote) => RollbackBacking::open_remote_checked(
                     Path::new(&config.backing.root),
                     remote_witness_client(remote)?,
+                    |current| {
+                        if compare_before_claim {
+                            refuse_before_claim(config, rollback, current)
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )?,
                 None => RollbackBacking::open(
                     Path::new(&config.backing.root),
@@ -141,7 +166,7 @@ pub fn build_backing(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonEr
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = rollback;
+            let _ = (rollback, compare_before_claim);
             return Err(DaemonError::Unsupported(
                 "backing rollback protection is supported only on Linux".to_string(),
             ));
@@ -177,6 +202,36 @@ fn refuse_unfinished_creation(backing: &dyn Backing) -> Result<(), DaemonError> 
         )));
     }
     Ok(())
+}
+
+/// What attach refuses once it has opened and recovered a remote-protected
+/// volume, refused before it claims a writer: a configured capacity that is
+/// not the stored one, then a setting fixed at creation that the superblock
+/// of the authority's `current` generation does not store. That superblock
+/// is the one recovery selects after the claim, which copies the generation
+/// unchanged, and its fixed settings are the same in every valid copy;
+/// attach compares again after recovery all the same.
+///
+/// Only the two superblock copies are read, each page authenticated against
+/// the manifest the authority selects (at most two 4 KiB pages), and
+/// nothing else: the open has already sent its one inspection and read and
+/// authenticated the manifest, as it did before. A read that fails (a page
+/// that does not authenticate) is refused here too, where the claim would
+/// otherwise have been sent and the copy then failed. A generation that
+/// holds no valid superblock has nothing to compare with: recovery refuses
+/// it after the claim, as before.
+#[cfg(target_os = "linux")]
+fn refuse_before_claim(
+    config: &VolumeConfig,
+    rollback: &maki_format::config::RollbackProtectionSection,
+    current: &ReadOnlyRollbackBacking,
+) -> Result<(), DaemonError> {
+    check_protected_capacity(rollback, current.capacity()?)?;
+    match maki_format::superblock::load_volume_superblock(current) {
+        Ok(envelope) => refuse_configuration_mismatch(config, &envelope.superblock),
+        Err(error @ FormatError::Io(_)) => Err(error.into()),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Refuse a configured capacity that differs from the `stored` one.
@@ -222,7 +277,10 @@ fn check_protected_capacity(
 /// a [`ReadOnlyRollbackBacking`], which sends the authority only
 /// inspections: [`build_backing`] claims a writer at the authority and
 /// copies the current generation into a namespace of its own, which a
-/// command that only reads must never do.
+/// command that only reads must never do. That view asks the authority
+/// again only when it is asked ([`Backing::check_freshness`]): a command
+/// that reports what it read through the backing returned here calls it
+/// once it has read everything, before it reports.
 pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, DaemonError> {
     use maki_backing::configured::BACKING_ROOT;
     let root = Path::new(&config.backing.root);
@@ -876,7 +934,7 @@ async fn dispatch_endpoint_set(
     let volume = match volume {
         Some(volume) => volume,
         None => {
-            let backing = build_backing(config)?;
+            let backing = build_backing_to_attach(config)?;
             let options = engine_options(config).volume;
             recovered = Arc::new(
                 tokio::task::spawn_blocking(move || Volume::recover(backing, options))
@@ -1562,7 +1620,7 @@ async fn attach_hardened(
     if let Err(e) = maki_backing::raise_open_file_limit() {
         tracing::warn!("cannot raise the open-file soft limit: {e}");
     }
-    let backing = build_backing(config)?;
+    let backing = build_backing_to_attach(config)?;
     let mut options = engine_options(config);
     let recovery_options = options.volume.clone();
     let volume = Arc::new(
@@ -1578,9 +1636,10 @@ async fn attach_hardened(
     );
     // Everything the configuration fixes at creation, before any provider
     // credential is loaded or transport built; `maki check` reports the same
-    // comparison. Opening the backing (for a remote witness, its TLS
-    // identity and a writer claim) and recovery come first: the superblock
-    // is inside the backing.
+    // comparison. Opening the backing and recovery come first: the
+    // superblock is inside the backing. With a remote witness the open
+    // (which loads the witness client's TLS identity to ask the authority)
+    // has compared already, before its writer claim.
     refuse_configuration_mismatch(config, volume.superblock())?;
     if let Some(identity) = &mut options.identity {
         identity.key_identity = configured_key_identity(config, &volume.superblock().key_identity);

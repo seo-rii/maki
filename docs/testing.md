@@ -336,7 +336,7 @@ host:
 | Feature | Gate | Requires |
 |---|---|---|
 | `maki-nbdkit/cgroup-qualification` | `memory_budget.rs` `delegated_cgroup_oom_enforces_memory_max` | `MAKI_MEMORY_TEST_CGROUP`, a disposable delegated cgroup v2 ([performance](performance.md)) |
-| `maki-witness/etcd-qualification` | `etcd_ha.rs` `real_three_member_quorum_cas_leader_failover_and_majority_loss` | `MAKI_ETCD_BIN` (verified etcd v3.6 with `etcdctl` beside it) and `MAKI_WITNESS_BIN` (built `maki-witness`) |
+| `maki-witness/etcd-qualification` | `etcd_ha.rs` `real_three_member_quorum_cas_leader_failover_and_majority_loss`, and `a_remote_volume_on_an_etcd_quorum_is_read_with_inspections_only` (the read-only view that `maki check` and `maki volume inspect` use, over the quorum behind a frontend: three inspections and nothing else) | `MAKI_ETCD_BIN` (verified etcd v3.6 with `etcdctl` beside it) and `MAKI_WITNESS_BIN` (built `maki-witness`) |
 
 ```bash
 cargo build --release --locked -p maki-witness-cli

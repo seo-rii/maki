@@ -869,10 +869,44 @@ impl RollbackBacking {
     }
 
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
+        Self::open_remote_checked(root, rpc, |_| Ok::<_, io::Error>(()))
+    }
+
+    /// [`Self::open_remote`], which lets `check` read the authority's current
+    /// generation before it claims a writer, and refuses what `check`
+    /// refuses with nothing claimed: the authority and the root are as they
+    /// were. Attach compares its configuration so.
+    ///
+    /// `check` runs where the claim would be sent: with the root's operation
+    /// lock held exclusively, after the one inspection the open sends and
+    /// once the generation that inspection names authenticates in the root
+    /// (its manifest, exactly, and the arena's size). It runs only when the
+    /// authority is released: otherwise the claim is refused anyway, as it
+    /// was. The view it is given ([`ReadOnlyRollbackBacking::before_claim`])
+    /// reads only what `check` reads, every page authenticated against that
+    /// manifest, and changes nothing. No writer runs in the root meanwhile,
+    /// and the claim carries the inspected record, so an authority that
+    /// changed in between refuses it.
+    pub fn open_remote_checked<E: From<io::Error>>(
+        root: &Path,
+        rpc: Arc<dyn Rpc>,
+        check: impl FnOnce(&ReadOnlyRollbackBacking) -> Result<(), E>,
+    ) -> Result<Self, E> {
         let disk = remote_root(root, false)?;
         let guard = OperationGuard::acquire(disk.as_ref())?;
         let expected = inspect(rpc.as_ref())?;
-        holds_current(&disk, &expected)?;
+        let manifest = holds_current(&disk, &expected)?;
+        if expected.phase == Phase::Released {
+            let current = expected
+                .current
+                .as_ref()
+                .ok_or_else(|| invalid("uninitialized remote backing"))?;
+            let namespace = scope(disk.clone(), &current.namespace)?;
+            check(&ReadOnlyRollbackBacking::before_claim(
+                namespace.as_ref(),
+                manifest,
+            )?)?;
+        }
         let authorization = SessionAuthorization::generate()?;
         let claim = transact(rpc.as_ref(), &expected, &authorization, Action::Claim)?;
         let result = Self::fork_current(disk.clone(), claim, rpc.clone(), authorization)?;
