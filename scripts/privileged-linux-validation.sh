@@ -21,6 +21,9 @@ readonly RAW_FIO_SIZE="64M"
 readonly FILE_FIO_SIZE="64M"
 readonly LV_SIZE="384M"
 readonly MIN_WORK_FREE_BYTES=$((768 * 1024 * 1024))
+# How often a release by hand looks, 100 ms apart, for the connection to go:
+# the helper's own wait, 15 s.
+readonly RELEASE_LOOKS=150
 
 device="/dev/nbd15"
 confirmed_device=""
@@ -53,7 +56,12 @@ Options:
   --kill-daemon          After the detach and second attach, SIGKILL nbdkit
                          under the mounted attachment, require maki-attach
                          cleanup to release it, start a new nbdkit, attach a
-                         third time, read the data back and detach.
+                         third time and read the data back. Then SIGKILL it
+                         again, disconnect the device over netlink and, while
+                         it still shows the connection, unmount and remove
+                         the mapping by hand, require cleanup's disconnected
+                         recovery to retire the record, attach a fourth
+                         time, read the data back and detach.
   --preflight            Show checks and missing commands without sudo or I/O.
   -h, --help             Show this help.
 
@@ -138,7 +146,7 @@ readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
-    blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
+    blkid blockdev cargo dd df dmsetup findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
     modprobe nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
     sudo sync vgchange vgcreate vgremove vgs
 )
@@ -161,7 +169,9 @@ if [[ "$preflight" == true ]]; then
     printf 'Scope:      kernel NBD -> raw fio -> LVM -> XFS -> file fio/SQLite\n'
     printf '            -> detach with an opener -> attach -> data read back\n'
     if [[ "$kill_daemon" == true ]]; then
-        printf '            -> SIGKILL nbdkit -> cleanup -> new nbdkit -> attach -> detach\n'
+        printf '            -> SIGKILL nbdkit -> cleanup -> new nbdkit -> attach\n'
+        printf '            -> SIGKILL nbdkit -> disconnect, unmount, unmap by hand\n'
+        printf '            -> cleanup (disconnected recovery) -> new nbdkit -> attach -> detach\n'
         printf 'Excluded:   OOM, power interruption, real disks\n'
     else
         printf 'Excluded:   forced crash, OOM, power interruption, real disks\n'
@@ -1075,8 +1085,11 @@ fi
 # final teardown must wait for (AUD-197); a second attach reads the data
 # back. With --kill-daemon, nbdkit is then killed under the mount, cleanup
 # must release the attachment without it, and a new nbdkit and a third attach
-# read the data back before the final detach. Every teardown must leave no
-# mount, holder, connection or attach record behind.
+# read the data back. nbdkit is killed again, the device is disconnected and
+# released by hand, cleanup must retire the record by disconnected recovery,
+# and a new nbdkit and a fourth attach read the data back before the final
+# detach. Each cleanup must take the path for what the device showed, and
+# every teardown must leave no mount, holder, connection or attach record.
 
 # Run one maki-attach verb on this run's volume. Its output goes to the log
 # and to $run_dir/<evidence>.txt, and its exit status is the function's.
@@ -1181,7 +1194,122 @@ check_lifecycle_data() {
     pass "data written and fsynced before the first detach reads back unchanged after the $1"
 }
 
+# The backend identifier the device shows, or nothing.
+shown_backend() {
+    tr -d '\n' 2>/dev/null <"/sys/block/$nbd_target/backend" || true
+}
+
+# The path a cleanup ($1.txt) took must be the one for what the device showed
+# before it ($2: the attachment's backend identifier, or empty for none): the
+# helper logs the path it takes.
+require_cleanup_path() {
+    local expected
+    if [[ -n "$2" ]]; then
+        expected="maki-attach: $device shows the attachment's connection; cleanup follows the detach path"
+    else
+        expected="maki-attach: $device shows no connection; cleanup follows disconnected recovery"
+    fi
+    grep -Fq -- "$expected" "$run_dir/$1.txt" ||
+        die "cleanup did not say it took the path for a device that showed ${2:-no connection}: $1.txt lacks '$expected'"
+    pass "cleanup took the path for a device that showed ${2:-no connection}: ${expected##*; }"
+}
+
+# SIGKILL nbdkit under the mounted attachment ($1: when), once what was
+# written is synced.
+kill_nbdkit() {
+    local killed_status=0 shown
+    log "killing nbdkit (PID $nbdkit_pid) with SIGKILL under the mounted attachment, $1"
+    sync -f "$mountpoint/work"
+    kill -KILL "$nbdkit_pid"
+    wait "$nbdkit_pid" || killed_status=$?
+    nbdkit_pid=""
+    [[ "$killed_status" == 137 ]] ||
+        die "nbdkit exited with status $killed_status, not 137 (SIGKILL)"
+    shown="$(shown_backend)"
+    log "with nbdkit dead, $device shows backend ${shown:-none}"
+    pass "nbdkit was killed with SIGKILL while XFS was mounted, $1"
+}
+
+# Start a new nbdkit on the same backing ($1: after what), which must
+# recover the volume and negotiate; nbdinfo's output goes to $run_dir/$2.txt.
+start_nbdkit() {
+    log "starting a new nbdkit on the same backing, $1"
+    remove_stale_test_socket "$socket_path"
+    printf '\n--- a new nbdkit %s ---\n' "$1" >>"$run_dir/nbdkit.log"
+    "${nbdkit_launcher[@]}" nbdkit --foreground -U "$socket_path" "$plugin_path" \
+        config="$config_path" >>"$run_dir/nbdkit.log" 2>&1 &
+    nbdkit_pid=$!
+    for _ in $(seq 1 200); do
+        [[ -S "$socket_path" ]] && break
+        kill -0 "$nbdkit_pid" 2>/dev/null || die "the new nbdkit exited before creating its socket"
+        sleep 0.05
+    done
+    [[ -S "$socket_path" ]] || die "the new nbdkit's socket did not become ready"
+    nbdinfo "$nbd_uri" >"$run_dir/$2.txt"
+    pass "a new nbdkit recovered the volume and negotiates, $1"
+}
+
+# Leave the device of a killed nbdkit showing no connection while its attach
+# record remains, as an operator could before running cleanup: disconnect it
+# over netlink (NBD_CMD_DISCONNECT; the helper's own nbd-disconnect refuses
+# an attachment's identifier), then, only while it still shows the
+# connection, unmount XFS and remove the LV's mapping by hand. The kernel
+# keeps a connection's attributes until the last opener of the device has
+# closed it: what the device shows after each step is logged.
+release_by_hand() {
+    local connection shown holder mapping looks=0
+    connection="$(shown_backend)"
+    [[ "$connection" =~ ^maki-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] ||
+        die "$device shows no attachment's connection before the release by hand (${connection:-none})"
+    # The invoking user deliberately opens the log file.
+    # shellcheck disable=SC2024
+    if ! sudo -n python3 -B "$REPO_ROOT/scripts/privileged_validation_nbd.py" --device "$device" \
+        --identifier "$connection" --helper "$attach_bin" kernel-disconnect \
+        >"$run_dir/kernel-disconnect.txt" 2>&1; then
+        cat "$run_dir/kernel-disconnect.txt" >&2
+        die "NBD_CMD_DISCONNECT of $device failed; see kernel-disconnect.txt above"
+    fi
+    cat "$run_dir/kernel-disconnect.txt"
+    shown="$(shown_backend)"
+    log "after NBD_CMD_DISCONNECT, with XFS mounted, $device shows backend ${shown:-none}"
+    if [[ -n "$shown" ]]; then
+        sudo -n umount "$mountpoint" || die "could not unmount $mountpoint by hand"
+        mount_active=false
+        shown="$(shown_backend)"
+        log "after the unmount by hand, $device shows backend ${shown:-none}"
+    fi
+    if [[ -n "$shown" ]]; then
+        for holder in "/sys/block/$nbd_target/holders/"*; do
+            [[ -e "$holder" ]] || continue
+            mapping="$(<"$holder/dm/name")"
+            sudo -n dmsetup remove "$mapping" || die "could not remove the mapping $mapping by hand"
+            log "removed the mapping $mapping (${holder##*/}) by hand"
+        done
+    fi
+    while [[ -n "$(shown_backend)" ]] || nbd_has_pid; do
+        ((++looks < RELEASE_LOOKS)) ||
+            die "$device still shows a connection (backend $(shown_backend)) after the release by hand"
+        sleep 0.1
+    done
+    log "$device shows no connection, $looks looks after the release by hand"
+    attach_record_state
+    [[ "$record_state" == present ]] || die "the attach record went before cleanup ran"
+    pass "$device shows no connection while the attach record of its killed nbdkit remains"
+}
+
+# What the helper's readers parse, from this attachment, as the helper runs
+# its probes: see privileged_validation_capture.py. Nothing in it is a key.
+capture_helper_outputs() {
+    # The invoking user deliberately opens the output file.
+    # shellcheck disable=SC2024
+    sudo -n python3 -B "$REPO_ROOT/scripts/privileged_validation_capture.py" --device "$device" \
+        --vg "$vg_name" --lv "$lv_name" --mountpoint "$mountpoint" \
+        >"$run_dir/helper-outputs.json" || die "could not capture the helper's probe outputs"
+    pass "captured the outputs of the helper's probes and the device's block topology (helper-outputs.json)"
+}
+
 require_attached "the first attach"
+capture_helper_outputs
 
 log "writing and fsyncing 32 MiB beside the SQLite database"
 dd if=/dev/urandom of="$mountpoint/work/lifecycle.dat" bs=1M count=32 conv=fsync status=none
@@ -1222,42 +1350,17 @@ run_helper verify maki-verify-reattach || die "maki-attach verify failed after t
 check_lifecycle_data reattach
 
 if [[ "$kill_daemon" == true ]]; then
-    log "killing nbdkit (PID $nbdkit_pid) with SIGKILL under the mounted attachment"
-    sync -f "$mountpoint/work"
-    kill -KILL "$nbdkit_pid"
-    killed_status=0
-    wait "$nbdkit_pid" || killed_status=$?
-    nbdkit_pid=""
-    [[ "$killed_status" == 137 ]] ||
-        die "nbdkit exited with status $killed_status, not 137 (SIGKILL)"
-    backend_after_kill=""
-    if [[ -r "/sys/block/$nbd_target/backend" ]]; then
-        backend_after_kill="$(<"/sys/block/$nbd_target/backend")"
-    fi
-    log "with nbdkit dead, $device shows backend ${backend_after_kill:-none}"
-    pass "nbdkit was killed with SIGKILL while XFS was mounted"
-
+    kill_nbdkit "after the second attach"
+    # Which path cleanup takes depends on what the device shows now.
+    shown="$(shown_backend)"
     run_helper cleanup maki-cleanup-dead-daemon ||
         die "maki-attach cleanup failed after nbdkit was killed; see maki-cleanup-dead-daemon.txt above"
     mount_active=false
     helper_cleanup_needed=false
+    require_cleanup_path maki-cleanup-dead-daemon "$shown"
     require_released "cleanup after nbdkit was killed"
 
-    log "starting a new nbdkit on the same backing"
-    remove_stale_test_socket "$socket_path"
-    printf '\n--- a new nbdkit after SIGKILL ---\n' >>"$run_dir/nbdkit.log"
-    "${nbdkit_launcher[@]}" nbdkit --foreground -U "$socket_path" "$plugin_path" \
-        config="$config_path" >>"$run_dir/nbdkit.log" 2>&1 &
-    nbdkit_pid=$!
-    for _ in $(seq 1 200); do
-        [[ -S "$socket_path" ]] && break
-        kill -0 "$nbdkit_pid" 2>/dev/null || die "the new nbdkit exited before creating its socket"
-        sleep 0.05
-    done
-    [[ -S "$socket_path" ]] || die "the new nbdkit's socket did not become ready"
-    nbdinfo "$nbd_uri" >"$run_dir/nbdinfo-after-kill.txt"
-    pass "a new nbdkit recovered the volume and negotiates"
-
+    start_nbdkit "after the first SIGKILL" nbdinfo-after-kill
     helper_cleanup_needed=true
     run_helper attach maki-attach-after-kill ||
         die "maki-attach attach failed after nbdkit was killed; see maki-attach-after-kill.txt above"
@@ -1265,6 +1368,28 @@ if [[ "$kill_daemon" == true ]]; then
     require_attached "the attach after nbdkit was killed"
     run_helper verify maki-verify-after-kill || die "maki-attach verify failed after nbdkit was killed"
     check_lifecycle_data restart
+
+    # Cleanup's path for a device that shows no connection (AUD-203): a
+    # killed nbdkit's device keeps showing it, so it is released by hand
+    # first, and the record is left for cleanup to retire.
+    kill_nbdkit "after the third attach"
+    release_by_hand
+    run_helper cleanup maki-cleanup-disconnected ||
+        die "maki-attach cleanup failed on the disconnected attachment; see maki-cleanup-disconnected.txt above"
+    mount_active=false
+    helper_cleanup_needed=false
+    require_cleanup_path maki-cleanup-disconnected ""
+    require_released "cleanup of the disconnected attachment"
+
+    start_nbdkit "after the second SIGKILL" nbdinfo-after-disconnect
+    helper_cleanup_needed=true
+    run_helper attach maki-attach-after-disconnect ||
+        die "maki-attach attach failed after disconnected recovery; see maki-attach-after-disconnect.txt above"
+    mount_active=true
+    require_attached "the attach after disconnected recovery"
+    run_helper verify maki-verify-after-disconnect ||
+        die "maki-attach verify failed after disconnected recovery"
+    check_lifecycle_data recovery
 
     run_helper detach maki-detach-final || die "the final maki-attach detach failed; see maki-detach-final.txt above"
     mount_active=false

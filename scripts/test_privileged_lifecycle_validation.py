@@ -508,7 +508,7 @@ sudo() {
                 self.assertIn("RELEASED", result.stdout)
 
     def test_a_release_by_hand_that_leaves_a_connection_or_no_record_stops_the_run(self):
-        cases = {"never gone": ({"gone_at": None}, "still shows a connection"),
+        cases = {"never gone": ({"gone_at": None}, "/dev/nbd15 still shows a connection"),
                  "disconnect refused": ({"gone_at": "mapping", "disconnect_status": 1},
                                         "NBD_CMD_DISCONNECT of /dev/nbd15 failed"),
                  "no record": ({"gone_at": "mapping", "record": False},
