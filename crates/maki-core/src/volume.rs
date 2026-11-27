@@ -428,7 +428,7 @@ impl Volume {
                 return Ok(sequence);
             }
         } else if self.reclaim_unwritten(unit)? == DiscardProbe::Unwritten {
-            // Only a header proving the unit unwritten skips the tombstone;
+            // Only a slot proving the unit unwritten skips the tombstone;
             // a damaged slot is retired by one rather than refused (R5-012).
             // There is no new record. A FUA result must not acknowledge
             // another unit's unsynced append as a durable discard.

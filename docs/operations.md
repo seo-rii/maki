@@ -278,16 +278,23 @@ segments written before the setting was lowered stay readable. Its
 `--journal-segment-size` flag is still accepted, but no value within that
 limit changes the verdict.
 
-The deep report states one of three verdicts as an `info: deep check verdict:`
-line, printed before any `warning:` and `ERROR:` lines; the report ends with
-`check passed` or `check FAILED`. The verdict describes the volume: a
+A deep check that runs to its end states one of three verdicts as an
+`info: deep check verdict:` line, printed before any `warning:` and `ERROR:`
+lines; the report ends with `check passed` or `check FAILED`. One that stops
+early prints no verdict line: when the root holds no superblock file, the
+volume lock is held, a read-only check finds `volume.lock` missing, the
+superblock no longer loads or no checkpoint state copy is valid, the report
+ends with its `ERROR:` lines and `check FAILED`, and one that cannot finish
+reading (an I/O error, or a remote witness whose record changed meanwhile)
+prints only an `error:` line on stderr. Both exit with status 1. The verdict
+describes the volume: a
 configuration mismatch (above) fails the check whatever the verdict says. A
 check of a backing root it may not write states a fourth, `unproven`, in place
 of `clean` and `recoverable` ([below](#checking-a-backing-that-cannot-be-written)).
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
-| `clean` | Every allocated slot reads back and no unlisted slot holds a damaged header; ordinary replay of the journal is all the next attach does | None |
+| `clean` | Every allocated slot reads back and every unlisted slot is a hole or holds a valid header for its unit; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
 | `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation in a way attach refuses. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
 
@@ -301,10 +308,15 @@ reports a lost canary as an `ERROR:` only when the volume has history but no
 ciphertext to probe, which every attach refuses; otherwise it is a `warning:`
 that says what attach needs.
 
-The check reads every slot the map lists and probes the header of every
-slot it does not list in an existing shard, exactly like the read path: a
-non-zero header that does not decode on a cleared slot is damage (EIO at
-runtime), not a hole.
+The check reads every slot the map lists and probes every slot it does not
+list in an existing shard, exactly like the read path: a cleared slot is a
+hole only if its header and ciphertext area are all zero. A non-zero header
+that does not decode there is damage (EIO at runtime), and so is an all-zero
+header over ciphertext bytes that are not all zero, such as a header sector
+that reads back as zeros. A slot write that tore that way in a crash has a
+journal record newer than the checkpoint and is reported as recoverable.
+Each probe reads the slot's header and ciphertext area, not only its 64
+header bytes, so a deep check reads nearly all of every shard file.
 
 The raw slot reader and recovery see different states of the same volume:
 the checker reports what is on disk, the verdict says what the next attach

@@ -2,8 +2,9 @@
 //!
 //! Read classification (SPEC §22):
 //! - shard absent from catalog → unwritten zero
-//! - allocation bit 0 → the slot header decides: all zero is unwritten zero,
-//!   a valid header for the unit is served, anything else is EIO (see below)
+//! - allocation bit 0 → the slot decides: a slot with no written byte is
+//!   unwritten zero, a valid header for the unit is served, anything else is
+//!   EIO (see below)
 //! - bit 1, slot invalid/missing → EIO (never fabricated data)
 //! - bit 1, slot valid → ciphertext
 //!
@@ -32,13 +33,17 @@
 //! for checkpointed data. So a data file the catalog does not list is
 //! adopted at open, and a slot whose bit is 0 is probed: a header that
 //! decodes for that unit is served (or, if its body is damaged, reported as
-//! EIO), and only a slot with an all-zero header reads as zeros — a hole is
-//! never partly written, so any other undecodable header is damage (EIO).
+//! EIO), and only a slot with no written byte reads as zeros — a hole is
+//! never partly written, so any other undecodable header is damage (EIO),
+//! and so is an all-zero header over ciphertext bytes that are not all zero
+//! (a zeroed header sector). The bytes a slot write can reach are its header
+//! and its ciphertext area (`slot_extent`); the alignment padding after them
+//! is never written.
 //!
 //! A data file is created at its physical size and synced before the shard
 //! is used, so a shorter file was truncated (media damage), unless the shard
-//! was never written into (uncataloged, empty allocation map, no slot header
-//! below the end of the file: creation never finished, and after a failed
+//! was never written into (uncataloged, empty allocation map, no written slot
+//! byte below the end of the file: creation never finished, and after a failed
 //! sync plus a restart even a full-size page-cache view proves nothing — the
 //! size is re-established before the shard is written to or cataloged). A truncated file's cleared slots
 //! beyond the end are marked allocated at open, because the next slot write
@@ -55,7 +60,7 @@ use maki_format::allocation::AllocationMap;
 use maki_format::catalog::ShardCatalog;
 use maki_format::geometry::Geometry;
 use maki_format::layout;
-use maki_format::slot::SlotHeader;
+use maki_format::slot::{SlotHeader, SLOT_HEADER_SIZE};
 use maki_format::superblock::{load_volume_superblock, VolumeSuperblock, SUPERBLOCK_VERSION_V3};
 use maki_format::FormatError;
 
@@ -76,8 +81,9 @@ pub enum SlotRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShortFile {
     /// Not named by the loaded catalog copy, with an empty allocation map
-    /// and no written slot header below the end of the file: nothing ever
-    /// wrote into the shard, so its creation never finished and nothing
+    /// and no slot below the end of the file that shows a write (a written
+    /// byte; for a file of full length, a written header byte, see `open`):
+    /// nothing ever wrote into the shard, so its creation never finished and nothing
     /// proves the file's size durable — the `set_len`
     /// was lost with the crash (short file), or its sync failed before a
     /// plain restart and the page cache still shows the full size (K-01).
@@ -239,16 +245,17 @@ fn catalog_store(geometry: &Geometry) -> AbStore {
 
 /// What the slot of a unit whose allocation bit is clear holds.
 enum Probe {
-    /// An all-zero header (or, in a shard never written into, a slot beyond
-    /// the end of the file): never written.
+    /// No written byte below the end of the file (or, in a shard never
+    /// written into, a slot beyond the end of the file): never written.
     Unwritten,
     /// A header for this unit: the allocation copy is behind the slot.
     Header(SlotHeader),
-    /// Bytes that are neither zero nor a header for this unit. A hole is
-    /// never partly written, so this slot was written and then damaged —
-    /// along with the allocation copy that listed it (SPEC §22). Reading
-    /// it as zeros would turn checkpointed data into a hole.
-    Damaged,
+    /// Bytes that are neither all zero nor a header for this unit, as the
+    /// error names them. A hole is never partly written, so this slot was
+    /// written and then damaged — along with the allocation copy that
+    /// listed it (SPEC §22). Reading it as zeros would turn checkpointed
+    /// data into a hole.
+    Damaged(&'static str),
 }
 
 /// A short slot is damage, but other read failures do not establish what
@@ -262,8 +269,51 @@ fn slot_read_error(unit: u64, part: &str, error: std::io::Error) -> CoreError {
     }
 }
 
-/// Probe the header of a slot whose allocation bit is clear.
-fn probe_header(
+/// The bytes of a slot that a slot write can reach: the header and the
+/// largest ciphertext. The alignment padding after them is never written.
+fn slot_extent(geometry: &Geometry) -> u64 {
+    u64::from(SLOT_HEADER_SIZE) + u64::from(geometry.max_ciphertext_size)
+}
+
+/// Bytes of one slot read at once while it is checked for written bytes.
+const PROBE_CHUNK: u64 = 64 * 1024;
+
+/// Whether every byte is zero. The fold has no early exit, so it vectorizes;
+/// the 4 KiB pieces keep the answer for a written slot prompt.
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes
+        .chunks(4096)
+        .all(|piece| piece.iter().fold(0u8, |acc, byte| acc | byte) == 0)
+}
+
+/// Whether the bytes of a unit's slot in `from..to` are all zero, read in
+/// pieces of at most `buffer.len()` bytes.
+fn zero_range(
+    data: &dyn BackingFile,
+    unit: u64,
+    from: u64,
+    to: u64,
+    buffer: &mut [u8],
+) -> Result<bool, CoreError> {
+    let capacity = buffer.len() as u64;
+    let mut position = from;
+    while position < to {
+        let piece = &mut buffer[..(to - position).min(capacity) as usize];
+        data.read_at(position, piece)
+            .map_err(|error| slot_read_error(unit, "slot", error))?;
+        if !all_zero(piece) {
+            return Ok(false);
+        }
+        position += piece.len() as u64;
+    }
+    Ok(true)
+}
+
+/// Probe the slot of a unit whose allocation bit is clear (SPEC §22). A
+/// non-zero header is decoded; an all-zero header is a hole only if the rest
+/// of the slot holds no written byte either. One read covers the header and
+/// a ciphertext area of up to 64 KiB.
+fn probe_slot(
     geometry: &Geometry,
     shard: &Shard,
     unit: u64,
@@ -271,7 +321,7 @@ fn probe_header(
     file_len: u64,
 ) -> Result<Probe, CoreError> {
     let offset = geometry.slot_offset(in_shard);
-    if offset + 64 > file_len {
+    if offset + u64::from(SLOT_HEADER_SIZE) > file_len {
         // A shard data file is created at its full sparse size and synced
         // before it is ever used (`ensure_shard`), so a file that ends
         // before this slot was truncated: damage, not a hole. The one
@@ -281,40 +331,80 @@ fn probe_header(
         return Ok(if shard.short == Some(ShortFile::Unproven) {
             Probe::Unwritten
         } else {
-            Probe::Damaged
+            Probe::Damaged(DAMAGED_HEADER)
         });
     }
-    let mut header_bytes = [0u8; 64];
+    // Bytes the end of the file cuts off are not read: a truncated file's
+    // slots whose header lies beyond the end are marked allocated at open.
+    let end = (offset + slot_extent(geometry)).min(file_len);
+    let mut buffer = vec![0u8; (end - offset).min(PROBE_CHUNK) as usize];
     shard
         .data
-        .read_at(offset, &mut header_bytes)
+        .read_at(offset, &mut buffer)
         .map_err(|error| slot_read_error(unit, "slot", error))?;
-    if header_bytes.iter().all(|b| *b == 0) {
-        return Ok(Probe::Unwritten);
+    let (header, body) = buffer.split_at(SLOT_HEADER_SIZE as usize);
+    if !all_zero(header) {
+        return Ok(SlotHeader::decode(header)
+            .ok()
+            .filter(|h| h.unit_index == unit)
+            .map_or(Probe::Damaged(DAMAGED_HEADER), Probe::Header));
     }
-    Ok(SlotHeader::decode(&header_bytes)
-        .ok()
-        .filter(|h| h.unit_index == unit)
-        .map_or(Probe::Damaged, Probe::Header))
+    let rest = offset + buffer.len() as u64;
+    if !all_zero(body) || !zero_range(shard.data.as_ref(), unit, rest, end, &mut buffer)? {
+        return Ok(Probe::Damaged(ZEROED_HEADER));
+    }
+    Ok(Probe::Unwritten)
 }
 
-/// Whether a slot of a shard data file, at a position of the device, has
-/// header bytes below the end of the file that are not all zero (a header
-/// the end of the file cuts counts with the part that remains). Only a slot
-/// write puts bytes there, and the data file's size is proven durable
-/// before the first slot write into a shard (`prove_data_file`, or the
-/// synced creation in `ensure_shard`): such a file is not one whose
+const DAMAGED_HEADER: &str =
+    "holds a damaged header (written, then damaged along with its allocation copy)";
+const ZEROED_HEADER: &str = "holds written bytes under an all-zero header (written, then \
+     damaged along with its allocation copy; a hole is never partly written)";
+
+/// The header a cleared slot holds for its unit, if any: the one thing the
+/// open-time audit marks. One 64-byte read; a slot beyond the end of the
+/// file holds none.
+fn unit_header(
+    geometry: &Geometry,
+    shard: &Shard,
+    unit: u64,
+    in_shard: u64,
+    file_len: u64,
+) -> Result<Option<SlotHeader>, CoreError> {
+    let offset = geometry.slot_offset(in_shard);
+    if offset + u64::from(SLOT_HEADER_SIZE) > file_len {
+        return Ok(None);
+    }
+    let mut header = [0u8; SLOT_HEADER_SIZE as usize];
+    shard
+        .data
+        .read_at(offset, &mut header)
+        .map_err(|error| slot_read_error(unit, "slot", error))?;
+    Ok(SlotHeader::decode(&header)
+        .ok()
+        .filter(|h| h.unit_index == unit))
+}
+
+/// Whether a slot of a shard data file, at a position of the device, holds
+/// a written byte below the end of the file within its first `scope` bytes
+/// (a slot the end of the file cuts counts with the part that remains).
+/// Only a slot write puts bytes there, and the data file's size is proven
+/// durable before the first slot write into a shard (`prove_data_file`, or
+/// the synced creation in `ensure_shard`): such a file is not one whose
 /// creation never finished, whatever its catalog and allocation copies say.
-/// One header read per slot, stopping at the first written one.
+/// `open` passes the header size for a file of full length and the whole
+/// reachable extent for a short one (see there). One read per slot (in
+/// pieces of at most 64 KiB), stopping at the first written one.
 fn holds_written_slot(
     geometry: &Geometry,
     data: &dyn BackingFile,
     shard: u64,
     in_device: u64,
     len: u64,
+    scope: u64,
     progress: &crate::recovery::RecoveryProgress<'_>,
 ) -> Result<bool, CoreError> {
-    let mut header = [0u8; 64];
+    let mut buffer = vec![0u8; scope.min(PROBE_CHUNK) as usize];
     for in_shard in 0..in_device {
         if in_shard > 0 && in_shard.is_multiple_of(256) {
             progress();
@@ -323,11 +413,8 @@ fn holds_written_slot(
         if offset >= len {
             break;
         }
-        let part = &mut header[..(len - offset).min(64) as usize];
         let unit = shard * geometry.units_per_shard() + in_shard;
-        data.read_at(offset, part)
-            .map_err(|error| slot_read_error(unit, "slot", error))?;
-        if part.iter().any(|b| *b != 0) {
+        if !zero_range(data, unit, offset, (offset + scope).min(len), &mut buffer)? {
             return Ok(true);
         }
     }
@@ -341,7 +428,8 @@ fn addressable_units(geometry: &Geometry, shard: u64) -> u64 {
 }
 
 /// Units of `shard` whose bit is clear but whose slot holds a header for
-/// them. One header read per cleared slot.
+/// them. One header read per cleared slot: a slot without such a header is
+/// left unmarked, whether it is a hole or damage.
 fn probe_shard(
     geometry: &Geometry,
     shard: &Shard,
@@ -371,7 +459,7 @@ fn probe_shard(
         // and a torn first write of a still-journaled unit (the common,
         // benign cause) is served from the overlay and rewritten by the
         // next checkpoint. `read_slot` reports it as EIO, never zeros.
-        if let Probe::Header(_) = probe_header(geometry, shard, unit, in_shard, len)? {
+        if unit_header(geometry, shard, unit, in_shard, len)?.is_some() {
             out.push(unit);
         }
         progress();
@@ -600,17 +688,34 @@ impl SlotStore {
             // catalog names it (its commit follows the synced full-size
             // file), an allocation copy lists a slot (a checkpoint wrote
             // into it, and the size had been proven before that write), or
-            // a slot holds a header (only a slot write puts bytes there, and
-            // every slot write follows `prove_data_file`). The catalog and
-            // the allocation maps are accelerators that can both fall back
-            // to a generation from before the first checkpoint into the
-            // shard; the slot headers below the end of the file cannot. A
-            // leftover empty allocation copy alone proves nothing — an
-            // earlier attempt can leave one behind after its never-dir-synced
-            // data file vanished in the crash. Nor does the observed length:
+            // a slot holds a written byte (only a slot write puts bytes
+            // there, and every slot write follows `prove_data_file`). The
+            // catalog and the allocation maps are accelerators that can both
+            // fall back to a generation from before the first checkpoint
+            // into the shard; the slot bytes below the end of the file
+            // cannot. A leftover empty allocation copy alone proves nothing
+            // — an earlier attempt can leave one behind after its
+            // never-dir-synced data file vanished in the crash. Nor does the
+            // observed length:
             // after a failed sync and a plain restart the page cache shows
             // the full size that the disk does not have (K-01). Only a bit
             // at an in-device position lists a slot.
+            //
+            // A header can read back as zeros over a written slot (SPEC §22),
+            // so for a short file every byte a slot write can reach counts:
+            // there the answer decides whether the slots past the end are
+            // holes or damage. For a file of full length no slot lies past
+            // the end; the answer decides only whether the size is proven
+            // again, which costs one more `set_len` and sync for a written
+            // shard taken for an unfinished one, and each cleared slot is
+            // still probed in full when read. There the header bytes
+            // suffice, and the scan of an unfinished creation's file (the
+            // common case) reads 64 bytes per slot.
+            let scope = if len < physical {
+                slot_extent(&geometry)
+            } else {
+                u64::from(SLOT_HEADER_SIZE)
+            };
             let never_written = adopted.contains(&shard_idx)
                 && !(0..in_device).any(|in_shard| alloc.get(in_shard))
                 && !holds_written_slot(
@@ -619,6 +724,7 @@ impl SlotStore {
                     shard_idx,
                     in_device,
                     len,
+                    scope,
                     progress,
                 )?;
             let short = if never_written {
@@ -638,8 +744,8 @@ impl SlotStore {
                 // Truncated. A cleared slot beyond the end is indistinguishable
                 // from a checkpointed slot the truncation removed, and the
                 // evidence is about to vanish: the next slot write past the
-                // end grows the file with zeros, after which such a slot has
-                // an all-zero header and would read as an unwritten hole.
+                // end grows the file with zeros, after which such a slot is
+                // all zero and would read as an unwritten hole.
                 // Record the damage in the one place that persists — the
                 // allocation map: marked allocated, the slot reads as
                 // allocated-but-invalid (EIO) until it is rewritten.
@@ -1092,7 +1198,7 @@ impl SlotStore {
     /// fresh size change followed by a successful sync proves it. For a
     /// truncated file the damage marks made at open are stored and
     /// dir-synced first: the extension zero-fills the slots they stand for,
-    /// and a crash between the two steps would otherwise leave zero headers
+    /// and a crash between the two steps would otherwise leave zeroed slots
     /// that read as holes.
     fn prove_data_file(&mut self, shard_idx: u64) -> Result<(), CoreError> {
         let physical = self.geometry.units_per_shard() * self.geometry.slot_size;
@@ -1462,6 +1568,11 @@ impl SlotStore {
                     CoreError::Corrupt("discard punch range length overflow".into())
                 })?;
                 fp("discard.punch")?;
+                // Every unit punched here has its discard bit set in both
+                // durable map copies (the callers persist the discard map
+                // first), and the bit is cleared only once a rewrite of the
+                // slot is synced: a partly released slot is answered by its
+                // discard bit and never probed as a hole (SPEC §22).
                 // A failed punch may already have released part of the range.
                 // A later write must reserve and sync it again even if the
                 // punch or its subsequent data barrier reports failure.
@@ -1487,6 +1598,8 @@ impl SlotStore {
     /// discarded) unit. Every header-level refusal of [`Self::read_slot`] applies
     /// here too, so a caller that finds a plaintext cache entry for
     /// `(unit, sequence)` may serve it without the payload read (R4-006).
+    /// A slot whose allocation bit is clear is read with its ciphertext area,
+    /// unverified, to tell a hole from damage (SPEC §22).
     pub fn slot_sequence(&self, unit: u64) -> Result<Option<u64>, CoreError> {
         Ok(self.slot_header(unit)?.map(|header| header.write_sequence))
     }
@@ -1609,12 +1722,11 @@ impl SlotStore {
             // Bit clear: unwritten unless the slot itself says otherwise
             // (allocation copy behind the data, see module docs).
             let len = data_len(shard_idx, shard.data.as_ref())?;
-            match probe_header(&self.geometry, shard, unit, in_shard, len)? {
+            match probe_slot(&self.geometry, shard, unit, in_shard, len)? {
                 Probe::Unwritten => return Ok(None),
-                Probe::Damaged => {
+                Probe::Damaged(what) => {
                     return Err(CoreError::Corrupt(format!(
-                        "unit {unit}: unlisted slot holds a damaged header (written, then \
-                         damaged along with its allocation copy)"
+                        "unit {unit}: unlisted slot {what}"
                     )))
                 }
                 Probe::Header(header) => {

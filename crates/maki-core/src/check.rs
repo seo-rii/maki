@@ -258,7 +258,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
     // warning, not a data-loss error (R4-004). Damage with no such record
     // is unrecoverable and stays an error. Slots whose allocation bit is
     // clear are probed as the read path probes them: a non-zero header that
-    // does not decode there is damage (EIO), never a hole.
+    // does not decode there is damage (EIO), never a hole, and so is an
+    // all-zero header over written ciphertext bytes (SPEC §22).
     let mut recoverable = 0u64;
     let mut unrecoverable = 0u64;
     // What attach would find to probe for a missing key canary: a stored
