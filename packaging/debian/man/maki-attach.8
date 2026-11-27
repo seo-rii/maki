@@ -76,7 +76,9 @@ Use
 .B recover
 for a disconnected backend.
 .B cleanup
-uses the attachment record to select detach or recovery.
+uses the attachment record to select detach or recovery, and logs which it
+selects: detach for a device that shows the recorded connection, recovery for
+one that shows none.
 After its NBD disconnect, a
 .BR detach " or " cleanup
 waits, as

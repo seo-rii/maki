@@ -906,7 +906,13 @@ helper observes the mappings again afterwards instead of trusting its status.
 packaged service lifecycle. Under the same single attach lock, no trusted
 record is already clean and succeeds without probing the backend. A matching
 connected backend follows the detach path; a known absent backend follows the
-recovery path. An unreadable backend fails before mutation and keeps the
+recovery path. Cleanup logs which of the two it takes (`<device> shows the
+attachment's connection; cleanup follows the detach path`, or `shows no
+connection; cleanup follows disconnected recovery`). The kernel keeps a
+connection's `backend` and `pid` while anything holds the device open, a
+mount or an LV mapping above all (read from its NBD driver), so a recorded
+device that shows no connection normally has nothing of the attachment left,
+and recovery then retires the record. An unreadable backend fails before mutation and keeps the
 record; a backend under another identity is never touched, and its record is
 retired only as described above. Re-run cleanup after a partial successful effect; each selected
 path re-observes storage identity before its next change.

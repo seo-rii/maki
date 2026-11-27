@@ -235,18 +235,22 @@ See [cache reload](operations.md#growth-and-cache-reload).
   close the device, which keeps showing the connection until then, so the
   detach must have waited (AUD-197). It attaches again and reads the data
   back, then kills nbdkit under the mount, cleans up without it, starts a new
-  nbdkit, attaches a third time and detaches. The Debian guide's install
-  steps, the quick start and its first-volume bootstrap (AUD-199) then run as
-  written on the package built from the same commit, under systemd with the
-  installed units, including the attach unit's `ExecStop` cleanup on two
-  planned stops. That is one local-provider volume at a time on one runner
-  kernel, and nbdkit is killed once, while the filesystem is idle after a
-  sync. In the job's first run the killed daemon's device still showed its
-  connection, so that cleanup took cleanup's detach path; its path for a
-  backend known to be absent (disconnected recovery) has not run on a kernel.
-  How often something holds a device open at a detach on a production host,
-  and many volumes stopping together while their devices are held open, have
-  not been measured.
+  nbdkit and attaches a third time. The Debian guide's install steps, the
+  quick start and its first-volume bootstrap (AUD-199) then run as written on
+  the package built from the same commit, under systemd with the installed
+  units, including the attach unit's `ExecStop` cleanup on two planned stops.
+  In the job's runs whose logs are kept the killed daemon's device still
+  showed its connection, so that cleanup took cleanup's detach path. The job
+  now also kills nbdkit a second time and disconnects and releases its device
+  by hand so that cleanup takes its disconnected recovery (AUD-203), captures
+  what the helper's readers parse on the attachment, runs the quick start
+  with the bootstrap stopped once (at `mkfs.xfs`, and at `vgchange`) and
+  continued from its record, and stops three volumes together, each device
+  held open for 10 s, recording how long each stop takes; no result of these
+  additions is recorded yet. That is local-provider volumes on one runner
+  kernel, and nbdkit is killed only while the filesystem is idle after a
+  sync. How often something holds a device open at a detach on a production
+  host has not been measured.
 
 ## Where the evidence lives
 
