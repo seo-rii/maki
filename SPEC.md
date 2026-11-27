@@ -3008,13 +3008,20 @@ Every change also drives whole attachments through a disposable runner VM's
 kernel NBD, device-mapper, LVM, XFS and systemd (the privileged validation
 runner, then the documented installation, quick start and first-volume
 bootstrap on the built package); that is one Ubuntu host and the local
-provider, not the qualification of a target platform. Every change also
-replays the committed fuzz seeds on a big-endian target (s390x under
-qemu-user). A separate workflow, dispatched by hand, runs the parser fuzz
-campaign of §56 on hosted runners and records, per target, the CPU time
-charged to its fuzzing processes, their executions, the coverage of the
-merged corpus and any input they failed on; it qualifies only the revision
-it ran on.
+provider, not the qualification of a target platform. It also boots cloud
+images of Debian 12 and of Rocky Linux 9, the latter with SELinux enforcing,
+as KVM guests on runner VMs and runs in each, on the guest's kernel, the
+installation guide's host steps, the quick start and the first-volume
+bootstrap with the package built from the commit for that distribution, and
+the privileged runner's lifecycle with that package's binaries. Those are
+virtual machines on GitHub's hardware, not bare-metal hosts, and Rocky Linux
+is a rebuild of RHEL, not RHEL; they qualify no target platform either.
+Every change also replays the committed fuzz seeds on a big-endian target
+(s390x under qemu-user). A separate workflow, dispatched by hand, runs the
+parser fuzz campaign of §56 on hosted runners and records, per target, the
+CPU time charged to its fuzzing processes, their executions, the coverage of
+the merged corpus and any input they failed on; it qualifies only the
+revision it ran on.
 See [the testing guide](docs/testing.md) for the implemented commands and limits.
 
 ## Pull Request

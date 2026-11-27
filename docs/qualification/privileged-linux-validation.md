@@ -20,6 +20,13 @@ run directory before requesting sudo credentials. The worker and the Cargo build
 use this source snapshot. Commit tracked changes before starting a run. The
 snapshot excludes untracked files. `source-revision` records its commit ID, and
 `artifact-sha256` records the hashes of the three binaries used in the run.
+With `--prebuilt DIR` the run builds nothing and needs neither Cargo nor
+rustc: it copies `maki`, `maki-attach` and `libmaki_nbdkit.so` from `DIR`
+(which must hold all three) into its `target/prebuilt/`, runs those copies and
+hashes them; `artifact-origin` names the directory. Nothing in the run then
+ties the binaries to the snapshot's commit; CI's booted-host jobs take them
+from a package built from the same commit
+([testing](../testing.md#automated-ci)).
 
 
 The automated run checks:
@@ -148,7 +155,14 @@ passwordless sudo), with `--install-missing --kill-daemon --device /dev/nbd15
 parameters the runner asks for; see
 [testing](../testing.md#automated-ci). It keeps the run directory, without
 `source/`, `target/` and `build/`, in the job's `kernel-lifecycle-logs`
-artifact.
+artifact. The booted-host jobs run it the same way in booted Debian 12 and
+Rocky Linux 9 KVM guests (virtual machines on GitHub's hardware, not
+bare-metal hosts; Rocky Linux is a rebuild of RHEL, not RHEL), as the guest's
+user `ci`, with `--prebuilt` naming
+the binaries taken from the package built from the commit (and
+`--install-missing` on Debian only: on Rocky Linux the job installs the tools
+with dnf); their `<guest>-guest-runner-logs` artifacts keep the run directory
+the same way.
 
 ## Logs and completion
 
@@ -192,7 +206,9 @@ filesystem. A stable symlink points to the newest run:
 ├── lifecycle-check-recovery.txt
 ├── maki-detach-final.txt
 ├── maki-cleanup-idempotent.txt
-└── maki-check.txt
+├── maki-check.txt
+├── artifact-sha256
+└── artifact-origin                  (built from the snapshot, or prebuilt DIR)
 ```
 
 `nbdkit.log` holds the output of the three nbdkit processes of a

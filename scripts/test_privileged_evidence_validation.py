@@ -93,6 +93,7 @@ confirmed_device="$device"
 install_missing=false
 discard=false
 kill_daemon=false
+prebuilt_dir=""
 work_root=""
 sudo() { echo later-edit > "$REPO_ROOT/version"; }
 """

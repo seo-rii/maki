@@ -1,6 +1,6 @@
-"""CI runs the documented installation, quick start and first-volume
-bootstrap as written: every block of the guides, in order, in one root shell
-that stops at the first command that fails. These tests compose the program
+"""CI runs the documented installation (Debian's, or RHEL's on EL9), quick
+start and first-volume bootstrap as written: every block of the guides, in
+order, in one root shell that stops at the first command that fails. These tests compose the program
 from the guides and run its mechanics with stand-in blocks; nothing here
 installs, attaches or runs as root."""
 import importlib.util
@@ -122,6 +122,108 @@ class DocumentedSteps(unittest.TestCase):
                 with self.assertRaises(FileExistsError), mock.patch("builtins.print"):
                     self.driver.main([str(target)])
                 self.assertEqual((target / name).read_text(), "an earlier run's\n")
+
+
+class RhelInstallation(unittest.TestCase):
+    """On EL9 the RHEL 9 guide's repository and install steps come first; it
+    sends its reader on to the same quick start."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.driver = load_driver()
+
+    def test_the_rhel_host_steps_come_first_and_then_the_same_quick_start(self):
+        guide = (GUIDES / "installation-rhel.md").read_text()
+        repositories = guide.split("\n## Repositories\n", 1)[1].split("\n## ", 1)[0]
+        install = guide.split("\n## Install the Maki package\n", 1)[1].split("\n## ", 1)[0]
+        expected = bash_blocks(repositories) + bash_blocks(install)
+        self.assertEqual(len(expected), 4)
+        self.assertIn("dnf repolist", expected[0])
+        self.assertIn("dnf install -y ./maki.rpm\n", expected[1])
+        self.assertIn("systemd-analyze verify maki@demo.service", expected[3])
+        # Building the package is the build host's: not a step on the target.
+        self.assertNotIn("build-rpm.py", "".join(expected))
+        rhel = self.driver.steps("rhel")
+        debian = self.driver.steps()
+        self.assertEqual([block for _, block in rhel[:4]], expected)
+        self.assertEqual(rhel[4:], debian[3:])
+        self.assertEqual([label for label, _ in rhel[:4]],
+                         ["installation-rhel.md, Repositories, block 1",
+                          "installation-rhel.md, Install the Maki package, block 1",
+                          "installation-rhel.md, Install the Maki package, block 2",
+                          "installation-rhel.md, Install the Maki package, block 3"])
+        self.assertEqual(self.driver.steps("debian"), debian)
+
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
+    def test_the_program_names_the_package_its_install_step_installs(self):
+        for installation, package in (("debian", "maki.deb"), ("rhel", "maki.rpm")):
+            with self.subTest(installation=installation):
+                program = self.driver.program(self.driver.steps(installation), installation)
+                self.assertIn(f"# in the directory that holds {package} and demo.toml", program)
+                self.assertIn(f"./{package}\n", program)
+
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
+    def test_main_writes_the_rhel_program_when_asked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "quickstart"
+            with mock.patch("builtins.print"):
+                self.assertEqual(self.driver.main(["--installation", "rhel", str(target)]), 0)
+            self.assertEqual((target / "quickstart.sh").read_text(),
+                             self.driver.program(self.driver.steps("rhel"), "rhel"))
+            self.assertEqual((target / "demo.toml").read_text(), self.driver.configuration())
+
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
+    def test_the_rhel_program_passes_the_list_check_at_every_depth_and_stops_once(self):
+        # The RHEL guide's host blocks hold no && or || at any depth, so
+        # DEEPER_LISTS names none of them; the quick start's blocks keep
+        # their labels and their entries.
+        rhel = self.driver.steps("rhel")
+        for label, block in rhel[:4]:
+            with self.subTest(label=label):
+                lines = self.driver.printed_lines(label, block)
+                self.assertEqual(self.driver.deeper_lists(lines), [])
+                self.assertFalse(self.driver.has_unguarded_list(lines))
+        self.assertFalse([label for label, _ in self.driver.DEEPER_LISTS
+                          if label.startswith("installation-")])
+        program = self.driver.program(rhel, "rhel")
+        self.assertIn("dnf install -y ./maki.rpm\n", program)
+        for command in sorted(self.driver.STOP_ONCE):
+            with self.subTest(stop_once=command), tempfile.TemporaryDirectory() as directory:
+                interrupted = self.driver.program(rhel, "rhel", stop_once=command)
+                self.assertIn(f"{command} fails", interrupted)
+                self.assertIn("holds maki.rpm and demo.toml", interrupted)
+                target = Path(directory) / "quickstart"
+                with mock.patch("builtins.print"):
+                    self.assertEqual(self.driver.main(["--installation", "rhel", "--stop-once", command,
+                                                       str(target)]), 0)
+                self.assertEqual((target / "quickstart.sh").read_text(), interrupted)
+
+    @unittest.skipUnless(shutil.which("bash"), "the program runs in Bash")
+    def test_the_install_step_stops_the_program_only_when_the_selinux_module_is_installed(self):
+        # The block's status is the program's verdict on it: the module check
+        # must succeed while nbdkit-selinux is absent, as the guide expects,
+        # and fail if it is installed.
+        label, block = self.driver.steps("rhel")[1]
+        self.assertIn("rpm -q nbdkit-selinux", block)
+        for installed in (False, True):
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "bin"
+                binary.mkdir()
+                (binary / "dnf").write_text("#!/bin/sh\nexit 0\n")
+                if installed:
+                    rpm = "#!/bin/sh\necho nbdkit-selinux-1.38.5-5.el9.noarch\nexit 0\n"
+                else:
+                    rpm = "#!/bin/sh\necho \"package $2 is not installed\"\nexit 1\n"
+                (binary / "rpm").write_text(rpm)
+                for name in ("dnf", "rpm"):
+                    (binary / name).chmod(0o700)
+                program = self.driver.program([(label, block), ("after", "touch after")], "rhel")
+                result = subprocess.run(["bash", "-c", program], cwd=root, capture_output=True, text=True,
+                                        env=dict(os.environ, PATH=f"{binary}{os.pathsep}{os.environ['PATH']}"),
+                                        timeout=10)
+                self.assertEqual(result.returncode == 0, not installed, result.stdout + result.stderr)
+                self.assertEqual((root / "after").exists(), not installed)
 
 
 @unittest.skipUnless(shutil.which("bash"), "requires Bash")
