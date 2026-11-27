@@ -10,10 +10,11 @@
 //! still shows the connection after the disconnect, and takes it again, in
 //! turn, before it decides anything from what the wait showed: under the
 //! lock it reads the volume's record again and goes on only if that is
-//! still the record it disconnected. While it waits the record is
-//! unchanged and still names the device, so no other volume's attach and no
-//! provisioning connect takes the device. Another helper of the same volume
-//! finds what it would find had this one been killed during the wait.
+//! still the record it disconnected. While it waits, only another helper of
+//! the same volume can replace or retire the record; until then it still
+//! names the device, so no other volume's attach and no provisioning connect
+//! takes the device, and such a helper finds what it would find had this one
+//! been killed during the wait.
 
 use super::*;
 

@@ -359,8 +359,29 @@ not, and fails the command. `nbd-disconnect` fails, saying that something still
 has the device open, when the device still shows its connection at the end.
 Detach and cleanup retire the trusted record only when the device shows no
 connection after the wait (§8); otherwise they keep it and fail, and a later
-run continues from what the device shows then. They wait under the attach lock,
-so every other helper's attach, detach, cleanup, recover and grow waits too.
+run continues from what the device shows then.
+
+Detach and cleanup MUST NOT hold the attach lock while they wait: when their
+first look after the disconnect still shows the connection, they release the
+lock for the rest of the wait, so that the other helpers (the cleanups of
+other volumes stopping at the same time above all) do not wait for an opener
+of this device. A wait that ends with the device showing a connection, or one
+that cannot be read, fails the command as above without taking the lock
+again. Otherwise they MUST take the lock again, in turn behind the helpers
+that queued meanwhile, before they act on what the wait showed, and MUST read
+the volume's trusted record again under it: only the record they disconnected
+may be retired, once observations under the lock show that nothing of its
+attachment remains and the device no connection (§8). A record that another
+helper retired meanwhile, which it does only when nothing of the attachment
+remains, ends the command as a success; one that another helper replaced
+(the volume attached again) is kept with the attachment it names, and the
+command fails. Only another helper of the same volume can replace or retire
+the record while they wait; until then it still names the device, so no other
+volume's attach and no provisioning connect takes the device (§8), and such a
+helper finds what it would find had the waiting one been killed during its
+wait. The failed-start hook's rollback keeps the
+lock through its wait: its command budget counts from the moment it got the
+lock, and its time bounds leave no room for a second turn on the lock.
 
 The kernel's own work on a request is not bounded: it runs inside the send of
 the request, and its mutex waits are uninterruptible, so no deadline or signal

@@ -90,6 +90,12 @@ device open. If the device shows another connection by then, the record is
 kept as well, and a later
 .B cleanup
 removes it only when nothing of the attachment remains on the host.
+The wait does not hold the attach lock, so the helpers of other volumes do
+not wait for it. The lock is taken again before the record is removed, and
+the record must then still be the one the command disconnected: one that
+another helper removed meanwhile ends the command successfully, and one that
+another helper replaced (the volume attached again) is kept, and the command
+fails.
 .B recover-failed-start
 is the systemd failed-start cleanup hook. It asks systemd to queue the
 recovery coordinator and, when the start died between LVM activation and the
