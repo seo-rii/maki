@@ -599,6 +599,75 @@ documents.
 
 ### Added
 
+- **CI boots Debian 12 and Rocky Linux 9 guests and runs the guides and the
+  privileged runner in them** (AUD-209, 2026-11-27;
+  [#412](https://github.com/seo-rii/maki/pull/412)). For developers: four jobs
+  run on every pull request, push to `main`, dispatch and scheduled run.
+  `debian12-package` builds the Debian package from the commit in `debian:12`,
+  and `el9-package` the RPM in the release workflow's CentOS Stream 9
+  container. `debian12-guest` and `el9-guest` boot Debian 12's generic cloud
+  image and Rocky Linux 9.9's GenericCloud image, pinned by digest and cached,
+  as KVM guests under QEMU on GitHub's runner VMs, a fresh guest per suite
+  (`scripts/booted-host-validation.py`, `scripts/booted-host-guest.py`). In
+  one, as root, the installation guide's host steps (the RHEL guide's on
+  Rocky, `documented_quickstart.py --installation rhel`), the quick start and
+  the first-volume bootstrap run with the package; in the other the privileged
+  runner's lifecycle runs as the guest's user `ci` with the package's binaries
+  (`privileged-linux-validation.sh --prebuilt DIR`). On Rocky Linux the job
+  requires SELinux enforcing, auditd active, no AVC that names Maki or an NBD
+  device and, after the guides, `maki@`'s nbdkit in `unconfined_service_t`
+  and the labels the RHEL guide lists. The privileged runner waits for its
+  opener by reading `/proc`, no longer with `kill -0`, which fails for a
+  process that sudo started while sudo checks its policy. The guests are
+  virtual machines on GitHub's hardware, not bare-metal hosts, Rocky Linux is
+  a rebuild of RHEL, not RHEL, and the jobs qualify nothing ([automated
+  CI](docs/testing.md#automated-ci)).
+- **CI's `kernel-lifecycle` job reaches cleanup's disconnected recovery, stops
+  the first-volume block and continues it, and stops three volumes together**
+  (AUD-208, 2026-11-27; [#413](https://github.com/seo-rii/maki/pull/413)). For
+  developers: `privileged-linux-validation.sh --kill-daemon` kills nbdkit a
+  second time and releases its device by hand
+  (`privileged_validation_nbd.py kernel-disconnect --volume`, an unmount and a
+  `dmsetup remove`), so that cleanup starts on a device that shows no
+  connection, and now needs `dmsetup`; every run captures what the helper's
+  readers parse into `helper-outputs.json`.
+  `documented_quickstart.py --stop-once mkfs.xfs|vgchange` writes the program
+  with the bootstrap's first run made to fail at that command and the block
+  run again as its recovery notes say, and
+  `scripts/stop-together-validation.py` stops three volumes whose devices are
+  held open with one `systemctl stop` and reads each stop's times from PID 1's
+  journal. The program writer now refuses `&&` or `||` lists at every depth of
+  a block unless `DEEPER_LISTS` names them. The job's limit is 150 minutes
+  ([automated CI](docs/testing.md#automated-ci), [privileged validation
+  runbook](docs/qualification/privileged-linux-validation.md)).
+- **A dispatched 24 CPU-hour fuzz qualification, a big-endian seed replay and
+  each fuzz target's input length** (AUD-210, 2026-11-27;
+  [#415](https://github.com/seo-rii/maki/pull/415)). For developers:
+  `.github/workflows/fuzz-qualification.yml`, run only when dispatched
+  (`targets`, `cpu_hours` 24 by default, `shard_hours` at most 5,
+  `max_parallel` at most 20), builds every target once, fuzzes each in shards
+  of 4 libFuzzer processes on hosted runners until the kernel has charged
+  every process its share of CPU time, merges each target's corpora and
+  writes a summary that fails unless every target qualified
+  (`scripts/fuzz_campaign.py`). Each target's `-max_len` is in that script,
+  which the scheduled `fuzz` job reads too: the job had given `nbd_netlink`
+  4,096 bytes and so cut its 16,392-byte seed. A `big-endian-seeds` job
+  replays the committed seeds on `s390x-unknown-linux-gnu` under `qemu-user`
+  on every change. `helper_sysfs` builds its trees under a directory of its
+  process's own and removes the trees of a crashing input and of ended
+  processes, and `witness_etcd` gains five seeds at etcd's 256 KiB answer and
+  the 64 KiB state. No 24 CPU-hour campaign had finished when this was
+  written ([fuzz qualification](docs/testing.md#fuzz-qualification)).
+- **CI requires the IPv6 loopback address for the connect tests and runs a
+  packet-drop test as root** (AUD-206, 2026-11-27;
+  [#414](https://github.com/seo-rii/maki/pull/414)). For developers:
+  `MAKI_TEST_REQUIRE_IPV6=1`, set for the whole workflow, makes the HTTP and
+  gRPC tests of a connect to the other address family fail without the IPv6
+  loopback address instead of skipping, and `scripts/run_root_tests.py`
+  passes it on and runs `maki-crypto-http`'s unit tests as root, one of which
+  drops SYNs with a packet filter in a private network namespace ([automated
+  CI](docs/testing.md#automated-ci)).
+
 - **A CI job drives whole attachments and the documented quick start through a
   runner's kernel** (AUD-203, 2026-11-26;
   [#406](https://github.com/seo-rii/maki/pull/406)). For developers:
@@ -694,6 +763,11 @@ documents.
   devices file and SELinux. RHEL 9 is not qualified: nothing has run on a RHEL
   kernel or with SELinux enforcing, and nothing has attached a device there
   ([RHEL 9 installation](docs/getting-started/installation-rhel.md)).
+  *Changed on 2026-11-27 (AUD-209,
+  [#412](https://github.com/seo-rii/maki/pull/412)): on every change CI boots
+  Rocky Linux 9.9 with SELinux enforcing as a KVM guest and attaches through
+  its kernel; Rocky Linux is a rebuild of RHEL, not RHEL, and nothing has run
+  on RHEL itself.*
 
 - **CI checks a RHEL 9 userspace and connects a kernel NBD device** (AUD-155,
   AUD-156, 2026-11-24; [#375](https://github.com/seo-rii/maki/pull/375),
@@ -829,6 +903,108 @@ documents.
 
 ### Changed
 
+- **With a remote witness, attach compares the configuration before it claims
+  a writer, and a read-only command asks the authority three or four times
+  instead of before every backing operation** (AUD-207, 2026-11-27;
+  [#411](https://github.com/seo-rii/maki/pull/411)). With remote rollback
+  protection attach compared the configuration with the volume only after
+  opening the backing to write, which claims a writer at the authority,
+  copies the current generation into a namespace of its own and recovers the
+  volume there, so a configuration it refused had already raised the
+  authority's fence and replaced its session and current namespace; a remote
+  provider built on its own did the same. Attach, and such a provider, now
+  compare the settings fixed at creation and
+  `backing.rollback_protection.capacity` with the authority's current
+  generation before the claim, reading the two superblock copies through a
+  view that authenticates every page and asks the authority nothing: a
+  mismatch is refused with the error attach gave after recovery, after one
+  inspection, and the authority and the root are unchanged. A superblock page
+  that does not authenticate is refused there with `rollback arena page
+  authentication failed`, where the claim was granted and the copy failed with
+  `source page authentication failed`. A normal attach reads at most two
+  4 KiB pages more and opens the arena once more. `maki volume inspect`,
+  `maki check` and `maki check --deep` of a remote-protected volume send three
+  inspections (four for `--deep`) however large the volume, where they sent
+  one per backing operation: the view asks while it opens, and the commands
+  ask again once they have read everything, before they print their report,
+  and before they report a failure. An authority that changed while one of
+  them read fails it at the end, with `the remote authority changed after the
+  backing was opened read-only`, where it failed at the next operation, and a
+  command that fails after the open reports the authority's change instead of
+  its own error, or names an authority it could not ask beside it. An
+  authority that cannot be reached now matters only while the view opens and
+  at those last inspections. A local witness is still read before every
+  operation, a writer's view still asks before every operation, and exit
+  statuses are unchanged ([checking a backing that cannot be
+  written](docs/operations.md#checking-a-backing-that-cannot-be-written),
+  [diagnostic
+  commands](docs/remote-witness-service.md#diagnostic-commands-and-writer-ownership),
+  maki(8), SPEC §20, §27).
+- **The gRPC transport starts the other address family halfway through a
+  `timeout` under 600 ms, and an HTTP `timeout` under 600 ms gets a warning**
+  (AUD-206, 2026-11-27; [#414](https://github.com/seo-rii/maki/pull/414)). The
+  gRPC transport waited 300 ms before it dialed the endpoint host's other
+  address family, so with a `timeout` of 300 ms or less a call whose first
+  family did not answer failed, retryable and unsent, and only a later call
+  could be served. It now waits `min(300 ms, timeout / 2)`, counted from the
+  dial; nothing changes at 600 ms or more. The HTTP transport keeps its
+  300 ms, which no option of reqwest 0.12.28 or 0.13.5 changes, so with an
+  HTTP `timeout` of 300 ms or less the other family is still never tried while
+  the first does not answer. A `remote-http` configuration whose
+  `[crypto.http] timeout` is under 600 ms is still accepted, and gets a
+  warning: `[crypto.http] timeout is 300ms: while the first address family of
+  an endpoint's host does not answer, the other family gets less than half of
+  a timeout under 600 ms and is never tried at 300 ms or less, so such a host
+  can fail every connect`. `maki volume create` prints it to stderr after it
+  has created the volume, `maki check` and `maki check --deep` print it as a
+  `warning:` line with their verdict and exit status unchanged, and attach
+  logs it at the warning level once the configuration matches the volume.
+  Nothing changes on the wire over HTTP or WebSocket ([remote HTTP
+  mapping](docs/configuration.md#remote-http-mapping), [WebSocket and gRPC
+  contracts](docs/configuration.md#websocket-and-grpc-contracts), [known
+  limitations](docs/status.md#known-limitations)).
+- **Detach and cleanup wait for a held-open device without the attach lock**
+  (AUD-205, 2026-11-27; [#410](https://github.com/seo-rii/maki/pull/410)).
+  After its disconnect a detach or cleanup waits up to 15 s for the device to
+  let go of the connection, and it held the global attach lock meanwhile, so
+  when the devices of many volumes were held open and the volumes stopped
+  together, their cleanups queued 15 s each on it and from about the eighth
+  on reached `TimeoutStopSec=120` before they had changed anything. When the
+  first look after the disconnect still shows the connection, they now let go
+  of the lock for the wait and take it again, in turn, before they act: the
+  waits run side by side, and each cleanup holds the lock only for its own
+  steps and the checks before the record is retired. In CI three such stops
+  with a 10 s hold ended together after about 10 s, where they had ended about
+  10, 20 and 30 s after they began. A device held open for the whole 15 s
+  still fails its own cleanup with "disconnect has not completed", its volume
+  torn down and its record kept. A record that another helper of the volume
+  retired during the wait ends the command as a success, logged as such, and
+  one that an attach of the volume replaced meanwhile fails it with "the
+  volume's attach record was replaced while this helper waited for … to let
+  go of the disconnected connection: another helper attached volume … again.
+  That record and its attachment are left as they are". During the wait an
+  `attach` of the same volume is refused while the device shows the
+  connection; since the record still names the device, another volume's
+  attach pinned to it is refused at once ("… is named by the attach record of
+  volume …") and an automatic one for which it was the last free device fails
+  with no free NBD device, where all three waited for the lock: run them again
+  once the detach has finished. The first-volume block's `flock -n` now gets
+  the lock during such a wait, and `nbd-connect` still refuses the device. A
+  cleanup that waited queues for its second turn behind every helper that
+  took the lock meanwhile, an attach of another volume included (up to its
+  180 s start timeout), so systemd can end it there, after its volume is torn
+  down, and the next cleanup retires the record. The failed-start hook keeps
+  the lock through its wait. For developers,
+  `maki_privileged::exec::AttachLock` and `lock_attach` are gone ([privileged
+  helper](docs/operations.md#privileged-helper), maki-attach(8), SPEC §6).
+- **`maki-attach cleanup` logs the path it takes** (AUD-208, 2026-11-27;
+  [#413](https://github.com/seo-rii/maki/pull/413)). Before its first step it
+  writes one more `INFO` line to standard error, `<device> shows the
+  attachment's connection; cleanup follows the detach path` or `<device> shows
+  no connection; cleanup follows disconnected recovery`; a device that shows
+  another connection logs its outcome as before. Nothing else changes
+  ([privileged helper](docs/operations.md#privileged-helper), maki-attach(8)).
+
 - **`maki check` and `maki volume inspect` read a rollback-protected backing
   they cannot write, and every remote-protected one, read-only** (AUD-202,
   2026-11-26; [#407](https://github.com/seo-rii/maki/pull/407)). On Linux a
@@ -866,7 +1042,10 @@ documents.
   cannot be written](docs/operations.md#checking-a-backing-that-cannot-be-written),
   [diagnostic
   commands](docs/remote-witness-service.md#diagnostic-commands-and-writer-ownership),
-  maki(8), maki-check(8), SPEC §27).
+  maki(8), maki-check(8), SPEC §27). *Changed on 2026-11-27 (AUD-207,
+  [#411](https://github.com/seo-rii/maki/pull/411)): a remote view's command
+  sends three inspections, four for `check --deep`, whatever the volume
+  holds, and the refusal of a snapshot destination is tested.*
 - **An HTTP connect gives each of the endpoint host's addresses a share of the
   timeout, and the WebSocket transport reaches the other address family with
   a short timeout** (AUD-201, 2026-11-26;
@@ -911,6 +1090,10 @@ documents.
   about the eighth on reach `TimeoutStopSec=120` and fail by timeout with
   their records kept ([privileged
   helper](docs/operations.md#privileged-helper), maki-attach(8), SPEC §6).
+  *Changed on 2026-11-27 (AUD-205,
+  [#410](https://github.com/seo-rii/maki/pull/410)): the wait no longer holds
+  the attach lock, so the held-open devices of volumes that stop together wait
+  side by side.*
 - **The WebSocket transport goes on to the endpoint host's other addresses
   within its connect deadline** (AUD-198, 2026-11-25;
   [#400](https://github.com/seo-rii/maki/pull/400)). An address that did not
@@ -1725,6 +1908,23 @@ observable behaviour:
   per-RPC deadlines cover gRPC readiness plus the call (BUG-017).
 
 ### Documentation
+
+- **2026-11-27 third follow-up round** (AUD-209;
+  [#412](https://github.com/seo-rii/maki/pull/412)). The RHEL guide's install
+  block checks for the SELinux module with `! rpm -q nbdkit-selinux`: the line
+  succeeds while the module is absent and fails if it is installed. With
+  `rpm -q`, which exits 1 for an absent package, the block failed exactly when
+  the module was absent, as the guide expects ([Install the Maki
+  package](docs/getting-started/installation-rhel.md#install-the-maki-package)).
+  The README, both installation guides, the support matrix and the status
+  page say what the booted-guest jobs run. The records change corrects the
+  kernel that the status page, the testing guide and the privileged validation
+  runbook gave for #413's run at `8b9ef4d` (`7.0.0-1016-aws`, not
+  `7.0.0-1020-azure`) and the testing guide's statements that fuzzing had run
+  only on one core and that no campaign had run, and adds three traps to the
+  development guide. `v0.1.0-rc.2` was tagged at `92d4dd4` on 2026-11-26,
+  before the second follow-up round, and no later release candidate had been
+  tagged when this was written.
 
 - **2026-11-26 second follow-up round** (AUD-203;
   [#406](https://github.com/seo-rii/maki/pull/406)). The first-volume block
