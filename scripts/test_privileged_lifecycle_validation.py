@@ -276,6 +276,7 @@ sudo() {
         # A script of the run, by its name, from the fixture.
         python3) shift 2; script="${1##*/}"; shift; "$FIXTURE/$script" "$@" ;;
         umount|dmsetup) "$FIXTURE/root-command" "$@" ;;
+        cat) shift; cat "$FIXTURE$1" ;;
         *) return 98 ;;
     esac
 }
@@ -462,13 +463,20 @@ sudo() {
     RELEASES = {"mapping": ["kernel-disconnect", "umount", "dmsetup"],
                 "mount": ["kernel-disconnect", "umount"], "disconnect": ["kernel-disconnect"]}
 
-    def release(self, gone_at, *, disconnect_status=0, record=True):
+    def release(self, gone_at, *, disconnect_status=0, record="kept", recorded=None):
         """The runner's release by hand on a mounted, mapped device whose
-        connection's attributes go at `gone_at` (or never, None)."""
+        connection's attributes go at `gone_at` (or never, None). The
+        attach record names `recorded` (device, identifier), the device and
+        identifier the device shows by default; `record` is "kept",
+        "missing" from the start or "gone" during the release."""
         self.attached()
         (self.sysfs / "backend").write_text(ATTACHMENT + "\n")
-        if not record:
-            (self.root / "run/maki-attach/privval-1000-42.nbd").unlink()
+        path = self.root / "run/maki-attach/privval-1000-42.nbd"
+        device, identifier = recorded or ("/dev/nbd15", ATTACHMENT)
+        path.write_text(json.dumps({"version": 1, "volume": "privval-1000-42", "device": device,
+                                    "connection_id": identifier}))
+        if record == "missing":
+            path.unlink()
         (self.sysfs / "holders/dm-0/dm").mkdir(parents=True)
         (self.sysfs / "holders/dm-0/dm/name").write_text("maki_validation_1000_42-data\n")
         gone = f'rm -f "{self.sysfs}/backend" "{self.sysfs}/pid"\n'
@@ -478,7 +486,8 @@ sudo() {
                     + (gone if gone_at == "disconnect" else "") + f"exit {disconnect_status}\n")
         self.script("root-command", calls + 'case "$1" in\n'
                     f'  umount) rm "{self.root}/mounted"; {gone if gone_at == "mount" else ":"} ;;\n'
-                    f'  dmsetup) rm -r "{self.sysfs}/holders/dm-0"; {gone if gone_at == "mapping" else ":"} ;;\n'
+                    f'  dmsetup) rm -r "{self.sysfs}/holders/dm-0"; {gone.strip() if gone_at == "mapping" else ":"}'
+                    + (f'; rm "{path}"' if record == "gone" else "") + " ;;\n"
                     "esac\n")
         result = self.run_fragment("release_by_hand\necho RELEASED")
         root_calls = self.root / "root-calls"
@@ -495,7 +504,8 @@ sudo() {
                 disconnect = made[0].split()
                 self.assertEqual(disconnect[1:], ["--device", "/dev/nbd15", "--identifier",
                                                   ATTACHMENT, "--helper",
-                                                  str(self.root / "maki-attach"), "kernel-disconnect"])
+                                                  str(self.root / "maki-attach"), "--volume",
+                                                  "privval-1000-42", "kernel-disconnect"])
                 if "umount" in steps:
                     self.assertEqual(made[1], f"umount {self.root}/mnt")
                 if "dmsetup" in steps:
@@ -511,7 +521,7 @@ sudo() {
         cases = {"never gone": ({"gone_at": None}, "/dev/nbd15 still shows a connection"),
                  "disconnect refused": ({"gone_at": "mapping", "disconnect_status": 1},
                                         "NBD_CMD_DISCONNECT of /dev/nbd15 failed"),
-                 "no record": ({"gone_at": "mapping", "record": False},
+                 "no record": ({"gone_at": "mapping", "record": "gone"},
                                "the attach record went before cleanup ran")}
         for name, (options, message) in cases.items():
             with self.subTest(case=name):
@@ -522,6 +532,25 @@ sudo() {
                 self.assertNotIn("RELEASED", result.stdout)
                 if name == "disconnect refused":
                     self.assertEqual([call.split()[0] for call in made], ["kernel-disconnect"])
+
+    def test_only_the_connection_the_attach_record_names_is_released_by_hand(self):
+        # The identifier the device shows is no proof of whose connection
+        # it is: the attach record's must be the one shown, on its device.
+        other = "maki-11111111-2222-3333-4444-555555555555"
+        cases = {"another identifier": ({"recorded": ("/dev/nbd15", other)},
+                                        f"names the connection {other} on /dev/nbd15, but "
+                                        f"/dev/nbd15 shows {ATTACHMENT}"),
+                 "another device": ({"recorded": ("/dev/nbd3", ATTACHMENT)},
+                                    f"names the connection {ATTACHMENT} on /dev/nbd3, but "
+                                    f"/dev/nbd15 shows {ATTACHMENT}"),
+                 "no record": ({"record": "missing"}, "could not read the attach record")}
+        for name, (options, message) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                result, made = self.release("mapping", **options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"DIE: {message}", result.stdout)
+                self.assertEqual(made, [])
 
     def test_no_release_by_hand_without_an_attachments_connection(self):
         for shown in ("maki-bootstrap-" + ATTACHMENT[5:], "maki-1", None):

@@ -578,7 +578,17 @@ class KernelDisconnect(unittest.TestCase):
         patcher = mock.patch.object(self.module, "SYSFS", self.sysfs.parent)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.state = Path(temporary.name) / "maki-attach"
+        self.state.mkdir()
+        patcher = mock.patch.object(self.module, "ATTACH_STATE", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.record(ATTACHMENT)
         self.events = []
+
+    def record(self, identifier, device="/dev/nbd15"):
+        (self.state / "pg.nbd").write_text(json.dumps(
+            {"version": 1, "volume": "pg", "device": device, "connection_id": identifier}))
 
     def kernel(self, *, refuse=0, noise=False):
         def answers(count, message):
@@ -634,7 +644,7 @@ class KernelDisconnect(unittest.TestCase):
         finally:
             self.events.append("unlock")
 
-    def invoke(self, identifier):
+    def invoke(self, identifier, volume=("--volume", "pg")):
         def disconnect(index):
             self.events.append(("disconnect", index))
         with mock.patch.object(self.module, "attach_lock", self.lock), \
@@ -642,7 +652,7 @@ class KernelDisconnect(unittest.TestCase):
                 mock.patch.object(self.module.subprocess, "run") as command, \
                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             result = self.module.main(["--device", "/dev/nbd15", "--identifier", identifier,
-                                       "--helper", HELPER, "kernel-disconnect"])
+                                       "--helper", HELPER, *volume, "kernel-disconnect"])
         command.assert_not_called()
         return result
 
@@ -661,6 +671,30 @@ class KernelDisconnect(unittest.TestCase):
                     (self.sysfs / "backend").write_text(shown + "\n")
                 self.assertNotEqual(self.invoke(ATTACHMENT), 0)
                 self.assertEqual(self.events, ["lock", "unlock"])
+
+    def test_only_the_connection_the_volumes_record_names_is_disconnected(self):
+        # Read under the lock: the record must name this device and this
+        # identifier, which the device must show.
+        (self.sysfs / "pid").write_text("12345\n")
+        (self.sysfs / "backend").write_text(ATTACHMENT + "\n")
+        other = "maki-11111111-2222-3333-4444-555555555555"
+        for name, change in (("another identifier", lambda: self.record(other)),
+                             ("another device", lambda: self.record(ATTACHMENT, "/dev/nbd3")),
+                             ("no record", lambda: (self.state / "pg.nbd").unlink()),
+                             ("an unreadable record", lambda: (self.state / "pg.nbd").write_text("{"))):
+            with self.subTest(case=name):
+                self.events.clear()
+                self.record(ATTACHMENT)
+                change()
+                self.assertNotEqual(self.invoke(ATTACHMENT), 0)
+                self.assertEqual(self.events, ["lock", "unlock"])
+        self.events.clear()
+        self.record(ATTACHMENT)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            self.invoke(ATTACHMENT, volume=())
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            self.invoke(ATTACHMENT, volume=("--volume", "../pg"))
+        self.assertEqual(self.events, [])
 
     def test_only_an_attachments_identifier_is_accepted(self):
         (self.sysfs / "backend").write_text("maki-privval-11111111-2222-3333-4444-555555555555\n")
