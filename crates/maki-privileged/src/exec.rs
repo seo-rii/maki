@@ -2417,11 +2417,24 @@ fn cleanup_in(
     let Some(record) = state.read(&plan.volume)? else {
         return Ok(());
     };
+    // The plan names these paths only as a choice, and a disconnected
+    // recovery that finds nothing left runs no step: say which one is taken.
+    // The third path logs its own outcome.
     match system.backend(&record.device)? {
         Some(connection_id) if connection_id == record.connection_id => {
+            tracing::info!(
+                "maki-attach: {} shows the attachment's connection; cleanup follows the detach path",
+                record.device
+            );
             execute_with_options(plan, Some(state), turn, system, true)
         }
-        None => recover_with(plan, state, system),
+        None => {
+            tracing::info!(
+                "maki-attach: {} shows no connection; cleanup follows disconnected recovery",
+                record.device
+            );
+            recover_with(plan, state, system)
+        }
         Some(identifier) => {
             // The connected and disconnected paths each compare the plan
             // with the record before their first step; so does this one.

@@ -196,13 +196,17 @@ class PrebuiltArtifactPath(unittest.TestCase):
         source = SCRIPT.read_text()
         required = fragment(source, "required_commands=(", "missing_commands() {")
         for prebuilt, expected in (("", True), (str(self.prebuilt), False)):
-            with self.subTest(prebuilt=prebuilt):
-                listed = subprocess.run(
-                    ["bash", "-c", f'set -euo pipefail\nprebuilt_dir="{prebuilt}"\ndiscard=false\n'
-                                   f'{required}\nprintf "%s\\n" "${{required_commands[@]}}"'],
-                    text=True, capture_output=True, check=True).stdout.split()
-                self.assertEqual("cargo" in listed, expected)
-                self.assertEqual("rustc" in listed, expected)
+            for killed in ("false", "true"):
+                with self.subTest(prebuilt=prebuilt, kill_daemon=killed):
+                    listed = subprocess.run(
+                        ["bash", "-c", f'set -euo pipefail\nprebuilt_dir="{prebuilt}"\ndiscard=false\n'
+                                       f'kill_daemon={killed}\n{required}\n'
+                                       'printf "%s\\n" "${required_commands[@]}"'],
+                        text=True, capture_output=True, check=True).stdout.split()
+                    self.assertEqual("cargo" in listed, expected)
+                    self.assertEqual("rustc" in listed, expected)
+                    # --kill-daemon's release by hand needs dmsetup, prebuilt or not.
+                    self.assertEqual("dmsetup" in listed, killed == "true")
                 for tool in ("git", "python3", "nbdkit", "nm", "sudo"):
                     self.assertIn(tool, listed)
 

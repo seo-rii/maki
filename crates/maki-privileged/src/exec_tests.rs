@@ -630,6 +630,9 @@ struct FakeSystem {
     mapping_during_preflight: bool,
     backends: HashMap<String, String>,
     steps: Vec<&'static str>,
+    /// Log each step as it runs, so that a test can tell what was logged
+    /// before it.
+    announce_steps: bool,
     fail_at: Option<&'static str>,
     nonzero_at: Option<&'static str>,
     /// The step's command is terminated by a signal: the runner reports a
@@ -1131,6 +1134,9 @@ impl System for FakeSystem {
         Ok(self.lv_size)
     }
     fn run_step(&mut self, step: &PlannedStep, identifier: Option<&str>) -> Result<(), ExecError> {
+        if self.announce_steps {
+            tracing::info!("the fake system runs {}", step.kind());
+        }
         self.steps.push(step.kind());
         self.command_limits.push(command::finish_by_limit());
         if self.nonzero_at == Some(step.kind()) || self.signalled_at == Some(step.kind()) {
@@ -1396,37 +1402,112 @@ fn cleanup_is_idempotent_when_no_trusted_record_exists() {
     assert!(state.read("pg").unwrap().is_none());
 }
 
+/// What cleanup logs for the path it takes, which its plan names only as a
+/// choice: an operator, and the kernel run of CI, read the path taken here.
+const DETACH_PATH: &str = "shows the attachment's connection; cleanup follows the detach path";
+const RECOVERY_PATH: &str = "shows no connection; cleanup follows disconnected recovery";
+
+/// A cleanup's verdict, what it logged, the steps it ran, the device its
+/// record named and whether the record is gone.
+struct LoggedCleanup {
+    result: Result<(), ExecError>,
+    log: String,
+    steps: Vec<&'static str>,
+    device: String,
+    retired: bool,
+}
+
+/// Each cleanup of an attachment of `request`, as a test that holds the
+/// attach lock runs it ([`cleanup_with`]) and as the helper's own run does,
+/// which takes the lock and lets go of it for a wait ([`cleanup_on`]).
+fn logged_cleanups(
+    request: &AttachRequest,
+    prepare: impl Fn(&mut FakeSystem),
+) -> Vec<LoggedCleanup> {
+    let mut found = Vec::new();
+    for held_by_the_run in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(request), Some(&state), &mut system).unwrap();
+        let device = state.read("pg").unwrap().unwrap().device;
+        system.steps.clear();
+        system.backend_probes.set(0);
+        system.announce_steps = true;
+        prepare(&mut system);
+        let (result, log) = logged(|| {
+            if held_by_the_run {
+                cleanup_on(&plan_detach(request), &state, &mut system)
+            } else {
+                cleanup_with(&plan_detach(request), &state, &mut system)
+            }
+        });
+        found.push(LoggedCleanup {
+            result,
+            log,
+            steps: system.steps.clone(),
+            device,
+            retired: state.read("pg").unwrap().is_none(),
+        });
+    }
+    found
+}
+
+/// The path's line comes before the line of the first step the path runs.
+fn assert_logged_before_the_first_step(log: &str, path: &str) {
+    let named = log.find(path).expect("the path is logged");
+    let first = log
+        .find("the fake system runs ")
+        .expect("the path runs a step");
+    assert!(
+        named < first,
+        "the path was logged after its first step:\n{log}"
+    );
+}
+
 #[test]
 fn cleanup_dispatches_an_owned_connection_to_detach() {
-    let fixture = Fixture::new();
-    let state = fixture.state();
-    let request = request();
-    let mut system = FakeSystem::default();
-    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-    system.steps.clear();
-    system.backend_probes.set(0);
-
-    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
-
-    assert_eq!(system.steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
-    assert!(state.read("pg").unwrap().is_none());
+    for LoggedCleanup {
+        result,
+        log,
+        steps,
+        device,
+        retired,
+    } in logged_cleanups(&request(), |_| {})
+    {
+        result.unwrap();
+        assert_eq!(steps, ["umount", "lvm-deactivate", "nbd-disconnect"]);
+        assert!(retired);
+        assert!(
+            log.contains(&format!("maki-attach: {device} {DETACH_PATH}")),
+            "{log}"
+        );
+        assert!(!log.contains(RECOVERY_PATH), "{log}");
+        assert_logged_before_the_first_step(&log, DETACH_PATH);
+    }
 }
 
 #[test]
 fn cleanup_dispatches_a_known_absent_connection_to_recovery() {
-    let fixture = Fixture::new();
-    let state = fixture.state();
-    let request = request();
-    let mut system = FakeSystem::default();
-    execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
-    system.steps.clear();
-    system.backends.clear();
-    system.backend_probes.set(0);
-
-    cleanup_with(&plan_detach(&request), &state, &mut system).unwrap();
-
-    assert_eq!(system.steps, ["umount", "lvm-deactivate"]);
-    assert!(state.read("pg").unwrap().is_none());
+    let absent = |system: &mut FakeSystem| system.backends.clear();
+    for LoggedCleanup {
+        result,
+        log,
+        steps,
+        device,
+        retired,
+    } in logged_cleanups(&request(), absent)
+    {
+        result.unwrap();
+        assert_eq!(steps, ["umount", "lvm-deactivate"]);
+        assert!(retired);
+        assert!(
+            log.contains(&format!("maki-attach: {device} {RECOVERY_PATH}")),
+            "{log}"
+        );
+        assert!(!log.contains(DETACH_PATH), "{log}");
+        assert_logged_before_the_first_step(&log, RECOVERY_PATH);
+    }
 }
 
 #[test]

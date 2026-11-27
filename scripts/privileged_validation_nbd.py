@@ -6,19 +6,31 @@ own provisioning verbs (maki-attach nbd-connect and nbd-disconnect), which take
 no lock of their own, so they run inside this one. Helper attach/cleanup must be
 called outside this wrapper: the helper owns its separate identifier, trusted
 record, and lock lifetime.
+
+`kernel-disconnect` is the one exception: it sends the kernel's own
+NBD_CMD_DISCONNECT over generic netlink for a device that shows an
+attachment's connection (`maki-<uuid>`), as an operator's tool could, which
+the helper's nbd-disconnect refuses by design. The runner uses it to leave a
+killed daemon's attachment disconnected, its record in place, for cleanup's
+disconnected recovery.
 """
 import argparse
 import contextlib
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
+import struct
 import subprocess
 import sys
 
 
 SYSFS = Path("/sys/block")
+# Where maki-attach keeps its attach records.
+ATTACH_STATE = Path("/run/maki-attach")
 
 
 @contextlib.contextmanager
@@ -59,6 +71,87 @@ def attach_lock(root=Path("/"), owner=0):
         for descriptor in reversed(descriptors):
             os.close(descriptor)
 
+# Generic netlink, as <linux/netlink.h>, <linux/genetlink.h> and
+# <linux/nbd-netlink.h> define it.
+NETLINK_GENERIC = 16
+NLM_F_REQUEST = 0x1
+NLM_F_ACK = 0x4
+NLMSG_ERROR = 0x2
+GENL_ID_CTRL = 0x10
+CTRL_CMD_GETFAMILY = 3
+CTRL_ATTR_FAMILY_ID = 1
+CTRL_ATTR_FAMILY_NAME = 2
+NBD_GENL_VERSION = 1
+NBD_CMD_DISCONNECT = 2
+NBD_ATTR_INDEX = 1
+NETLINK_TIMEOUT = 10
+
+
+def netlink_attribute(kind, payload):
+    length = 4 + len(payload)
+    return struct.pack("=HH", length, kind) + payload + bytes(-length % 4)
+
+
+def netlink_request(family, sequence, command, version, attributes):
+    """A generic netlink request that asks for an acknowledgement."""
+    payload = struct.pack("=BBH", command, version, 0) + attributes
+    return struct.pack("=IHHII", 16 + len(payload), family, NLM_F_REQUEST | NLM_F_ACK,
+                       sequence, 0) + payload
+
+
+def netlink_exchange(sock, request, sequence):
+    """Send `request`; return the payloads the kernel answered it with
+    before its acknowledgement. A refusal raises OSError with its errno.
+    Answers from another sender or to another request are not this one's."""
+    sock.send(request)
+    replies = []
+    while True:
+        datagram, (sender, _) = sock.recvfrom(65536)
+        if sender != 0:
+            continue
+        offset = 0
+        while offset + 16 <= len(datagram):
+            length, kind, _, answered, _ = struct.unpack_from("=IHHII", datagram, offset)
+            if length < 16 or offset + length > len(datagram):
+                raise RuntimeError("malformed netlink answer")
+            payload = datagram[offset + 16:offset + length]
+            offset += (length + 3) & ~3
+            if answered != sequence:
+                continue
+            if kind == NLMSG_ERROR:
+                (error,) = struct.unpack_from("=i", payload)
+                if error:
+                    raise OSError(-error, os.strerror(-error))
+                return replies
+            replies.append(payload)
+
+
+def family_id(replies):
+    """The family identifier CTRL_CMD_GETFAMILY's reply names."""
+    for payload in replies:
+        offset = 4
+        while offset + 4 <= len(payload):
+            length, kind = struct.unpack_from("=HH", payload, offset)
+            if length < 4:
+                break
+            if kind & 0x3fff == CTRL_ATTR_FAMILY_ID and length >= 6:
+                return struct.unpack_from("=H", payload, offset + 4)[0]
+            offset += (length + 3) & ~3
+    raise RuntimeError("the kernel did not name the nbd netlink family")
+
+
+def kernel_disconnect(index, open_socket=socket.socket):
+    """NBD_CMD_DISCONNECT for nbd<index>, acknowledged by the kernel."""
+    with open_socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_GENERIC) as sock:
+        sock.bind((0, 0))
+        sock.settimeout(NETLINK_TIMEOUT)
+        name = netlink_attribute(CTRL_ATTR_FAMILY_NAME, b"nbd\0")
+        family = family_id(netlink_exchange(
+            sock, netlink_request(GENL_ID_CTRL, 1, CTRL_CMD_GETFAMILY, 1, name), 1))
+        device = netlink_attribute(NBD_ATTR_INDEX, struct.pack("=I", index))
+        netlink_exchange(sock, netlink_request(family, 2, NBD_CMD_DISCONNECT, NBD_GENL_VERSION,
+                                               device), 2)
+
 
 def backend(target):
     directory = SYSFS / target
@@ -78,6 +171,18 @@ def backend(target):
     except FileNotFoundError:
         return None
     raise RuntimeError("connected NBD device has no readable backend identifier")
+
+
+def attachment_of(volume):
+    """(device, connection identifier) of `volume`'s attach record."""
+    descriptor = os.open(ATTACH_STATE / f"{volume}.nbd", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, encoding="utf-8") as source:
+        try:
+            record = json.loads(source.read(65536))
+            return record["device"], record["connection_id"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError(f"the attach record of volume {volume} cannot be read: "
+                               f"{error}") from None
 
 
 def execute(args):
@@ -102,6 +207,24 @@ def execute(args):
             return 0
         if observed != args.identifier:
             raise RuntimeError("refusing to change an absent or foreign NBD backend")
+        if args.action == "kernel-disconnect":
+            # The identifier the device shows proves nothing about whose
+            # connection it is: the volume's attach record, read under the
+            # lock, must name this device and this identifier.
+            recorded = attachment_of(args.volume)
+            if recorded != (args.device, args.identifier):
+                raise RuntimeError(f"the attach record of volume {args.volume} names "
+                                   f"{recorded[1]} on {recorded[0]}, not {args.identifier} on "
+                                   f"{args.device}")
+            kernel_disconnect(int(target.removeprefix("nbd")))
+            # The connection's attributes stay while anything holds the
+            # device open: say what it shows now, which is not a verdict.
+            try:
+                shown = repr(backend(target))
+            except (OSError, RuntimeError) as error:
+                shown = f"unreadable ({error})"
+            print(f"the kernel acknowledged NBD_CMD_DISCONNECT for {target}; it shows backend {shown}")
+            return 0
         commands = {
             "check": None,
             "disconnect": [args.helper, "nbd-disconnect", "--nbd-device", args.device,
@@ -134,17 +257,28 @@ def main(argv=None):
     parser.add_argument("--helper", required=True,
                         help="absolute path of the maki-attach binary this run built")
     parser.add_argument("action", choices=("connect", "check", "disconnect", "activate-vg",
-                                           "remove-lv", "remove-vg", "remove-pv"))
+                                           "remove-lv", "remove-vg", "remove-pv",
+                                           "kernel-disconnect"))
     parser.add_argument("--socket")
     parser.add_argument("--vg")
     parser.add_argument("--lv")
+    parser.add_argument("--volume", help="kernel-disconnect: the volume whose attach record names "
+                                         "the connection")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"/dev/nbd(?:0|[1-9][0-9]{0,2})", args.device) or int(args.device[8:]) > 255:
         parser.error("device must be a canonical /dev/nbdN with N <= 255")
-    if not re.fullmatch(r"maki-privval-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.identifier):
+    # Only an attachment's own connection is disconnected by the kernel
+    # alone; every other action is on this run's raw connection.
+    prefix = "maki-" if args.action == "kernel-disconnect" else "maki-privval-"
+    if not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                        args.identifier):
         parser.error("invalid validation connection identifier")
     if not args.helper.startswith("/"):
         parser.error("the helper must be an absolute path")
+    if args.action == "kernel-disconnect" and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}",
+                                                               args.volume or ""):
+        parser.error("kernel-disconnect requires the --volume whose attach record names the "
+                     "connection")
     if args.action == "connect" and (not args.socket or not args.socket.startswith("/")):
         parser.error("connect requires an absolute socket path")
     if args.action in ("activate-vg", "remove-lv", "remove-vg"):

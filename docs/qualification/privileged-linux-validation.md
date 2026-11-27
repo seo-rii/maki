@@ -47,6 +47,15 @@ The automated run checks:
 - root-owned mode-`0600` attach configuration and exact PV/VG/LV UUID pins;
 - unprivileged fio through the mounted XFS filesystem;
 - a SQLite WAL checkpoint with `synchronous=FULL` and `integrity_check`;
+- what the helper's readers parse, captured as root after the first attach
+  by `scripts/privileged_validation_capture.py` into `helper-outputs.json`:
+  the output, exit status and standard error of LVM's `fullreport`, the
+  `blkid` label and filesystem probes, `dmsetup info`, the LV's size and the
+  mount source's UUID, each run with the helper's own arguments, an
+  environment of only `PATH` and `LC_ALL=C` and no inherited descriptors;
+  the device's nodes below `/sys/class/block` (the device, its partitions
+  and every mapping above them) in the `helper_sysfs` fuzz input's line
+  format; and the mount table. No key or payload is in it;
 - 32 MiB written with `fsync` beside the database, and the SHA-256 of both;
 - a `maki-attach detach` while `scripts/privileged_validation_opener.py`
   holds the device open: the opener reads whole blocks until a read fails
@@ -70,14 +79,27 @@ instead sends `SIGKILL` to its nbdkit under the mounted attachment (exit
 status 137 required), requires `maki-attach cleanup` to release the
 attachment without the daemon, removes the dead daemon's socket, starts a new
 nbdkit on the same backing and configuration, which must negotiate, attaches
-a third time, compares the hashes and ends with `maki-attach detach`. Either
-way a second cleanup must then succeed without a record.
+a third time and compares the hashes. It then kills that nbdkit too and
+leaves its device showing no connection with the attach record in place, as
+an operator could: `privileged_validation_nbd.py kernel-disconnect` sends the
+kernel's `NBD_CMD_DISCONNECT` over netlink for the attachment's identifier
+(which the helper's own `nbd-disconnect` refuses), and only while the device
+still shows the connection does the run unmount XFS and then remove the LV's
+mapping with `dmsetup remove`, logging what the device shows after each step
+and waiting up to 15 s for the connection to go. `maki-attach cleanup` must
+then retire the record by its disconnected recovery, a fourth attach after a
+new nbdkit must compare the hashes, and the run ends with `maki-attach
+detach`. The helper logs which path cleanup takes, and each cleanup must have
+taken the one for what the device showed when it started: the detach path
+for the attachment's connection, disconnected recovery for none. Either way
+a second cleanup must then succeed without a record.
 
 The run does **not** induce an OOM, interrupt power, test a real disk, or
 modify installed Maki systemd units, and without `--kill-daemon` it forces no
 daemon crash and sends no `SIGKILL`/`SIGSEGV`. Those scenarios need an
 isolated destructive-test host; `--kill-daemon` kills only the run's own
-nbdkit, once, while the filesystem is idle after a sync, and is meant for
+nbdkit, twice, each time while the filesystem is idle after a sync,
+disconnects and unmaps only the run's own device, and is meant for
 disposable hosts such as CI's runner.
 
 The duplicate-attach check uses the same backing, volume and crypto settings
@@ -163,6 +185,7 @@ filesystem. A stable symlink points to the newest run:
 ├── maki-attach-plan.txt
 ├── maki-verify-before-workload.txt
 ├── maki-verify-after-workload.txt
+├── helper-outputs.json
 ├── lifecycle.sha256
 ├── detach-opener.txt
 ├── maki-detach.txt
@@ -170,11 +193,17 @@ filesystem. A stable symlink points to the newest run:
 ├── maki-verify-reattach.txt
 ├── lifecycle-check-reattach.txt
 ├── maki-cleanup.txt                 (without --kill-daemon)
-├── maki-cleanup-dead-daemon.txt     (--kill-daemon: this, the next five)
+├── maki-cleanup-dead-daemon.txt     (--kill-daemon: this, the next eleven)
 ├── nbdinfo-after-kill.txt
 ├── maki-attach-after-kill.txt
 ├── maki-verify-after-kill.txt
 ├── lifecycle-check-restart.txt
+├── kernel-disconnect.txt
+├── maki-cleanup-disconnected.txt
+├── nbdinfo-after-disconnect.txt
+├── maki-attach-after-disconnect.txt
+├── maki-verify-after-disconnect.txt
+├── lifecycle-check-recovery.txt
 ├── maki-detach-final.txt
 ├── maki-cleanup-idempotent.txt
 ├── maki-check.txt
@@ -182,8 +211,9 @@ filesystem. A stable symlink points to the newest run:
 └── artifact-origin                  (built from the snapshot, or prebuilt DIR)
 ```
 
-`nbdkit.log` holds the output of both nbdkit processes of a `--kill-daemon`
-run, the second after a `--- a new nbdkit after SIGKILL ---` line. The
+`nbdkit.log` holds the output of the three nbdkit processes of a
+`--kill-daemon` run, the later ones after `--- a new nbdkit after the first
+SIGKILL ---` and `--- a new nbdkit after the second SIGKILL ---` lines. The
 lifecycle's helper output also goes to `run.log`, with each command's exit
 status and duration, and a command that stops the run is named there with
 its line number.
@@ -267,6 +297,28 @@ attach and a final detach, and CI's `kernel-lifecycle` job runs it with
 `--kill-daemon` on GitHub's Ubuntu runner on every change. No result below
 includes these checks, and none had been run on a host outside CI when this
 was written.
+
+## Disconnected recovery and the helper's inputs — 2026-11-27
+
+`--kill-daemon` now kills nbdkit a second time and releases its device by
+hand before cleanup, so that cleanup starts on a device that shows no
+connection, and every run captures what the helper's readers parse after
+the first attach. In both CI runs of 2026-11-26 the killed daemon's device
+still showed its connection when cleanup started. Read from the kernel's
+NBD driver, it keeps a connection's attributes until the last opener of the
+device closes it, and a mounted filesystem or an LV mapping is such an
+opener, so a device that shows no connection has no mount or mapping of it
+left, and cleanup's disconnected recovery then has nothing to unmount or
+deactivate and retires the record. The run logs what the device shows after
+each step of the release by hand. CI's runs with these checks (2026-11-27,
+GitHub's Ubuntu runner, Linux `7.0.0-1020-azure`, at commits a6c2006,
+f933c7c, 8b9ef4d and 31b7ef8 of #413) passed them. In the three whose logs
+are kept the device still showed the connection after the disconnect with
+XFS mounted on the LV and after the unmount, showed none once the LV's
+mapping was removed, and cleanup logged disconnected recovery and left
+nothing. That shows the mapping keeping the
+connection's attributes; the mount sits on the mapping, so its own effect is
+not told apart. No run outside CI has these checks yet.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 
