@@ -789,6 +789,19 @@ class GuestPhases(unittest.TestCase):
                 self.assertEqual(words[words.index("--prebuilt") + 1], str(self.guest.PREBUILT))
                 self.assertEqual(words[words.index("--device") + 1], "/dev/nbd15")
                 self.assertEqual(words[words.index("--confirm-wipe") + 1], "/dev/nbd15")
+        # --kill-daemon's release by hand runs dmsetup, and the capture of the
+        # helper's inputs blkid, lvm, dmsetup and blockdev. On EL9 lvm2 does
+        # not require device-mapper, which holds dmsetup; on Debian the
+        # runner's --install-missing brings lvm2 and util-linux, and dmsetup
+        # is named here as well.
+        runner = (ROOT / "scripts" / "privileged-linux-validation.sh").read_text()
+        apt = runner[runner.index("install -y --no-install-recommends"):]
+        apt = apt[:apt.index("pass ")].split()
+        for package in ("lvm2", "util-linux"):
+            self.assertIn(package, apt)
+        self.assertIn("dmsetup", self.guest.DEBIAN_RUNNER_PACKAGES)
+        for package in ("device-mapper", "lvm2", "util-linux"):
+            self.assertIn(package, self.guest.EL9_RUNNER_PACKAGES)
         # EL9's tools come from BaseOS and AppStream: nbdkit-server, never the
         # metapackage that pulls in nbdkit-selinux.
         packages = self.guest.EL9_RUNNER_PACKAGES

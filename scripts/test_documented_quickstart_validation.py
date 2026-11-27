@@ -172,6 +172,32 @@ class RhelInstallation(unittest.TestCase):
                              self.driver.program(self.driver.steps("rhel"), "rhel"))
             self.assertEqual((target / "demo.toml").read_text(), self.driver.configuration())
 
+    @unittest.skipUnless(shutil.which("bash"), "the writer reads each block with Bash")
+    def test_the_rhel_program_passes_the_list_check_at_every_depth_and_stops_once(self):
+        # The RHEL guide's host blocks hold no && or || at any depth, so
+        # DEEPER_LISTS names none of them; the quick start's blocks keep
+        # their labels and their entries.
+        rhel = self.driver.steps("rhel")
+        for label, block in rhel[:4]:
+            with self.subTest(label=label):
+                lines = self.driver.printed_lines(label, block)
+                self.assertEqual(self.driver.deeper_lists(lines), [])
+                self.assertFalse(self.driver.has_unguarded_list(lines))
+        self.assertFalse([label for label, _ in self.driver.DEEPER_LISTS
+                          if label.startswith("installation-")])
+        program = self.driver.program(rhel, "rhel")
+        self.assertIn("dnf install -y ./maki.rpm\n", program)
+        for command in sorted(self.driver.STOP_ONCE):
+            with self.subTest(stop_once=command), tempfile.TemporaryDirectory() as directory:
+                interrupted = self.driver.program(rhel, "rhel", stop_once=command)
+                self.assertIn(f"{command} fails", interrupted)
+                self.assertIn("holds maki.rpm and demo.toml", interrupted)
+                target = Path(directory) / "quickstart"
+                with mock.patch("builtins.print"):
+                    self.assertEqual(self.driver.main(["--installation", "rhel", "--stop-once", command,
+                                                       str(target)]), 0)
+                self.assertEqual((target / "quickstart.sh").read_text(), interrupted)
+
     @unittest.skipUnless(shutil.which("bash"), "the program runs in Bash")
     def test_the_install_step_stops_the_program_only_when_the_selinux_module_is_installed(self):
         # The block's status is the program's verdict on it: the module check
