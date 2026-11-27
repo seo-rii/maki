@@ -50,9 +50,9 @@ const LINUX_ONLY: [&str; 4] = [
     "helper_sysfs",
 ];
 
-/// The largest seed file: one handshake seed is longer than the client's
-/// 64 KiB byte limit.
-const MAX_SEED_BYTES: usize = 72 << 10;
+/// The largest seed file: one of etcd's answers is a byte longer than the
+/// witness store's 256 KiB limit.
+const MAX_SEED_BYTES: usize = 257 << 10;
 
 fn fuzz_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
