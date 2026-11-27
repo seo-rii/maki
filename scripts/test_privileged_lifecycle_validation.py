@@ -717,6 +717,23 @@ class Opener(unittest.TestCase):
         self.assertTrue(device.closed)
         self.assertGreater(clock.now, self.module.DEADLINE)
 
+    def test_the_hold_after_the_disconnect_is_chosen_by_the_caller(self):
+        # Several volumes stopping together hold each device longer than
+        # the lifecycle's detach does; the default stays two seconds.
+        for arguments, seconds in (([], 2.0), (["--hold", "10"], 10.0)):
+            with self.subTest(arguments=arguments), \
+                    mock.patch.object(self.module, "Device"), \
+                    mock.patch.object(self.module, "hold", return_value=0) as hold:
+                self.assertEqual(self.module.main(["--device", "/dev/nbd2", "--stop-file",
+                                                   "/nonexistent", *arguments]), 0)
+                self.assertEqual(hold.call_args.kwargs["hold_seconds"], seconds)
+        for value in ("0", "-1", "61", "nan"):
+            with self.subTest(hold=value):
+                with self.assertRaises(SystemExit), open(os.devnull, "w") as quiet, \
+                        mock.patch("sys.stderr", quiet):
+                    self.module.main(["--device", "/dev/nbd2", "--stop-file", "/nonexistent",
+                                      "--hold", value])
+
     def test_only_a_canonical_nbd_device_is_opened(self):
         for device in ("/dev/sda", "/dev/nbd256", "/dev/nbd01", "nbd0"):
             with self.subTest(device=device):
