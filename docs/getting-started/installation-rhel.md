@@ -145,8 +145,11 @@ enable a volume, and never starts, stops or restarts a service.
 
 ```bash
 dnf install -y ./maki.rpm
-rpm -q nbdkit-selinux   # expected: package nbdkit-selinux is not installed
+! rpm -q nbdkit-selinux   # expected: package nbdkit-selinux is not installed
 ```
+
+The `!` turns the check around: the line succeeds while the SELinux module is
+absent and fails if it is installed.
 
 The package's `%post` runs `systemd-sysusers` and `systemd-tmpfiles --create`
 for Maki's rules, so the `maki` user, the `maki-admin` group and the runtime
