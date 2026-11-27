@@ -1378,8 +1378,11 @@ recovery selects inside the backing.
 With remote rollback protection, opening the backing to write claims a writer
 at the authority, copies the current generation into a namespace of its own
 and recovers the volume there. Attach therefore compares first, where the
-claim would be sent, and MUST NOT claim a writer for a configuration that it
-refuses. With the root's operation lock held, after the one inspection the
+claim would be sent, and MUST NOT claim a writer for a configuration that this
+comparison refuses. (A different key under the same name, an unavailable
+credential, a failed self-test and a generation without a valid superblock
+are still found after the claim.) With the root's operation lock held, after
+the one inspection the
 open sends (which loads the witness client's TLS identity) and once the
 authority's current generation authenticates in the root (the manifest the
 authority selects, exactly, and the arena's size), it reads that generation's
@@ -2077,8 +2080,10 @@ between the first inspection and the moment both locks are held. Every later
 read MUST be authenticated again against the manifest that was read. A local
 witness MUST be read again before every operation, and one that no longer
 selects what was read MUST stop the view. A remote authority MUST be asked
-again before the command reports anything it read, and a record that differs
-from the one the open read MUST fail the command and stop the view; it is not
+again before the command reports anything it read, and before it reports a
+failure it met once the open had read the record twice (the open's own
+included), and a record that differs from the one the open read MUST stop the
+view and be reported instead of what was read or of the failure; it is not
 asked before every operation, as a writer's view asks it. That proves what an
 inspection before every operation proves: while the view is open its locks keep
 out every operation that changes the root, every read is authenticated against

@@ -51,6 +51,9 @@ struct View {
     stopped: OnceLock<String>,
     /// The shared locks that keep a writer out while the view is open.
     _locks: Vec<Box<dyn VolumeLock>>,
+    /// Whether a stop is logged as a read-only session's: not for the view a
+    /// writable open reads before its claim ([`Freshness::BeforeClaim`]).
+    logs_stop: bool,
 }
 
 /// What tells the view whether the witness still selects what it read.
@@ -138,6 +141,36 @@ fn shared_lock_refusal(error: io::Error, name: &str, holder: &str) -> io::Error 
     }
 }
 
+/// What a remote open reports when the authority's record changed while it
+/// opened.
+fn changed_while_opening() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "the remote authority changed while the backing was opened read-only: run the command \
+         again",
+    )
+}
+
+/// `error`, which a remote open met after it read the authority's `record`
+/// and before it could be opened, as the open reports it. The authority is
+/// asked once more first, as a command asks it before it reports what it
+/// read: if its record changed meanwhile, that is reported instead, since
+/// what the open found may no longer be the volume's state. If it cannot be
+/// asked, `error` is reported, saying so.
+fn asked_again(rpc: &dyn Rpc, record: &Record, error: io::Error) -> io::Error {
+    match remote::inspect(rpc) {
+        Ok(current) if current == *record => error,
+        Ok(_) => changed_while_opening(),
+        Err(asked) => io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; the remote authority could not be asked again whether it still selects \
+                 what was read: {asked}"
+            ),
+        ),
+    }
+}
+
 /// Who holds a local backing's or witness's lock exclusively.
 const LOCAL_WRITER: &str = "an attached volume, or a command that opened the backing to write";
 
@@ -211,7 +244,10 @@ impl ReadOnlyRollbackBacking {
     /// an earlier value again (every claim raises the fence, an activation
     /// or a release moves the phase on within it, an advance raises the
     /// generation), so a record that is the same at the end was the same at
-    /// every read in between.
+    /// every read in between. A failure the open meets once it has read the
+    /// record twice (the current generation not found or not authenticated)
+    /// is reported only after the authority has been asked once more, and a
+    /// record that changed meanwhile is reported instead.
     pub fn open_remote(root: &Path, rpc: Arc<dyn Rpc>) -> io::Result<Self> {
         let disk = remote::backup_root(root)?;
         let operation = disk
@@ -253,15 +289,16 @@ impl ReadOnlyRollbackBacking {
             }
         };
         if remote::inspect(rpc.as_ref())? != record {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "the remote authority changed while the backing was opened read-only: run the \
-                 command again",
-            ));
+            return Err(changed_while_opening());
         }
-        let manifest = remote::holds_current(&disk, &record)?;
-        let arena = open_arena(namespace.as_ref(), &manifest)?;
-        authenticate_pages(arena.as_ref(), &manifest)?;
+        let opened = (|| {
+            let manifest = remote::holds_current(&disk, &record)?;
+            let arena = open_arena(namespace.as_ref(), &manifest)?;
+            authenticate_pages(arena.as_ref(), &manifest)?;
+            Ok((manifest, arena))
+        })();
+        let (manifest, arena) =
+            opened.map_err(|error| asked_again(rpc.as_ref(), &record, error))?;
         Ok(Self::assemble(
             manifest,
             arena,
@@ -277,6 +314,10 @@ impl ReadOnlyRollbackBacking {
     /// view it reads only what it is asked for, each page authenticated
     /// against `manifest`; it holds no lock and asks the authority nothing
     /// ([`Freshness::BeforeClaim`]).
+    ///
+    /// No read-only command runs through it: a page that does not
+    /// authenticate stops it, as it stops every view, and the open that
+    /// asked refuses with that error, but nothing is logged here.
     pub(super) fn before_claim(namespace: &dyn Backing, manifest: Manifest) -> io::Result<Self> {
         let arena = open_arena(namespace, &manifest)?;
         Ok(Self::assemble(
@@ -297,6 +338,7 @@ impl ReadOnlyRollbackBacking {
             view: Arc::new(View {
                 manifest,
                 arena,
+                logs_stop: !matches!(witness, Freshness::BeforeClaim),
                 witness: Mutex::new(witness),
                 stopped: OnceLock::new(),
                 _locks: locks,
@@ -345,6 +387,7 @@ impl View {
             .stopped
             .set(format!("rollback session stopped: {cause}"))
             .is_ok()
+            && self.logs_stop
         {
             tracing::warn!(
                 "read-only rollback session stopped: {cause}; every operation fails until the \

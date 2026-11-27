@@ -328,10 +328,12 @@ one failing gate binary from hiding the result of every binary after it.
 
 Gates that need operator-provided infrastructure refuse to skip, so they are
 compiled only with an opt-in feature and are not part of that `-- --ignored`
-run. The etcd gate has its own scheduled job, `etcd-qualification`, which
-installs a digest-pinned etcd v3.6.5 and builds `maki-witness`; no CI job
-provides the delegated cgroup, so the cgroup gate runs only on an operator's
-host:
+run. The etcd gates have their own scheduled job, `etcd-qualification`, which
+installs a digest-pinned etcd v3.6.5, builds `maki-witness` and runs the gates
+one at a time (`--test-threads=1`): each starts a three-member cluster and a
+frontend on ports it chose by binding port 0 and releasing it, so two started
+together can take each other's ports. No CI job provides the delegated
+cgroup, so the cgroup gate runs only on an operator's host:
 
 | Feature | Gate | Requires |
 |---|---|---|
@@ -342,7 +344,7 @@ host:
 cargo build --release --locked -p maki-witness-cli
 MAKI_ETCD_BIN=/opt/etcd-v3.6/etcd MAKI_WITNESS_BIN=$PWD/target/release/maki-witness \
   cargo test --release --locked -p maki-witness --features etcd-qualification \
-  --test etcd_ha -- --ignored --nocapture
+  --test etcd_ha -- --ignored --test-threads=1 --nocapture
 ```
 
 The `nightly-gates` job also builds the Linux cdylib, verifies the global

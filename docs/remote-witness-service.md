@@ -731,16 +731,22 @@ and the authority is asked again once the command has read everything, before
 it reports (`check --deep` asks once more, before its verdict): `volume
 inspect` and `check` send three inspections and `check --deep` four, however
 large the volume, where the view used to send one before every backing
-operation as a writer's operations do. A record that changed since the open
-fails the command and nothing it read is reported; because a record never
+operation as a writer's operations do. A command that fails once the view
+has read the record asks the authority again before it reports the failure.
+A record that changed since the open fails the command and is reported
+instead of what it read or of the failure; because a record never
 takes an earlier value again, one that is the same at the end was the same
 throughout
 ([checking a backing that cannot be written](operations.md#checking-a-backing-that-cannot-be-written)).
 Its deep verdict is `unproven`. It loads the witness client's TLS identity to
 ask the authority, but no volume key, and decrypts nothing, so it does not
 replace an offline data-integrity check. A configuration whose root is a
-snapshot destination is refused: the snapshot's namespace holds no
-`rollback.lock`.
+snapshot destination is refused: while the authority still names the
+namespace the snapshot copied, because that namespace holds no
+`rollback.lock` (`… is missing, and a read-only open cannot create it`), and
+once the volume has been opened to write again, because the snapshot does
+not hold the namespace the authority names (`this backing root does not hold
+the remote authority's current generation …`).
 
 Attach, which claims a writer, compares the configuration with the volume
 before its claim: with the root's operation lock held and the authority's

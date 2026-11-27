@@ -300,11 +300,13 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
                         return build_backing(config);
                     }
                     let backing = ReadOnlyRollbackBacking::open(root, witness)?;
-                    refuse_unfinished_creation(&backing)?;
+                    refuse_unfinished_creation(&backing)
+                        .map_err(|error| refused_after_reading(&backing, error))?;
                     backing
                 }
             };
-            check_protected_capacity(rollback, backing.capacity()?)?;
+            check_protected_capacity(rollback, backing.capacity()?)
+                .map_err(|error| refused_after_reading(&backing, error))?;
             return Ok(Arc::new(backing));
         }
         #[cfg(not(target_os = "linux"))]
@@ -332,6 +334,70 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
         ));
     }
     Ok(Arc::new(view))
+}
+
+/// What asking the witness of a backing that a command only reads once more
+/// says, before the command reports a failure it met after the open.
+enum AskedAgain {
+    /// Report the failure: the witness still selects what was read, or the
+    /// view had stopped already, for the reason the failure gives.
+    Failure,
+    /// The witness no longer selects what was read (the view's stop
+    /// reason): report this instead of the failure, which may describe a
+    /// state that is no longer the volume's.
+    Changed(String),
+    /// The witness could not be asked (this error).
+    Unanswered(String),
+}
+
+fn ask_again(backing: &dyn Backing) -> AskedAgain {
+    if backing.session_stopped().is_some() {
+        return AskedAgain::Failure;
+    }
+    match backing.check_freshness() {
+        Ok(()) => AskedAgain::Failure,
+        Err(error) => match backing.session_stopped() {
+            Some(stopped) => AskedAgain::Changed(stopped),
+            None => AskedAgain::Unanswered(error.to_string()),
+        },
+    }
+}
+
+/// How a command that reads a backing through [`build_backing_to_read`]
+/// reports `failure`, met after the backing was opened. A remote view asks
+/// its authority only while it opens and when asked, and a command asks it
+/// before it reports what it read (SPEC §27); it asks before it reports a
+/// failure too. If the witness no longer selects what was read, that is
+/// reported instead of the failure; if it cannot be asked, the failure is,
+/// saying so. Any other backing answers as it answers before each of its
+/// operations, and the failure is reported as it is.
+pub fn read_failure(backing: &dyn Backing, failure: String) -> String {
+    match ask_again(backing) {
+        AskedAgain::Failure => failure,
+        AskedAgain::Changed(change) => change,
+        AskedAgain::Unanswered(error) => unanswered(&failure, &error),
+    }
+}
+
+/// [`read_failure`] for a refusal of [`build_backing_to_read`] itself.
+#[cfg(target_os = "linux")]
+fn refused_after_reading(backing: &dyn Backing, refusal: DaemonError) -> DaemonError {
+    match ask_again(backing) {
+        AskedAgain::Failure => refusal,
+        AskedAgain::Changed(change) => {
+            DaemonError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, change))
+        }
+        AskedAgain::Unanswered(error) => {
+            DaemonError::Io(std::io::Error::other(unanswered(&refusal, &error)))
+        }
+    }
+}
+
+fn unanswered(failure: &dyn std::fmt::Display, error: &str) -> String {
+    format!(
+        "{failure}; the witness could not be asked again whether it still selects what was \
+         read: {error}"
+    )
 }
 
 /// Check for volume markers without opening a writer session or contacting the witness.
