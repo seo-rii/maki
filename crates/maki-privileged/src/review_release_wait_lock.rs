@@ -406,3 +406,64 @@ fn a_record_another_helper_retired_during_the_wait_ends_the_run() {
         );
     }
 }
+
+/// A record that another helper retired during the wait ends the run as a
+/// success also when the device then shows a connection under another
+/// backend identifier, which ends the wait: another client connected the
+/// device once no record named it. Nothing of this attachment is left, and
+/// the other connection is not this run's to touch or to report as a
+/// disconnect that has not completed.
+#[test]
+fn a_record_retired_during_the_wait_ends_the_run_beside_another_connection() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        system.steps.clear();
+        system.defer_disconnect = true;
+        let retired = Arc::new(Mutex::new(None));
+        let (outcome, root, plan) = (retired.clone(), fixture.0.clone(), plan_detach(&request));
+        system.on_sleep = Some(Box::new(move |system, sleep| {
+            if sleep != 3 || !lock_is_free(&state_at(&root)) {
+                return;
+            }
+            // The opener lets go, another cleanup retires the record, and
+            // another client connects the device that no record names now.
+            system.backends.remove("/dev/nbd3");
+            let mut other = FakeSystem::default();
+            let result = cleanup_on(&plan, &state_at(&root), &mut other);
+            *outcome.lock().unwrap() =
+                Some((result.map_err(|error| error.to_string()), other.steps));
+            system
+                .backends
+                .insert("/dev/nbd3".into(), "other-connection".into());
+        }));
+
+        let (result, log) = logged(|| tear_down(verb, &request, &state, &mut system));
+
+        result.unwrap_or_else(|error| panic!("{verb}: {error}"));
+        assert_eq!(
+            retired.lock().unwrap().take(),
+            Some((Ok(()), Vec::new())),
+            "{verb}: the other cleanup did not run while this helper waited"
+        );
+        assert!(state.read("pg").unwrap().is_none(), "{verb}");
+        assert_eq!(
+            system.backends.get("/dev/nbd3").map(String::as_str),
+            Some("other-connection"),
+            "{verb}"
+        );
+        assert_eq!(
+            system.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"],
+            "{verb}"
+        );
+        assert_eq!(system.sleeps, vec![NBD_RELEASE_INTERVAL; 3], "{verb}");
+        assert!(
+            log.contains("another helper retired the attach record of volume pg"),
+            "{verb}: {log}"
+        );
+    }
+}
