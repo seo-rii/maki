@@ -252,9 +252,11 @@ See [cache reload](operations.md#growth-and-cache-reload).
   and showed none once the mapping was removed; cleanup then took its
   disconnected recovery and left nothing; both stopped quick starts passed;
   and the three stops ended about 10.2, 20.3 and 30.5 s after they began,
-  queued one after another on the global attach lock (read from the units'
-  journal: the stop step failed then on a reading the driver took before the
-  attach units had stopped, since fixed). That is local-provider volumes on one runner
+  queued one after another on the global attach lock, about 30.7 s in all
+  again in the next run (read from the units' journal: the stop step itself
+  failed in both runs, reading systemd's unit timestamps first before the
+  attach units had stopped and then after systemd had forgotten them; it now
+  reads the journal). That is local-provider volumes on one runner
   kernel, and nbdkit is killed only while the filesystem is idle after a
   sync. How often something holds a device open at a detach on a production
   host has not been measured.
