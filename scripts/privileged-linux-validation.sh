@@ -146,13 +146,19 @@ readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
 required_commands=(
-    blkid blockdev cargo dd df dmsetup findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
+    blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
     modprobe nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
     sudo sync vgchange vgcreate vgremove vgs
 )
 
 if [[ "$discard" == true ]]; then
     required_commands+=(fstrim)
+fi
+
+# The release by hand before cleanup's disconnected recovery removes the
+# mapping with it.
+if [[ "$kill_daemon" == true ]]; then
+    required_commands+=(dmsetup)
 fi
 
 missing_commands() {

@@ -241,10 +241,6 @@ def bootstrap_values(block):
     return values
 
 
-STATUS_CHECK = ('documented_status=$?\n'
-                'if [ "$documented_status" -ne 0 ]; then exit "$documented_status"; fi\n')
-
-
 def shimmed(command):
     """Program text that puts a `command` that fails first on PATH."""
     quoted = shlex.quote(command)
@@ -324,7 +320,10 @@ def interrupted(found, command):
     """(label, text) of each step of `found` with the bootstrap stopped once,
     in its first run, by a failure of `command`, and continued as the
     first-volume guide's recovery notes say. A block keeps its label, or has
-    the run it is added to it; `text` is what the program runs for it."""
+    the run it is added to it; `text` is what the program runs for it. The
+    text of a run that must fail judges its status itself and ends with a
+    status of 0 once it has, so that the program's usual check after each
+    step holds for every step."""
     provision = f"{QUICKSTART.name}, {PROVISION_STEP}: "
     creation = f"{QUICKSTART.name}, {CREATION_STEP}, block 1"
     [index] = [index for index, (label, _) in enumerate(found) if label.startswith(provision)]
@@ -334,19 +333,18 @@ def interrupted(found, command):
     outcome = STOP_ONCE[command]
     runs = 3 if outcome == "unfinished" else 2
     block = block if block.endswith("\n") else block + "\n"
-    steps = [(name, text + STATUS_CHECK) for name, text in found[:index]]
+    steps = list(found[:index])
     steps.append((f"{label} (run 1 of {runs}: {command} fails)",
                   shimmed(command) + block + stopped(command, values, outcome == "finished")))
     steps.append((f"{label} (run 2 of {runs}: continues from the record)",
-                  block + STATUS_CHECK if outcome == "finished"
-                  else "set +e\n" + block + released(values)))
+                  block if outcome == "finished" else "set +e\n" + block + released(values)))
     if outcome == "unfinished":
         directory, unit = recovery_reset()
         steps.append((f"{FIRST_VOLUME.name}, Recovering from a failed bootstrap: remove {directory} "
                       f"while {unit} is stopped", reset(directory, unit)))
-        steps.append((f"{creation_label} (again)", creation_block + STATUS_CHECK))
-        steps.append((f"{label} (run 3 of 3)", block + STATUS_CHECK))
-    steps.extend((name, text + STATUS_CHECK) for name, text in found[index + 1:])
+        steps.append((f"{creation_label} (again)", creation_block))
+        steps.append((f"{label} (run 3 of 3)", block))
+    steps.extend(found[index + 1:])
     return steps
 
 
@@ -375,17 +373,15 @@ def program(found, stop_once=None):
             raise ValueError(f"{label} has && or || below its own level that DEEPER_LISTS does not "
                              f"name for it: {unread[0]!r}. set -e does not stop at a failed list "
                              "there either: read it and add it, or reword the block")
-    if stop_once is None:
-        steps = [(label, (block if block.endswith("\n") else block + "\n") + STATUS_CHECK)
-                 for label, block in found]
-    else:
-        steps = interrupted([(label, block if block.endswith("\n") else block + "\n")
-                             for label, block in found], stop_once)
+    if stop_once is not None:
+        found = interrupted(found, stop_once)
     lines = [PRELUDE]
-    for number, (label, text) in enumerate(steps, 1):
-        lines.append(f"step={shlex.quote(f'[{number}/{len(steps)}] {label}')}\n")
+    for number, (label, block) in enumerate(found, 1):
+        lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")
         lines.append("printf '\\n==> %s\\n' \"$step\"\n")
-        lines.append(text)
+        lines.append(block if block.endswith("\n") else block + "\n")
+        lines.append('documented_status=$?\n'
+                     'if [ "$documented_status" -ne 0 ]; then exit "$documented_status"; fi\n')
     lines.append("step=''\nprintf '\\n==> every documented step succeeded\\n'\n")
     return "".join(lines)
 
