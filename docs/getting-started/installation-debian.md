@@ -6,9 +6,10 @@ package with every dependency satisfied. It ends where the
 the [support matrix](../deployment/support-matrix.md)); other distributions
 need the same components but are not qualified. On every change CI runs the
 [install steps](#install-the-maki-package), the quick start and its
-first-volume bootstrap as written in a booted Debian 12 cloud image, a KVM
-guest on a GitHub runner VM, after refreshing its package lists
-([testing](../testing.md#automated-ci)).
+first-volume bootstrap as written in a booted Debian 12 cloud image, after
+refreshing its package lists ([testing](../testing.md#automated-ci)). That
+guest is a KVM virtual machine on a GitHub runner VM, on GitHub's hardware,
+not a bare-metal host.
 
 Everything here runs as root unless stated otherwise. Use a disposable host
 for a first installation.

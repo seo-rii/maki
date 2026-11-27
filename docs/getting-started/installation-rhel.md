@@ -26,9 +26,10 @@ RHEL itself. Two CI jobs run on every change
   the first-volume bootstrap with an RPM built from the commit, so
   `maki-attach` attaches and detaches under systemd; in another guest it runs
   the privileged runner's attach lifecycle and workload with that RPM's
-  binaries. It requires SELinux still enforcing afterwards and no AVC denial
-  that names Maki or an NBD device, and after the quick start the domain and
-  labels the [SELinux section](#selinux) states.
+  binaries, as the guest's user `ci` with passwordless sudo. It requires
+  SELinux still enforcing afterwards, auditd active and no AVC denial that
+  names Maki or an NBD device, and after the quick start the domain and the
+  labels the [SELinux section](#selinux) names.
 
 Rocky Linux rebuilds RHEL's published sources unchanged; it is not RHEL, and
 its kernel is Rocky's build. The guest is a virtual machine on GitHub's
@@ -226,10 +227,14 @@ Maki ships no SELinux policy module, and the targeted policy has none for it.
 What follows was read from the CentOS Stream 9 targeted policy
 (`selinux-policy-targeted` 38.1.87) with `sesearch` and `selabel_lookup`. The
 `el9-guest` CI job runs the quick start on Rocky Linux 9.9 with SELinux
-enforcing and fails unless the nbdkit of `maki@demo.service` runs in
-`unconfined_service_t`, the files below carry the labels listed here, and no
-AVC denial names Maki or an NBD device ([testing](../testing.md#automated-ci));
-the metapackage case below was not run.
+enforcing and fails unless auditd is active, no AVC denial names Maki or an
+NBD device, the nbdkit of `maki@demo.service` runs in `unconfined_service_t`,
+and these carry the labels listed below: `/usr/bin/maki`, `maki-attach` and
+`maki-check`, `/usr/sbin/nbdkit`, the plugin, `/etc/maki`, `/var/lib/maki`,
+`/run/maki`, `/run/maki-control`, `/run/maki-attach`, the four unit files,
+and `/dev/nbd0`, the device the quick start attaches; no other NBD device is
+checked ([testing](../testing.md#automated-ci)). The metapackage case below
+was not run.
 
 - The installed files take the policy's default labels: the binaries
   `bin_t`, the plugin `lib_t`, `/etc/maki` `etc_t`, `/var/lib/maki`

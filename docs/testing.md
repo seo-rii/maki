@@ -60,7 +60,7 @@ The executable workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.
 | Service lifecycle | Pull requests and pushes | Disposable Ubuntu systemd host, Rust 1.94.0 | Real failed-start hook and private simulated-resource unit graph block independently |
 | Kernel lifecycle | Pull requests and pushes | Disposable Ubuntu runner VM: its kernel, udev and systemd, Rust 1.94.0 | A whole attachment through kernel NBD, LVM, device-mapper and XFS with the privileged runner (attach, a detach held open by another process, a second attach, a cleanup after nbdkit is killed, a third attach, a final detach), then the Debian install steps, quick start and first-volume bootstrap on the package built from the commit, block independently |
 | RHEL 9 userspace | Pull requests and pushes | CentOS Stream 9 container on Ubuntu, Rust 1.94.0 | Packaged build, nbdkit ABI against EL9's header, the `maki-privileged`, `maki-attach` and `maki-nbdkit` suites with EL9's nbdkit, the RPM contract, and install, check and removal of the built RPM block independently |
-| Booted hosts | Pull requests and pushes | Debian 12 and Rocky Linux 9 (SELinux enforcing) cloud images booted as KVM guests under QEMU on Ubuntu runner VMs; packages built in `debian:12` and CentOS Stream 9 containers, Rust 1.94.0 | In a fresh guest per suite, as root on the guest's kernel: the installation guide's host steps, the quick start and the first-volume bootstrap with the package built from the commit; and the privileged runner's lifecycle with that package's binaries; on Rocky Linux also no AVC naming Maki or NBD, `maki@`'s nbdkit in `unconfined_service_t` and the guide's file labels; each guest and suite blocks independently |
+| Booted hosts | Pull requests and pushes | Cloud images of Debian 12 and of Rocky Linux 9 (SELinux enforcing on Rocky) booted as KVM guests under QEMU on Ubuntu runner VMs, not on bare metal; packages built in `debian:12` and CentOS Stream 9 containers, Rust 1.94.0 | In a fresh guest per suite, on the guest's kernel: as root, the installation guide's host steps, the quick start and the first-volume bootstrap with the package built from the commit; as the guest's user `ci` with passwordless sudo, the privileged runner's lifecycle with that package's binaries; on Rocky Linux also auditd active, no AVC naming Maki or NBD, `maki@`'s nbdkit in `unconfined_service_t` and the guide's file labels; each guest and suite blocks independently |
 | Extended | Scheduled run | Ubuntu, Rust 1.94.0 | Ignored model, crash, HA, database, and power-loss gates block |
 | etcd qualification | Scheduled run | Ubuntu, Rust 1.94.0, digest-pinned etcd v3.6.5 | Real three-member etcd quorum and witness frontend gate blocks |
 | Fuzzing | Scheduled run | Ubuntu, pinned nightly `nightly-2026-11-24`, `cargo-fuzz` 0.13.2 | Every [fuzz target](#fuzzing) runs for 30 seconds from its committed seeds under libFuzzer and AddressSanitizer; a crash blocks |
@@ -285,10 +285,22 @@ downloads the guest's cloud image, pinned by name and digest:
   enforcing as shipped. Rocky Linux rebuilds RHEL's published sources
   unchanged, aiming at bug-for-bug compatibility; AlmaLinux has aimed at ABI
   compatibility since 2023 and builds from CentOS Stream, so Rocky Linux is
-  the closer of the two to RHEL. Rocky keeps a minor release's current image
-  and, after the next minor release, its last one in the vault, which the
-  download tries second; once neither has the pinned image, the step fails
-  and says to pin the current one.
+  the closer of the two to RHEL, though it is not RHEL. Rocky keeps a minor
+  release's current image under `pub/` and moves the release's last image
+  to the vault once the next minor release is out; the download tries the
+  vault second, and the 9.9 vault address answers 404 until then.
+
+The guest jobs cache the image with `actions/cache`, keyed by the pinned file
+name, the digest algorithm and the digest (no fallback key, so another pin's
+image is never restored), and save it right after a miss, also when a later
+step fails. A cache saved by a run on `main` is shared with pull requests; one
+saved by a pull request serves only that pull request's later runs. `fetch`
+checks a restored image's digest as it checks a download, and downloads it
+again if it differs. When the pinned image leaves `pub/` (Rocky replaces it,
+or a new minor release moves it), a warm cache keeps the job passing until
+GitHub evicts the entry (unused for 7 days, or the repository's 10 GB limit),
+and a cold cache fails the `guest image` step at both addresses, saying to
+pin the current image; that holds every pull request until the pin moves.
 
 It refuses an image with another digest, checks that the package's
 `SHA256SUMS` hold and that it was built from the checkout's `HEAD`, and boots
@@ -300,9 +312,13 @@ key generated for the run, no password and passwordless sudo, and pins an
 SSH host key generated for the run; SSH accepts only that key. The driver
 waits for SSH and for `cloud-init status --wait`, asking again when the
 connection drops while cloud-init restarts sshd, and copies the payload in.
-Every step has a time limit, each phase runs in the guest under `timeout`,
-and the host gives up on its connection 90 s after that limit.
-`scripts/booted-host-guest.py` runs each phase in the guest as root:
+Every step has a time limit. Each phase runs in the guest as root under
+`sudo timeout`, so the limit runs as root and reaches the phase's children
+(as `ci`, `timeout` could signal only sudo, which relays to its command
+alone), and the host gives up on the connection 90 s after that limit; the
+boot, its SSH probes, cloud-init's wait and the copy of the payload together
+end within the boot step's limit. `scripts/booted-host-guest.py` runs each
+phase in the guest as root:
 
 - `facts` records the release, kernel, virtualization, security modules, the
   `nbd` module's file (and on EL9 its package), the LVM devices file and the
@@ -329,12 +345,19 @@ and the host gives up on its connection 90 s after that limit.
   hashes instead of building; its scripts still come from its snapshot of the
   commit. The lifecycle is the one the `kernel-lifecycle` job runs.
 - `selinux` (EL9, after either suite, also when it failed): `getenforce` must
-  still print `Enforcing`; every AVC, USER_AVC and SELinux error since boot
+  still print `Enforcing` and auditd must be active (without it AVC records
+  go to the kernel log and `ausearch` finds none); every AVC, USER_AVC and
+  SELinux error since boot
   (`ausearch -m AVC,USER_AVC,SELINUX_ERR,USER_SELINUX_ERR -ts boot -i`) is
   kept, and one that names Maki or an NBD device fails. After the guides, the
-  nbdkit of `maki@demo.service` must have run in `unconfined_service_t` and
-  the installed files must carry the labels the
-  [RHEL guide](getting-started/installation-rhel.md#selinux) lists; a
+  nbdkit of `maki@demo.service` must have run in `unconfined_service_t`, and
+  these must carry the labels the
+  [RHEL guide](getting-started/installation-rhel.md#selinux) lists: `maki`,
+  `maki-attach`, `maki-check` and `/usr/sbin/nbdkit` `bin_t`, the plugin
+  `lib_t`, `/etc/maki` `etc_t`, `/var/lib/maki` `var_lib_t`, `/run/maki`,
+  `/run/maki-control` and `/run/maki-attach` `var_run_t`, the four unit
+  files `systemd_unit_file_t`, and `/dev/nbd0`, the device the quick start
+  attaches, `fixed_disk_device_t` (no other NBD device is checked). A
   sampler records each nbdkit and `maki*` process with its unit and label
   every half second during either suite.
 - `versions` records the kernel and the versions of the packages the guides
@@ -345,7 +368,9 @@ package), the runner's run directory (not its snapshot or builds), the
 journal, the kernel log, cloud-init's logs and, on EL9, the audit log, copies
 them out with the guest's console log, and powers the guest off. Neither key
 (`/etc/maki/secrets`, the runner's work tree), no backing, no SSH key and not
-the seed, which holds the host key, is kept. The artifacts are
+the seed, which holds the host key, nor anything under `/var/lib/cloud` (its
+copy of the seed) is kept, and a file that holds a private key stops the
+collection. The artifacts are
 `<guest>-guest-<suite>-logs`. The jobs use the local provider, one volume at
 a time, QEMU's user-mode network and no power loss; the EL9 kernel is Rocky
 Linux's build of RHEL's kernel, not RHEL's own, and `maki-attach grow` does
@@ -712,7 +737,7 @@ packaged configuration without installing services or creating users.
 | Package removal and inputs (R4-003, R4-007) | `scripts/test_debian_package.py`: `prerm` refuses removal under an attachment record or an active `maki@`/`maki-attach@`/`maki-workload@` unit or when `systemctl` cannot be queried but never blocks upgrades, no maintainer script starts/stops/restarts a service, ELF stubs of the wrong machine, class, type or a non-ELF file are refused, unknown architectures are refused, the dependency scan is on by default and fails closed on unanalysable artifacts or a missing `dpkg-shlibdeps`, `--no-shlibdeps` warns and keeps only the static `Depends` |
 | RPM package (RHEL 9) | `scripts/test_rpm_package.py`: the RPM installs the Debian package's files with the same modes and root ownership (compared file by file where `dpkg-deb` exists; the deliberate differences are the unit's nbdkit path, the license text RHEL lacks and dnf's protection file), `maki@.service` runs `/usr/sbin/nbdkit` and a unit without exactly one Debian nbdkit `ExecStart=` is refused, `%preun` refuses an erase under an attachment record, an active unit or a failed `systemctl` query with the Debian `prerm`'s check and never blocks an upgrade, no scriptlet starts, stops or restarts a service, the Debian builder's artifact checks apply for `x86_64`, `aarch64`, `ppc64le` and `s390x`, a binary whose ELF interpreter no package of the build host owns is refused unless `--no-autoreq`, the plugin is not provided as a library, the package conflicts with `nbdkit-selinux` and the `nbdkit` metapackage, its one file below `/etc` is the `%config(noreplace)` `/etc/dnf/protected.d/maki.conf`, which names only `maki` and says how the package is removed, it provides the user and groups of its sysusers file and is the same file whether or not the build host has rpm's sysusers dependency generator (checked with a stand-in generator), versions rpm cannot express are refused and candidate versions keep their order, a missing `SOURCE_DATE_EPOCH` or one before 1990 (which rpm cannot put in the changelog) is refused, and the build is reproducible |
 | Release workflow | `scripts/test_release_workflow_validation.py`: `.github/workflows/release.yml` runs only when dispatched with a tag, from `main`, and accepts only `v<workspace version>-rc.<n>` (a final tag is refused while production approval is pending); a taken tag or release is refused before anything is built; only the publish job may write; the Debian bundle comes from `prepare_release.py` in `debian:12` and the RPM from `build-rpm.py` in CentOS Stream 9, both from the dispatched commit with its whole history and no cache, and only first-party actions and the baseline toolchain are used; `scripts/release_assets.py` refuses bundles whose sums, manifests, commit or version disagree, gives the assets names GitHub keeps and writes one `SHA256SUMS`; the notes name every asset and its distribution and say that nothing is signed and the release is not qualified; against a stand-in `gh` the release is a draft pre-release until every asset is uploaded, a failure before publication leaves no release and no tag, and one after it is reported, not deleted |
-| Booted-host jobs | `scripts/test_ci_gate_validation.py`: each guest's package is built from the commit in its distribution's container and uploaded with its checksums and revision; each guest job needs only its own package job, runs both suites in fresh guests on a runner VM with KVM opened and required, runs its steps in order, each with a time limit within the job's, every guest phase as root under a limit below its step's, the SELinux phase only on EL9, and always keeps the logs. `scripts/test_booted_host_validation.py`: the images are pinned by name and digest (Debian's generic image, Rocky's GenericCloud Base image with its vault address), an image with another digest is refused and not kept, the payload refuses a package whose checksums fail or that another commit built and holds the installation's program or a clone of `HEAD`; the guest runs with KVM on a copy-on-write overlay with SSH on `127.0.0.1` only, its seed creates a key-only user without a password and pins the host key that SSH alone accepts, cloud-init is awaited across the sshd restart it causes, a guest that does not come up fails with its console, a command runs under `timeout` and is given up after its limit, and the logs kept never include a key or the seed. In the guest: the release decides the guest, EL9 requires enforcing, the sampler records each Maki process's unit and label once, the SELinux verdict fails for another mode, a denial naming Maki or NBD, a failed `ausearch`, `maki@`'s nbdkit outside `unconfined_service_t` or unsampled, and a label the RHEL guide does not list, a finished quick start's leftovers fail, the runner runs as `ci` on `/dev/nbd15` with the package's binaries, and the archive leaves out the package, the snapshot and the builds |
+| Booted-host jobs | `scripts/test_ci_gate_validation.py`: each guest's package is built from the commit in its distribution's container and uploaded with its checksums and revision; each guest job needs only its own package job, runs both suites in fresh guests on a runner VM with KVM opened and required, runs its steps in order, each with a time limit within the job's, caches the image under its pin and checks it after a hit, ends the boot and the copy within the boot step's limit, runs every guest phase as root under a limit inside sudo below its step's, the SELinux phase only on EL9, and always keeps the logs. `scripts/test_booted_host_validation.py`: the images are pinned by name and digest (Debian's generic image, Rocky's GenericCloud Base image with its vault address), an image with another digest is refused and not kept, the payload refuses a package whose checksums fail or that another commit built and holds the installation's program or a clone of `HEAD`; the guest runs with KVM on a copy-on-write overlay with SSH on `127.0.0.1` only, its seed creates a key-only user without a password and pins the host key that SSH alone accepts, cloud-init is awaited across the sshd restart it causes, a guest that does not come up fails with its console, a command runs under `timeout` (inside `sudo` for a root phase) and is given up after its limit, a copy into the guest is given up after its limit, an image already there is used only with the pinned digest and the cache key names the pin, and the logs kept never include a key, the seed or anything of `/var/lib/cloud`, nor a file that holds a private key. In the guest: the release decides the guest, EL9 requires enforcing, the sampler records each Maki process's unit and label once, the SELinux verdict fails for another mode, auditd not active, a denial naming Maki or NBD, a failed `ausearch`, `maki@`'s nbdkit outside `unconfined_service_t` or unsampled, and a label the RHEL guide does not list (every packaged unit file and `/dev/nbd0` are checked), the guides phase fails with the program's status and with a finished quick start's leftovers, the runner runs as `ci` on `/dev/nbd15` with the package's binaries, and the archive leaves out the package, the snapshot and the builds |
 | RHEL 9 installation guide | `scripts/test_docs_rhel_installation_validation.py`: the guide and `packaging/rpm/README.md` quote the spec's static `Requires` and its `Conflicts` exactly and its `Provides`, and say that the package is removed with `rpm -e` (no command of the guide removes a package with dnf), every `dnf` command of the guide installs from BaseOS and AppStream only (no `--enablerepo`, `config-manager`, COPR or EPEL) and never the `nbdkit` metapackage, the one RPM builder call in each uses only options the builder accepts and keeps the automatic requirements, the guide says RHEL 9 is not qualified as the support matrix's row does, and the README, the documentation index, the status page and the support matrix link it |
 | Deep-check verdict (R4-004) | `maki-core/tests/review_r4_check_verdict.rs`: recoverable slot damage passes with a warning and is repaired by recovery, damage without a journal source fails, mixed damage reports both classes, a healthy volume is `clean`, a damaged header on an unlisted slot is `unrecoverable` |
 | Overlay memory bound (R4-005) | `maki-core/tests/review_r4_overlay_bound.rs`, `maki-format/tests/review_r4_overlay_limits.rs`, `maki-nbdkit/tests/review_r4_overlay_options.rs`: bytes and entries stay under their limits without journal pressure, the worker checkpoints on the overlay watermark with a manual clock, a failed reclaim refuses the write and degrades, a concurrent volatile write during an inline reclaim does not cause ENOSPC (multi-thread, `checkpoint.slot_write` hook), defaults/zero/minimum validation, and the daemon mapping |

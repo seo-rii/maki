@@ -134,7 +134,9 @@ parameters the runner asks for; see
 [testing](../testing.md#automated-ci). It keeps the run directory, without
 `source/`, `target/` and `build/`, in the job's `kernel-lifecycle-logs`
 artifact. The booted-host jobs run it the same way in booted Debian 12 and
-Rocky Linux 9 KVM guests, as the guest's user `ci`, with `--prebuilt` naming
+Rocky Linux 9 KVM guests (virtual machines on GitHub's hardware, not
+bare-metal hosts; Rocky Linux is a rebuild of RHEL, not RHEL), as the guest's
+user `ci`, with `--prebuilt` naming
 the binaries taken from the package built from the commit (and
 `--install-missing` on Debian only: on Rocky Linux the job installs the tools
 with dnf); their `<guest>-guest-runner-logs` artifacts keep the run directory
