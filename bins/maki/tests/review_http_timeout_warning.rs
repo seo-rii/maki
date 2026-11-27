@@ -2,10 +2,11 @@
 //! `timeout` under 600 ms.
 //!
 //! The HTTP transport starts the other address family of an endpoint's host
-//! 300 ms after the first, which reqwest does not let the provider change
-//! (docs/configuration.md, remote HTTP mapping): under 600 ms that family
-//! gets less than half of the `timeout`, and at 300 ms or less it is never
-//! tried. Such a configuration is still valid: creation succeeds and both
+//! 300 ms after the first, or at once when the first family has failed,
+//! which reqwest does not let the provider change (docs/configuration.md,
+//! remote HTTP mapping): while the first family does not answer, the other
+//! gets less than half of a `timeout` under 600 ms and is never tried at
+//! 300 ms or less. Such a configuration is still valid: creation succeeds and both
 //! checks pass, with a `warning:` line that names the value. A `timeout` of
 //! 600 ms or more, or none (10 s), gets no warning.
 
@@ -68,9 +69,10 @@ fn text(output: &Output) -> String {
 /// The warning line for an HTTP `timeout` printed as `value`.
 fn warning(value: &str) -> String {
     format!(
-        "warning: [crypto.http] timeout is {value}: under 600 ms the other address family of \
-         an endpoint's host gets less than half of it, and at 300 ms or less it is never \
-         tried, so a host whose first address family does not answer can fail every connect"
+        "warning: [crypto.http] timeout is {value}: while the first address family of an \
+         endpoint's host does not answer, the other family gets less than half of a timeout \
+         under 600 ms and is never tried at 300 ms or less, so such a host can fail every \
+         connect"
     )
 }
 

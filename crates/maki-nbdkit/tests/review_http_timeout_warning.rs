@@ -1,11 +1,12 @@
 //! An HTTP provider `timeout` under 600 ms is accepted with a warning.
 //!
 //! The HTTP transport starts the other address family of an endpoint's host
-//! 300 ms after the first (hyper-util's delay, which reqwest does not let
-//! the provider change; docs/configuration.md, remote HTTP mapping). Under
-//! 600 ms that family gets less than half of the `timeout`, and at 300 ms or
-//! less it is never tried, so a host whose first family does not answer can
-//! fail every connect. `maki check` (through
+//! 300 ms after the first, or at once when the first family has failed
+//! (hyper-util's delay, which reqwest does not let the provider change;
+//! docs/configuration.md, remote HTTP mapping). While the first family does
+//! not answer, the other gets less than half of a `timeout` under 600 ms
+//! and is never tried at 300 ms or less, so such a host can fail every
+//! connect. `maki check` (through
 //! `report_configuration_mismatches`) and attach say so, naming the value;
 //! a longer or unset `timeout`, and the WebSocket and gRPC transports, which
 //! start the other family halfway through a short timeout, get no warning.
@@ -26,9 +27,9 @@ const BOUND: Duration = Duration::from_secs(30);
 /// The warning for an HTTP `timeout` printed as `value`.
 fn warning(value: &str) -> String {
     format!(
-        "[crypto.http] timeout is {value}: under 600 ms the other address family of an \
-         endpoint's host gets less than half of it, and at 300 ms or less it is never tried, \
-         so a host whose first address family does not answer can fail every connect"
+        "[crypto.http] timeout is {value}: while the first address family of an endpoint's \
+         host does not answer, the other family gets less than half of a timeout under 600 ms \
+         and is never tried at 300 ms or less, so such a host can fail every connect"
     )
 }
 
