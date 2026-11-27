@@ -1,12 +1,11 @@
-//! The TCP connector handed to tonic is hyper-util's, configured as tonic
-//! configures its own: each resolved address of a family may take an equal
-//! share of the RPC `timeout`, and the other family starts 300 ms after the
-//! first, or at once when the first family has failed. The connection is
-//! made by a payload-free background worker (`connection.rs`) that may run
-//! for several timeouts, so a connect that outlives one RPC can serve the
-//! next. The endpoint's name resolves, through `TestResolver`, to the
-//! test's loopback addresses; one that never answers is a listener whose
-//! accept queue is full, whose SYNs Linux drops. Time is paused and moved by
+//! The TCP connector handed to tonic is hyper-util's: each resolved address
+//! of a family may take an equal share of the RPC `timeout`, and the other
+//! family starts 300 ms after the first, or halfway through a `timeout`
+//! under 600 ms, or at once when the first family has failed. The
+//! connection is made by a payload-free background worker (`connection.rs`)
+//! that may run for several timeouts. The endpoint's name resolves, through
+//! `TestResolver`, to the test's loopback addresses; one that never answers
+//! is a listener whose accept queue is full, whose SYNs Linux drops. Time is paused and moved by
 //! hand; loopback I/O runs while a test polls without letting it advance.
 //!
 //! The tests of the other family need the IPv6 loopback address; without it
@@ -28,7 +27,7 @@ use super::{
 };
 use maki_crypto::{
     Capability, CiphertextUnit, CryptoCapabilities, CryptoContext, CryptoError, CryptoProvider,
-    ErrorClass, PlaintextUnit, SecretBuffer,
+    PlaintextUnit, SecretBuffer,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -367,10 +366,12 @@ async fn a_dead_ipv6_address_gives_way_to_ipv4_after_300_ms() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn with_a_short_timeout_the_other_family_is_dialed_for_the_next_call() {
+async fn with_a_short_timeout_the_other_family_starts_halfway_and_serves_the_call() {
     if !ipv6_loopback() {
         return;
     }
+    // Below 600 ms the other family starts halfway through the timeout, not
+    // after 300 ms: at 300 ms or later this call would have ended unserved.
     let timeout = Duration::from_millis(200);
     let dead = Unanswered::at(Ipv6Addr::LOCALHOST.into());
     let endpoint = Endpoint::start().await;
@@ -380,39 +381,26 @@ async fn with_a_short_timeout_the_other_family_is_dialed_for_the_next_call() {
     let mut call = provider.encrypt_batch(&context, &units);
     start(&mut call).await;
 
-    tokio::time::advance(timeout - TICK).await;
+    tokio::time::advance(timeout / 2 - TICK).await;
     assert!(
         run_for(&mut call, QUIET).await.is_none(),
-        "the call ended before its timeout"
+        "the call finished before IPv4 was dialed"
     );
-    assert!(endpoint.accepted_at(started).is_empty());
-    // The IPv6 address's share is the whole timeout, and the call ends with
-    // it, before the other family's delay: IPv4 was never dialed for it.
-    tokio::time::advance(2 * TICK).await;
-    let error = run_for(&mut call, PATIENCE)
-        .await
-        .expect("the call outlived its timeout")
-        .expect_err("nothing served the call in time");
-    assert_eq!(error.class(), ErrorClass::Retryable, "{error:?}");
-    assert!(error.is_not_sent(), "{error:?}");
-    // The connection worker goes on: IPv6 has failed, so IPv4 is dialed at
-    // once, and its connection serves the next call.
-    let mut idle = std::future::pending::<()>();
-    let wall = std::time::Instant::now();
-    while endpoint.accepted_at(started).is_empty() {
-        assert!(wall.elapsed() < PATIENCE, "IPv4 was never dialed");
-        run_for(&mut idle, TICK).await;
-    }
-    let accepted = endpoint.accepted_at(started);
     assert!(
-        accepted[0] >= timeout && accepted[0] <= timeout + TICK,
+        endpoint.accepted_at(started).is_empty(),
+        "IPv4 was dialed before half the timeout"
+    );
+    tokio::time::advance(2 * TICK).await;
+    served(
+        run_for(&mut call, PATIENCE).await,
+        "IPv4 was not dialed halfway through the timeout",
+    );
+    let accepted = endpoint.accepted_at(started);
+    assert_eq!(accepted.len(), 1, "{accepted:?}");
+    assert!(
+        accepted[0] >= timeout / 2 && accepted[0] <= timeout / 2 + TICK,
         "IPv4 was dialed at {:?}",
         accepted[0]
     );
-    let mut next = provider.encrypt_batch(&context, &units);
-    served(
-        run_for(&mut next, PATIENCE).await,
-        "the worker's connection did not serve the next call",
-    );
-    assert_eq!(endpoint.accepted_at(started).len(), 1);
+    assert!(started.elapsed() < timeout, "{:?}", started.elapsed());
 }
