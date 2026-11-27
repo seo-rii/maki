@@ -485,7 +485,7 @@ the Rust source and checks every committed seed against its length:
 | `backing_records` | 70,000 | The remote witness state, at most 64 KiB |
 | `witness_rpc` | 70,000 | A frame of at most 64 KiB |
 | `witness_etcd` | 270,000 | etcd's answer, at most 256 KiB, with a witness state of at most 64 KiB |
-| `helper_reports` | 70,000 | At most 64 KiB of a command's output |
+| `helper_reports` | 70,000 | LVM's report (`MAX_REPORT`), and the output of the filesystem probe and of `dmsetup info`, at most 64 KiB each |
 
 A length only lets a run get there: a run keeps a longer input only when it
 reaches code no shorter one did. Seeds reach the format targets' bound (a
@@ -530,29 +530,42 @@ it, in five jobs:
    processes of the target's binary on one corpus, from the target's seeds,
    with the target's `-max_len`, `-timeout=25`, `-rss_limit_mb=2048` and
    `-print_final_stats=1`, `ASAN_OPTIONS` as `cargo fuzz run` sets it and a
-   temporary directory of the shard's own on `/dev/shm` (on the runner's
-   disk, `helper_sysfs`, which builds a tree for every input, would wait on
-   the filesystem for most of its time). Each process fuzzes in rounds on
+   temporary directory of the shard's own on `/dev/shm`. `helper_sysfs`
+   builds a tree for every input: in a run on the host this guide was
+   written on, it was charged 36 % of its wall time with its trees on the
+   disk and 91 % on `/dev/shm`; a runner's disk was not measured. Each
+   process fuzzes in rounds on
    the shard's corpus: the first with `-max_total_time` its share, each
    further one as long as the CPU time it still lacks and at least a
    minute, until the kernel has charged it its share (user and system time,
    from `wait4`) or no round fits the wall time left. A process charged less
    than its wall time (a target that waits for a thread of its own or for
-   the filesystem) so takes longer, not less CPU time. A process still
-   running 10 minutes after its round's time is interrupted, and killed a
-   minute later. The job records, for each process and each round, its
+   the filesystem) so takes longer, not less CPU time; a process whose
+   rounds exit 0 before half of their time three times in a row is not
+   started again. A process still running 10 minutes after its round's time
+   is interrupted, and killed a minute later. When GitHub interrupts the
+   step (its time limit, a cancelled run), the runner sends the step's own
+   process SIGINT, SIGTERM 7.5 seconds later and kills it 2.5 seconds after
+   that; bash, which runs the step's script, does not hand a signal on to a
+   command it waits for, so the step `exec`s the script. The script then
+   interrupts every process at once, kills one still running 2 seconds
+   later, and writes its record, marked interrupted, before the SIGTERM; a
+   kill alone leaves no record. The job records, for each process and each round, its
    exit, the CPU time the kernel charged it, its wall time, its seed, its
    executions and its last coverage line; every input libFuzzer wrote (a
    crash, a timeout, an input beyond the memory limit or a leak fails the
    shard, and a slow unit is only listed); and what the processes left in
-   their temporary directory. A process that stopped on an input, or was
-   charged less than its share, fails the shard. Its corpus and logs are
+   their temporary directory. A process that stopped on an input, was
+   interrupted, ended its rounds early or was charged less than its share
+   fails the shard. Its corpus and logs are
    kept for 30 days, its record (`fuzz-stats-*`) and failing inputs
    (`fuzz-crashes-*`) for 90.
 4. `merge` merges each target's seeds and shard corpora with `-merge=1` and
    runs the merged corpus once (`-runs=0`), whose `INITED` line gives the
    edges and features it covers. The corpus (`fuzz-corpus-<target>`) is
-   kept for 90 days, also after a shard failed.
+   kept for 90 days, also after a shard failed. Interrupted like a shard's,
+   the step stops libFuzzer's processes (the merge runs one of its own) and
+   writes `coverage.json`, marked interrupted.
 5. `summary` writes a table to the run's summary and to
    `fuzz-qualification-summary` (`summary.md`, `summary.json`), kept for 90
    days: per target, the CPU-hours charged to its processes, their
