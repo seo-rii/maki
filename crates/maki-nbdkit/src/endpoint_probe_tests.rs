@@ -28,6 +28,9 @@ enum Answer {
     Away,
     /// Refuses every request with a failure that refuses the attach.
     Refuse,
+    /// Serves every request but those of the key canary check, which fail
+    /// as ones that timed out.
+    LoseCanary,
 }
 
 /// An endpoint whose every request first takes `latency` on the paused
@@ -69,6 +72,8 @@ impl Scripted {
             Answer::Serve => Ok(()),
             Answer::Away => Err(CryptoError::Retryable("timed out".into())),
             Answer::Refuse => Err(CryptoError::ProviderFatal("refused".into())),
+            Answer::LoseCanary if canary => Err(CryptoError::Retryable("timed out".into())),
+            Answer::LoseCanary => Ok(()),
         }
     }
 
@@ -113,6 +118,7 @@ impl CryptoProvider for Scripted {
 struct Fixture {
     directory: tempfile::TempDir,
     config: VolumeConfig,
+    superblock: Superblock,
 }
 
 /// A created volume whose configuration names a remote provider; the
@@ -160,10 +166,11 @@ journal_emergency_reserve_bytes = "0B"
 mode = "off"
 "#
     );
-    create_volume_from_config_str(&raw).unwrap();
+    let superblock = create_volume_from_config_str(&raw).unwrap();
     Fixture {
         config: parse_and_validate(&raw).unwrap(),
         directory,
+        superblock,
     }
 }
 
@@ -242,9 +249,9 @@ async fn endpoints_that_do_not_answer_cost_one_probe_however_many_are_listed() {
     }
 }
 
-/// On a new volume the first endpoint in configuration order that passes
-/// its self-test establishes the key canary and the others verify it, as
-/// when they were probed one after another, even when a later endpoint
+/// On a new volume the first endpoint in configuration order whose key
+/// canary check succeeds establishes the canary and the others verify it,
+/// as when they were probed one after another, even when a later endpoint
 /// answers first and one between them has finished its probe before the
 /// first: the canary check loads and writes the volume's canary.
 #[tokio::test(start_paused = true)]
@@ -272,6 +279,28 @@ async fn the_first_endpoint_in_configuration_order_establishes_the_key_canary() 
     ] {
         assert!(root.join(copy).exists(), "{copy} was not written");
     }
+}
+
+/// An endpoint that passes its self-test but whose canary check fails with
+/// a transport failure in every attempt establishes nothing and keeps the
+/// turn through its attempts; the next endpoint in configuration order
+/// establishes the canary after it, as one after another.
+#[tokio::test(start_paused = true)]
+async fn an_endpoint_whose_canary_check_fails_leaves_the_canary_to_the_next() {
+    let volume = fixture(true);
+    let losing = Scripted::new(Answer::LoseCanary, Duration::from_secs(1));
+    let serving = Scripted::new(Answer::Serve, Duration::ZERO);
+    let (_, set) = probe(&volume.config, &[losing.clone(), serving.clone()]).await;
+    assert_eq!(
+        validated(&set.unwrap()),
+        [("ep0".to_string(), false), ("ep1".to_string(), true)]
+    );
+    assert_eq!(losing.canary_encrypts.load(Ordering::SeqCst), 3);
+    assert_eq!(serving.canary_encrypts.load(Ordering::SeqCst), 1);
+    // Had the second endpoint established the canary first, the first one's
+    // checks would have decrypted it instead.
+    assert_eq!(losing.canary_decrypts.load(Ordering::SeqCst), 0);
+    assert_eq!(serving.canary_decrypts.load(Ordering::SeqCst), 1);
 }
 
 /// An endpoint that refuses the attach stops the probe before any endpoint
@@ -348,9 +377,11 @@ async fn results_are_reported_in_configuration_order() {
 
 /// Probe `endpoints` as the native plugin's attach does, and when each
 /// report of the probe's progress came, on the paused clock, from `started`
-/// to `ended`.
+/// to `ended`. Then send a request through the set the probe built, which
+/// also starts the validation of each quarantined endpoint
+/// (`EndpointSet::promote_quarantined`): neither reports.
 async fn probe_reporting(
-    config: &VolumeConfig,
+    volume: &Fixture,
     endpoints: &[Arc<Scripted>],
 ) -> (Vec<tokio::time::Instant>, Arc<EndpointSet>) {
     let reports = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -359,17 +390,53 @@ async fn probe_reporting(
         Arc::new(move || reports.lock().push(tokio::time::Instant::now()))
     };
     let started = tokio::time::Instant::now();
-    let set = dispatch_endpoint_set(config, named(endpoints), None, Some(progress))
+    let set = dispatch_endpoint_set(&volume.config, named(endpoints), None, Some(progress))
         .await
         .unwrap();
     let ended = tokio::time::Instant::now();
     let mut times = vec![started];
     times.extend(reports.lock().iter().copied());
     times.push(ended);
-    // The set's own requests (its validation of quarantined endpoints) do
-    // not report: nothing extends the start deadline once the set is built.
+    // The set's own requests do not report: nothing extends the start
+    // deadline once the set is built.
     let reported = reports.lock().len();
+    let before: Vec<usize> = endpoints
+        .iter()
+        .map(|endpoint| endpoint.requests())
+        .collect();
+    let context = CryptoContext {
+        volume_uuid: volume.superblock.volume_uuid,
+        format_version: volume.superblock.format_version,
+        crypto_compatibility_id: volume.superblock.crypto_compatibility_id.clone(),
+    };
+    let ciphertext = set
+        .encrypt_batch(
+            &context,
+            &[PlaintextUnit {
+                unit_index: 7,
+                data: maki_crypto::SecretBuffer::from_slice(&[0x5a; 512]),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ciphertext.len(), 1);
+    // Let the validations the request started run.
     tokio::time::sleep(Duration::from_secs(600)).await;
+    let mut served = 0;
+    for status in set.endpoint_status() {
+        let index: usize = status.name["ep".len()..].parse().unwrap();
+        let sent = endpoints[index].requests() - before[index];
+        if status.validated {
+            served += sent;
+        } else {
+            assert!(
+                sent > 0,
+                "{} was not validated through the set",
+                status.name
+            );
+        }
+    }
+    assert!(served > 0, "no request reached a validated endpoint");
     assert_eq!(reports.lock().len(), reported, "reported after the probes");
     (times, set)
 }
@@ -396,7 +463,7 @@ async fn every_probe_request_that_ends_reports_progress() {
         Scripted::new(Answer::Away, request),
         Scripted::new(Answer::Serve, Duration::ZERO),
     ];
-    let (times, _set) = probe_reporting(&volume.config, &endpoints).await;
+    let (times, _set) = probe_reporting(&volume, &endpoints).await;
     let elapsed = *times.last().unwrap() - times[0];
     assert!(elapsed > Duration::from_secs(180), "{elapsed:?}");
     assert!(longest_gap(&times) <= request + DELAY, "{times:?}");
@@ -413,7 +480,7 @@ async fn every_cross_endpoint_check_request_that_ends_reports_progress() {
         Scripted::new(Answer::Serve, Duration::ZERO),
         Scripted::new(Answer::Serve, request),
     ];
-    let (times, set) = probe_reporting(&volume.config, &endpoints).await;
+    let (times, set) = probe_reporting(&volume, &endpoints).await;
     assert_eq!(
         validated(&set),
         [("ep0".to_string(), true), ("ep1".to_string(), true)]
