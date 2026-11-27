@@ -124,7 +124,9 @@ returns zero too; a script that needs
 .B clean
 reads the
 .B "info: deep check verdict:"
-line. Invalid command usage, including a malformed option value
+line. A deep check that stops before its verdict (the volume lock is held,
+no checkpoint state copy is valid, the backing cannot be read) prints no
+such line and returns 1. Invalid command usage, including a malformed option value
 or approval and an option given where a configuration, a directory or a
 reload section belongs, returns 2 before anything is read. Name a file
 whose name starts with a dash as

@@ -291,7 +291,9 @@ accelerators that an A/B fallback can leave one generation behind. Opening the
 store adopts data files the catalog copy does not list and, for a shard with an
 invalid or absent allocation copy, audits its slot headers and repairs the map
 in memory (the next checkpoint persists it; the deep check reports it). Reading
-a cleared slot probes its header before answering zeros. A cataloged shard with
+a cleared slot probes it before answering zeros: only a slot whose header and
+ciphertext area are all zero is a hole, since a header can read back as zeros
+over ciphertext that survives it. A cataloged shard with
 no valid allocation copy at all refuses attach, as does a shard whose data file
 is missing while the catalog names it or its allocation map lists a slot.
 
@@ -483,8 +485,10 @@ timing. A slow reader's older version never displaces a newer cached one:
 neither its `put` nor its lookup evicts the newer entry. A partial-unit write
 takes the unit's current plaintext from the cache the same way, so a small
 write over a cached unit needs no payload read or decryption. Entries use zeroizing buffers and are never written back. A read
-establishes the current sequence first (overlay entry or 64-byte slot header)
-and serves a hit without reading the payload or calling the provider, so the
+establishes the current sequence first (overlay entry or 64-byte slot header;
+a slot whose allocation bit is clear is read with its ciphertext area to tell
+a hole from damage) and serves a hit without reading the payload or calling
+the provider, so the
 cache saves both the ciphertext read and the crypto call; the trade-off
 (payload damage under a valid header is served until eviction) is described
 with the [read-cache settings](configuration.md#read-cache).

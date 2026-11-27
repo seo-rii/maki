@@ -38,10 +38,12 @@ unit-aligned chunks of at most that size, and FUA on the request makes the
 whole range durable (R5-010). Trim is a hint, so an edge-only request
 can complete without changing data. Discarding an already-zero unit does not
 create a shard, reserve a slot, or append another journal record. "Already
-zero" is decided from the slot header alone, so a discard never reads the
-payload; a unit whose payload or header is damaged is retired by its tombstone
-instead of failing the discard with EIO (R5-012). Discard admission needs only
-the emergency reserve, not the checkpoint headroom (R5-011), so a raw discard
+zero" is decided without verifying a payload: from the slot header, and on a
+slot whose allocation bit is clear from its header and ciphertext area, which
+are all zero only in a hole. A unit whose payload or header is damaged is
+retired by its tombstone instead of failing the discard with EIO (R5-012).
+Discard admission needs only the emergency reserve, not the checkpoint
+headroom (R5-011), so a raw discard
 of the exported device is still admitted inside the headroom. A filesystem on
 the volume cannot use that: deleting a file needs writes, and XFS `fstrim`
 forces a log write before it discards, so both are refused there

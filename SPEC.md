@@ -1685,7 +1685,8 @@ shard absent from catalog
 
 shard exists
 allocation bit = 0
-slot header bytes are all zero
+every byte of the slot that a slot write reaches (its header and the
+max_ciphertext_size bytes after it) is zero below the end of the file
 → unwritten zero
 
 allocation bit = 0
@@ -1700,29 +1701,48 @@ slot header bytes are neither zero nor a valid header for this unit
   copy that listed it; a hole is never partly written)
 
 allocation bit = 0
+slot header bytes are all zero, a byte after them that a slot write
+reaches is not
+→ EIO (a written slot whose header was damaged, such as a sector that
+  reads back as zeros; a hole is never partly written)
+
+allocation bit = 0
 slot lies beyond the end of a data file shorter than its physical size
 (units_per_shard × slot_size)
 → EIO (the file is created at its full sparse size and synced before
   any slot is written, so a short file was truncated)
 ```
 
+The alignment padding after the largest ciphertext is never written and
+says nothing about the slot. A crash leaves an all-zero header over written
+ciphertext only where a slot write tore before its shard was synced: the
+checkpoint did not complete, so the unit's journal record is newer than the
+checkpoint, and before the volume is exposed recovery replays the unit's
+newest record: it rewrites the slot, or, when that record is a v3 trim,
+discards the unit, which then reads as zeros (the deep check calls such a
+slot recoverable either way). The slot of a
+discarded unit (v3, below) is answered by its discard bit, however much of it
+a hole punch released.
+
 A truncated data file is media damage, and its evidence is volatile: the
 next slot write past the end grows the file with zeros, after which a removed
-slot has an all-zero header and would read as a hole. Open therefore marks
+slot is all zero and would read as a hole. Open therefore marks
 every cleared slot beyond the end *allocated* (persisted before the file is
 grown back), so it reads as allocated-but-invalid, EIO, until it is
 rewritten. The only legitimately short data file belongs to a shard that was
 never written into: not named by the loaded catalog copy, with an empty
 allocation map (a stale empty copy from an earlier creation attempt proves
-nothing), and with no slot below the end of the file whose header bytes are
-not all zero. Its creation (§14) never finished, so no slot of it holds
+nothing), and with no byte below the end of the file, in a slot's header
+or in the bytes after it that a slot write reaches, that is not zero. Its
+creation (§14) never finished, so no slot of it holds
 data and its holes stay holes. Nothing proves such a file's size durable —
 not even a full-size page-cache view after a restart (§27) — so the
 size is set and synced again before the shard is written to or cataloged.
 The catalog and the allocation map can both fall back to a generation from
-before the first checkpoint into a shard; a written slot header cannot,
+before the first checkpoint into a shard; written slot bytes cannot,
 since only a slot write puts bytes there and the file's size is proven
-before the first one, so such a header makes a short file a truncated one.
+before the first one, so such a byte (of a header, or after a header that
+reads back as zeros) makes a short file a truncated one.
 
 ```text
 allocation bit = 1
