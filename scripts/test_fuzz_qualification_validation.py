@@ -880,6 +880,25 @@ class Merge(Fixture):
         self.assertFalse(tree.exists())
         self.assertTrue(self.campaign.remove(tree, threading.Event()))
 
+    def test_an_earlier_unpacking_that_cannot_be_removed_is_not_unpacked_over(self):
+        # Its files would be merged with the archive's.
+        self.shard(1, b"one")
+        stale = self.unpacked(1)
+        stale.mkdir(parents=True)
+        (stale / "stale").write_bytes(b"not in the archive")
+
+        def refused(tree, interrupted):
+            raise PermissionError(13, "Permission denied", str(tree))
+
+        self.campaign.remove = refused
+        sources, unmerged = self.campaign.shard_corpora(self.root / "shards", "witness_etcd", 1)
+        self.assertEqual(sources, [])
+        self.assertEqual([entry["why"] for entry in unmerged], [
+            "fuzz-shard-witness_etcd-1/shard.tar: an earlier unpacking of it could not be removed: "
+            f"[Errno 13] Permission denied: '{stale.parent}'"])
+        self.assertEqual(sorted(path.name for path in stale.iterdir()), ["stale"])
+        self.assertTrue(self.downloaded(1).exists())
+
     def test_an_earlier_unpacking_is_removed_only_until_an_interrupt(self):
         self.shard(1, b"one")
         stale = self.unpacked(1)
@@ -1454,11 +1473,15 @@ class Summary(unittest.TestCase):
         self.coverage("witness_etcd", sources=[
             {"shard": 1, "artifact": "fuzz-shard-witness_etcd-1", **counted}])
         self.assertEqual(self.verdicts()["witness_etcd"], [])
-        # A shard record without the count does not vouch for any corpus.
+        # A shard record without the count does not vouch for any corpus,
+        # not even a source that has none either.
         self.shard("witness_etcd", 1, corpus=None)
         self.assertEqual(self.verdicts()["witness_etcd"], [
             "the merge's corpus of shard 1 held 143,835 inputs of 519,875,759 bytes, "
             "its record counted no count"])
+        self.coverage("witness_etcd", sources=[{"shard": 1, "artifact": "fuzz-shard-witness_etcd-1"}])
+        self.assertEqual(self.verdicts()["witness_etcd"], [
+            "the merge's corpus of shard 1 held no count, its record counted no count"])
         self.assertFalse(self.summarize()["qualified"])
 
     def test_a_binary_the_build_did_not_make_does_not_qualify(self):
