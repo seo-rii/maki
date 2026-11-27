@@ -120,10 +120,28 @@ fn read_only() -> io::Error {
     )
 }
 
+/// What a lock file that a read-only open does not find means.
+#[derive(Clone, Copy)]
+enum Missing {
+    /// An open where the backing can be written creates it: a local root's
+    /// `rollback.lock`, a witness directory's `witness.lock` and a remote
+    /// root's operation lock.
+    Recreated,
+    /// No open creates it: the `rollback.lock` of a remote root's current
+    /// namespace. The writer that forks a namespace creates its lock before
+    /// the authority names it, and a writable open forks a new namespace
+    /// rather than open the current one ([`RollbackBacking::open_remote`]).
+    /// A root whose current namespace lacks it is a copy of that namespace,
+    /// such as a snapshot destination ([`RollbackBacking::snapshot_remote`]),
+    /// and a writable open of the copy claims a writer and forks the current
+    /// generation there, which moves the volume onto it.
+    NotTheLiveRoot,
+}
+
 /// `error`, met taking the lock file `name` shared, in words that say what
 /// it means for a read-only open. `holder` says who holds the lock when it
-/// is held.
-fn shared_lock_refusal(error: io::Error, name: &str, holder: &str) -> io::Error {
+/// is held, `missing` what it means when it is missing.
+fn shared_lock_refusal(error: io::Error, name: &str, holder: &str, missing: Missing) -> io::Error {
     match error.kind() {
         io::ErrorKind::WouldBlock => io::Error::new(
             error.kind(),
@@ -138,8 +156,20 @@ fn shared_lock_refusal(error: io::Error, name: &str, holder: &str) -> io::Error 
             format!(
                 "{name} is missing, and a read-only open cannot create it: without it a writer \
                  could start while the backing is read, so the backing is refused before its \
-                 manifest or any of its pages is read (opening the backing where it can be \
-                 written recreates the file)"
+                 manifest or any of its pages is read{}",
+                match missing {
+                    Missing::Recreated => {
+                        " (opening the backing where it can be written recreates the file)"
+                    }
+                    Missing::NotTheLiveRoot => {
+                        ". A writer creates its namespace's lock before the authority names the \
+                         namespace, so this root is probably not the volume's live root but a \
+                         copy of its current namespace, such as a `maki volume snapshot` \
+                         destination: do not attach it or open it to write, which would claim a \
+                         writer at the authority and move the volume onto this copy (its own \
+                         root would then no longer hold the authority's current generation)"
+                    }
+                }
             ),
         ),
         _ => error,
@@ -206,9 +236,14 @@ impl ReadOnlyRollbackBacking {
         // whole session.
         let disk_lock = disk
             .try_lock_shared_existing(LOCK)
-            .map_err(|error| shared_lock_refusal(error, LOCK, LOCAL_WRITER))?;
+            .map_err(|error| shared_lock_refusal(error, LOCK, LOCAL_WRITER, Missing::Recreated))?;
         let witness_lock = FileWitness::lock_read_only(witness.as_ref(), |error| {
-            shared_lock_refusal(error, "the witness directory's witness.lock", LOCAL_WRITER)
+            shared_lock_refusal(
+                error,
+                "the witness directory's witness.lock",
+                LOCAL_WRITER,
+                Missing::Recreated,
+            )
         })?;
         let listed = witness.clone();
         open_marker(disk.as_ref(), move || listed.list(""))?;
@@ -263,6 +298,7 @@ impl ReadOnlyRollbackBacking {
                     OPERATION_LOCK,
                     "an operation that changes the root: an attach while it opens, a takeover, \
                      a restore, a snapshot, GC or an enrollment",
+                    Missing::Recreated,
                 )
             })?;
         let record = remote::inspect(rpc.as_ref())?;
@@ -290,6 +326,7 @@ impl ReadOnlyRollbackBacking {
                     &lock,
                     "the writer session of this namespace: an attached volume, or a command \
                      that opened the volume to write",
+                    Missing::NotTheLiveRoot,
                 ))
             }
         };

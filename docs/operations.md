@@ -408,7 +408,16 @@ too:
 
 - `volume inspect`, `check` and `check --deep` all refuse a backing that a
   daemon or another writer holds (`… is held by another process`), and a
-  missing lock file (`… is missing, and a read-only open cannot create it`);
+  missing lock file (`… is missing, and a read-only open cannot create it`).
+  For the backing root's `rollback.lock`, the witness directory's
+  `witness.lock` and a remote root's `remote.operation.lock` the refusal
+  adds that opening the backing where it can be written recreates the file,
+  as attach does. No open recreates the `rollback.lock` of a remote root's
+  current namespace: a writer creates it when it forks the namespace, before
+  the authority names it, and attach forks a new namespace rather than open
+  the current one. Its refusal says instead that the root is probably not
+  the volume's live root but a copy of its current namespace, such as a
+  snapshot destination, and not to attach it or open it to write (below);
 - a daemon that starts while one of them runs fails to take its lock, and
   other read-only checks are admitted;
 - with a remote witness the authority's record is read again once both locks
@@ -416,12 +425,17 @@ too:
 - a configuration whose `backing.root` is a snapshot destination (the
   target of `maki volume snapshot`) is refused. While the authority still
   names the namespace the snapshot copied, the refusal is `… is missing, and
-  a read-only open cannot create it`: the snapshot copies the current
-  generation into a namespace of the same name without the `rollback.lock`
-  that a writer's namespace holds. Once the volume has been opened to write
-  again, the authority names a namespace the snapshot does not hold, and the
-  refusal is `this backing root does not hold the remote authority's current
-  generation …`.
+  a read-only open cannot create it`, with the warning above: the snapshot
+  copies the current generation into a namespace of the same name without
+  the `rollback.lock` that a writer's namespace holds. Do not attach that
+  configuration or run `maki volume snapshot` with it: either opens the
+  destination to write, which claims a writer at the authority and forks the
+  current generation inside the snapshot directory, so that the volume's own
+  root is then refused by every command as one that does not hold the
+  authority's current generation. Once the volume has been opened to write
+  again from its own root, the authority names a namespace the snapshot does
+  not hold, and the refusal is `this backing root does not hold the remote
+  authority's current generation …`.
 
 Every read is authenticated again against the manifest that was read. A local
 witness is read again before every operation, as a writer's operations read
