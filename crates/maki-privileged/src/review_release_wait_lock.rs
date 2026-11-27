@@ -294,6 +294,70 @@ fn a_record_replaced_during_the_wait_is_kept() {
     }
 }
 
+/// The attach that replaces the record during the wait can connect the same
+/// device, which the allocator hands out again once it shows no connection:
+/// the wait then ends at a look that shows the new attachment's backend
+/// identifier. The waiting helper must not report that as a disconnect that
+/// has not completed, whose advice to run cleanup again would tear the new
+/// attachment down: under the lock again it finds the replaced record and
+/// says so, and leaves the record and the connection alone.
+#[test]
+fn a_device_connected_again_for_a_replaced_record_ends_the_wait_as_replaced() {
+    for verb in ["detach", "cleanup"] {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let request = request();
+        let mut system = FakeSystem::default();
+        execute_with(&plan_attach(&request), Some(&state), &mut system).unwrap();
+        let disconnected = state.read("pg").unwrap().unwrap();
+        let nonce = std::fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap();
+        let replacing = BoundDeviceRecord {
+            connection_id: format!("maki-{}", nonce.trim()),
+            ..disconnected.clone()
+        };
+        system.steps.clear();
+        system.defer_disconnect = true;
+        let (root, record) = (fixture.0.clone(), replacing.clone());
+        system.on_sleep = Some(Box::new(move |system, sleep| {
+            if sleep != 3 {
+                return;
+            }
+            let state = state_at(&root);
+            let Ok(_attaching) = state.lock_until(Instant::now()) else {
+                return;
+            };
+            // The opener lets go; the other attach writes its record, then
+            // connects the device under its own identifier.
+            state.write(&record).unwrap();
+            system
+                .backends
+                .insert("/dev/nbd3".into(), record.connection_id.clone());
+        }));
+
+        let error = tear_down(verb, &request, &state, &mut system)
+            .expect_err("the waiting helper succeeded beside another attachment")
+            .to_string();
+
+        assert!(
+            error.contains("attach record was replaced while this helper waited"),
+            "{verb}: {error}"
+        );
+        assert!(!error.contains("cleanup retry"), "{verb}: {error}");
+        assert_eq!(state.read("pg").unwrap(), Some(replacing.clone()), "{verb}");
+        assert_eq!(
+            system.backends.get("/dev/nbd3"),
+            Some(&replacing.connection_id),
+            "{verb}"
+        );
+        assert_eq!(
+            system.steps,
+            ["umount", "lvm-deactivate", "nbd-disconnect"],
+            "{verb}"
+        );
+        assert_eq!(system.sleeps, vec![NBD_RELEASE_INTERVAL; 3], "{verb}");
+    }
+}
+
 /// Another cleanup of the same volume can run while the helper waits: once
 /// the device has let go it finds a disconnected record with nothing left of
 /// it and retires it. The waiting helper then finds no record under the
