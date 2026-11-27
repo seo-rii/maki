@@ -12,6 +12,38 @@ documents.
 
 ### Breaking changes
 
+- **A cleared slot whose header reads back as zeros over written bytes reads
+  EIO, not zeros** (AUD-211, 2026-11-27;
+  [#422](https://github.com/seo-rii/maki/pull/422)). A slot whose allocation
+  bit, and on a v3 volume its discard bit, is clear was read as a hole when
+  its 64 header bytes were all zero, whatever the rest of the slot held, so a
+  checkpointed unit whose newest allocation-map copy no longer decoded and
+  whose header sector read back as zeros (a remapped or zero-filled bad
+  sector) was served as zeros, and `maki check --deep` called the volume
+  `clean`. Such a slot is now a hole only if its header and its ciphertext
+  area (the `64 + max_ciphertext_size` bytes a slot write reaches) are all
+  zero below the end of the file. Otherwise the unit reads EIO (`unit N:
+  unlisted slot holds written bytes under an all-zero header …`) and the deep
+  check reports it as `unrecoverable`; that includes a stray byte in a
+  never-written slot's ciphertext area, which nothing tells apart from a
+  written slot whose header was zeroed. A trim of such a unit journals a
+  tombstone and retires it. A zeroed header under a journal record that the
+  checkpoint covers no longer refuses attach with "covered journal write at
+  sequence N has no visible slot": that unit reads EIO. On a volume without a
+  key canary, attach's search for a ciphertext to probe the key fails on such
+  a slot, where it took it for a hole. An uncataloged shard with an empty
+  allocation map and a short data file counts as truncated when a slot below
+  the end holds a ciphertext byte under a zeroed header, so its units past the
+  end read EIO. The deep check calls a slot write that a crash tore (its
+  header lost over surviving ciphertext, its journal record newer than the
+  checkpoint) `recoverable` where it said `clean`, and its warning for a
+  recoverable slot ends "recovery rewrites the slot, or discards the unit when
+  that record is a trim". A read of a hole in an existing shard reads the
+  slot's ciphertext area too (about 1.5 µs instead of 0.7 µs with a warm page
+  cache, in the pull request's measurement on ext4), and the deep check reads
+  nearly all of every shard file (about 20–21 s instead of 8–10 s for a full
+  64 GiB shard, scaled from a 2 GiB one). No format changes ([volume
+  lifecycle](docs/operations.md#volume-lifecycle), SPEC §22).
 - **`maki check` fails for a configuration that does not match the volume, and
   attach compares the configuration before it loads a provider credential**
   (AUD-194, 2026-11-25; [#399](https://github.com/seo-rii/maki/pull/399)).
@@ -81,7 +113,11 @@ documents.
   shard's creation also proves the size of every shard whose size no sync
   has proven, where an adopted shard whose size proof had failed could be
   cataloged as it was and read as EIO after a power loss (AUD-182)
-  ([architecture](docs/architecture.md), SPEC §14, §22).
+  ([architecture](docs/architecture.md), SPEC §14, §22). *Changed on
+  2026-11-27 (AUD-211, [#422](https://github.com/seo-rii/maki/pull/422)): for
+  a short data file open reads each slot's header and ciphertext area, where
+  it read 64 bytes, and a written byte of the ciphertext area under a zeroed
+  header also makes the file a truncated one.*
 - **An option given where `maki` or `maki-witness` expects a path exits 2**
   (AUD-190, 2026-11-25; [#393](https://github.com/seo-rii/maki/pull/393)).
   With the configuration forgotten, `maki check --deep`, `maki status
@@ -663,7 +699,14 @@ documents.
   cause: that target's entry function spawns a thread for every input, under
   which an AddressSanitizer build grows; a fix is pending, so
   `nbd_handshake` is not qualified ([fuzz
-  qualification](docs/testing.md#fuzz-qualification)).
+  qualification](docs/testing.md#fuzz-qualification)). *Changed on 2026-11-27
+  (AUD-223, AUD-224, [#421](https://github.com/seo-rii/maki/pull/421),
+  [#424](https://github.com/seo-rii/maki/pull/424)): the campaign finished and
+  qualified eleven targets. `nbd_handshake` no longer starts a thread per
+  input, and the summary's "qualified" for `witness_etcd`, `http_response`,
+  `grpc_response` and `helper_reports` was wrong, since their shard corpora
+  never reached their merges; those five were dispatched again, and that run
+  had not finished when the tenth round was recorded.*
 - **CI requires the IPv6 loopback address for the connect tests and runs a
   packet-drop test as root** (AUD-206, 2026-11-27;
   [#414](https://github.com/seo-rii/maki/pull/414)). For developers:
@@ -866,7 +909,10 @@ documents.
   *Changed on 2026-11-25 (AUD-195,
   [#403](https://github.com/seo-rii/maki/pull/403)): on Linux a check of a
   backing root it may not write states `unproven` in place of `clean` and
-  `recoverable`.*
+  `recoverable`.* *Corrected on 2026-11-27 (AUD-217,
+  [#422](https://github.com/seo-rii/maki/pull/422)): a deep check that stops
+  before its verdict (the volume lock held, no valid checkpoint state copy, a
+  superblock that no longer loads) prints no verdict line and exits 1.*
 - **Debian package safety**: `prerm` refuses removal while a volume is
   attached (upgrades are exempt), the builder verifies every artifact's ELF
   architecture against `--architecture`, and native library dependencies are
@@ -909,6 +955,100 @@ documents.
 
 ### Changed
 
+- **A remote read-only command holds what it logs until the authority answers,
+  and the refusal of a root without a remote lock file no longer sends the
+  operator to open a copy to write** (AUD-212, AUD-213, 2026-11-27;
+  [#418](https://github.com/seo-rii/maki/pull/418)). With a remote witness,
+  `maki check`, `maki check --deep` and `maki volume inspect` wrote what they
+  logged while they read (the store's warnings, such as `shard data file not
+  listed by the loaded catalog copy; adopting it`, and the view's own
+  `read-only rollback session stopped: …`) to stderr at once, also when the
+  authority then answered that it no longer selected what was read. Those
+  lines are now held back from the moment the view is open and written, in
+  order, once the authority has answered that it still selects what was read,
+  before the report or the error. When it has not (it changed, answered so
+  that the view stopped, or could not be asked), they are dropped, any warning
+  about the connections to the authority among them, and `warning: dropped N
+  log lines held back since the volume was opened: the remote authority did
+  not confirm that it still selects what was read` comes before the error. At
+  most 16 MiB of log text is kept (`log lines held back beyond 16 MiB of log
+  text were not kept`), and lines that a panic leaves unreleased are dropped
+  with `log lines held back were dropped unwritten: nothing released them`. A
+  command with a local witness or none holds nothing, and exit statuses,
+  reports and the number of inspections are unchanged. The read-only refusal
+  of a missing lock file said that opening the backing where it can be written
+  recreates the file, which no open does for the `rollback.lock` of a remote
+  root's current namespace: on a `maki volume snapshot` destination, which
+  holds that namespace without its lock, following it with attach or `volume
+  snapshot` claimed a writer and moved the volume onto the copy, after which
+  its own root was refused as one that does not hold the authority's current
+  generation. That refusal now says that the root is probably a copy, such as
+  a snapshot destination, and not to attach it or open it to write; the
+  refusal of a remote root without `remote.operation.lock` says that it is
+  either the live root with the file removed or a copy made without its lock
+  files, and not to attach a copy or open it to write. A local root's refusals
+  are unchanged. The operations and remote witness guides say how to put a
+  volume that was moved onto a copy back on its own root. For developers,
+  `maki_nbdkit::daemon::read_failure` and `still_current` return `Reported`
+  instead of `String`, and `maki_core::logging` gains `hold` ([checking a
+  backing that cannot be
+  written](docs/operations.md#checking-a-backing-that-cannot-be-written),
+  [snapshot, takeover and
+  restore](docs/remote-witness-service.md#snapshot-takeover-and-restore),
+  maki(8), SPEC §27).
+- **Attach probes a set's endpoints at the same time, and the probes extend
+  the service's start deadline** (AUD-216, 2026-11-27;
+  [#419](https://github.com/seo-rii/maki/pull/419)). Attach probed the
+  endpoints of a remote provider one after another, so each endpoint that
+  never answered delayed the next by about three times `timeout` (six over
+  WebSocket) and two `retry.initial_delay`s: at the default 10 s, three such
+  WebSocket endpoints listed before a healthy one, six over HTTP or gRPC, or
+  two at a 30 s `timeout`, held its probe past `maki@`'s
+  `TimeoutStartSec=180`, and systemd would stop the start. The endpoints are
+  now probed at once: endpoints that do not answer cost the attach about one
+  probe however many are listed (60 s for three WebSocket endpoints at 10 s in
+  the pull request's test), and the attach still waits until every probe has
+  ended. Their key canary checks still run one at a time in configuration
+  order, so the same endpoint establishes, rewrites or verifies the canary as
+  before, and endpoints that pass their self-test and then fail their canary
+  check with transport failures still delay the ones after them, each by up to
+  its own probe. Every endpoint is now sent its self-test requests at the
+  start, also one listed after an endpoint whose probe refuses the attach,
+  which was never contacted before. The refusals, their texts and their order
+  (configuration order) are unchanged, and a lone endpoint is probed as
+  before. With `NOTIFY_SOCKET` set, each probe request that ends, answered or
+  failed, and each request of the cross-endpoint check after the probes sends
+  `EXTEND_TIMEOUT_USEC=180000000` with `STATUS=Probing crypto endpoints`, at
+  most once every 30 s, a limit it shares with recovery's extension. The
+  deadline still expires when no request ends for about 150 s, and the
+  engine's self-test after the probes extends nothing. A failed notification
+  fails the start as during recovery, with "startup progress notification
+  failed" for both, where recovery's said "recovery progress notification
+  failed" ([WebSocket and gRPC
+  contracts](docs/configuration.md#websocket-and-grpc-contracts), [data-plane
+  readiness](docs/operations.md#data-plane-readiness), SPEC §10, §34).
+- **A TLS failure inside a remote call is handled where its error is
+  recognised** (AUD-214, AUD-215, 2026-11-27;
+  [#417](https://github.com/seo-rii/maki/pull/417)). Over WebSocket, a TLS
+  protocol failure on an established connection while a request waits for its
+  reply (a record that does not decrypt, a fatal alert from the server)
+  returns `endpoint fatal: websocket TLS authentication or protocol failure`,
+  where it returned `retryable: connection lost: closed`: the endpoint's
+  circuit opens at once, and a retry-safe provider no longer sends the request
+  again on a new connection within the call. The request still counts as sent,
+  so the dispatcher fails it over only for a retry-safe provider. A connection
+  lost otherwise, also one closed without `close_notify`, stays retryable.
+  Over gRPC, a TLS failure of tonic's reconnect inside a cached channel now
+  retires the channel also when no call had completed on it and its first 4 ×
+  `timeout` had not passed, so the next call opens a new connection through
+  Maki's own connection attempt, whose failure is marked unsent and fails over
+  also for a provider that is not retry-safe; before, such a channel was kept,
+  and the next call's TLS failure counted as sent. A TLS failure on an
+  established gRPC connection, a TLS 1.3 server's refusal of the client
+  certificate among them, is still a retryable status counted as sent, which
+  the documents now say ([provider error
+  signals](docs/configuration.md#provider-error-signals), [known
+  limitations](docs/status.md#known-limitations), SPEC §18).
 - **With a remote witness, attach compares the configuration before it claims
   a writer, and a read-only command asks the authority three or four times
   instead of before every backing operation** (AUD-207, 2026-11-27;
@@ -1363,6 +1503,45 @@ documents.
 
 ### Fixed
 
+- **2026-11-27 tenth round: the fuzz qualification's verdicts** (AUD-220,
+  AUD-223, AUD-224; [#416](https://github.com/seo-rii/maki/pull/416),
+  [#421](https://github.com/seo-rii/maki/pull/421),
+  [#424](https://github.com/seo-rii/maki/pull/424)). For developers.
+  `fuzz_campaign.py merge` records the inputs libFuzzer's merge wrote and the
+  attempts its log shows, and the merge fails on a crash, timeout,
+  out-of-memory or leak input, on a second attempt and on a log that shows
+  none: libFuzzer's `-merge=1` exits 0 after an input fails its inner process
+  and leaves the input out, so such a merge had qualified its target. The fuzz
+  job uploads each shard's output as one archive (`shard.tar` in
+  `fuzz-shard-<target>-<n>`), and the merge job the merged corpus as
+  `merged.tar` in `fuzz-corpus-<target>`; the merge requires
+  `--planned-shards`, reads each planned shard's archive and fails without a
+  corpus of every one, and the summary checks the merge's sources against the
+  plan and each merged corpus against its shard record's count.
+  `actions/upload-artifact@v4` had failed with `Maximum call stack size
+  exceeded` on the shard corpora of four targets (143,835 to 405,750 files),
+  whose merges then held their seeds alone and which the summary of the first
+  24 CPU-hour campaign (run 45983119347) called qualified. `nbd_handshake`'s
+  entry function runs the server side of its socket pair on the calling
+  thread, where it started a thread for every input, under which every process
+  of that campaign's AddressSanitizer build ran out of memory after about 10
+  million executions ([fuzz
+  qualification](docs/testing.md#fuzz-qualification)).
+- **2026-11-27 tenth round: tests** (AUD-221, AUD-222, AUD-225;
+  [#416](https://github.com/seo-rii/maki/pull/416),
+  [#423](https://github.com/seo-rii/maki/pull/423)). For developers.
+  `documented_quickstart.py --stop-once` requires the mark its shim leaves, so
+  a bootstrap whose first run failed before the shimmed command no longer
+  passes as stopped there. Rules of the validation scripts that no test held
+  now have tests: a plan without targets, the coverage run's status, a round
+  after one that failed, the stopped bootstrap's record, connection and reset,
+  a leftover backend or mount after the stop together, and the guest runner
+  phase's and the `run` command's exit statuses. Refused test endpoints are
+  sockets that are bound and never listen, held for the whole test, where a
+  listener was dropped and its port could be handed to a parallel test's
+  `127.0.0.1:0` bind, which failed two tests of maki-crypto-websocket's
+  `review_unsent_failover.rs` in CI ([automated
+  CI](docs/testing.md#automated-ci)).
 - **2026-11-25 ninth round: refusals of the rollback-protected backing**
   (AUD-183 to AUD-186; [#391](https://github.com/seo-rii/maki/pull/391)).
   `maki volume gc` refuses a remote backing root that does not hold the
@@ -1904,7 +2083,11 @@ observable behaviour:
   verifies the unsynced records before syncing again (F01 / BUG-021).
 - Media damage to a shard data file (truncation, damaged slot headers on
   cleared allocation bits) reads as EIO, never as zeros (S-01 residuals,
-  `db39faa`).
+  `db39faa`). *Corrected on 2026-11-27 (AUD-211,
+  [#422](https://github.com/seo-rii/maki/pull/422)): a header that read back
+  as zeros over the slot's surviving ciphertext still read as zeros, and reads
+  EIO since; the cases that still read as zeros are in the [remediation
+  log](docs/review-remediation.md#not-closed-in-the-tenth-round).*
 - The attach helper rolls back observed steps on failure, refuses foreign
   mounts, verifies the backend identity before every disconnect, and drains
   control sessions on shutdown (BUG-015, BUG-018, O-07, F06).
@@ -1915,6 +2098,24 @@ observable behaviour:
 
 ### Documentation
 
+- **2026-11-27 tenth round** (AUD-217 to AUD-219;
+  [#422](https://github.com/seo-rii/maki/pull/422),
+  [#416](https://github.com/seo-rii/maki/pull/416),
+  [#420](https://github.com/seo-rii/maki/pull/420)). The operations guide,
+  maki(8) and maki-check(8) say that a deep check that stops before its
+  verdict (the volume lock held, a read-only check without `volume.lock`, a
+  superblock that no longer loads, no valid checkpoint state copy, a root with
+  no superblock file) prints no verdict line and exits 1, where the guide said
+  that every deep report states one. The testing guide says that a qualifying
+  process's rounds may end early, where it said that every round ran to its
+  time limit. The third follow-up round's records change added notes to this
+  file's entry for #398 and to the remediation log's AUD-197 row saying that
+  the wait no longer holds the attach lock. The records change of the tenth
+  round updates the testing guide's and the background storage page's
+  statements about the 24 CPU-hour campaign and adds a development guide trap
+  about ports that a dropped listener frees. `v0.1.0-rc.2` was tagged at
+  `92d4dd4` on 2026-11-26, before the second follow-up round, and no later
+  release candidate had been tagged when this was written.
 - **2026-11-27 third follow-up round** (AUD-209;
   [#412](https://github.com/seo-rii/maki/pull/412)). The RHEL guide's install
   block checks for the SELinux module with `! rpm -q nbdkit-selinux`: the line
