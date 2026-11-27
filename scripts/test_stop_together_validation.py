@@ -14,6 +14,23 @@ from unittest import mock
 
 
 DRIVER = Path(__file__).with_name("stop-together-validation.py")
+# The MESSAGE_IDs of systemd's catalog: a stop job has begun, has finished;
+# a unit has succeeded, has failed.
+STOPPING = "de5b426a63be47a7b6ac3eaac82e2f6f"
+STOPPED = "9d1aaa27d60140bd96365438aad20286"
+SUCCEEDED = "7ad2d189f7e94e70a38c781354912448"
+FAILED = "d9b373ed55a64feb8242e02dbe79a49c"
+
+
+def entry(unit, seconds, message_id, **fields):
+    """A journal entry of PID 1 about `unit`, as `journalctl -o json` prints it."""
+    return {"__MONOTONIC_TIMESTAMP": str(int(seconds * 1e6)), "_PID": "1", "UNIT": unit,
+            "MESSAGE_ID": message_id, "MESSAGE": f"{message_id} {unit}",
+            **{name: str(value) for name, value in fields.items()}}
+
+
+def journal(*entries):
+    return "".join(json.dumps(item) + "\n" for item in entries)
 
 
 def load_driver():
@@ -80,21 +97,45 @@ class DocumentedVolumes(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "names no NBD device"):
                 self.driver.device_of("stop1", state)
 
-    def test_the_stop_times_are_systemds_monotonic_timestamps(self):
-        shown = ("ActiveExitTimestampMonotonic=100250000\n"
-                 "InactiveEnterTimestampMonotonic=110500000\nResult=success\n")
-        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout=shown))
-        self.assertEqual(self.driver.unit_times("stop1", 100.0, run),
+    def test_the_stop_times_are_the_journals_for_the_stop_job_after_the_request(self):
+        # systemd forgets a unit that has stopped, and its timestamps with
+        # it; the journal of PID 1 keeps the stop job's messages.
+        unit = "maki-attach@stop1.service"
+        found = journal(
+            # A stop of the same unit before the request is not this one.
+            entry(unit, 50.0, STOPPING, JOB_ID=7, JOB_TYPE="stop"),
+            entry(unit, 50.5, STOPPED, JOB_ID=7, JOB_TYPE="stop", JOB_RESULT="done"),
+            entry(unit, 100.25, STOPPING, JOB_ID=42, JOB_TYPE="stop"),
+            entry(unit, 110.49, SUCCEEDED),
+            entry(unit, 110.5, STOPPED, JOB_ID=42, JOB_TYPE="stop", JOB_RESULT="done"))
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout=found))
+        self.assertEqual(self.driver.journal_times("stop1", 100.0, run, lambda _: None),
                          {"stop_began": 0.25, "stop_ended": 10.5, "stop_seconds": 10.25,
-                          "result": "success"})
-        self.assertEqual(run.call_args.args[0][-1], "maki-attach@stop1.service")
-        for broken in ("ActiveExitTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=5\n",
-                       "ActiveExitTimestampMonotonic=9\nInactiveEnterTimestampMonotonic=5\n",
-                       "Result=success\n"):
-            with self.subTest(shown=broken):
-                run.return_value = subprocess.CompletedProcess([], 0, stdout=broken)
-                with self.assertRaises(RuntimeError):
-                    self.driver.unit_times("stop1", 100.0, run)
+                          "result": "success", "job_result": "done"})
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "journalctl")
+        for needed in ("--boot", "--output=json", "--no-pager", "_PID=1", f"UNIT={unit}"):
+            self.assertIn(needed, argv)
+        # A unit that failed its stop is reported with its result.
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=journal(
+            entry(unit, 100.25, STOPPING, JOB_ID=42, JOB_TYPE="stop"),
+            entry(unit, 110.49, FAILED, UNIT_RESULT="exit-code"),
+            entry(unit, 110.5, STOPPED, JOB_ID=42, JOB_TYPE="stop", JOB_RESULT="done")))
+        self.assertEqual(self.driver.journal_times("stop1", 100.0, run, lambda _: None)["result"],
+                         "exit-code")
+        # Without a stop job begun and finished after the request there are
+        # no times, also once the journal has been looked at again.
+        for entries in ((), (entry(unit, 50.0, STOPPING, JOB_ID=7),
+                             entry(unit, 50.5, STOPPED, JOB_ID=7, JOB_RESULT="done")),
+                        (entry(unit, 100.25, STOPPING, JOB_ID=42),),
+                        (entry(unit, 100.25, STOPPING, JOB_ID=42),
+                         entry(unit, 110.5, STOPPED, JOB_ID=43, JOB_RESULT="done"))):
+            with self.subTest(entries=entries):
+                run.reset_mock()
+                run.return_value = subprocess.CompletedProcess([], 0, stdout=journal(*entries))
+                with self.assertRaisesRegex(RuntimeError, "journal shows no"):
+                    self.driver.journal_times("stop1", 100.0, run, lambda _: None)
+                self.assertGreater(run.call_count, 1)
 
 
 class FakeOpener:
@@ -147,6 +188,12 @@ class StopTogether(unittest.TestCase):
         # it entered inactive (GitHub's run of 2026-11-27).
         self.deactivating = {1: 2, 2: 4, 3: 6}
         self.ended = "inactive"
+        # Once an attach unit is inactive systemd garbage-collects it, and
+        # `systemctl show` then loads a fresh one: every timestamp 0 and
+        # Result=success (GitHub's run 45969555304). A failed unit stays
+        # loaded while it is failed. The journal of PID 1 keeps the stop
+        # job's messages, the last ones this many looks late.
+        self.journal_lag = {1: 0, 2: 0, 3: 0}
 
     def host(self, argv, **_):
         self.events.append(argv)
@@ -156,6 +203,25 @@ class StopTogether(unittest.TestCase):
                     (self.state / f"{name}.nbd").unlink()
                     (self.sysfs / f"nbd{index}/backend").unlink()
             return subprocess.CompletedProcess(argv, self.stop_status)
+        if argv[0] == "journalctl":
+            unit = next(word[len("UNIT="):] for word in argv if word.startswith("UNIT="))
+            index = int(unit[len("maki-attach@stop"):-len(".service")])
+            entries = [entry(unit, 50.0, STOPPING, JOB_ID=10 + index, JOB_TYPE="stop"),
+                       entry(unit, 50.5, STOPPED, JOB_ID=10 + index, JOB_TYPE="stop",
+                             JOB_RESULT="done"),
+                       entry(unit, 100 + index * 0.01, STOPPING, JOB_ID=100 + index,
+                             JOB_TYPE="stop")]
+            if self.deactivating[index] == 0 and self.journal_lag[index] == 0:
+                if self.ended == "failed":
+                    entries.append(entry(unit, 100 + index * 10.2 - 0.001, FAILED,
+                                         UNIT_RESULT=self.result))
+                else:
+                    entries.append(entry(unit, 100 + index * 10.2 - 0.001, SUCCEEDED))
+                entries.append(entry(unit, 100 + index * 10.2, STOPPED, JOB_ID=100 + index,
+                                     JOB_TYPE="stop", JOB_RESULT="done"))
+            elif self.deactivating[index] == 0:
+                self.journal_lag[index] -= 1
+            return subprocess.CompletedProcess(argv, 0, stdout=journal(*entries))
         attach = argv[-1].startswith("maki-attach@stop")
         index = int(argv[-1][len("maki-attach@stop"):-len(".service")]) if attach else None
         stopping = attach and self.deactivating[index] > 0
@@ -166,6 +232,11 @@ class StopTogether(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, stdout=(self.ended if attach
                                                                  else "inactive") + "\n")
         if argv[:2] == ["systemctl", "show"]:
+            if not stopping and self.ended == "inactive":
+                # Garbage-collected: a fresh unit.
+                return subprocess.CompletedProcess(argv, 0, stdout=(
+                    "ActiveExitTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=0\n"
+                    "Result=success\n"))
             ended = 0 if stopping else (100 + index * 10.2) * 1e6
             return subprocess.CompletedProcess(argv, 0, stdout=(
                 f"ActiveExitTimestampMonotonic={(100 + index * 0.01) * 1e6:.0f}\n"
@@ -219,7 +290,8 @@ class StopTogether(unittest.TestCase):
                 if name == "stop":
                     self.stop_status = value
                 elif name == "result":
-                    self.result = value
+                    # A unit whose stop fails ends failed, and stays loaded.
+                    self.ended, self.result = "failed", value
                 elif name == "opener":
                     opener = {"status": value}
                 else:
@@ -242,6 +314,18 @@ class StopTogether(unittest.TestCase):
             self.assertGreaterEqual(len([look for look in looks if look < read]), 2 * index + 1)
         self.assertEqual([volume["result"] for volume in report["volumes"]], ["success"] * 3)
         self.assertEqual(report["stop_command_seconds"], 0.0)
+
+    def test_the_times_survive_the_units_garbage_collection_and_a_late_journal(self):
+        # The run of 45969555304: every attach unit had stopped, systemd had
+        # forgotten it, and its stop's last messages may reach the journal
+        # after it shows the unit inactive.
+        self.journal_lag = {1: 0, 2: 3, 3: 1}
+        report, printed = self.stop()
+        self.assertEqual([(volume["stop_began"], volume["stop_ended"], volume["stop_seconds"])
+                          for volume in report["volumes"]],
+                         [(0.01, 10.2, 10.19), (0.02, 20.4, 20.38), (0.03, 30.6, 30.57)])
+        self.assertEqual([volume["result"] for volume in report["volumes"]], ["success"] * 3)
+        self.assertNotIn("unknown", printed)
 
     def test_an_attach_unit_that_does_not_stop_or_fails_is_reported(self):
         for case, message in (("never", "maki-attach@stop2.service did not stop within 300 s"),
