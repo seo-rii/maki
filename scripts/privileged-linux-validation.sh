@@ -34,6 +34,7 @@ install_missing=false
 preflight=false
 discard=false
 kill_daemon=false
+prebuilt_dir=""
 
 usage() {
     cat <<'EOF'
@@ -41,7 +42,7 @@ Usage:
   scripts/privileged-linux-validation.sh --preflight [--device /dev/nbdN]
   scripts/privileged-linux-validation.sh --background [--install-missing] \
       --device /dev/nbdN --confirm-wipe /dev/nbdN [--work-root DIR] [--discard] \
-      [--kill-daemon]
+      [--kill-daemon] [--prebuilt DIR]
 
 Options:
   --device PATH          Dedicated kernel NBD device (default: /dev/nbd15).
@@ -62,6 +63,10 @@ Options:
                          the mapping by hand, require cleanup's disconnected
                          recovery to retire the record, attach a fourth
                          time, read the data back and detach.
+  --prebuilt DIR         Use DIR's maki, maki-attach and libmaki_nbdkit.so
+                         (copied into the run directory) instead of building
+                         them from the source snapshot; Cargo and rustc are
+                         then not needed.
   --preflight            Show checks and missing commands without sudo or I/O.
   -h, --help             Show this help.
 
@@ -123,6 +128,11 @@ while (($#)); do
             kill_daemon=true
             shift
             ;;
+        --prebuilt)
+            (($# >= 2)) || die "--prebuilt requires a value"
+            prebuilt_dir="$2"
+            shift 2
+            ;;
         --run-dir)
             (($# >= 2)) || die "--run-dir requires a value"
             run_dir="$2"
@@ -145,11 +155,25 @@ nbd_target="$(basename "$device")"
 readonly nbd_target
 ((nbd_index <= 255)) || die "NBD index is unreasonably large: $nbd_index"
 
+# Prebuilt artifacts are named by an absolute path, which the worker started
+# from its source snapshot inherits, and must all be there.
+readonly prebuilt_artifacts=(maki maki-attach libmaki_nbdkit.so)
+if [[ -n "$prebuilt_dir" ]]; then
+    prebuilt_dir="$(readlink -f -- "$prebuilt_dir")" || die "--prebuilt must name a directory"
+    [[ -d "$prebuilt_dir" ]] || die "--prebuilt must name a directory"
+    for artifact in "${prebuilt_artifacts[@]}"; do
+        [[ -f "$prebuilt_dir/$artifact" ]] || die "--prebuilt $prebuilt_dir has no $artifact"
+    done
+fi
+
 required_commands=(
-    blkid blockdev cargo dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
-    modprobe nbdinfo nbdkit nm pvcreate pvremove pvs python3 rustc setpriv sha256sum sqlite3
+    blkid blockdev dd df findmnt fio git lsblk lvcreate lvremove lvs mkfs.xfs
+    modprobe nbdinfo nbdkit nm pvcreate pvremove pvs python3 setpriv sha256sum sqlite3
     sudo sync vgchange vgcreate vgremove vgs
 )
+if [[ -z "$prebuilt_dir" ]]; then
+    required_commands+=(cargo rustc)
+fi
 
 if [[ "$discard" == true ]]; then
     required_commands+=(fstrim)
@@ -172,6 +196,11 @@ if [[ "$preflight" == true ]]; then
     [[ "$background" == false ]] || die "--preflight and --background are mutually exclusive"
     printf 'Repository: %s\n' "$REPO_ROOT"
     printf 'Device:     %s\n' "$device"
+    if [[ -n "$prebuilt_dir" ]]; then
+        printf 'Artifacts:  prebuilt in %s\n' "$prebuilt_dir"
+    else
+        printf 'Artifacts:  built from the source snapshot\n'
+    fi
     printf 'Scope:      kernel NBD -> raw fio -> LVM -> XFS -> file fio/SQLite\n'
     printf '            -> detach with an opener -> attach -> data read back\n'
     if [[ "$kill_daemon" == true ]]; then
@@ -237,6 +266,7 @@ if [[ -z "$run_dir" ]]; then
     [[ "$install_missing" == false ]] || child_args+=(--install-missing)
     [[ "$discard" == false ]] || child_args+=(--discard)
     [[ "$kill_daemon" == false ]] || child_args+=(--kill-daemon)
+    [[ -z "$prebuilt_dir" ]] || child_args+=(--prebuilt "$prebuilt_dir")
     snapshot_runner="$run_dir/source/scripts/privileged-linux-validation.sh"
     if [[ "$background" == false ]]; then
         exec > >(tee -a "$run_dir/run.log") 2>&1
@@ -645,13 +675,23 @@ mapfile -t still_missing < <(missing_commands)
 [[ "$(fio --version)" =~ ^fio-[0-9] ]] || die "fio resolves to an unexpected executable: $(fio --version)"
 pass "required native tools available"
 
+readonly build_target_dir="$run_dir/target"
+if [[ -n "$prebuilt_dir" ]]; then
+    # Bind this run to its own copies, as a build binds it to its own outputs:
+    # a later change in the given directory does not reach the run.
+    log "copying the prebuilt release binaries and nbdkit plugin from $prebuilt_dir"
+    release_dir="$build_target_dir/prebuilt"
+    mkdir -p "$release_dir"
+    install -m 0755 "$prebuilt_dir/maki" "$prebuilt_dir/maki-attach" "$release_dir/"
+    install -m 0644 "$prebuilt_dir/libmaki_nbdkit.so" "$release_dir/"
+    printf 'prebuilt %s\n' "$prebuilt_dir" >"$run_dir/artifact-origin"
+else
 log "building release binaries and nbdkit plugin"
 # Bind this run to its own build outputs, even when Cargo configuration or
 # environment variables select a shared directory or a cross-compilation target.
 native_target="$(cd "$REPO_ROOT" && rustc -vV | sed -n 's/^host: //p')"
 [[ "$native_target" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "cannot determine native Rust target"
 readonly native_target
-readonly build_target_dir="$run_dir/target"
 log "native build target: $native_target ($build_target_dir)"
 (
     cd "$REPO_ROOT"
@@ -660,14 +700,18 @@ log "native build target: $native_target ($build_target_dir)"
         --target-dir "$build_target_dir" --target "$native_target" \
         -p maki -p maki-attach -p maki-nbdkit
 )
-readonly maki_bin="$build_target_dir/$native_target/release/maki"
-readonly attach_bin="$build_target_dir/$native_target/release/maki-attach"
-readonly plugin_path="$build_target_dir/$native_target/release/libmaki_nbdkit.so"
+release_dir="$build_target_dir/$native_target/release"
+printf 'built from the source snapshot for %s\n' "$native_target" >"$run_dir/artifact-origin"
+fi
+readonly release_dir
+readonly maki_bin="$release_dir/maki"
+readonly attach_bin="$release_dir/maki-attach"
+readonly plugin_path="$release_dir/libmaki_nbdkit.so"
 [[ -x "$maki_bin" && -x "$attach_bin" && -f "$plugin_path" ]] ||
     die "release artifacts are incomplete"
 nm -D --defined-only "$plugin_path" | grep -Eq '[[:space:]]T[[:space:]]plugin_init$' ||
     die "plugin_init is not exported by $plugin_path"
-(cd "$build_target_dir/$native_target/release" &&
+(cd "$release_dir" &&
     sha256sum maki maki-attach libmaki_nbdkit.so) >"$run_dir/artifact-sha256"
 pass "release binaries and plugin_init export"
 
@@ -1160,6 +1204,18 @@ require_released() {
     pass "$1 left no mount, holder, connection or attach record"
 }
 
+# Whether process $1 still runs, read from /proc: a zombie the shell has not
+# reaped yet has gone. Unlike kill -0 this needs no permission to signal it.
+# sudo checks its policy with real, effective and saved uid 0 (sudoers'
+# PERM_ROOT), so for that moment the invoking user's kill -0 on its PID fails
+# with EPERM although it runs: in the Debian 12 guest the wait for the opener
+# stopped so at its first look.
+process_running() {
+    local stat
+    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+    [[ "${stat##*) }" != Z* ]]
+}
+
 # Start an opener of the device (privileged_validation_opener.py) and wait
 # until it holds the device.
 hold_device_open() {
@@ -1173,7 +1229,7 @@ hold_device_open() {
     opener_pid=$!
     for _ in $(seq 1 200); do
         grep -q ' holding the device open' "$run_dir/detach-opener.txt" && return 0
-        kill -0 "$opener_pid" 2>/dev/null || break
+        process_running "$opener_pid" || break
         sleep 0.05
     done
     cat "$run_dir/detach-opener.txt" >&2

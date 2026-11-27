@@ -6,12 +6,15 @@ read them (each ```bash fence; the bootstrap is the first-volume guide's block
 in its section 1): the Debian guide's "Install the Maki package" section, then
 the quick start, whose step 4 is the bootstrap. The quick start's ```toml
 block is the volume configuration that its step 2 installs from `demo.toml`.
+With `--installation rhel` the RHEL 9 guide's "Repositories" and "Install the
+Maki package" sections come first instead; that guide sends its reader on to
+the same quick start.
 
-    python3 -B scripts/documented_quickstart.py DIRECTORY
+    python3 -B scripts/documented_quickstart.py [--installation rhel] [--stop-once COMMAND] DIRECTORY
 
 writes DIRECTORY/demo.toml and DIRECTORY/quickstart.sh. Run the program as
-root in DIRECTORY, beside the package as `maki.deb`, on a disposable host:
-`sudo bash quickstart.sh`. With `--stop-once mkfs.xfs` or `--stop-once
+root in DIRECTORY, beside the package as `maki.deb` (`maki.rpm` for RHEL), on
+a disposable host: `sudo bash quickstart.sh`. With `--stop-once mkfs.xfs` or `--stop-once
 vgchange`, the bootstrap's first run has a shim first on PATH that fails
 that command, and the program requires that the run stopped there with its
 record and the device showing its connection, then runs the same block again
@@ -50,15 +53,20 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 GUIDES = ROOT / "docs" / "getting-started"
 INSTALLATION = GUIDES / "installation-debian.md"
+RHEL_INSTALLATION = GUIDES / "installation-rhel.md"
 QUICKSTART = GUIDES / "quickstart.md"
 FIRST_VOLUME = GUIDES / "first-volume.md"
 INSTALL_SECTION = "Install the Maki package"
+# The sections an operator runs on the host, in order, and the package the
+# install step names; building the package belongs to the build host.
+INSTALLATIONS = {"debian": ((INSTALL_SECTION,), "maki.deb"),
+                 "rhel": (("Repositories", INSTALL_SECTION), "maki.rpm")}
 PROVISION_STEP = "4. Provision LVM and XFS on the export"
 BOOTSTRAP_SECTION = "1. Provision and record the layout"
 
 PRELUDE = """\
 # Written by scripts/documented_quickstart.py from the guides. Run it as root
-# in the directory that holds maki.deb and demo.toml, on a disposable host.
+# in the directory that holds @PACKAGE@ and demo.toml, on a disposable host.
 set -e -o pipefail
 step=''
 documented_stop() {
@@ -69,6 +77,10 @@ documented_stop() {
 }
 trap documented_stop EXIT
 """
+
+
+def installation_guide(installation):
+    return INSTALLATION if installation == "debian" else RHEL_INSTALLATION
 
 
 def sections(path):
@@ -88,10 +100,12 @@ def section(path, heading):
     return found[0]
 
 
-def steps():
+def steps(installation="debian"):
     """(label, block) for each block, in the order an operator runs them."""
-    found = [(f"{INSTALLATION.name}, {INSTALL_SECTION}, block {index}", block)
-             for index, block in enumerate(fenced(section(INSTALLATION, INSTALL_SECTION), "bash"), 1)]
+    guide = installation_guide(installation)
+    found = [(f"{guide.name}, {heading}, block {index}", block)
+             for heading in INSTALLATIONS[installation][0]
+             for index, block in enumerate(fenced(section(guide, heading), "bash"), 1)]
     bootstrap = fenced(section(FIRST_VOLUME, BOOTSTRAP_SECTION), "bash")
     if len(bootstrap) != 1:
         raise ValueError(f"{FIRST_VOLUME.name} section 1 has {len(bootstrap)} bash blocks")
@@ -348,7 +362,7 @@ def interrupted(found, command):
     return steps
 
 
-def program(found, stop_once=None):
+def program(found, installation="debian", stop_once=None):
     """One Bash program that runs each (label, block) in order in one shell.
 
     `set -e -o pipefail` stops at a failed command or pipeline; one inside an
@@ -375,7 +389,7 @@ def program(found, stop_once=None):
                              "there either: read it and add it, or reword the block")
     if stop_once is not None:
         found = interrupted(found, stop_once)
-    lines = [PRELUDE]
+    lines = [PRELUDE.replace("@PACKAGE@", INSTALLATIONS[installation][1])]
     for number, (label, block) in enumerate(found, 1):
         lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")
         lines.append("printf '\\n==> %s\\n' \"$step\"\n")
@@ -389,6 +403,8 @@ def program(found, stop_once=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--installation", choices=sorted(INSTALLATIONS), default="debian",
+                        help="the installation guide whose host steps come first (default debian)")
     parser.add_argument("--stop-once", choices=sorted(STOP_ONCE),
                         help="fail this command in the bootstrap's first run, and continue as "
                              "the first-volume guide's recovery notes say")
@@ -399,7 +415,8 @@ def main(argv=None):
     with open(args.directory / "demo.toml", "x", encoding="utf-8") as output:
         output.write(configuration())
     with open(args.directory / "quickstart.sh", "x", encoding="utf-8") as output:
-        output.write(program(steps(), stop_once=args.stop_once))
+        output.write(program(steps(args.installation), args.installation,
+                             stop_once=args.stop_once))
     print(args.directory / "quickstart.sh")
     return 0
 

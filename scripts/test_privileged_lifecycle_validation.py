@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -202,6 +203,7 @@ confirmed_device="$device"
 install_missing=true
 discard=false
 kill_daemon={killed}
+prebuilt_dir=""
 work_root=""
 background=false
 sudo() {{ :; }}
@@ -589,6 +591,74 @@ sudo() {
         self.assertIn("DIE: the opener did not start holding /dev/nbd15", result.stdout)
         self.assertIn("Permission denied", result.stderr)
         self.assertNotIn("STARTED", result.stdout)
+
+    # sudo checks its policy with real, effective and saved uid 0, so for
+    # that moment the invoking user's `kill -0` on its PID fails with EPERM.
+    # In CI's first booted-host run (Debian 12) the wait's first look fell
+    # there, before the opener had written that it held the device, and the
+    # run stopped although the opener was starting.
+    REFUSE_SIGNALS = ('kill() { if [ "$1" = -0 ]; then echo "kill: ($2) - Operation not permitted" >&2; '
+                      'return 1; fi; builtin kill "$@"; }\n')
+    # The harness's sleep returns at once, so the wait's 200 looks take only
+    # as long as their greps (about 0.35 s on the development host, less on
+    # CI's runner) and a deadline in seconds says nothing. These tests count
+    # the looks instead: the wait sleeps once after each look that found the
+    # opener running and its line not yet written.
+    COUNT_LOOKS = 'sleep() { echo look >>"$FIXTURE/looks"; command sleep 0.005; }\n'
+    # A fixture process ends once the test's directory is gone, also when the
+    # fragment stopped before it let the process go: none is left behind.
+    UNTIL = ('wait_until() { i=0; while [ -d "$FIXTURE" ] && [ "$i" -lt 2000 ] && ! eval "$1"; do '
+             'sleep 0.005; i=$((i + 1)); done; }\n')
+
+    def looks(self):
+        path = self.root / "looks"
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def test_the_wait_does_not_signal_the_opener_that_sudo_started(self):
+        # The opener writes its line only after the wait has looked three
+        # times, with every kill -0 refused meanwhile.
+        self.opener(self.UNTIL +
+                    'wait_until \'[ "$(wc -l <"$FIXTURE/looks" 2>/dev/null || echo 0)" -ge 3 ]\'\n'
+                    'echo "  0.000s holding the device open; it shows backend \'maki-1\'"\n'
+                    'wait_until \'[ -e "$FIXTURE/release" ]\'\n')
+        result = self.run_fragment(self.REFUSE_SIGNALS + self.COUNT_LOOKS + 'hold_device_open\necho HOLDING\n'
+                                   'touch "$FIXTURE/release"\nfinish_opener\necho FINISHED')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("HOLDING", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        self.assertNotIn("DIE:", result.stdout)
+        self.assertGreaterEqual(self.looks(), 3)
+
+    def test_an_opener_that_exits_before_holding_the_device_ends_the_wait_at_once(self):
+        # Without signals the wait still sees the opener go, long before its
+        # 200 looks are up.
+        self.opener('echo "cannot open /dev/nbd15: No such device or address"\nexit 2\n')
+        result = self.run_fragment(self.REFUSE_SIGNALS + self.COUNT_LOOKS + "hold_device_open\necho STARTED")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("DIE: the opener did not start holding /dev/nbd15", result.stdout)
+        self.assertIn("No such device or address", result.stderr)
+        self.assertNotIn("STARTED", result.stdout)
+        self.assertLess(self.looks(), 100)
+
+    def test_a_process_runs_until_it_exits_whoever_owns_it(self):
+        # PID 1 belongs to root: a runner user cannot signal it, and it runs.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.kill)
+        zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+        deadline = time.monotonic() + 10
+        while (Path(f"/proc/{zombie.pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.addCleanup(zombie.wait)
+        script = "".join(f'if process_running {pid}; then echo "{pid} running"; else echo "{pid} gone"; fi\n'
+                         for pid in (1, child.pid, zombie.pid, 2 ** 22 + 1))
+        result = self.run_fragment(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "1 running", f"{child.pid} running", f"{zombie.pid} gone", f"{2 ** 22 + 1} gone"])
+        if os.geteuid() != 0:
+            # What the wait cannot rely on.
+            self.assertNotEqual(subprocess.run(["bash", "-c", "kill -0 1"], capture_output=True).returncode, 0)
 
 
 class ScriptedDevice:

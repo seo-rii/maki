@@ -609,6 +609,377 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  debian12-package:
+    # The package the Debian 12 guests install, built from this commit in a
+    # debian:12 container as the release workflow builds it: against
+    # bookworm's glibc, with dpkg-shlibdeps adding the native libraries to
+    # Depends. The Ubuntu runner's glibc is newer than bookworm's.
+    runs-on: ubuntu-latest
+    container: debian:12
+    # Above the sum of the step limits.
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: build dependencies
+        timeout-minutes: 10
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            build-essential dpkg-dev python3 git curl ca-certificates
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+      # The steps run as root in a workspace that belongs to the runner's uid
+      # 1001: root's git refuses it unless it is a safe directory.
+      - name: root in the runner-owned workspace
+        timeout-minutes: 1
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@1.94.0
+        timeout-minutes: 10
+      - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
+        with:
+          key: debian12-package
+      - name: packaged binaries
+        timeout-minutes: 40
+        run: cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+      - name: guest package
+        timeout-minutes: 5
+        run: |
+          mkdir dist
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 -B packaging/debian/build-deb.py --release-dir target/release \
+            --version 0.0.0~ci --architecture "$(dpkg --print-architecture)" --output dist/maki.deb
+          dpkg-deb --info dist/maki.deb
+          git rev-parse --verify 'HEAD^{commit}' > dist/source-revision
+          (cd dist && sha256sum maki.deb source-revision | tee SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: debian12-package
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  el9-package:
+    # The RPM the EL9 guests install, built from this commit in the CentOS
+    # Stream 9 container the release workflow builds the published RPM in:
+    # against glibc 2.34, with rpm's library requirements.
+    runs-on: ubuntu-latest
+    container: quay.io/centos/centos:stream9
+    # Above the sum of the step limits.
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: build dependencies
+        timeout-minutes: 10
+        run: |
+          dnf install -y -q --setopt=install_weak_deps=False \
+            gcc git-core python3 rpm-build cpio diffutils findutils gzip tar
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+      - name: root in the runner-owned workspace
+        timeout-minutes: 1
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@1.94.0
+        timeout-minutes: 10
+      - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
+        with:
+          key: el9-package
+      - name: packaged binaries
+        timeout-minutes: 40
+        run: cargo build --release --locked -p maki -p maki-attach -p maki-check -p maki-nbdkit
+      - name: guest package
+        timeout-minutes: 5
+        run: |
+          mkdir dist
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 -B packaging/rpm/build-rpm.py --release-dir target/release \
+            --version 0.0.0~ci --architecture "$(rpm --eval '%{_arch}')" --output dist/maki.rpm
+          rpm -qip dist/maki.rpm
+          rpm -qp --requires dist/maki.rpm
+          git rev-parse --verify 'HEAD^{commit}' > dist/source-revision
+          (cd dist && sha256sum maki.rpm source-revision | tee SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: el9-package
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  debian12-guest:
+    # A booted Debian 12 host: Debian's generic cloud image (its standard
+    # kernel), pinned by name and digest, under QEMU with KVM on the runner,
+    # set up by cloud-init (scripts/booted-host-validation.py). It is a KVM
+    # virtual machine on GitHub's hardware, not a bare-metal host. Each suite
+    # gets a fresh guest. guides: the Debian guide's install steps, the quick
+    # start and the first-volume bootstrap, written by
+    # documented_quickstart.py, run as root with the package from this
+    # commit. runner: the privileged runner's lifecycle (--kill-daemon) on
+    # /dev/nbd15, with the binaries taken from that package. Every step of
+    # the guest runs scripts/booted-host-guest.py under a time limit.
+    needs: debian12-package
+    runs-on: ubuntu-latest
+    # Above the sum of the step limits, so that a hung step fails by its own
+    # limit and the logs are still collected.
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [guides, runner]
+    defaults:
+      run:
+        shell: bash
+    env:
+      GUEST: debian12
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - name: runner host
+        timeout-minutes: 2
+        run: |
+          uname -a
+          cat /etc/os-release
+          nproc
+          free -m
+          df -h / "$RUNNER_TEMP"
+          ls -l /dev/kvm
+      # GitHub's Linux runners have /dev/kvm, open only to the kvm group.
+      - name: enable KVM
+        timeout-minutes: 2
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-maki-ci-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          ls -l /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - name: QEMU and seed tools
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 qemu-utils genisoimage \
+            openssh-client
+          qemu-system-x86_64 --version
+          qemu-img --version
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: debian12-package
+          path: ${{ runner.temp }}/package
+      # The image, cached under its pinned name and digest: fetch checks a
+      # restored image's digest as it checks a download, and the cache is
+      # saved right after a miss, also when a later step fails.
+      - name: image cache key
+        id: image
+        timeout-minutes: 1
+        run: python3 -B scripts/booted-host-validation.py image-key --guest "$GUEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: image-cache
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
+      - name: guest image
+        timeout-minutes: 15
+        run: python3 -B scripts/booted-host-validation.py fetch --guest "$GUEST" --directory "$RUNNER_TEMP/images"
+      - uses: actions/cache/save@v4
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
+      - name: guest payload
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py payload --guest "$GUEST" --suite "$SUITE" --package "$RUNNER_TEMP/package" --output "$RUNNER_TEMP/payload"
+      # The boot's deadline, an SSH probe that overruns it, cloud-init's wait
+      # given up 90 s after its limit, then the copy: within the step's limit.
+      - name: boot the guest
+        timeout-minutes: 20
+        run: |
+          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 600
+          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" --timeout 300 "$RUNNER_TEMP/payload"
+      - name: guest facts
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
+      - name: guest package manager
+        timeout-minutes: 10
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
+      - name: installation guide and quick start
+        if: matrix.suite == 'guides'
+        timeout-minutes: 40
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
+      - name: privileged runner lifecycle
+        if: matrix.suite == 'runner'
+        timeout-minutes: 50
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
+      - name: guest versions
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
+      # The results, the program and its output (not the package), the
+      # runner's run directory (not its snapshot or builds), the journal and
+      # the guest's console. Neither key (/etc/maki/secrets, the runner's
+      # work tree), no backing, no SSH key and no seed is collected.
+      - name: collect guest logs
+        if: always()
+        timeout-minutes: 15
+        run: python3 -B scripts/booted-host-validation.py finish --work "$RUNNER_TEMP/guest" --output "$RUNNER_TEMP/guest-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 10
+        with:
+          name: debian12-guest-${{ matrix.suite }}-logs
+          path: ${{ runner.temp }}/guest-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  el9-guest:
+    # A booted EL9 host: Rocky Linux 9's GenericCloud image, pinned by name
+    # and digest, with SELinux enforcing as the image ships it. Rocky Linux
+    # rebuilds RHEL's published sources unchanged (bug-for-bug compatible);
+    # AlmaLinux has aimed at ABI compatibility since 2023, building from
+    # CentOS Stream. The same steps as debian12-guest, with the RHEL guide's
+    # repository and install steps and the RPM, plus the SELinux record:
+    # getenforce, every AVC since boot (one that names Maki or an NBD device
+    # fails), the domain maki@'s nbdkit ran in and the installed files'
+    # labels. A KVM virtual machine on GitHub's hardware, not a bare-metal
+    # host.
+    needs: el9-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [guides, runner]
+    defaults:
+      run:
+        shell: bash
+    env:
+      GUEST: el9
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - name: runner host
+        timeout-minutes: 2
+        run: |
+          uname -a
+          cat /etc/os-release
+          nproc
+          free -m
+          df -h / "$RUNNER_TEMP"
+          ls -l /dev/kvm
+      # GitHub's Linux runners have /dev/kvm, open only to the kvm group.
+      - name: enable KVM
+        timeout-minutes: 2
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-maki-ci-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          ls -l /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - name: QEMU and seed tools
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 qemu-utils genisoimage \
+            openssh-client
+          qemu-system-x86_64 --version
+          qemu-img --version
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: el9-package
+          path: ${{ runner.temp }}/package
+      # The image, cached under its pinned name and digest: fetch checks a
+      # restored image's digest as it checks a download, and the cache is
+      # saved right after a miss, also when a later step fails.
+      - name: image cache key
+        id: image
+        timeout-minutes: 1
+        run: python3 -B scripts/booted-host-validation.py image-key --guest "$GUEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: image-cache
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
+      - name: guest image
+        timeout-minutes: 15
+        run: python3 -B scripts/booted-host-validation.py fetch --guest "$GUEST" --directory "$RUNNER_TEMP/images"
+      - uses: actions/cache/save@v4
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        with:
+          key: ${{ steps.image.outputs.key }}
+          path: ${{ runner.temp }}/images
+      - name: guest payload
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py payload --guest "$GUEST" --suite "$SUITE" --package "$RUNNER_TEMP/package" --output "$RUNNER_TEMP/payload"
+      # The boot's deadline, an SSH probe that overruns it, cloud-init's wait
+      # given up 90 s after its limit, then the copy: within the step's limit.
+      - name: boot the guest
+        timeout-minutes: 20
+        run: |
+          python3 -B scripts/booted-host-validation.py boot --guest "$GUEST" --images "$RUNNER_TEMP/images" --work "$RUNNER_TEMP/guest" --timeout 600
+          python3 -B scripts/booted-host-validation.py copy-in --work "$RUNNER_TEMP/guest" --timeout 300 "$RUNNER_TEMP/payload"
+      - name: guest facts
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py facts --guest "$GUEST"
+      - name: guest package manager
+        timeout-minutes: 10
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 480 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py prepare --guest "$GUEST"
+      - name: installation guide and quick start
+        if: matrix.suite == 'guides'
+        timeout-minutes: 40
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2220 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py guides --guest "$GUEST"
+      - name: privileged runner lifecycle
+        if: matrix.suite == 'runner'
+        timeout-minutes: 50
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 2820 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py runner --guest "$GUEST"
+      # Also after a failed suite: a denial may be why it failed.
+      - name: SELinux
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py selinux --guest "$GUEST" --suite "$SUITE"
+      - name: guest versions
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -B scripts/booted-host-validation.py run --work "$RUNNER_TEMP/guest" --timeout 180 --root -- python3 -B /var/tmp/maki-ci/booted-host-guest.py versions --guest "$GUEST"
+      # The results, the program and its output (not the package), the
+      # runner's run directory (not its snapshot or builds), the journal,
+      # the audit log and the guest's console. Neither key
+      # (/etc/maki/secrets, the runner's work tree), no backing, no SSH key
+      # and no seed is collected.
+      - name: collect guest logs
+        if: always()
+        timeout-minutes: 15
+        run: python3 -B scripts/booted-host-validation.py finish --work "$RUNNER_TEMP/guest" --output "$RUNNER_TEMP/guest-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 10
+        with:
+          name: el9-guest-${{ matrix.suite }}-logs
+          path: ${{ runner.temp }}/guest-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   nightly-gates:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'review/integration-'))
     runs-on: ubuntu-latest

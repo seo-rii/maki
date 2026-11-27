@@ -58,8 +58,11 @@ to build and install the Maki package:
 
 - [Installing on Debian 12](docs/getting-started/installation-debian.md)
 - [Installing on RHEL 9](docs/getting-started/installation-rhel.md) and its
-  rebuilds: an RPM from BaseOS and AppStream packages; not qualified, CI
-  checks the userspace only
+  rebuilds: an RPM from BaseOS and AppStream packages; not qualified. CI
+  checks the userspace in a CentOS Stream 9 container and, on every change,
+  attaches through the kernel of a booted Rocky Linux 9 guest with SELinux
+  enforcing: a KVM virtual machine on a GitHub runner, on GitHub's hardware,
+  not a bare-metal host, and Rocky Linux, a rebuild of RHEL, not RHEL itself
 
 Release candidates are published only as unsigned GitHub pre-releases by the
 [release workflow](docs/releasing.md#publishing-a-pre-release); otherwise
