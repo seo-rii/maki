@@ -294,7 +294,7 @@ of `clean` and `recoverable` ([below](#checking-a-backing-that-cannot-be-written
 
 | `deep check verdict:` | Meaning | Operator action |
 |---|---|---|
-| `clean` | Every allocated slot reads back and every unlisted slot is a hole or holds a valid header for its unit; ordinary replay of the journal is all the next attach does | None |
+| `clean` | Every allocated slot reads back, and every unlisted slot is a hole or holds a valid header for its unit over ciphertext that matches the header's checksum; ordinary replay of the journal is all the next attach does | None |
 | `recoverable` | Some slot payloads are damaged, but each such unit has a validated journal record newer than the checkpoint, so recovery rewrites (or discards) the slot before the volume is exposed. The report lists them as `warning: slot: recoverable: …` and `check passed` | Attach normally; re-run the deep check afterwards and expect `clean` |
 | `unrecoverable` | A slot is damaged and no journal record can repair it (the unit reads EIO at runtime), or checkpoint, canary or journal metadata failed validation in a way attach refuses. These are `ERROR:` lines and `check FAILED` | Restore from backup or migrate the database; do not edit format bytes |
 

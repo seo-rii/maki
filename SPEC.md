@@ -1695,8 +1695,10 @@ The alignment padding after the largest ciphertext is never written and
 says nothing about the slot. A crash leaves an all-zero header over written
 ciphertext only where a slot write tore before its shard was synced: the
 checkpoint did not complete, so the unit's journal record is newer than the
-checkpoint and recovery rewrites the slot from it before the volume is
-exposed (the deep check calls such a slot recoverable). The slot of a
+checkpoint, and before the volume is exposed recovery replays the unit's
+newest record: it rewrites the slot, or, when that record is a v3 trim,
+discards the unit, which then reads as zeros (the deep check calls such a
+slot recoverable either way). The slot of a
 discarded unit (v3, below) is answered by its discard bit, however much of it
 a hole punch released.
 

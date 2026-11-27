@@ -302,7 +302,8 @@ pub fn deep_check(backing: Arc<dyn Backing>, segment_size: u64) -> Result<CheckR
                         if recoverable as usize <= MAX_SLOT_ERRORS {
                             report.warnings.push(format!(
                                 "slot: recoverable: {e} (a validated journal record for unit \
-                                 {unit} is newer than the checkpoint; recovery rewrites the slot)"
+                                 {unit} is newer than the checkpoint; recovery rewrites the slot, \
+                                 or discards the unit when that record is a trim)"
                             ));
                         }
                     } else {
