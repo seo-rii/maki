@@ -1478,10 +1478,10 @@ class Summary(unittest.TestCase):
         self.shard("witness_etcd", 1, corpus=None)
         self.assertEqual(self.verdicts()["witness_etcd"], [
             "the merge's corpus of shard 1 held 143,835 inputs of 519,875,759 bytes, "
-            "its record counted no count"])
+            "its record has no count"])
         self.coverage("witness_etcd", sources=[{"shard": 1, "artifact": "fuzz-shard-witness_etcd-1"}])
         self.assertEqual(self.verdicts()["witness_etcd"], [
-            "the merge's corpus of shard 1 held no count, its record counted no count"])
+            "the merge's corpus of shard 1 held no count, its record has no count"])
         self.assertFalse(self.summarize()["qualified"])
 
     def test_a_binary_the_build_did_not_make_does_not_qualify(self):

@@ -792,8 +792,10 @@ def corpus_mismatches(result, records):
         held = (source.get("inputs"), source.get("bytes"))
         recorded = (corpus.get("inputs"), corpus.get("bytes"))
         if held != recorded or counted(*recorded) == "no count":
+            theirs = ("has no count" if counted(*recorded) == "no count"
+                      else f"counted {counted(*recorded)}")
             reasons.append(f"the merge's corpus of shard {source['shard']} held {counted(*held)}, "
-                           f"its record counted {counted(*recorded)}")
+                           f"its record {theirs}")
     return reasons
 
 

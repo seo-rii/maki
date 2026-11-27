@@ -762,7 +762,8 @@ it, in five jobs:
    `fuzz-shard-<target>-<n>`, kept for 30 days: `actions/upload-artifact@v4`
    fails with `Maximum call stack size exceeded` on a directory of more
    than about 123,000 entries (measured on Node 22; the action declares
-   `node20`), and a 24 CPU-hour shard's corpus held up to 405,750 inputs. The archive takes that name only once `tar` succeeded.
+   `node20`), and a 24 CPU-hour shard's corpus held up to 405,750 inputs.
+   The archive takes that name only once `tar` succeeded.
    The record (`fuzz-stats-*`) and the failing inputs (`fuzz-crashes-*`)
    are also kept on their own, for 90 days.
 4. `merge` unpacks the archive of each shard the plan has, from the
@@ -775,7 +776,8 @@ it, in five jobs:
    of shard N`), whatever the shard's record says: the merge records the
    shards it merged (`sources`, with the inputs and bytes of each corpus)
    and why it had no corpus of the others (`unmerged`). It removes each
-   archive once it unpacked it and keeps one it did not, to be looked at.
+   downloaded archive once it unpacked it; the `fuzz-shard-<target>-<n>`
+   artifact keeps every shard's archive for 30 days.
    libFuzzer's merge survives an input that
    fails its inner process: it writes the input to the merge's artifacts as
    a crash, timeout or out-of-memory input, runs the inner process
