@@ -159,6 +159,10 @@ if mode == "crash":
     Path(flags["artifact_prefix"] + "crash-0123456789abcdef").write_bytes(b"boom")
     final(50)
     sys.exit(77)
+if mode == "fail":
+    # An exit with a nonzero status and no input written.
+    final(5)
+    sys.exit(1)
 if mode in ("hang", "stubborn"):
     if mode == "hang":
         def interrupted(*_):
@@ -573,6 +577,16 @@ class Run(Fixture):
         self.assertEqual(record["failures"], [
             f"process 1 was charged {worker['cpu_seconds']:.0f} of its 10 CPU seconds in 2 s"])
 
+    def test_a_round_that_fails_is_the_processes_last_though_it_lacks_cpu_time(self):
+        # A round that exits nonzero, here at once without writing an input,
+        # is not followed by rounds that would charge the process its share.
+        os.environ.update(FAKE_MODES=json.dumps(["fail"] + ["burn"] * 12), FAKE_BURN="0.25")
+        out, record = self.run_shard(workers=1, cpu_seconds=0.6, wall_seconds=30, min_round=1)
+        worker, = record["workers"]
+        self.assertEqual((worker["rounds_run"], worker["exit"]), (1, 1))
+        self.assertEqual(len(self.calls_made()), 1)
+        self.assertEqual(record["failures"], ["process 1 ended with status 1"])
+
     def test_rounds_that_end_long_before_their_time_are_not_restarted_without_end(self):
         # libFuzzer runs to -max_total_time; a process that exits 0 at once
         # (here the stand-in) is not restarted until the wall time is spent.
@@ -680,6 +694,12 @@ class Merge(Fixture):
         record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
                                      self.root / "again")
         self.assertEqual(record["failures"], ["the coverage run printed no INITED line"])
+        os.environ["FAKE_NO_INITED"] = "0"
+        os.environ["FAKE_COVERAGE_EXIT"] = "1"
+        record = self.campaign.merge(self.binary, "witness_etcd", self.seeds, self.root / "shards",
+                                     self.root / "measured")
+        self.assertEqual(record["coverage_exit"], 1)
+        self.assertEqual(record["failures"], ["the coverage run ended with status 1"])
         self.assertEqual(self.campaign.main(["merge", "--binary", str(self.binary), "--target",
                                              "witness_etcd", "--seeds", str(self.seeds),
                                              "--shards", str(self.root / "shards"),
@@ -1046,6 +1066,14 @@ class Summary(unittest.TestCase):
         summary = self.summarize()
         self.assertFalse(summary["qualified"])
         self.assertEqual(summary["unreadable"], ["the build job's record (SHA256SUMS) is missing"])
+
+    def test_a_plan_without_targets_does_not_qualify(self):
+        self.plan = dict(self.plan, targets=[])
+        summary = self.summarize()
+        self.assertEqual((summary["targets"], summary["unreadable"]), ([], []))
+        self.assertFalse(summary["qualified"])
+        self.assertTrue(campaign().markdown(summary).rstrip().endswith(
+            "Qualified: no, see the verdicts"))
 
     def test_the_summary_is_written_and_its_status_is_the_verdict(self):
         out = self.root / "summary"
