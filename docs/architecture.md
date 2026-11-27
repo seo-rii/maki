@@ -411,7 +411,10 @@ URLs from transport errors before classification and formatting, keeping query
 credentials out of those error messages. Its connector, hyper-util's as for
 gRPC, gives each address of a family a fixed share of the request `timeout`
 (reqwest's `connect_timeout`, which hyper-util divides among them), so an
-address that does not answer leaves the next one time. The WebSocket transport
+address that does not answer leaves the next one time. reqwest builds that
+connector and keeps hyper-util's 300 ms before the other family, which the
+provider cannot change without a connector of its own
+([remote HTTP mapping](configuration.md#remote-http-mapping)). The WebSocket transport
 resolves the endpoint's host itself and connects straight to its addresses. As
 in the gRPC and HTTP transports' connector, the other address family starts
 300 ms after the first; unlike it, that is halfway to the deadline when less

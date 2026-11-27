@@ -907,9 +907,11 @@ impl GrpcCryptoProvider {
         // immediately rather than leaving it in tonic's background queue.
         // The bound is several RPC timeouts: a slow but working handshake
         // still completes in the background for the next RPC, as before.
-        // The TCP connector is configured like tonic's own: its timeout is
-        // divided across the resolved addresses, so an unreachable first
-        // address (`localhost` as `::1` on Windows) leaves time for the next.
+        // The TCP connector is configured like tonic's own: hyper-util
+        // divides its timeout among the resolved addresses of each family
+        // and starts the other family 300 ms after the first, so an
+        // unreachable first address (`localhost` as `::1` on Windows) leaves
+        // time for the next (`connect_tests.rs`).
         let mut tcp =
             hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(resolver);
         tcp.enforce_http(false);

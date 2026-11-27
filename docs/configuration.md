@@ -530,12 +530,30 @@ connection failure that was not sent. hyper-util reports the family's first
 failure, so the error reads "connect timeout" when the first address's share
 ran out and "transport error" when the first address refused the connection,
 whatever the later ones did. When an address is still connecting at the
-`timeout`, the request fails as a request timeout. Keep `timeout` well above `n` times the time a
-connect is expected to take: with a short `timeout`, a host with many
-addresses can have every live one given up, and on Linux one lost SYN already
-delays a connect by 1 s. reqwest does not expose the 300 ms, so with a
-`timeout` of 300 ms or less the other family is never tried when the first one
-does not answer.
+`timeout`, the request fails as a request timeout. A host with one address
+per family keeps the whole `timeout` for it, and a resolution that never
+returns or a TLS handshake that never completes ends at the `timeout` too, as
+a request timeout: none of these is marked as unsent. Keep `timeout` well
+above `n` times the time a connect is expected to take: with a short
+`timeout`, a host with many addresses can have every live one given up, and on
+Linux one lost SYN already delays a connect by 1 s. With a `timeout` of 300 ms
+or less the other family is never tried when the first one does not answer,
+and below 600 ms it has `timeout` minus 300 ms, less than half.
+
+Maki cannot shorten those 300 ms over HTTP. reqwest builds hyper-util's
+connector itself and never sets its other-family delay
+(`set_happy_eyeballs_timeout`); neither reqwest 0.12.28 nor 0.13.5 offers a
+way to. Its resolver hook decides only which addresses there are and in what
+order: the connector still splits them by family, and the first family's
+addresses together keep the whole connect timeout. A connect timeout shorter
+than `timeout` would end the first family, and so start the other, sooner,
+but it is also the bound over a host's only address and over the whole
+connect, TLS handshake included. A connector layer sees no URI and cannot make
+the connection type reqwest uses, so it can only wrap reqwest's own connect.
+Two clients, one for each family, raced by Maki would keep a pool each and
+could both send a request that is not retry-safe. Shortening the delay needs
+a change to reqwest, or an HTTP client built on hyper-util with a connector of
+Maki's own, as the WebSocket transport dials the addresses itself.
 
 A per-item mapping without `body.items_path` sends one unit per HTTP call.
 Units within a parent request run concurrently only within the existing
@@ -598,6 +616,13 @@ A gRPC request gives up after `timeout`, but the connection attempt behind it
 (TCP connect and TLS handshake together) may continue for up to four times
 `timeout`, so a slow handshake still serves the next request; a peer that never
 completes the handshake is abandoned then and the next request reconnects.
+Its TCP connector is hyper-util's, as for HTTP, and tries the addresses the
+same way: each of a family's `n` addresses may take `timeout / n`, and the
+other family starts 300 ms after the first, or at once when the first family
+has failed. So with a `timeout` of 300 ms or less and a first family that does
+not answer, the request that opened the connection fails, retryable and not
+sent, and the attempt dials the other family when the first family's shares
+have run out, at that `timeout`; its connection serves a later request.
 
 A WebSocket request's `timeout` covers the connection it opens, including the
 time the request waited for the connection. The endpoint's host is resolved;

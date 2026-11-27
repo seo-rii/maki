@@ -143,15 +143,22 @@ See [cache reload](operations.md#growth-and-cache-reload).
   (two IPv4 addresses, say) costs its share: half the timeout for two. With
   less than 600 ms of a connect left, the WebSocket transport starts the
   other family halfway to its deadline instead. The HTTP transport cannot:
-  the 300 ms is hyper-util's and reqwest 0.12 does not expose it, so with an
-  HTTP `timeout` of 300 ms or less the other family is never tried when the
-  first one does not answer, and below 600 ms it has less than half of the
-  time; this is read from the code, not tested. The HTTP shares are fixed,
-  as in the gRPC connector: each of a family's `n` addresses may take
-  `timeout / n`, however soon the one before it failed, so one refused at
-  once does not pass its time on, and a live address slower to accept the
-  connection than its share is given up
-  ([remote HTTP mapping](configuration.md#remote-http-mapping)).
+  the 300 ms is set in hyper-util's connector, which reqwest builds and
+  offers no way to change or to replace (the
+  [remote HTTP mapping](configuration.md#remote-http-mapping) says why), so
+  with an HTTP `timeout` of 300 ms or less the other family is never tried
+  when the first one does not answer, and below 600 ms it has less than
+  half of the time. The gRPC transport's connector waits the same 300 ms:
+  with a `timeout` of 300 ms or less and a first family that does not
+  answer, the request that opened the connection fails, and the connection
+  attempt dials the other family once the first family's shares have run
+  out, for a later request. The HTTP
+  shares are fixed, as in the gRPC connector: each of a family's `n`
+  addresses may take `timeout / n`, however soon the one before it failed,
+  so one refused at once does not pass its time on, and a live address
+  slower to accept the connection than its share is given up. The tests
+  reach IPv6 only on loopback, and a route that drops packets only as a
+  packet filter in a private network namespace (a root-only test).
 - Recovery uses a 1 MiB replay grouping target; a permitted single record
   can be larger. Live replay payload storage is bounded by 1 MiB plus
   `max_ciphertext_size`, with record/index metadata and shard maps/catalogs
