@@ -935,10 +935,11 @@ impl VolumeConfig {
     ///
     /// An HTTP `timeout` under [`HTTP_SHORT_TIMEOUT`]: the HTTP transport
     /// starts the other address family of an endpoint's host 300 ms after the
-    /// first (hyper-util's delay, which reqwest does not let the provider
-    /// change), so that family gets less than half of the `timeout`, and none
-    /// of one of 300 ms or less. The WebSocket and gRPC transports start it
-    /// halfway through a short timeout instead.
+    /// first, or at once when the first family has failed (hyper-util's
+    /// delay, which reqwest does not let the provider change). So while the
+    /// first family does not answer, the other gets less than half of the
+    /// `timeout`, and none of one of 300 ms or less. The WebSocket and gRPC
+    /// transports start it halfway through a short timeout instead.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         let http_timeout = match (&self.crypto.provider[..], &self.crypto.http) {
@@ -948,10 +949,10 @@ impl VolumeConfig {
         if let Some(MakiDuration(timeout)) = http_timeout {
             if timeout < HTTP_SHORT_TIMEOUT {
                 warnings.push(format!(
-                    "[crypto.http] timeout is {timeout:?}: under 600 ms the other address family \
-                     of an endpoint's host gets less than half of it, and at 300 ms or less it is \
-                     never tried, so a host whose first address family does not answer can fail \
-                     every connect"
+                    "[crypto.http] timeout is {timeout:?}: while the first address family of an \
+                     endpoint's host does not answer, the other family gets less than half of a \
+                     timeout under 600 ms and is never tried at 300 ms or less, so such a host \
+                     can fail every connect"
                 ));
             }
         }
