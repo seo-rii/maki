@@ -235,6 +235,27 @@ async fn closed_port_url() -> String {
     url
 }
 
+/// The tests of this file run side by side in one process, and each binds
+/// `127.0.0.1:0` for its peers. The refused endpoint's port must stay out of
+/// their reach for as long as a test uses it: one that another test's peer
+/// is given is no longer refused, and its request is served there.
+#[tokio::test]
+async fn the_refused_endpoint_keeps_its_port_while_a_test_uses_it() {
+    let down = closed_port_url().await;
+    let address: std::net::SocketAddr = down.strip_prefix("ws://").unwrap().parse().unwrap();
+    // The kernel gives a listener only a port that it could bind like this.
+    let taken = TcpListener::bind(address).await;
+    assert!(
+        matches!(&taken, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
+        "another listener could take the refused endpoint's port: {taken:?}"
+    );
+    let connected = tokio::net::TcpStream::connect(address).await;
+    assert!(
+        matches!(&connected, Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused),
+        "the refused endpoint did not refuse the connection: {connected:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_refused_connection_fails_a_non_retry_safe_request_over_to_a_peer() {
     let down = closed_port_url().await;
