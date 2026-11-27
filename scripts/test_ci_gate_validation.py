@@ -30,6 +30,8 @@ BYTECODE_STEP = "Python suites leave no bytecode in the checkout (Linux)"
 FAKE_STEP = 'release build refuses provider = "fake"'
 KERNEL_RUNNER_STEP = "attach lifecycle through the privileged runner"
 QUICKSTART_STEP = "documented quick start on the installed package"
+STOPPED_STEP = "documented quick start stopped once and continued from its record"
+TOGETHER_STEP = "several volumes stopping together on the installed package"
 RUNNER = ROOT / "scripts" / "privileged-linux-validation.sh"
 # What `maki volume create` prints for provider = "fake" without the feature.
 FAKE_REFUSAL = ('error: config invalid: provider "fake" is not compiled into this build '
@@ -457,13 +459,16 @@ if name == "sudo":
     if args[:1] == ["bash"]:
         print("the documented program's output")
         sys.exit(int(os.environ.get("QUICKSTART_STATUS", "0")))
+    if args[:3] == ["python3", "-B", "scripts/stop-together-validation.py"]:
+        print("the stop-together driver's output")
+        sys.exit(int(os.environ.get("TOGETHER_STATUS", "0")))
     if args[:1] == ["test"]:
         assert args[1:3] == ["!", "-e"], args
         sys.exit(1 if Path(args[3]).exists() else 0)
     assert args[:1] == ["apt-get"], args
 elif name == "python3":
     if args[:2] == ["-B", "scripts/documented_quickstart.py"]:
-        directory = Path(args[2])
+        directory = Path(args[-1])
         directory.mkdir(parents=True)
         (directory / "quickstart.sh").write_text("program\n")
         (directory / "demo.toml").write_text("configuration\n")
@@ -564,6 +569,12 @@ class KernelLifecycleJob(unittest.TestCase):
         # Also after the runner failed: the quick start's verdict is its own.
         for name in ("packaged binaries", QUICKSTART_STEP):
             self.assertEqual(conditions[name], ["${{ !cancelled() }}"], name)
+        # The later runs on the installed package need the host the quick
+        # start's clean-up leaves, whatever the runner's step did.
+        self.assertIn("\n        id: quickstart\n", self.step(QUICKSTART_STEP))
+        for name in (STOPPED_STEP, TOGETHER_STEP):
+            self.assertEqual(conditions[name],
+                             ["${{ !cancelled() && steps.quickstart.outcome == 'success' }}"], name)
 
     @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
     def test_the_runners_status_is_the_steps(self):
@@ -597,7 +608,67 @@ class KernelLifecycleJob(unittest.TestCase):
         self.assertNotRegex(script, r"(?m)\b(?:apt|apt-get|dpkg) (?:-\S+ )*(?:install|-i)\b.*maki")
         self.assertIn("sudo bash quickstart.sh 2>&1 | tee quickstart.log\n", script)
 
-    def run_quickstart_step(self, **environment):
+    def test_the_stopped_quick_starts_and_the_stop_together_follow_the_quick_start(self):
+        order = [self.names.index(name) for name in (
+            QUICKSTART_STEP, STOPPED_STEP, TOGETHER_STEP, "diagnostics on failure")]
+        self.assertEqual(order, sorted(order))
+        for name in (STOPPED_STEP, TOGETHER_STEP):
+            self.assertRegex(self.step(name), r"(?m)^        timeout-minutes: \d+$")
+        stopped = step_script(STOPPED_STEP)
+        self.assertIn("for command in mkfs.xfs vgchange; do\n", stopped)
+        self.assertIn('python3 -B scripts/documented_quickstart.py --stop-once "$command" "$workdir"\n',
+                      stopped)
+        together = step_script(TOGETHER_STEP)
+        self.assertIn("sudo python3 -B scripts/stop-together-validation.py --volumes 3 --hold 10 "
+                      '"$workdir" 2>&1 |', together)
+        # The job's own limit is above the sum of its steps' and the build.
+        limits = sum(int(limit) for limit in re.findall(r"(?m)^        timeout-minutes: (\d+)$",
+                                                         self.job))
+        job_limit = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", self.job).group(1))
+        self.assertGreater(job_limit, limits + 10)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_each_stopped_quick_start_runs_in_its_directory_with_the_package(self):
+        result, calls, root = self.run_quickstart_step(step=STOPPED_STEP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        writers = [call for call in calls if call[0] == "python3"]
+        self.assertEqual([call[2:] for call in writers], [
+            ["-B", "scripts/documented_quickstart.py", "--stop-once", command,
+             str(root / "temp" / f"quickstart-stop-{command}")] for command in ("mkfs.xfs", "vgchange")])
+        runs = [call for call in calls if call[:1] == ["sudo"] and call[2:3] == ["bash"]]
+        self.assertEqual([call[1:] for call in runs], [
+            [str(root / "temp" / f"quickstart-stop-{command}"), "bash", "quickstart.sh"]
+            for command in ("mkfs.xfs", "vgchange")])
+        for command in ("mkfs.xfs", "vgchange"):
+            workdir = root / "temp" / f"quickstart-stop-{command}"
+            self.assertEqual((workdir / "maki.deb").read_text(), "package\n")
+            self.assertIn("the documented program's output", (workdir / "quickstart.log").read_text())
+        # A failed program, or one that leaves the attachment, fails the step
+        # before the next program runs.
+        for failure in ({"QUICKSTART_STATUS": "3"}, {"RECORD": "1"}, {"ACTIVE_STATE": "active"},
+                        {"BACKEND": "1"}, {"MOUNTED": "1"}):
+            with self.subTest(failure=failure):
+                result, calls, _ = self.run_quickstart_step(step=STOPPED_STEP, **failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len([call for call in calls if call[:1] == ["sudo"]
+                                      and call[2:3] == ["bash"]]), 1, calls)
+
+    @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
+    def test_the_stop_together_runs_as_root_and_its_failure_fails_the_step(self):
+        result, calls, root = self.run_quickstart_step(step=TOGETHER_STEP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        workdir = str(root / "temp" / "stop-together")
+        [driver] = [call for call in calls if call[:1] == ["sudo"] and call[2:3] == ["python3"]]
+        self.assertEqual(driver[2:], ["python3", "-B", "scripts/stop-together-validation.py",
+                                      "--volumes", "3", "--hold", "10", workdir])
+        self.assertIn("the stop-together driver's output",
+                      (Path(workdir) / "stop-together.log").read_text())
+        for failure in ({"TOGETHER_STATUS": "1"}, {"MOUNTED": "1"}, {"ACTIVE_STATE": "failed"}):
+            with self.subTest(failure=failure):
+                result, _, _ = self.run_quickstart_step(step=TOGETHER_STEP, **failure)
+                self.assertNotEqual(result.returncode, 0)
+
+    def run_quickstart_step(self, step=QUICKSTART_STEP, **environment):
         directory = tempfile.TemporaryDirectory(prefix="maki-ci-quickstart-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -614,9 +685,14 @@ class KernelLifecycleJob(unittest.TestCase):
             (root / "run/maki-attach/demo.nbd").write_text("{}")
         if environment.pop("BACKEND", None):
             (root / "sys/block/nbd0/backend").write_text("maki-demo\n")
-        script = step_script(QUICKSTART_STEP)
+        if step != QUICKSTART_STEP:
+            # What the quick start's step leaves for the later ones.
+            (root / "temp/quickstart").mkdir(parents=True)
+            (root / "temp/quickstart/maki.deb").write_text("package\n")
+        script = step_script(step)
         for old in ("/run/maki-attach/", "/sys/block/"):
-            self.assertIn(old, script)
+            if step != TOGETHER_STEP or old == "/run/maki-attach/":
+                self.assertIn(old, script)
             script = script.replace(old, f"{root}{old}")
         env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
                    FIXTURE=str(root), RUNNER_TEMP=str(root / "temp"), **environment)
@@ -659,7 +735,7 @@ class KernelLifecycleJob(unittest.TestCase):
         # Also when a time limit cancels the job, as a hung kernel request would.
         self.assertIn("if: ${{ failure() || cancelled() }}", diagnostics)
         self.assertRegex(diagnostics, r"(?m)^        timeout-minutes: \d+$")
-        self.assertEqual(self.names.index("diagnostics on failure"), self.names.index(QUICKSTART_STEP) + 1)
+        self.assertEqual(self.names.index("diagnostics on failure"), self.names.index(TOGETHER_STEP) + 1)
         for needed in ('latest="$HOME/logs/maki-privileged-validation.latest"', 'cat "$latest/status"',
                        '"$latest"/*.txt', "sudo dmesg", "journalctl -b", "-u 'maki*'",
                        "/sys/block/nbd*", "dmsetup", "sudo ls -la /run/maki-attach", "fuser -v /dev/nbd*"):
@@ -675,6 +751,10 @@ class KernelLifecycleJob(unittest.TestCase):
         self.assertLess(self.names.index("collect logs"), self.names.index("actions/upload-artifact@v4"))
         self.assertIn("--exclude=./source --exclude=./target --exclude=./build", collect)
         self.assertIn("--exclude=./maki.deb", collect)
+        # The stopped quick starts' programs and output, and the stop
+        # together's report and openers, also without the package.
+        for directory in ('"$RUNNER_TEMP"/quickstart-stop-*', '"$RUNNER_TEMP/stop-together"'):
+            self.assertIn(directory, collect)
         for needed in ("journalctl -b --no-pager -o short-monotonic -k",
                        "journalctl -b --no-pager -o short-monotonic -u 'maki*'"):
             self.assertIn(needed, collect)
