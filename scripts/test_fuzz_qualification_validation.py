@@ -804,6 +804,16 @@ class Merge(Fixture):
         self.assertFalse((self.root / "shards" / "escaped").exists())
         self.assertEqual(self.main("partly-again", planned=8), 1)
 
+    def test_what_an_archive_that_fails_while_it_is_unpacked_left_is_removed(self):
+        # An archive whose members all pass, that fails only once they are
+        # written out: a member below a file an earlier member made.
+        self.shard(1, b"one", extra=[(tarfile.TarInfo("shard/corpus/input-0/below"), b"x")])
+        record = self.merge("merged")
+        self.assertEqual(record["sources"], [])
+        self.assertRegex(record["failures"][0], r"^the merge had no corpus of shard 1 "
+                                                r"\(fuzz-shard-witness_etcd-1/shard\.tar does not unpack: .+\)$")
+        self.assertFalse((self.root / "shards" / "fuzz-shard-witness_etcd-1" / "shard").exists())
+
     def test_an_earlier_unpacking_is_replaced_not_merged(self):
         self.shard(1, b"one", b"two")
         stale = self.unpacked(1)
@@ -857,7 +867,10 @@ class Merge(Fixture):
             return unpack(*arguments)
 
         self.campaign.shard_corpora = interrupted_meanwhile
-        record = self.merge("merged")
+        try:
+            record = self.merge("merged")
+        except KeyboardInterrupt:
+            self.fail("the interrupt reached the script before the merge's handlers were in place")
         self.assertTrue(record["interrupted"])
         self.assertEqual(record["failures"], ["the merge was interrupted"])
         self.assertEqual(record["unmerged"], [{"shard": 1, "artifact": "fuzz-shard-witness_etcd-1",
