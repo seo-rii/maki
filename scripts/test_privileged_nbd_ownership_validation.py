@@ -5,11 +5,14 @@ verbs (maki-attach nbd-connect and nbd-disconnect), system locks, LVM, mounts,
 and process cleanup are replaced. No kernel device is opened.
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -504,6 +507,169 @@ class LockedNbdOperations(unittest.TestCase):
                 with self.module.attach_lock(self.root, os.getuid()):
                     self.fail("writable parent accepted")
             flock.assert_not_called()
+
+
+ATTACHMENT = "maki-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c"
+
+
+class FakeNetlink:
+    """A generic netlink socket whose kernel answers each request with the
+    datagrams `answers` gives for it."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.sent = []
+        self.pending = []
+        self.bound = None
+        self.closed = False
+
+    def __call__(self, family, kind, protocol):
+        self.opened = (family, kind, protocol)
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.closed = True
+
+    def bind(self, address):
+        self.bound = address
+
+    def settimeout(self, seconds):
+        self.timeout = seconds
+
+    def send(self, message):
+        self.sent.append(message)
+        self.pending.extend(self.answers(len(self.sent), message))
+        return len(message)
+
+    def recvfrom(self, size):
+        return self.pending.pop(0)
+
+
+def header(length, kind, sequence, flags=0, port=0):
+    return struct.pack("=IHHII", length, kind, flags, sequence, port)
+
+
+def acknowledgement(sequence, error=0, port=0):
+    return header(36, 2, sequence, port=port) + struct.pack("=i", error) + header(16, 0, sequence)
+
+
+def family_reply(sequence, family=0x1e):
+    attributes = struct.pack("=HH", 8, 2) + b"nbd\0" + struct.pack("=HHH", 6, 1, family) + b"\0\0"
+    return header(20 + len(attributes), 0x10, sequence) + struct.pack("=BBH", 1, 2, 0) + attributes
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux generic netlink")
+class KernelDisconnect(unittest.TestCase):
+    """`kernel-disconnect`: the kernel's NBD_CMD_DISCONNECT, over generic
+    netlink, of an attachment's connection, which the helper's own
+    nbd-disconnect refuses by design."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("validation_nbd", WRAPPER)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        temporary = tempfile.TemporaryDirectory(prefix="maki-nbd-kernel-")
+        self.addCleanup(temporary.cleanup)
+        self.sysfs = Path(temporary.name) / "nbd15"
+        self.sysfs.mkdir()
+        patcher = mock.patch.object(self.module, "SYSFS", self.sysfs.parent)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.events = []
+
+    def kernel(self, *, refuse=0, noise=False):
+        def answers(count, message):
+            sequence = struct.unpack_from("=I", message, 8)[0]
+            if count == 1:
+                found = [(family_reply(sequence), (0, 0)), (acknowledgement(sequence), (0, 0))]
+            else:
+                found = [(acknowledgement(sequence, refuse), (0, 0))]
+            if noise:
+                # Neither another sender's nor another request's answer is
+                # this request's.
+                found = [(acknowledgement(sequence, -1, port=99), (99, 0)),
+                         (acknowledgement(sequence + 7, -1), (0, 0)), *found]
+            return found
+        return FakeNetlink(answers)
+
+    def test_the_family_is_resolved_and_the_device_disconnected(self):
+        for noise in (False, True):
+            with self.subTest(noise=noise):
+                kernel = self.kernel(noise=noise)
+                self.module.kernel_disconnect(15, open_socket=kernel)
+                self.assertEqual(kernel.opened, (socket.AF_NETLINK, socket.SOCK_RAW, 16))
+                self.assertTrue(kernel.closed)
+                lookup, disconnect = kernel.sent
+                # CTRL_CMD_GETFAMILY for "nbd" to the controller, with an ack.
+                self.assertEqual(lookup, header(28, 0x10, 1, flags=0x5) + struct.pack("=BBH", 3, 1, 0)
+                                 + struct.pack("=HH", 8, 2) + b"nbd\0")
+                # NBD_CMD_DISCONNECT (2) with NBD_ATTR_INDEX (1) = 15 to the
+                # family the kernel named.
+                self.assertEqual(disconnect, header(28, 0x1e, 2, flags=0x5) + struct.pack("=BBH", 2, 1, 0)
+                                 + struct.pack("=HHI", 8, 1, 15))
+
+    def test_a_refusal_is_the_kernels_errno(self):
+        kernel = self.kernel(refuse=-errno.EPERM)
+        with self.assertRaises(OSError) as raised:
+            self.module.kernel_disconnect(15, open_socket=kernel)
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
+    def test_a_family_reply_without_its_id_is_refused(self):
+        def answers(count, message):
+            sequence = struct.unpack_from("=I", message, 8)[0]
+            return [(acknowledgement(sequence), (0, 0))]
+        kernel = FakeNetlink(answers)
+        with self.assertRaisesRegex(RuntimeError, "did not name"):
+            self.module.kernel_disconnect(15, open_socket=kernel)
+        self.assertEqual(len(kernel.sent), 1)
+
+    @contextlib.contextmanager
+    def lock(self):
+        self.events.append("lock")
+        try:
+            yield
+        finally:
+            self.events.append("unlock")
+
+    def invoke(self, identifier):
+        def disconnect(index):
+            self.events.append(("disconnect", index))
+        with mock.patch.object(self.module, "attach_lock", self.lock), \
+                mock.patch.object(self.module, "kernel_disconnect", disconnect), \
+                mock.patch.object(self.module.subprocess, "run") as command, \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            result = self.module.main(["--device", "/dev/nbd15", "--identifier", identifier,
+                                       "--helper", HELPER, "kernel-disconnect"])
+        command.assert_not_called()
+        return result
+
+    def test_only_the_named_attachments_connection_is_disconnected_under_the_lock(self):
+        (self.sysfs / "pid").write_text("12345\n")
+        (self.sysfs / "backend").write_text(ATTACHMENT + "\n")
+        self.assertEqual(self.invoke(ATTACHMENT), 0)
+        self.assertEqual(self.events, ["lock", ("disconnect", 15), "unlock"])
+        for shown in ("maki-11111111-2222-3333-4444-555555555555", None):
+            with self.subTest(shown=shown):
+                self.events.clear()
+                if shown is None:
+                    (self.sysfs / "backend").unlink()
+                    (self.sysfs / "pid").unlink()
+                else:
+                    (self.sysfs / "backend").write_text(shown + "\n")
+                self.assertNotEqual(self.invoke(ATTACHMENT), 0)
+                self.assertEqual(self.events, ["lock", "unlock"])
+
+    def test_only_an_attachments_identifier_is_accepted(self):
+        (self.sysfs / "backend").write_text("maki-privval-11111111-2222-3333-4444-555555555555\n")
+        for identifier in ("maki-privval-11111111-2222-3333-4444-555555555555",
+                           "maki-bootstrap-0f7c2b1a-3d4e-4f5a-8b6c-7d8e9f0a1b2c", "maki-1"):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(SystemExit):
+                    self.invoke(identifier)
+                self.assertEqual(self.events, [])
 
 
 if __name__ == "__main__":
