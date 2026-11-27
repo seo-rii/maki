@@ -337,7 +337,8 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
 }
 
 /// How a command that reads a backing through [`build_backing_to_read`]
-/// reports `failure`, met after the backing was opened. A remote view asks
+/// reports `failure`, met after the backing was opened, and whether the
+/// witness still selects what the command read ([`Reported`]). A remote view asks
 /// its authority only while it opens and when asked, and a command asks it
 /// before it reports what it read (SPEC §27); it asks before it reports a
 /// failure too ([`Backing::ask_witness_again`]), also when the failure
@@ -348,14 +349,23 @@ pub fn build_backing_to_read(config: &VolumeConfig) -> Result<Arc<dyn Backing>, 
 /// stopped on what it read is reported by its stop reason, which names
 /// that. Any other backing answers as it answers before each of its
 /// operations.
-pub fn read_failure(backing: &dyn Backing, failure: String) -> String {
+pub fn read_failure(backing: &dyn Backing, failure: String) -> Reported {
     match backing.ask_witness_again() {
-        WitnessAnswer::Selects => backing.session_stopped().unwrap_or(failure),
-        WitnessAnswer::Stopped(reason) => reason,
-        WitnessAnswer::Unanswered(error) => unanswered(
-            &backing.session_stopped().unwrap_or(failure),
-            &error.to_string(),
-        ),
+        WitnessAnswer::Selects => Reported {
+            error: backing.session_stopped().unwrap_or(failure),
+            witness_selects: true,
+        },
+        WitnessAnswer::Stopped(reason) => Reported {
+            error: reason,
+            witness_selects: false,
+        },
+        WitnessAnswer::Unanswered(error) => Reported {
+            error: unanswered(
+                &backing.session_stopped().unwrap_or(failure),
+                &error.to_string(),
+            ),
+            witness_selects: false,
+        },
     }
 }
 
@@ -364,14 +374,39 @@ pub fn read_failure(backing: &dyn Backing, failure: String) -> String {
 /// everything it reports, before it reports (SPEC §27): one inspection of a
 /// remote authority, however much was read. A record that changed since the
 /// view was opened fails the command, and so does a view that stopped, after
-/// its witness has been asked again as for any failure ([`read_failure`]).
-pub fn still_current(backing: &dyn Backing) -> Result<(), String> {
+/// its witness has been asked again as for any failure ([`read_failure`]),
+/// and a witness that cannot be asked.
+pub fn still_current(backing: &dyn Backing) -> Result<(), Reported> {
     match backing.check_freshness() {
         Ok(()) => Ok(()),
         Err(error) => Err(match backing.session_stopped() {
-            None => error.to_string(),
+            None => Reported {
+                error: error.to_string(),
+                witness_selects: false,
+            },
             Some(_) => read_failure(backing, error.to_string()),
         }),
+    }
+}
+
+/// A failure as a command that read through [`build_backing_to_read`]
+/// reports it once it has asked the witness again ([`read_failure`],
+/// [`still_current`]).
+#[derive(Debug)]
+pub struct Reported {
+    /// What the command reports.
+    pub error: String,
+    /// Whether the witness answered that it still selects what the command
+    /// read (or the backing has no witness to ask): then what the command
+    /// logged while it read describes the volume's state, also when it
+    /// failed on an error of its own. False when the witness no longer
+    /// selects it, answered so that the view stopped, or could not be asked.
+    pub witness_selects: bool,
+}
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.error)
     }
 }
 
