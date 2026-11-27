@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -1505,11 +1506,16 @@ class FuzzQualificationWorkflow(unittest.TestCase):
         entry = campaign().plan("journal_scan", "1", "5", "4")["matrix"][0]
         for key in re.findall(r"\$\{\{ matrix\.(\w+) \}\}", fuzz):
             self.assertIn(key, entry)
+        # The shard's output is uploaded as one archive, packed whatever the
+        # fuzzing step did, and the merge reads it by the script's name.
+        self.assertEqual(self.names("fuzz")[4:6], ["pack the shard", "actions/upload-artifact@v4"])
+        self.assertIn("        if: always()\n", self.step("fuzz", "pack the shard"))
+        self.assertEqual(campaign().SHARD_ARCHIVE, "shard.tar")
         uploads = [step for name, step in steps(fuzz) if name == "actions/upload-artifact@v4"]
         self.assertEqual(len(uploads), 3)
         for upload, condition, name, path in (
                 (uploads[0], "always()", "fuzz-shard-${{ matrix.target }}-${{ matrix.shard }}",
-                 "${{ runner.temp }}/shard"),
+                 "${{ runner.temp }}/shard.tar"),
                 (uploads[1], "always()", "fuzz-stats-${{ matrix.target }}-${{ matrix.shard }}",
                  "${{ runner.temp }}/shard/shard.json"),
                 (uploads[2], "failure()", "fuzz-crashes-${{ matrix.target }}-${{ matrix.shard }}",
@@ -1522,20 +1528,96 @@ class FuzzQualificationWorkflow(unittest.TestCase):
     def test_each_targets_shard_corpora_are_merged_with_its_seeds(self):
         merge = self.jobs["merge"]
         self.assertIn("      matrix:\n        target: ${{ fromJSON(needs.plan.outputs.targets) }}\n", merge)
-        self.assertIn("          pattern: fuzz-shard-${{ matrix.target }}-*\n", merge)
+        # Each shard's artifact to a directory of its own, named after it.
+        download = [step for name, step in steps(merge) if name == "actions/download-artifact@v4"][1]
+        self.assertIn("          pattern: fuzz-shard-${{ matrix.target }}-*\n", download)
+        self.assertIn("          path: ${{ runner.temp }}/shards\n", download)
+        self.assertNotIn("merge-multiple", download)
         script = job_step_script(merge, "merge the seeds and the shard corpora")
         self.assertEqual(shlex.split(script.replace("\\\n", " ")), [
             "exec", "python3", "-B", "scripts/fuzz_campaign.py", "merge", "--binary", "$RUNNER_TEMP/binaries/$TARGET",
             "--target", "$TARGET", "--seeds", "fuzz/seeds/$TARGET", "--shards", "$RUNNER_TEMP/shards",
-            "--out", "$RUNNER_TEMP/merged"])
+            "--planned-shards", "$SHARDS", "--out", "$RUNNER_TEMP/merged"])
+        # The merge needs a corpus of every shard the plan has.
+        step = self.step("merge", "merge the seeds and the shard corpora")
+        self.assertIn("          SHARDS: ${{ fromJSON(needs.plan.outputs.plan).shards }}\n", step)
+        self.assertIn("shards", campaign().plan("journal_scan", "1", "5", "4"))
+        # The merged corpus is uploaded as one archive too.
+        self.assertEqual(self.names("merge")[-3:], ["pack the merged corpus", "actions/upload-artifact@v4",
+                                                    "actions/upload-artifact@v4"])
+        self.assertIn("        if: always()\n", self.step("merge", "pack the merged corpus"))
         uploads = [step for name, step in steps(merge) if name == "actions/upload-artifact@v4"]
         self.assertEqual(len(uploads), 2)
-        for upload, name, path in ((uploads[0], "fuzz-corpus-${{ matrix.target }}", "${{ runner.temp }}/merged"),
+        for upload, name, path in ((uploads[0], "fuzz-corpus-${{ matrix.target }}",
+                                    "${{ runner.temp }}/merged.tar"),
                                    (uploads[1], "fuzz-coverage-${{ matrix.target }}",
                                     "${{ runner.temp }}/merged/coverage.json")):
             self.assertIn("        if: always()\n", upload)
             self.assertIn(f"          name: {name}\n", upload)
             self.assertIn(f"          path: {path}\n", upload)
+
+    def packed(self, job, step, directory, files, tar=None):
+        """Write `files` ({path: bytes}, or None for no directory at all)
+        below RUNNER_TEMP/`directory`, run the job's step that packs it, with
+        the shell script `tar` in place of tar if given, and return the
+        step's result and the regular files of the archive it left ({path:
+        bytes}), or None if it left none."""
+        with tempfile.TemporaryDirectory(prefix="maki-ci-qualification-") as temp:
+            temp = Path(temp)
+            for name, data in (files or {}).items():
+                (temp / directory / name).parent.mkdir(parents=True, exist_ok=True)
+                (temp / directory / name).write_bytes(data)
+            environment = {"RUNNER_TEMP": str(temp)}
+            if tar is not None:
+                (temp / "bin").mkdir()
+                (temp / "bin" / "tar").write_text(tar)
+                (temp / "bin" / "tar").chmod(0o700)
+                environment["PATH"] = str(temp / "bin") + os.pathsep + os.environ["PATH"]
+            result = run_bash(job_step_script(self.jobs[job], step), ROOT, environment)
+            archive = temp / f"{directory}.tar"
+            if not archive.exists():
+                return result, None
+            with tarfile.open(archive) as handle:
+                found = {member.name: handle.extractfile(member).read()
+                         for member in handle.getmembers() if member.isfile()}
+            if directory == "shard":
+                # What the merge reads of it once downloaded: the artifact
+                # in a directory named after it.
+                downloaded = temp / "shards" / "fuzz-shard-journal_scan-1"
+                downloaded.mkdir(parents=True)
+                shutil.copy(archive, downloaded / "shard.tar")
+                sources, unmerged = campaign().shard_corpora(temp / "shards", "journal_scan", 1)
+                self.assertEqual(unmerged, [])
+                self.assertEqual([(source["shard"], source["inputs"]) for source in sources],
+                                 [(1, sum(name.startswith("corpus/") for name in files))])
+            return result, found
+
+    @unittest.skipUnless(os.name == "posix", "the steps run in bash on Linux runners")
+    def test_a_shards_output_and_the_merged_corpus_are_packed_into_one_archive_each(self):
+        # A 24 CPU-hour shard's corpus held up to 405,750 inputs, and
+        # upload-artifact@v4 fails on a directory of more than about 123,000.
+        corpus = {f"corpus/{index:040x}": index.to_bytes(4, "big") * (index % 7) for index in range(3000)}
+        shard = dict(corpus, **{"logs/worker-1-round-1.log": b"INFO: Seed: 1\n",
+                                "artifacts/slow-unit-01": b"slow", "shard.json": b"{}\n"})
+        merged = dict(corpus, **{"artifacts/crash-01": b"boom", "merge.log": b"MERGE-OUTER: attempt 1\n",
+                                 "coverage.log": b"", "coverage.json": b"{}\n"})
+        for job, step, directory, files in (("fuzz", "pack the shard", "shard", shard),
+                                            ("merge", "pack the merged corpus", "merged", merged)):
+            with self.subTest(step=step):
+                result, found = self.packed(job, step, directory, files)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(found, {f"{directory}/{name}": data for name, data in files.items()})
+                # A pack that fails leaves no archive to upload: without the
+                # directory, tar writes an empty archive, and when it cannot
+                # read a file, one without it, and fails.
+                failing = (f'#!/bin/sh\n"{shutil.which("tar")}" "$@"\n'
+                           f'echo "tar: {directory}/corpus/0: Cannot open: Permission denied" >&2\n'
+                           "exit 2\n")
+                for case, present, tar in (("no directory", None, None), ("tar failed", files, failing)):
+                    with self.subTest(case=case):
+                        result, found = self.packed(job, step, directory, present, tar)
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIsNone(found)
 
     @unittest.skipUnless(os.name == "posix", "the step runs in bash on Linux runners")
     def test_the_summary_is_kept_and_its_status_is_the_verdict(self):
@@ -1561,7 +1643,8 @@ class FuzzQualificationWorkflow(unittest.TestCase):
             (temp / "coverage" / "fuzz-coverage-journal_scan" / "coverage.json").write_text(json.dumps({
                 "target": "journal_scan", "binary_sha256": digest, "merge_exit": 0, "attempts": 1,
                 "artifacts": [], "coverage_exit": 0, "cov": 169, "ft": 300, "inputs": 9, "bytes": 900,
-                "seeds": 7}))
+                "seeds": 7, "planned_shards": 1, "unmerged": [],
+                "sources": [{"shard": 1, "artifact": "fuzz-shard-journal_scan-1", "inputs": 4}]}))
             step_summary = temp / "step-summary.md"
             for cpu, status in ((plan["cpu_seconds"], 0), (0.5, 1)):
                 with self.subTest(cpu=cpu):
