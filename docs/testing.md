@@ -192,11 +192,15 @@ step. `maki-attach cleanup` must then take its disconnected recovery
 (AUD-203), and a new nbdkit and a fourth attach must compare the hashes
 before the final detach. The helper logs the path cleanup takes, and the run
 requires each cleanup to have taken the one for what the device showed when
-it started. Read from the kernel's NBD driver, not yet observed: the device
-keeps a connection's attributes while anything holds it open, a mount or a
-mapping above all, so a device that shows no connection has neither left,
-and the disconnected recovery that a kernel can reach only retires the
-record. Each attach must show the mount, the attachment's backend identifier
+it started. Read from the kernel's NBD driver, the device keeps a
+connection's attributes while anything holds it open, a mount or a mapping
+above all, so a device that shows no connection has neither left, and the
+disconnected recovery that a kernel can reach only retires the record. The
+job's first run with these steps (2026-11-27, Linux `7.0.0-1020-azure`)
+showed it: after `NBD_CMD_DISCONNECT` the device still showed the connection
+with XFS mounted and again after the unmount, and showed none once the
+mapping was removed; cleanup then logged disconnected recovery, ran no step
+and left nothing. Each attach must show the mount, the attachment's backend identifier
 and the attach record; after each detach, and after each cleanup that ends
 an attachment, the mount, the device's holders, its connection and size and
 the attach record must be gone, and a look for the record that fails stops

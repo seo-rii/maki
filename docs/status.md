@@ -246,8 +246,15 @@ See [cache reload](operations.md#growth-and-cache-reload).
   what the helper's readers parse on the attachment, runs the quick start
   with the bootstrap stopped once (at `mkfs.xfs`, and at `vgchange`) and
   continued from its record, and stops three volumes together, each device
-  held open for 10 s, recording how long each stop takes; no result of these
-  additions is recorded yet. That is local-provider volumes on one runner
+  held open for 10 s, recording how long each stop takes. In the job's first
+  run with these additions (2026-11-27) the device kept showing the
+  connection after the disconnect, with XFS mounted and after the unmount,
+  and showed none once the mapping was removed; cleanup then took its
+  disconnected recovery and left nothing; both stopped quick starts passed;
+  and the three stops ended about 10.2, 20.3 and 30.5 s after they began,
+  queued one after another on the global attach lock (read from the units'
+  journal: the stop step failed then on a reading the driver took before the
+  attach units had stopped, since fixed). That is local-provider volumes on one runner
   kernel, and nbdkit is killed only while the filesystem is idle after a
   sync. How often something holds a device open at a detach on a production
   host has not been measured.

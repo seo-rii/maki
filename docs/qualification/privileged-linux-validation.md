@@ -289,13 +289,17 @@ hand before cleanup, so that cleanup starts on a device that shows no
 connection, and every run captures what the helper's readers parse after
 the first attach. In both CI runs of 2026-11-26 the killed daemon's device
 still showed its connection when cleanup started. Read from the kernel's
-NBD driver, not yet observed: it keeps a connection's attributes until the
-last opener of the device closes it, and a mounted filesystem or an LV
-mapping is such an opener, so a device that shows no connection has no
-mount or mapping of it left, and cleanup's disconnected recovery then has
-nothing to unmount or deactivate and retires the record. The run logs what
-the device shows after each step of the release by hand. No run of these
-checks is recorded here yet.
+NBD driver, it keeps a connection's attributes until the last opener of the
+device closes it, and a mounted filesystem or an LV mapping is such an
+opener, so a device that shows no connection has no mount or mapping of it
+left, and cleanup's disconnected recovery then has nothing to unmount or
+deactivate and retires the record. The run logs what the device shows after
+each step of the release by hand. CI's first run with these checks
+(2026-11-27, GitHub's Ubuntu runner, Linux `7.0.0-1020-azure`) passed them:
+the device still showed the connection after the disconnect with XFS
+mounted and after the unmount, showed none once the mapping was removed, and
+cleanup logged disconnected recovery and left nothing. No run outside CI has
+these checks yet.
 
 ## Installed systemd combined Debian 12 GCE result — 2026-09-17
 

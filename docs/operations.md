@@ -910,7 +910,8 @@ recovery path. Cleanup logs which of the two it takes (`<device> shows the
 attachment's connection; cleanup follows the detach path`, or `shows no
 connection; cleanup follows disconnected recovery`). The kernel keeps a
 connection's `backend` and `pid` while anything holds the device open, a
-mount or an LV mapping above all (read from its NBD driver), so a recorded
+mount or an LV mapping above all (read from its NBD driver and seen on a
+GitHub runner's Linux 7.0 kernel), so a recorded
 device that shows no connection normally has nothing of the attachment left,
 and recovery then retires the record. An unreadable backend fails before mutation and keeps the
 record; a backend under another identity is never touched, and its record is
