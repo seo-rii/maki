@@ -657,7 +657,12 @@ documents.
   process's own and removes the trees of a crashing input and of ended
   processes, and `witness_etcd` gains five seeds at etcd's 256 KiB answer and
   the 64 KiB state. No 24 CPU-hour campaign had finished when this was
-  written ([fuzz qualification](docs/testing.md#fuzz-qualification)).
+  written. The first, dispatched on 2026-11-27, had already failed both
+  `nbd_handshake` shards: every process ended at libFuzzer's 2048 MB memory
+  limit after about 10 million executions, because that target's entry
+  function spawns a thread for every input, under which an AddressSanitizer
+  build grows; a fix is pending, so `nbd_handshake` is not qualified ([fuzz
+  qualification](docs/testing.md#fuzz-qualification)).
 - **CI requires the IPv6 loopback address for the connect tests and runs a
   packet-drop test as root** (AUD-206, 2026-11-27;
   [#414](https://github.com/seo-rii/maki/pull/414)). For developers:

@@ -272,7 +272,7 @@ See [cache reload](operations.md#growth-and-cache-reload).
   10.2, 20.3 and 30.5 s after they began at f933c7c, and about 30.5 s from
   the first stop's start to the last one's end at 8b9ef4d (whose driver
   found every unit stopped after 30.678 s). Detach and cleanup now wait for a held-open device without the
-  attach lock (AUD-197, #410), and at 31b7ef8, which has that change, the
+  attach lock (AUD-205, #410), and at 31b7ef8, which has that change, the
   stop together passed: the three stops took 10.183, 10.246 and 10.310 s,
   about the 10 s hold each, and every attach unit had stopped 10.388 s after
   the request; at a2db40e they took 10.153 to 10.214 s, and 10.488 s in
