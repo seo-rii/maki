@@ -11,7 +11,15 @@ block is the volume configuration that its step 2 installs from `demo.toml`.
 
 writes DIRECTORY/demo.toml and DIRECTORY/quickstart.sh. Run the program as
 root in DIRECTORY, beside the package as `maki.deb`, on a disposable host:
-`sudo bash quickstart.sh`. It runs under `set -e -o pipefail` and checks
+`sudo bash quickstart.sh`. With `--stop-once mkfs.xfs` or `--stop-once
+vgchange`, the bootstrap's first run has a shim first on PATH that fails
+that command, and the program requires that the run stopped there with its
+record and the device showing its connection, then runs the same block again
+as the first-volume guide's recovery notes say: after `mkfs.xfs`, the next
+run must release the export, stop the daemon, remove the record and fail;
+the volume is reset (its backing directory removed while the daemon is
+stopped, the creation block run again) and a third run starts over. After
+`vgchange`, the next run must finish. It runs under `set -e -o pipefail` and checks
 each block's status after it, so it stops at a failed command that `set -e`
 stops at (a pipeline included, whichever of its commands failed) and at a
 block whose last command failed, an `&&` list that ends the block included,
@@ -191,7 +199,158 @@ def deeper_lists(lines):
             if line.startswith(" ") and ("&&" in line or "||" in line)]
 
 
-def program(found):
+# A command of the bootstrap that a shim on PATH fails in the bootstrap's
+# first run (`--stop-once`), by what the first-volume guide's recovery notes
+# say the next run of the same block does then.
+STOP_ONCE = {
+    # The run stops before it records the filesystem: the next run releases
+    # the export, stops the daemon, removes the record and fails. The volume
+    # is reset as the notes say, created again, and a third run starts over.
+    "mkfs.xfs": "unfinished",
+    # The run stops after it, at the release: the next run finishes.
+    "vgchange": "finished",
+}
+# Where the program looks for the device's backend identifier.
+SYSFS = "/sys/block"
+# The recovery notes' reset of a volume that never held data.
+RESET = re.compile(r"remove `(/var/lib/maki/[^`\s]+)` while `(maki@[^`\s]+\.service)` is stopped "
+                   r"and run its \[creation block\]\(quickstart\.md#3-create-the-volume\) again")
+CREATION_STEP = "3. Create the volume"
+
+
+def recovery_reset():
+    """The backing directory and the daemon's unit of the first-volume
+    guide's reset of a volume that never held data."""
+    found = RESET.search(" ".join(FIRST_VOLUME.read_text(encoding="utf-8").split()))
+    if found is None:
+        raise ValueError(f"{FIRST_VOLUME.name} no longer says how to reset a volume that never held "
+                         "data (remove its backing directory while its daemon is stopped and run "
+                         "the creation block again)")
+    return found.group(1), found.group(2)
+
+
+def bootstrap_values(block):
+    """The bootstrap's volume, device and record, as the block sets them."""
+    values = {}
+    for name, pattern in (("volume", r"[a-z0-9][a-z0-9_-]*"), ("dev", r"/dev/nbd[0-9]+"),
+                          ("record", r"/[A-Za-z0-9_./-]+")):
+        found = re.search(rf"(?m)^{name}=({pattern})$", block)
+        if found is None:
+            raise ValueError(f"the bootstrap block sets no plain {name}")
+        values[name] = found.group(1)
+    return values
+
+
+STATUS_CHECK = ('documented_status=$?\n'
+                'if [ "$documented_status" -ne 0 ]; then exit "$documented_status"; fi\n')
+
+
+def shimmed(command):
+    """Program text that puts a `command` that fails first on PATH."""
+    quoted = shlex.quote(command)
+    return (f"documented_shim=$(mktemp -d)\n"
+            f"printf '#!/bin/sh\\necho \"%s: failed once by documented_quickstart.py\" >&2\\n"
+            f"exit 97\\n' {quoted} >\"$documented_shim\"/{quoted}\n"
+            f"chmod 0755 \"$documented_shim\"/{quoted}\n"
+            "documented_path=$PATH\n"
+            'export PATH="$documented_shim:$PATH"\n'
+            "set +e\n")
+
+
+def backend_of(dev):
+    return shlex.quote(f"{SYSFS}/{dev.removeprefix('/dev/')}/backend")
+
+
+def stopped(command, values, formatted):
+    """Program text that judges the first run: it stopped at `command`, and
+    left the record of a run that had (`formatted`) or had not recorded the
+    filesystem, with the device showing its connection."""
+    record = shlex.quote(values["record"])
+    must = "name" if formatted else "not name"
+    return ("documented_status=$?\nset -e\n"
+            'export PATH="$documented_path"\nrm -rf -- "$documented_shim"\n'
+            'if [ "$documented_status" -eq 0 ]; then\n'
+            f"    echo 'the bootstrap did not stop where {command} failed' >&2\n    exit 1\nfi\n"
+            f"if [ ! -f {record} ]; then\n"
+            f"    echo 'the stopped bootstrap left no record {values['record']}' >&2\n    exit 1\nfi\n"
+            f"echo 'the stopped bootstrap'\"'\"'s record {values['record']}:'\ncat {record}\n"
+            f"if grep -q '^fs_uuid=' {record}; then documented_formatted=yes; "
+            "else documented_formatted=no; fi\n"
+            f'if [ "$documented_formatted" != {"yes" if formatted else "no"} ]; then\n'
+            f"    echo 'the record of a bootstrap stopped at {command} must {must} a filesystem' >&2\n"
+            "    exit 1\nfi\n"
+            f"documented_backend=$(cat {backend_of(values['dev'])} 2>/dev/null || true)\n"
+            'case "$documented_backend" in\n'
+            f"    maki-bootstrap-*) echo \"{values['dev']} shows the stopped bootstrap's connection "
+            '$documented_backend" ;;\n'
+            f"    *) echo \"{values['dev']} does not show the stopped bootstrap's connection "
+            '(${documented_backend:-none})" >&2\n       exit 1 ;;\nesac\n')
+
+
+def released(values):
+    """Program text that judges the run after a stop that recorded no
+    filesystem: it failed once it had released the export, stopped the
+    daemon and removed the record."""
+    record = shlex.quote(values["record"])
+    unit = f"maki@{values['volume']}.service"
+    return ("documented_status=$?\nset -e\n"
+            'if [ "$documented_status" -eq 0 ]; then\n'
+            "    echo 'the run after a stop that recorded no filesystem must fail once it has "
+            "released the export' >&2\n    exit 1\nfi\n"
+            f"if [ -e {record} ] || [ -L {record} ]; then\n"
+            f"    echo 'the run that released the export kept its record {values['record']}' >&2\n"
+            "    exit 1\nfi\n"
+            f"documented_backend=$(cat {backend_of(values['dev'])} 2>/dev/null || true)\n"
+            'if [ -n "$documented_backend" ]; then\n'
+            f"    echo \"{values['dev']} still shows the connection $documented_backend\" >&2\n"
+            "    exit 1\nfi\n"
+            f"documented_state=$(systemctl show -P ActiveState {unit})\n"
+            'if [ "$documented_state" != inactive ]; then\n'
+            f'    echo "{unit} is $documented_state, not stopped" >&2\n    exit 1\nfi\n'
+            f"echo 'the run released the export, stopped {unit} and removed its record'\n")
+
+
+def reset(directory, unit):
+    """Program text for the recovery notes' reset: remove the backing
+    directory while the daemon is stopped."""
+    return (f"documented_state=$(systemctl show -P ActiveState {unit})\n"
+            'if [ "$documented_state" != inactive ]; then\n'
+            f'    echo "{unit} is $documented_state: the volume is reset only while it is stopped" >&2\n'
+            "    exit 1\nfi\n"
+            f"rm -rf -- {shlex.quote(directory)}\n")
+
+
+def interrupted(found, command):
+    """(label, text) of each step of `found` with the bootstrap stopped once,
+    in its first run, by a failure of `command`, and continued as the
+    first-volume guide's recovery notes say. A block keeps its label, or has
+    the run it is added to it; `text` is what the program runs for it."""
+    provision = f"{QUICKSTART.name}, {PROVISION_STEP}: "
+    creation = f"{QUICKSTART.name}, {CREATION_STEP}, block 1"
+    [index] = [index for index, (label, _) in enumerate(found) if label.startswith(provision)]
+    [(creation_label, creation_block)] = [step for step in found if step[0].startswith(creation)]
+    label, block = found[index]
+    values = bootstrap_values(block)
+    outcome = STOP_ONCE[command]
+    runs = 3 if outcome == "unfinished" else 2
+    block = block if block.endswith("\n") else block + "\n"
+    steps = [(name, text + STATUS_CHECK) for name, text in found[:index]]
+    steps.append((f"{label} (run 1 of {runs}: {command} fails)",
+                  shimmed(command) + block + stopped(command, values, outcome == "finished")))
+    steps.append((f"{label} (run 2 of {runs}: continues from the record)",
+                  block + STATUS_CHECK if outcome == "finished"
+                  else "set +e\n" + block + released(values)))
+    if outcome == "unfinished":
+        directory, unit = recovery_reset()
+        steps.append((f"{FIRST_VOLUME.name}, Recovering from a failed bootstrap: remove {directory} "
+                      f"while {unit} is stopped", reset(directory, unit)))
+        steps.append((f"{creation_label} (again)", creation_block + STATUS_CHECK))
+        steps.append((f"{label} (run 3 of 3)", block + STATUS_CHECK))
+    steps.extend((name, text + STATUS_CHECK) for name, text in found[index + 1:])
+    return steps
+
+
+def program(found, stop_once=None):
     """One Bash program that runs each (label, block) in order in one shell.
 
     `set -e -o pipefail` stops at a failed command or pipeline; one inside an
@@ -199,7 +358,12 @@ def program(found):
     checked after it, and a block that `has_unguarded_list` finds with `&&`
     or `||` at its own level before its last command is refused, as is one
     with a list below its level (in a compound command's body, a brace group
-    or a function, at any depth) that `DEEPER_LISTS` does not name for it."""
+    or a function, at any depth) that `DEEPER_LISTS` does not name for it.
+
+    With `stop_once`, a command of `STOP_ONCE`, the bootstrap's first run
+    has a shim on PATH that fails that command, and the program checks
+    that it stopped there and that the next runs of the same block do what
+    the first-volume guide's recovery notes say (`interrupted`)."""
     for label, block in found:
         lines = printed_lines(label, block)
         if has_unguarded_list(lines):
@@ -211,13 +375,17 @@ def program(found):
             raise ValueError(f"{label} has && or || below its own level that DEEPER_LISTS does not "
                              f"name for it: {unread[0]!r}. set -e does not stop at a failed list "
                              "there either: read it and add it, or reword the block")
+    if stop_once is None:
+        steps = [(label, (block if block.endswith("\n") else block + "\n") + STATUS_CHECK)
+                 for label, block in found]
+    else:
+        steps = interrupted([(label, block if block.endswith("\n") else block + "\n")
+                             for label, block in found], stop_once)
     lines = [PRELUDE]
-    for number, (label, block) in enumerate(found, 1):
-        lines.append(f"step={shlex.quote(f'[{number}/{len(found)}] {label}')}\n")
+    for number, (label, text) in enumerate(steps, 1):
+        lines.append(f"step={shlex.quote(f'[{number}/{len(steps)}] {label}')}\n")
         lines.append("printf '\\n==> %s\\n' \"$step\"\n")
-        lines.append(block if block.endswith("\n") else block + "\n")
-        lines.append('documented_status=$?\n'
-                     'if [ "$documented_status" -ne 0 ]; then exit "$documented_status"; fi\n')
+        lines.append(text)
     lines.append("step=''\nprintf '\\n==> every documented step succeeded\\n'\n")
     return "".join(lines)
 
@@ -225,6 +393,9 @@ def program(found):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--stop-once", choices=sorted(STOP_ONCE),
+                        help="fail this command in the bootstrap's first run, and continue as "
+                             "the first-volume guide's recovery notes say")
     parser.add_argument("directory", type=Path)
     args = parser.parse_args(argv)
     args.directory.mkdir(parents=True, exist_ok=True)
@@ -232,7 +403,7 @@ def main(argv=None):
     with open(args.directory / "demo.toml", "x", encoding="utf-8") as output:
         output.write(configuration())
     with open(args.directory / "quickstart.sh", "x", encoding="utf-8") as output:
-        output.write(program(steps()))
+        output.write(program(steps(), stop_once=args.stop_once))
     print(args.directory / "quickstart.sh")
     return 0
 
