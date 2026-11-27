@@ -594,15 +594,29 @@ def shard_artifact(target, shard):
 
 def unpack(archive, directory, interrupted):
     """Unpack the shard archive `archive` into `directory`, replacing an
-    earlier unpacking there. Returns None, or why it did not."""
+    earlier unpacking there. Returns None, or why it did not. It looks at
+    `interrupted` before each member it reads and each it unpacks: the
+    runner kills the step 10 s after its interrupt, and listing an archive
+    of 405,755 members took 9.8 s on the host this was written on. What an
+    interrupted unpacking left stays where it is, unmerged, as removing it
+    could take as long."""
     name = f"{directory.name}/{archive.name}"
     if not archive.is_file():
         return f"no {name}"
     unpacked = directory / "shard"
     shutil.rmtree(unpacked, ignore_errors=True)
+    stopped = "the merge was interrupted while it unpacked it"
     try:
         with tarfile.open(archive, "r:") as handle:
-            members = handle.getmembers()
+            members = []
+            for member in handle:
+                if interrupted.is_set():
+                    return stopped
+                parts = PurePosixPath(member.name).parts
+                if parts[:1] != ("shard",) or ".." in parts or not (member.isfile() or member.isdir()):
+                    return (f"{name} holds {member.name!r}, which is not a file or directory "
+                            "below shard/")
+                members.append(member)
             # An archive ends with two zero blocks after its last member;
             # tarfile reads one cut in a member's header as a shorter one.
             with open(archive, "rb") as raw:
@@ -610,14 +624,8 @@ def unpack(archive, directory, interrupted):
                 if raw.read(2 * tarfile.BLOCKSIZE) != bytes(2 * tarfile.BLOCKSIZE):
                     return f"{name} does not unpack: it ends before its end-of-archive marker"
             for member in members:
-                parts = PurePosixPath(member.name).parts
-                if parts[:1] != ("shard",) or ".." in parts or not (member.isfile() or member.isdir()):
-                    return (f"{name} holds {member.name!r}, which is not a file or directory "
-                            "below shard/")
-            for member in members:
                 if interrupted.is_set():
-                    shutil.rmtree(unpacked, ignore_errors=True)
-                    return "the merge was interrupted while it unpacked it"
+                    return stopped
                 handle.extract(member, directory, **EXTRACT)
     except (tarfile.TarError, OSError) as error:
         shutil.rmtree(unpacked, ignore_errors=True)
