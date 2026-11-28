@@ -1545,12 +1545,14 @@ documents.
   a leftover backend or mount after the stop together, and the guest runner
   phase's and the `run` command's exit statuses. Ten more that the audit
   found, in the stop together, the opener and the booted-host scripts, have
-  tests since #426, and every one of the audit's 41 mutations of those scripts
-  now fails a test. Refused test endpoints are sockets that are bound and
-  never listen, held for the whole test, where a listener was dropped and its
-  port could be handed to a parallel test's `127.0.0.1:0` bind, which failed
-  two tests of maki-crypto-websocket's `review_unsent_failover.rs` in CI
-  ([automated CI](docs/testing.md#automated-ci)).
+  tests since #426, and every one of the audit's 41 mutations of the other
+  validation scripts (those three, `kernel-disconnect` in
+  `privileged_validation_nbd.py` and the capture) now fails a test. Refused
+  test endpoints are sockets that are bound and never listen, held for the
+  whole test, where a listener was dropped and its port could be handed to a
+  parallel test's `127.0.0.1:0` bind, which failed two tests of
+  maki-crypto-websocket's `review_unsent_failover.rs` in CI ([automated
+  CI](docs/testing.md#automated-ci)).
 - **2026-11-25 ninth round: refusals of the rollback-protected backing**
   (AUD-183 to AUD-186; [#391](https://github.com/seo-rii/maki/pull/391)).
   `maki volume gc` refuses a remote backing root that does not hold the

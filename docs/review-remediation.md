@@ -280,31 +280,52 @@ requests merged; #426, merged after it at `c57f8e1`, changes only tests and
 the testing guide's rows, and the items it touches were checked there.
 
 - Every fuzz target has qualified at 24 CPU-hours, but in two campaigns at two
-  revisions (AUD-210, AUD-223, AUD-224): eleven in run 45983119347 at
-  `32efe0b`, and `nbd_handshake`, `witness_etcd`, `http_response`,
-  `grpc_response` and `helper_reports` in run 46062600943 at `945596b`, which
-  the coordinator dispatched for those five after #421 and #424 (24 CPU-hours
-  each, `shard_hours=5`, `max_parallel=12`). By its summary each of the five
-  was charged 24.11 or 24.12 CPU-hours, from 306,066,059 (`witness_etcd`) to
-  897,017,682 (`helper_reports`) executions, and no process stopped on an
-  input. Between the two revisions none of the code that the eleven earlier
-  targets' entry functions reach changed: of the files that changed outside
-  tests, `maki-crypto-websocket`'s `lib.rs` changed only the connection
-  attempt's classification and the reader's handling of a stream error, which
-  `websocket_response`'s entry, handing `receive` a message, does not reach;
-  `fuzz/harness/src/nbd.rs` changed only `nbd_handshake`; the other source
-  files are not reached by any of the eleven, and `Cargo.lock` and
+  revisions (AUD-210, AUD-223, AUD-224), and by SPEC §55 a campaign qualifies
+  only the revision it ran on: these qualify `32efe0b` and `945596b`, and no
+  later revision, the release's included, until a campaign runs on it. Eleven
+  targets qualified in run 45983119347 at `32efe0b`, and `nbd_handshake`,
+  `witness_etcd`, `http_response`, `grpc_response` and `helper_reports` in run
+  46062600943 at `945596b`, which the coordinator dispatched for those five
+  after #421 and #424 (24 CPU-hours each, `shard_hours=5`, `max_parallel=12`).
+  By its summary each of the five was charged 24.11 or 24.12 CPU-hours, from
+  306,066,059 (`witness_etcd`) to 897,017,682 (`helper_reports`) executions,
+  and no process stopped on an input, and that summary compared each merged
+  corpus's inputs and bytes with its shard's record. The eleven ran before
+  #416's and #424's checks. Their merges, read by hand, took one attempt,
+  wrote no input and merged two sources each, and after the run the
+  coordinator compared by hand each of their 22 shard records (`shard.json` in
+  `fuzz-stats-<target>-<n>`) with the merge record (`coverage.json` in
+  `fuzz-corpus-<target>`), which this records change repeated on the same
+  artifacts: every shard's `corpus.inputs` equals the `inputs` of its source
+  in the merge, every shard ran the merge's binary (`binary_sha256`), no shard
+  record lists an artifact or a failure or is interrupted, and every merge and
+  its coverage run exited 0. Bytes were not compared: those merge records hold
+  no byte count per source, which only the format that #424 introduced
+  records. The counts, shard 1 and shard 2 and then the merged inputs:
+  `backing_records` 102,857 and 108,201, 4,993; `config_parse` 117,443 and
+  97,028, 4,200; `endpoint_url` 44,673 and 51,694, 3,826; `format_decoders`
+  692 and 650, 146; `format_records` 1,230 and 1,318, 221; `helper_sysfs`
+  83,391 and 82,679, 2,844; `journal_scan` 516 and 401, 68; `nbd_netlink` 962
+  and 918, 142; `probe_parsers` 41,864 and 40,968, 1,363; `websocket_response`
+  83,419 and 80,807, 3,732; `witness_rpc` 45,457 and 42,497, 3,233. Between
+  the two revisions none of the code that the eleven targets' entry functions
+  reach changed, which does not make them qualified at `945596b`: of the files
+  that changed outside tests, `maki-crypto-websocket`'s `lib.rs` changed only
+  the connection attempt's classification and the reader's handling of a
+  stream error, which `websocket_response`'s entry, handing `receive` a
+  message, does not reach; `fuzz/harness/src/lib.rs`, which holds the entry
+  functions of nine of the eleven, gained only a paragraph of module
+  documentation (#421); `fuzz/harness/src/nbd.rs`, which holds those of
+  `nbd_netlink` and `helper_sysfs`, changed only `nbd_handshake`; the other
+  source files are not reached by any of the eleven; and `Cargo.lock` and
   `maki-witness`'s manifest gained only a dev-dependency (read from the diff
-  and the harness). The eleven ran before #416's and #424's checks: their
-  merges, read by hand, took one attempt, wrote no input and merged both
-  shards' corpora, but no record here compares those corpora with their
-  shards' counts, which #424's summary now does. Both runs were on GitHub's
-  hosted runners, virtual machines. The coverage run (`-runs=0`) still has no
-  `-artifact_prefix`, so an input it fails on, which fails the merge by its
-  status, is written to its working directory (#416). The limit of
-  `actions/upload-artifact@v4` was measured on Node 22, not on the `node20`
-  the action declares; the shard and merged corpora are uploaded as archives,
-  so their directories no longer meet it (#424).
+  and the harness). Both runs were on GitHub's hosted runners, virtual
+  machines. The coverage run (`-runs=0`) still has no `-artifact_prefix`, so
+  an input it fails on, which fails the merge by its status, is written to its
+  working directory (#416). The limit of `actions/upload-artifact@v4` was
+  measured on Node 22, not on the `node20` the action declares; the shard and
+  merged corpora are uploaded as archives, so their directories no longer meet
+  it (#424).
 - On a host whose `net.core.wmem_default` is below 65,968 bytes,
   `nbd_handshake`'s longest seed (65,840 bytes) fails
   `review_fuzz_entry_threads.rs`, since fuzzing it would start a thread there,
