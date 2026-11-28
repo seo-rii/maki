@@ -281,8 +281,9 @@ the testing guide's rows, and the items it touches were checked there.
 
 - Every fuzz target has qualified at 24 CPU-hours, but in two campaigns at two
   revisions (AUD-210, AUD-223, AUD-224), and by SPEC §55 a campaign qualifies
-  only the revision it ran on: these qualify `32efe0b` and `945596b`, and no
-  later revision, the release's included, until a campaign runs on it. Eleven
+  only the revision it ran on: these qualify the eleven targets named below at
+  `32efe0b` and the five at `945596b`, and no later revision, the release's
+  included, until a campaign runs on it. Eleven
   targets qualified in run 45983119347 at `32efe0b`, and `nbd_handshake`,
   `witness_etcd`, `http_response`, `grpc_response` and `helper_reports` in run
   46062600943 at `945596b`, which the coordinator dispatched for those five
