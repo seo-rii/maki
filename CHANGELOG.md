@@ -705,8 +705,9 @@ documents.
   qualified eleven targets. `nbd_handshake` no longer starts a thread per
   input, and the summary's "qualified" for `witness_etcd`, `http_response`,
   `grpc_response` and `helper_reports` was wrong, since their shard corpora
-  never reached their merges; those five were dispatched again, and that run
-  had not finished when the tenth round was recorded.*
+  never reached their merges; those five were dispatched again on `main` at
+  `945596b` (run 46062600943) and all qualified, so every target has qualified
+  at 24 CPU-hours, in two runs.*
 - **CI requires the IPv6 loopback address for the connect tests and runs a
   packet-drop test as root** (AUD-206, 2026-11-27;
   [#414](https://github.com/seo-rii/maki/pull/414)). For developers:
@@ -1527,26 +1528,29 @@ documents.
   qualified. `nbd_handshake`'s entry function runs the server side of its
   socket pair on the calling thread, where it started a thread for every
   input, under which every process of that campaign's AddressSanitizer build
-  ran out of memory after about 10 million executions ([fuzz
+  ran out of memory after about 10 million executions. A second campaign of
+  those five targets on `main` at `945596b` (run 46062600943), with these
+  checks, qualified each of them, so every target has now qualified at 24
+  CPU-hours, eleven at `32efe0b` and five at `945596b` ([fuzz
   qualification](docs/testing.md#fuzz-qualification)).
 - **2026-11-27 tenth round: tests** (AUD-221, AUD-222, AUD-225;
   [#416](https://github.com/seo-rii/maki/pull/416),
-  [#423](https://github.com/seo-rii/maki/pull/423)). For developers.
+  [#423](https://github.com/seo-rii/maki/pull/423),
+  [#426](https://github.com/seo-rii/maki/pull/426)). For developers.
   `documented_quickstart.py --stop-once` requires the mark its shim leaves, so
   a bootstrap whose first run failed before the shimmed command no longer
   passes as stopped there. Rules of the validation scripts that no test held
   now have tests: a plan without targets, the coverage run's status, a round
   after one that failed, the stopped bootstrap's record, connection and reset,
   a leftover backend or mount after the stop together, and the guest runner
-  phase's and the `run` command's exit statuses. Ten others that the audit
-  found, in the stop together, the opener and the booted-host scripts, still
-  have none (the [remediation
-  log](docs/review-remediation.md#not-closed-in-the-tenth-round)). Refused
-  test endpoints are sockets that are bound and never listen, held for the
-  whole test, where a listener was dropped and its port could be handed to a
-  parallel test's `127.0.0.1:0` bind, which failed two tests of
-  maki-crypto-websocket's `review_unsent_failover.rs` in CI ([automated
-  CI](docs/testing.md#automated-ci)).
+  phase's and the `run` command's exit statuses. Ten more that the audit
+  found, in the stop together, the opener and the booted-host scripts, have
+  tests since #426, and every one of the audit's 41 mutations of those scripts
+  now fails a test. Refused test endpoints are sockets that are bound and
+  never listen, held for the whole test, where a listener was dropped and its
+  port could be handed to a parallel test's `127.0.0.1:0` bind, which failed
+  two tests of maki-crypto-websocket's `review_unsent_failover.rs` in CI
+  ([automated CI](docs/testing.md#automated-ci)).
 - **2026-11-25 ninth round: refusals of the rollback-protected backing**
   (AUD-183 to AUD-186; [#391](https://github.com/seo-rii/maki/pull/391)).
   `maki volume gc` refuses a remote backing root that does not hold the
