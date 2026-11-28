@@ -2,7 +2,8 @@
 
 `scripts/storage-repeat-validation.py` repeats existing storage tests on the
 local Linux host without an interactive agent watching them. It creates no
-cloud resources. The parser corpus campaign remains separate and deferred.
+cloud resources. The parser corpus campaign is separate: the
+[fuzz qualification](testing.md#fuzz-qualification) workflow runs it.
 
 ```sh
 # First check one round, including extended DB/persistence gates.
